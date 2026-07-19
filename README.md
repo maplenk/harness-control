@@ -49,6 +49,11 @@ bin (`npm link` for a global command, or run `npx tsx src/cli/index.ts …`
 during development). Run state lives under `HARNESS_HOME` (default
 `~/.harness`): one SQLite database plus a content-addressed artifact store.
 
+`dist/` is packaged (`files`/`bin`) but gitignored, so a `prepack` hook runs
+`npm run build` before `npm pack`/`npm publish` — the tarball always reflects
+current source, never a stale local `dist/`. CI should still assert
+`dist/` matches a clean build (build from a clean checkout, diff the tree).
+
 ## Walkthrough (PLAN §18)
 
 Every command accepts `--json` for a stable machine-readable payload.
@@ -77,10 +82,17 @@ harness-orchestrator spec revise RUN_ID --feedback "Tighten AC-2; no new deps"
 harness-orchestrator approve RUN_ID --spec-version SPEC_ID --spec-hash HASH
 
 # 4. Drive implement → verify → (bounded remediation) → merge-readiness.
-#    Profiles are packed tokens: harness[:model[:effort]].
+#    Profiles are packed tokens: harness[:model[:effort]]. Each flag is OPTIONAL:
+#    when omitted it DEFAULTS to the approved spec's proposed profile (the
+#    coordinator's proposedImplementorProfile/proposedVerifierProfile); an
+#    explicit flag always overrides. `run` refuses only when a role has neither
+#    a flag nor a resolvable proposal.
 harness-orchestrator run RUN_ID \
   --implementor codex:gpt-5.6-terra:medium \
   --verifier claude:sonnet:medium
+
+# 4b. …or let the approved spec's proposals stand in — no profile flags needed:
+harness-orchestrator run RUN_ID
 
 # 5. Inspect: phase, suspension, honest ETA, vitals (rss / context window /
 #    measured + estimated cost with per-role and per-phase attribution),

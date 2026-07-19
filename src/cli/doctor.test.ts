@@ -226,6 +226,31 @@ describe('package.json os restriction (W4-5: supervision is macOS-only in MVP)',
   });
 });
 
+describe('package.json release hygiene (review-6 F5: dist/ is shipped but gitignored)', () => {
+  it('runs the production build via a prepack hook so `npm pack`/`npm publish` never ship a stale dist', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const pkgRaw = await readFile(path.join(process.cwd(), 'package.json'), 'utf8');
+    const pkg = JSON.parse(pkgRaw) as {
+      files?: readonly string[];
+      scripts?: Record<string, string>;
+      bin?: Record<string, string>;
+    };
+    // dist/ is gitignored yet packaged (files + bin point into it) — nothing in
+    // the tree rebuilds it, so pack must rebuild it itself. npm runs `prepack`
+    // before `npm pack`/`npm publish`; it must invoke the production build
+    // (which chmods the bin via postbuild). Without this the packaged dist is
+    // whatever was last built locally — potentially stale, missing recent src.
+    expect(pkg.files).toContain('dist');
+    const prepack = pkg.scripts?.prepack;
+    expect(prepack, 'package.json must define a prepack script').toBeTruthy();
+    // Delegate to the single build entry point rather than duplicating the
+    // tsc invocation, so bin-chmod (postbuild) and any future build steps are
+    // covered by one source of truth.
+    expect(prepack).toBe('npm run build');
+    expect(pkg.scripts?.build).toBe('tsc -p tsconfig.build.json');
+  });
+});
+
 describe('cli arg parsing (hand-rolled, §18)', () => {
   it('parses doctor with --json and --config in both forms', () => {
     expect(parseCliArgs(['doctor'])).toEqual({ kind: 'doctor', json: false });

@@ -2754,14 +2754,38 @@ export class OrchestrationService {
       );
     }
     const resolved = resolveRoleModel(spec);
-    const handle = this.#adapterFactory.create({
-      role,
-      cwd: meta.workspacePath,
-      clock: this.#clock,
-      // Deny-all headless mediation: a probe never needs tool permissions.
-      permissions: toPermissionConfig(DEFAULT_HEADLESS_MEDIATION, role),
-      resolved,
-    });
+    // W4-8/F8 (§14 concurrency): a probe spawns a REAL child process, so it
+    // must pass the SAME admission guard as a role spawn — admit against
+    // `maxLiveChildren` (or REFUSE with `MaxLiveChildrenExceededError`) BEFORE
+    // any provider resource is created (incl. the Codex §17.1 H-1 isolated
+    // `CODEX_HOME`), exactly like `runRole`. The §14 identity is allocated up
+    // front so `#admitSpawn` can key the durable reservation and so the same
+    // generation reconciles with the later registry record. The slot is
+    // released in this method's `finally` on every exit path (or the setup
+    // guard below if adapter resource creation throws after admission).
+    const generationId = newProcessGenerationId(this.#ids);
+    this.#admitSpawn(generationId);
+    let handle: RoleAdapterHandle;
+    try {
+      handle = this.#adapterFactory.create({
+        role,
+        cwd: meta.workspacePath,
+        clock: this.#clock,
+        // Deny-all headless mediation: a probe never needs tool permissions.
+        permissions: toPermissionConfig(DEFAULT_HEADLESS_MEDIATION, role),
+        resolved,
+      });
+    } catch (error) {
+      // Resource setup failed AFTER admission was granted (e.g. the factory
+      // could not prepare the Codex isolated `CODEX_HOME` — the factory
+      // disposes its OWN temp home on a failed build, H-1). Release the durable
+      // reservation + in-process mirror so the failed setup holds no slot, then
+      // rethrow. No handle to dispose and no heartbeat has started yet, so the
+      // `finally` machinery below never runs for this path.
+      this.#releaseSpawnReservation(generationId);
+      this.#concurrency.release(generationId);
+      throw error;
+    }
     const ctx: SpawnContext = {
       runId,
       role,
@@ -2769,7 +2793,7 @@ export class OrchestrationService {
       adapter: handle.adapter,
       handle,
       segmentId: newSegmentId(this.#ids),
-      generationId: newProcessGenerationId(this.#ids),
+      generationId,
       cwd: meta.workspacePath,
       mediation: DEFAULT_HEADLESS_MEDIATION,
     };
@@ -2833,6 +2857,13 @@ export class OrchestrationService {
       }
       this.#releaseSpawnSupervision(ctx, disposedCleanly);
       this.#endHeartbeat(runId);
+      // W4-8/F8: free the admitted concurrency slot on EVERY exit path (probe
+      // OK, still-limited, inconclusive, budget refusal, dispose failure) —
+      // both the durable reservation (cross-process cap) and the in-process
+      // mirror. The durable registry record's lifecycle is owned by
+      // `#releaseSpawnSupervision` above.
+      this.#releaseSpawnReservation(ctx.generationId);
+      this.#concurrency.release(ctx.generationId);
     }
   }
 

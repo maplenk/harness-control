@@ -73,6 +73,8 @@ import {
 import type { VerificationRunner } from '../app/flows/implementor.js';
 import { collectIncidentProbeState, latestIncidentEvent } from '../scheduler/limit-schedule.js';
 import { redactText } from '../redaction/index.js';
+import { parseRoleProfile } from './profile.js';
+import { isErr, ok, type Result } from '../lib/result.js';
 import { DEFAULT_ENGINE_CONFIG } from '../config/loader.js';
 import type { GitWorktreeManager } from '../worktree/index.js';
 import type { RunCommand } from './args.js';
@@ -699,21 +701,6 @@ async function handleRun(
     const text = `run requires an approved spec; run ${cmd.runId} is at '${st.phase}'.${hint}`;
     return finish('run', { runId: cmd.runId, phase: st.phase, error: 'not_approved', detail: text }, text, 1);
   }
-  if (cmd.implementor === undefined || cmd.verifier === undefined) {
-    const missing = [
-      cmd.implementor === undefined ? '--implementor' : undefined,
-      cmd.verifier === undefined ? '--verifier' : undefined,
-    ]
-      .filter((v): v is string => v !== undefined)
-      .join(' and ');
-    const draft = service.getSpecDraft(cmd.runId);
-    const suggestion =
-      draft !== undefined
-        ? ` The approved spec proposed implementor='${draft.proposedImplementorProfile}', verifier='${draft.proposedVerifierProfile}'.`
-        : '';
-    const text = `run needs ${missing}: pass the implementor/verifier profiles explicitly.${suggestion}`;
-    return finish('run', { runId: cmd.runId, phase: st.phase, error: 'missing_profiles', detail: text }, text, 2);
-  }
   const draft = service.getSpecDraft(cmd.runId);
   if (draft === undefined) {
     // W3-4: distinguish "never drafted" from "drafted, durably completed,
@@ -769,6 +756,25 @@ async function handleRun(
       1,
     );
   }
+  // F9: the stable CLI contract (PLAN §18) is that `run`'s implementor/verifier
+  // DEFAULT to the approved spec draft's proposed profiles (persisted from the
+  // coordinator round). An explicit flag always overrides. We refuse ONLY when a
+  // role has NEITHER an explicit flag NOR a usable (parseable) proposed profile.
+  const implementor = resolveRunProfile(cmd.implementor, draft.proposedImplementorProfile);
+  const verifier = resolveRunProfile(cmd.verifier, draft.proposedVerifierProfile);
+  if (isErr(implementor) || isErr(verifier)) {
+    const problems = [
+      isErr(implementor) ? `--implementor (${implementor.error})` : undefined,
+      isErr(verifier) ? `--verifier (${verifier.error})` : undefined,
+    ].filter((v): v is string => v !== undefined);
+    const text =
+      `run needs a usable ${problems.join(' and ')}: pass the profile flag explicitly, or have the ` +
+      `approved spec propose a resolvable one. The approved spec proposed ` +
+      `implementor='${draft.proposedImplementorProfile}', verifier='${draft.proposedVerifierProfile}'.`;
+    return finish('run', { runId: cmd.runId, phase: st.phase, error: 'missing_profiles', detail: text }, text, 2);
+  }
+  const implementorSpec = implementor.value;
+  const verifierSpec = verifier.value;
   if (flows === undefined) {
     const text =
       'run cannot drive the implement→verify loop: the flow runtime is not configured. ' +
@@ -790,8 +796,8 @@ async function handleRun(
     {
       runId: cmd.runId,
       assignmentId: asg,
-      implementor: cmd.implementor,
-      verifier: cmd.verifier,
+      implementor: implementorSpec,
+      verifier: verifierSpec,
       specHash: draft.specHash,
       specDocument: draft.canonicalSpec,
       goal: draft.goal,
@@ -802,7 +808,22 @@ async function handleRun(
     },
   );
 
-  return loopResultOutput('run', service, cmd.runId, result, cmd.implementor, cmd.verifier);
+  return loopResultOutput('run', service, cmd.runId, result, implementorSpec, verifierSpec);
+}
+
+/**
+ * F9: resolve a `run` role profile — an explicit `--implementor`/`--verifier`
+ * flag always wins; otherwise DEFAULT to the approved spec draft's proposed
+ * profile token, parsed the same way the flag would be. Returns an `Err` (with
+ * the reason) only when no flag was given AND the proposed token is not a
+ * resolvable `harness[:model[:effort]]`.
+ */
+function resolveRunProfile(
+  flag: RoleModelSpec | undefined,
+  proposed: string,
+): Result<RoleModelSpec, string> {
+  if (flag !== undefined) return ok(flag);
+  return parseRoleProfile({ profile: proposed });
 }
 
 /** Shared renderer for an implement→verify loop result — `run` and the W2-5

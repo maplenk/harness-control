@@ -329,6 +329,144 @@ describe('D-1: the shipped CLI (executeCommand) drives the full P3 slice', () =>
     expect(types).toContain('merge.readiness.recorded');
   });
 
+  // F9 REGRESSION (fails without the fix): `run` with NO --implementor/--verifier
+  // flags DEFAULTS to the approved spec draft's proposed profiles (PLAN §18). The
+  // coordinator here proposes resolvable profiles; the flagless run must reach
+  // merge_ready and the plan must reflect the PROPOSED harness/model — not exit
+  // `missing_profiles` (the pre-fix behavior).
+  it('run with NO profile flags defaults to the approved spec draft proposed profiles → merge_ready', async () => {
+    const specWithProfiles = {
+      ...validSpec(),
+      proposedImplementorProfile: 'codex:gpt-5.6-terra',
+      proposedVerifierProfile: 'claude:opus',
+    };
+    const { service, db, deps } = await setup({
+      coordinator: [{ turns: [coordinatorTurn(specWithProfiles)] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+            ]),
+          ],
+        },
+      ],
+    });
+
+    const start = await executeCommand(
+      service,
+      db,
+      { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
+      {},
+      deps,
+    );
+    const runId = start.json['runId'] as RunId;
+    const spec = start.json['spec'] as { specVersionId: string; specHash: string };
+
+    const approve = await executeCommand(
+      service,
+      db,
+      {
+        kind: 'approve',
+        json: true,
+        runId,
+        specVersionId: toSpecVersionId(spec.specVersionId),
+        specHash: toSpecHash(spec.specHash),
+        testApprove: true,
+      },
+      { HARNESS_TEST_MODE: '1' },
+    );
+    expect(approve.exitCode).toBe(0);
+
+    // No --implementor/--verifier — the approved spec's proposals are the default.
+    const run = await executeCommand(service, db, { kind: 'run', json: true, runId }, {}, deps);
+    expect(run.json['error']).toBeUndefined();
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ command: 'run', ok: true, outcome: 'merge_ready', phase: 'merge_ready' });
+    const plan = run.json['plan'] as {
+      implementor: { harness: string; model: string };
+      verifier: { harness: string; model: string };
+    };
+    expect(plan.implementor).toMatchObject({ harness: 'codex', model: 'gpt-5.6-terra' });
+    expect(plan.verifier).toMatchObject({ harness: 'claude', model: 'opus' });
+  });
+
+  // F9: an explicit flag still OVERRIDES the approved spec's proposal.
+  it('run with an explicit --implementor overrides the approved spec proposal', async () => {
+    const specWithProfiles = {
+      ...validSpec(),
+      proposedImplementorProfile: 'codex:gpt-5.6-terra',
+      proposedVerifierProfile: 'claude:opus',
+    };
+    const { service, db, deps } = await setup({
+      coordinator: [{ turns: [coordinatorTurn(specWithProfiles)] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+            ]),
+          ],
+        },
+      ],
+    });
+
+    const start = await executeCommand(
+      service,
+      db,
+      { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
+      {},
+      deps,
+    );
+    const runId = start.json['runId'] as RunId;
+    const spec = start.json['spec'] as { specVersionId: string; specHash: string };
+    await executeCommand(
+      service,
+      db,
+      {
+        kind: 'approve',
+        json: true,
+        runId,
+        specVersionId: toSpecVersionId(spec.specVersionId),
+        specHash: toSpecHash(spec.specHash),
+        testApprove: true,
+      },
+      { HARNESS_TEST_MODE: '1' },
+    );
+
+    // Explicit --implementor (claude:opus) must win over the proposed codex:gpt-5.6-terra;
+    // --verifier omitted still defaults to the proposed claude:opus.
+    const run = await executeCommand(
+      service,
+      db,
+      { kind: 'run', json: true, runId, implementor: { harness: 'claude', model: 'opus', effort: 'low' } },
+      {},
+      deps,
+    );
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ outcome: 'merge_ready' });
+    const plan = run.json['plan'] as {
+      implementor: { harness: string; model: string };
+      verifier: { harness: string; model: string };
+    };
+    expect(plan.implementor).toMatchObject({ harness: 'claude', model: 'opus' });
+    expect(plan.verifier).toMatchObject({ harness: 'claude', model: 'opus' });
+  });
+
   it('spec revise completes the round: T2 → coordinator re-drive → NEW draft → awaiting_approval (W1-F7)', async () => {
     const revisedSpec = {
       ...validSpec(),

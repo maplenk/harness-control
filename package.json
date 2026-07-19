@@ -21,6 +21,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "postbuild": "node -e \"require('node:fs').chmodSync('dist/cli/index.js', 0o755)\"",
+    "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

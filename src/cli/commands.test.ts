@@ -64,7 +64,12 @@ function toAwaitingApproval(service: OrchestrationService): RunId {
 }
 
 /** A minimal persisted coordinator draft (what `start` writes) for W1-F3 binding tests. */
-function draftState(version: string, hash: string, revision = 1): SpecDraftState {
+function draftState(
+  version: string,
+  hash: string,
+  revision = 1,
+  proposed: { implementor: string; verifier: string } = { implementor: 'implementor', verifier: 'verifier' },
+): SpecDraftState {
   return {
     specVersionId: specVersionId(version),
     specHash: specHash(hash),
@@ -78,8 +83,8 @@ function draftState(version: string, hash: string, revision = 1): SpecDraftState
         expectedEvidence: 'exit code 0',
       },
     ],
-    proposedImplementorProfile: 'implementor',
-    proposedVerifierProfile: 'verifier',
+    proposedImplementorProfile: proposed.implementor,
+    proposedVerifierProfile: proposed.verifier,
     revision,
   };
 }
@@ -291,14 +296,38 @@ describe('executeCommand — run', () => {
     expect(out.json).toMatchObject({ command: 'run', error: 'not_approved', phase: 'awaiting_approval' });
   });
 
-  it('requires explicit profiles when none are passed, once approved (exit 2)', async () => {
+  // F9: when NEITHER a --implementor/--verifier flag NOR a *resolvable* proposed
+  // profile exists, `run` still errors clearly (exit 2). Here the approved
+  // draft's proposals are bare role labels ('implementor'/'verifier') that carry
+  // no harness:model — so there is no usable default and the run refuses.
+  it('errors clearly when no flags AND the proposed profiles are not resolvable (exit 2)', async () => {
     const { service, db } = await setup();
     const runId = toAwaitingApproval(service);
+    service.saveSpecDraft(runId, draftState('spec_1', 'h1'));
     service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: specHash('h1') });
-    // No --implementor/--verifier: rejected before any flow work (exit 2).
     const out = await executeCommand(service, db, { kind: 'run', json: true, runId }, {});
     expect(out.exitCode).toBe(2);
     expect(out.json).toMatchObject({ error: 'missing_profiles' });
+  });
+
+  // F9 REGRESSION (fails without the fix): the stable contract is that `run`
+  // with NO profile flags DEFAULTS to the approved spec draft's proposed
+  // profiles. Before the fix this exited `missing_profiles` (exit 2) regardless
+  // of the proposals. With resolvable proposals it must NOT be missing_profiles —
+  // here (no flow runtime injected) it advances to the `flows_unavailable` gate,
+  // proving the implementor/verifier were resolved from the draft.
+  it('defaults implementor/verifier from the approved spec draft when no flags are passed', async () => {
+    const { service, db } = await setup();
+    const runId = toAwaitingApproval(service);
+    service.saveSpecDraft(
+      runId,
+      draftState('spec_1', 'h1', 1, { implementor: 'codex:gpt-5.6-terra', verifier: 'claude:opus' }),
+    );
+    service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: specHash('h1') });
+    // No --implementor/--verifier: the draft's proposed profiles are the default.
+    const out = await executeCommand(service, db, { kind: 'run', json: true, runId }, {});
+    expect(out.json['error']).not.toBe('missing_profiles');
+    expect(out.json).toMatchObject({ error: 'flows_unavailable' });
   });
 });
 

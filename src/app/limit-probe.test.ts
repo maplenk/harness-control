@@ -21,7 +21,7 @@
  *    provider's own ETA elapses — including from a fresh process (anchoring).
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { ManualClock } from '../lib/clock.js';
+import { ManualClock, isoTimestamp } from '../lib/clock.js';
 import { acpSessionId, runId, type RunId } from '../domain/ids.js';
 import { draftEvent, type DomainEvent } from '../domain/events.js';
 import {
@@ -37,6 +37,12 @@ import { DeterministicIdFactory } from '../lib/id-factory.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../persistence/test-support.js';
 import { parseEngineConfig } from '../config/loader.js';
 import { unwrap } from '../lib/result.js';
+import {
+  MaxLiveChildrenExceededError,
+  type ProcessIdentitySample,
+  type PsClient,
+} from '../supervisor/index.js';
+import { DurableSpawnReservationStore } from './spawn-reservation-store.js';
 import type { EngineConfig } from '../config/schema.js';
 import {
   DEFAULT_PROBE_ADOPT_AFTER_MS,
@@ -613,5 +619,157 @@ describe('runScheduledProbe — structured retry_after', () => {
       },
     });
     expect(successor.getResumePlan(id)).toEqual({ kind: 'resume_now', resumesAt: RESUMES_AT });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F8 (external review 6): the limit-probe spawn is a REAL child process and
+// MUST pass the SAME concurrency admission guard (#admitSpawn) as a role spawn
+// — reserve a slot before spawn (refusing with MaxLiveChildrenExceededError
+// when maxLiveChildren is at the cap, rather than exceeding it), and release
+// it in `finally` on every exit path. Before the fix the probe path bypassed
+// admission entirely, so probes could exceed the global cap.
+//
+// Deterministic: an injected fake `ps` (identity + liveness) so a seeded
+// durable reservation owned by a LIVE peer counts against the global cap,
+// exactly like #admitSpawn's cross-process tally.
+// ---------------------------------------------------------------------------
+const PROBE_STILL_LIMITED: FakeScript = { turns: [{ errorEnvelope: rateLimitErrorEnvelope() }] };
+const PROBE_SELF_PID = 90_000;
+
+interface FakePs {
+  readonly client: PsClient;
+  readonly alive: Set<number>;
+}
+
+function makeFakePs(): FakePs {
+  const alive = new Set<number>([PROBE_SELF_PID]);
+  const sample = (pid: number): ProcessIdentitySample => ({
+    pid,
+    ppid: 1,
+    pgid: pid,
+    startedAt: `lstart-${pid}`,
+    executablePath: '/fake/agent',
+  });
+  return {
+    alive,
+    client: {
+      sampleProcessTree: (pgid) => ({
+        pgid,
+        rssBytes: 0,
+        processCount: 1,
+        pids: [pgid],
+        sampledAt: isoTimestamp('2026-07-19T00:00:00.000Z'),
+      }),
+      sampleIdentity: (pid) => (alive.has(pid) ? sample(pid) : undefined),
+      isAlive: (pid) => alive.has(pid),
+    },
+  };
+}
+
+async function setupWithPs(
+  scripts: readonly FakeScript[],
+  config: EngineConfig,
+): Promise<{
+  service: OrchestrationService;
+  db: TestDatabaseHandle['db'];
+  created: CreatedFake[];
+  clock: ManualClock;
+  ps: FakePs;
+  seedLiveReservation: (generationId: string, ownerPid: number) => void;
+}> {
+  const clock = new ManualClock(T0);
+  handle = await openTestDatabase({ kind: 'better-sqlite3', file: false, clock });
+  const db = handle.db;
+  const { factory, created } = makeQueueFactory(scripts);
+  const ps = makeFakePs();
+  const service = new OrchestrationService({
+    db,
+    ids: new DeterministicIdFactory(),
+    adapterFactory: factory,
+    config,
+    supervision: {
+      ps: ps.client,
+      selfPid: PROBE_SELF_PID,
+      sendSignal: () => undefined,
+      envNonce: { verifyNonce: () => 'match' },
+    },
+  });
+  const seedLiveReservation = (generationId: string, ownerPid: number): void => {
+    ps.alive.add(ownerPid);
+    new DurableSpawnReservationStore(db).reserveWithin({
+      generationId,
+      ownerPid,
+      ownerStartedAt: `lstart-${ownerPid}`,
+      reservedAt: clock.nowIso(),
+    });
+  };
+  return { service, db, created, clock, ps, seedLiveReservation };
+}
+
+describe('runScheduledProbe — F8 concurrency admission (maxLiveChildren)', () => {
+  it('refuses a due probe when maxLiveChildren is at the cap (never exceeds it), spawning nothing and leaking no reservation', async () => {
+    const cap1 = unwrap(parseEngineConfig({ maxLiveChildren: 1 }));
+    const { service, db, created, clock, seedLiveReservation } = await setupWithPs(
+      [PAUSE_SCRIPT, PROBE_STILL_LIMITED],
+      cap1,
+    );
+    const id = await pauseRun(service);
+    // The paused role's spawn admitted then released its slot on the pause path.
+    expect(new DurableSpawnReservationStore(db).list()).toHaveLength(0);
+    expect(created).toHaveLength(1); // only the paused role's adapter so far
+
+    // A live peer now holds the ONLY slot (cap=1) via a durable reservation.
+    seedLiveReservation('gen-live-peer', 90_001);
+
+    clock.advanceMs(DEADLINE1_OFFSET_MS + 1000);
+    const refusal: unknown = await service
+      .runScheduledProbe(id)
+      .then(() => undefined)
+      .catch((e: unknown) => e);
+
+    // The probe was REFUSED admission — it did not exceed the cap.
+    expect(refusal).toBeInstanceOf(MaxLiveChildrenExceededError);
+    expect((refusal as MaxLiveChildrenExceededError).max).toBe(1);
+    // Admission precedes adapter/resource creation → no probe adapter spawned.
+    expect(created).toHaveLength(1);
+    // No probe reservation leaked — only the seeded live peer remains.
+    expect(new DurableSpawnReservationStore(db).list().map((r) => r.generationId)).toEqual([
+      'gen-live-peer',
+    ]);
+  });
+
+  it('admits a probe when a slot is free and RELEASES it afterward, so the slot is reusable', async () => {
+    // cap=1, ladder of two rungs so a second probe can be scheduled.
+    const cap1 = unwrap(
+      parseEngineConfig({ maxLiveChildren: 1, limitProbe: { ladderMinutes: [30, 60] } }),
+    );
+    const { service, db, created, clock, seedLiveReservation } = await setupWithPs(
+      [PAUSE_SCRIPT, PROBE_STILL_LIMITED],
+      cap1,
+    );
+    const id = await pauseRun(service);
+
+    // Probe #1 admits the only slot (nothing else live), runs, and releases.
+    clock.advanceMs(DEADLINE1_OFFSET_MS + 1000);
+    const first = await service.runScheduledProbe(id);
+    expect(first.outcome).toBe('still_limited');
+    expect(created).toHaveLength(2); // the probe DID spawn
+    // The slot is free again — the probe released its reservation in `finally`.
+    expect(new DurableSpawnReservationStore(db).list()).toHaveLength(0);
+
+    // Occupy the freed slot with a live peer, then advance to rung 2's probe:
+    // it is now refused — proving admission is enforced per probe, not once.
+    seedLiveReservation('gen-live-peer', 90_002);
+    const plan2 = service.getResumePlan(id);
+    expect(plan2?.kind).toBe('probe_at');
+    if (plan2?.kind !== 'probe_at') return;
+    clock.advanceMs(Date.parse(plan2.at) - Date.parse(clock.nowIso()) + 1000);
+    const refusal: unknown = await service
+      .runScheduledProbe(id)
+      .then(() => undefined)
+      .catch((e: unknown) => e);
+    expect(refusal).toBeInstanceOf(MaxLiveChildrenExceededError);
+    expect(created).toHaveLength(2); // rung-2 probe spawned nothing
   });
 });
