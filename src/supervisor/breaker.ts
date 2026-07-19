@@ -65,7 +65,7 @@
  */
 import type { IsoTimestamp } from '../lib/clock.js';
 import type { IdFactory } from '../lib/id-factory.js';
-import { newIdempotencyKey, type ArtifactHash, type AssignmentId, type RunId, type SegmentId } from '../domain/ids.js';
+import { newIdempotencyKey, type ArtifactHash, type AssignmentId, type ProcessGenerationId, type RunId, type SegmentId } from '../domain/ids.js';
 import { draftEvent, type EventOfType } from '../domain/events.js';
 import { DEFAULT_BOUNDS, type EngineBounds, type RestartCounters } from '../domain/state.js';
 import { DEFAULT_ENGINE_CONFIG } from '../config/schema.js';
@@ -111,9 +111,20 @@ export interface RestartAttemptInput {
   readonly signal?: string;
   readonly classifiedAs?: 'crash' | 'nonzero_exit' | 'clean_exit_unexpected';
   /**
+   * F4 (§5x): the ACTIVE process generation this crash belongs to. Stamped
+   * onto the `restart.exhausted` (T14) / `child.exited.unexpectedly` (T13)
+   * trigger this module builds so the engine's `generation_matches_active`
+   * guard can reject a stale/superseded/late report — an UNSTAMPED generation
+   * passes that guard (making it a no-op), so the stamp is load-bearing.
+   */
+  readonly generationId?: ProcessGenerationId;
+  /**
    * Current AUTHORITATIVE counters — read by the caller from the durably
    * persisted `EngineState` projection. This module is never the source of
-   * truth for `lifetimeRestarts` (see module doc); it only reads it here.
+   * truth for `lifetimeRestarts` (see module doc); it only reads it here. F4
+   * (§5x): `counters.restartWindow` (the durable, reducer-pruned restart
+   * timestamps) also seeds this module's in-memory window deque on first use
+   * per assignment, so the fast 5/10min window survives a fresh process.
    */
   readonly counters: RestartCounters;
 }
@@ -220,6 +231,14 @@ export class RestartBreaker {
   evaluateCrash(input: RestartAttemptInput): BreakerAdvice {
     const nowMs = Date.parse(input.occurredAt);
 
+    // F4 (§5x): seed the in-memory window deque from the DURABLE, reducer-pruned
+    // `counters.restartWindow` the FIRST time this process sees the assignment
+    // (or the first crash after a `reset`) — so the fast 5/10min window is not
+    // amnesiac across a fresh CLI invocation. Subsequent in-process crashes use
+    // the accumulated deque directly (the reducer keeps the durable copy in sync
+    // on each folded T13). Never re-seeds a still-tracked assignment.
+    this.#hydrateWindow(input.assignmentId, input.counters);
+
     if (input.counters.lifetimeRestarts >= this.#engineBounds.lifetimeRestartMax) {
       return this.#breakerOpen(input, 'lifetime_cap');
     }
@@ -261,6 +280,19 @@ export class RestartBreaker {
     };
   }
 
+  /** F4 (§5x): lazily seed the in-memory window deque from the durable
+   * `counters.restartWindow` on first use per assignment (a fresh process, or
+   * the first crash after `reset` cleared the key). A still-tracked assignment
+   * is never re-seeded — the in-memory deque is authoritative once populated
+   * (the reducer keeps the durable copy in lockstep). */
+  #hydrateWindow(assignmentId: AssignmentId, counters: RestartCounters): void {
+    if (this.#windowTimestampsMs.has(assignmentId)) return;
+    const seeded = (counters.restartWindow ?? [])
+      .map((iso) => Date.parse(iso))
+      .filter((ms) => Number.isFinite(ms));
+    this.#windowTimestampsMs.set(assignmentId, seeded);
+  }
+
   #prunedWindow(assignmentId: AssignmentId, nowMs: number): number[] {
     const spanMs = this.#bounds.windowMinutes * 60_000;
     const existing = this.#windowTimestampsMs.get(assignmentId) ?? [];
@@ -278,6 +310,7 @@ export class RestartBreaker {
       payload: {
         segmentId: input.segmentId,
         classifiedAs: input.classifiedAs ?? 'crash',
+        ...(input.generationId !== undefined ? { generationId: input.generationId } : {}),
         ...(input.exitCode !== undefined ? { exitCode: input.exitCode } : {}),
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
       },
@@ -290,7 +323,9 @@ export class RestartBreaker {
     return draftEvent({
       type: 'restart.exhausted',
       runId: input.runId,
-      payload: { reason },
+      // F4 (§5x): stamp the generation so T14's `generation_matches_active`
+      // guard bites (an unstamped generationId passes → the guard is a no-op).
+      payload: { reason, ...(input.generationId !== undefined ? { generationId: input.generationId } : {}) },
       idempotencyKey: newIdempotencyKey(this.#ids),
       occurredAt: input.occurredAt,
     });

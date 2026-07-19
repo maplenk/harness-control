@@ -164,6 +164,19 @@ export interface RestartCounters {
   readonly probeCount: number;
   /** Remediation rounds consumed (§6.3 default bound 3; exhaustion → failed). */
   readonly remediationRounds: number;
+  /**
+   * F4 (§5x) DURABLE sliding-restart window: the `occurredAt` of each folded
+   * T13 restart, PRUNED in the pure reducer by the trigger event's own
+   * `occurredAt` (never `Date.now`) against `EngineBounds.windowMinutes` and
+   * hard-capped at `lifetimeRestartMax`. Unlike the monotonic
+   * `restartsInWindow` counter (which never decays), this genuinely
+   * time-decays, so the fast 5/10min window survives a fresh process: the
+   * `RestartBreaker` hydrates its in-memory deque from here lazily
+   * per-assignment. Optional so a projection persisted before F4 (no field)
+   * reads back as an empty window. This rides F1's single atomic T13 write —
+   * NOT a second breaker store.
+   */
+  readonly restartWindow?: readonly IsoTimestamp[];
 }
 
 export const ZERO_COUNTERS: RestartCounters = {
@@ -171,10 +184,16 @@ export const ZERO_COUNTERS: RestartCounters = {
   lifetimeRestarts: 0,
   probeCount: 0,
   remediationRounds: 0,
+  restartWindow: [],
 };
 
 export interface EngineBounds {
   readonly restartWindowMax: number;
+  /** F4 (§5x): sliding-window SPAN in minutes for the durable `restartWindow`
+   * prune (single source of truth: `EngineConfig.restarts.windowMinutes`).
+   * The pure T13 reducer decays entries older than this from the trigger
+   * event's own `occurredAt`. */
+  readonly windowMinutes: number;
   readonly lifetimeRestartMax: number;
   readonly probeMax: number;
   readonly remediationMax: number;
@@ -182,6 +201,7 @@ export interface EngineBounds {
 
 export const DEFAULT_BOUNDS: EngineBounds = {
   restartWindowMax: 5, // §14: window bound default 5/10min
+  windowMinutes: 10, // §14: window span default 10min
   lifetimeRestartMax: 10, // §14: lifetime cap default 10, non-disableable
   probeMax: 6, // §13: max 6 probes per incident
   remediationMax: 3, // §6.3: remediation bound default 3

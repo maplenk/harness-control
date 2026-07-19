@@ -197,9 +197,16 @@ export interface EventPayloads {
     readonly signal?: string;
     readonly classifiedAs: 'crash' | 'nonzero_exit' | 'clean_exit_unexpected';
   };
-  /** T14 — restart bounds exhausted / no-progress detected by supervisor. */
+  /** T14 — restart bounds exhausted / no-progress detected by supervisor.
+   * F4 (§5x): STAMPED with the process generation (same rule as T13) so the
+   * `generation_matches_active` guard can reject a stale/superseded/late
+   * report — WITHOUT a stamp that guard is a no-op (an unstamped generationId
+   * passes), so a late breaker-open could clobber a moved-on / paused_limit /
+   * terminal run. Optional only for the module-level breaker unit tests that
+   * drive the reducer with an unstamped trigger. */
   'restart.exhausted': {
     readonly reason: 'window_bound' | 'lifetime_cap' | 'no_progress' | 'max_elapsed_recovery';
+    readonly generationId?: ProcessGenerationId;
   };
   /** T15 — user `breaker reset`. */
   'breaker.reset.requested': Empty;
@@ -345,12 +352,37 @@ export interface EventPayloads {
     readonly reason: CheckpointReason;
     readonly segmentId?: SegmentId;
   };
-  /** §12.2 atomicity — commits with artifact hash in the same transaction. */
+  /**
+   * §12.2 atomicity — commits with artifact hash in the same transaction.
+   *
+   * F3 (§5x, Approach B): the binding fields (`specHash`, `role`, and — when
+   * a role round is dispatched — `round`/`assignmentId`) are DENORMALIZED onto
+   * the event so resume can DERIVE the latest binding-compatible checkpoint
+   * from the LOG ALONE, without loading every checkpoint artifact. This is
+   * what makes `resolveResumeCheckpoint` (and the "resume re-derives from the
+   * log" contract) real: a crash between the `checkpoint.recorded` append and
+   * the separate `round.checkpointRef` save no longer loses the checkpoint,
+   * and cadence checkpoints (which never touch `checkpointRef`) become
+   * visible to resume. The `specHash` filter is the superseded-spec guard.
+   */
   'checkpoint.recorded': {
     readonly checkpointId: CheckpointId;
     readonly artifactHash: ArtifactHash;
     readonly reason: CheckpointReason;
     readonly segmentId?: SegmentId;
+    /** The spec hash this checkpoint is bound to (the documented empty
+     * sentinel `''` means no spec existed at checkpoint time — never a
+     * mismatch). The superseded-spec guard filters on this. */
+    readonly specHash: SpecHash;
+    /** The role whose round produced this checkpoint (absent only on a
+     * checkpoint written outside a role spawn — none exist today). */
+    readonly role?: RoleName;
+    /** The 1-based dispatch round, when a role round is dispatched (absent for
+     * a coordinator pause taken before any round dispatch). */
+    readonly round?: number;
+    /** The assignment whose worktree the round runs in — the resume
+     * derivation's open/non-stale assignment filter key. */
+    readonly assignmentId?: AssignmentId;
   };
   /** §11.2 — effective-value echo confirmed the switch. */
   'model.switch.confirmed': {

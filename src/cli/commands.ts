@@ -1502,8 +1502,12 @@ async function reenterImplementVerify(
     const text = `run ${runId}: no workspace path recorded for this run.`;
     return finish(kind, { runId, error: 'workspace_missing', detail: text }, text, 1);
   }
-  const checkpoint =
-    round.checkpointRef !== undefined ? service.getCheckpointContent(round.checkpointRef) : undefined;
+  // F3 (§5x): DERIVE the checkpoint from the log rather than trusting the
+  // separately-saved `round.checkpointRef` pointer — a crash between the
+  // atomic `checkpoint.recorded` append and the `checkpointRef` save, or a
+  // cadence checkpoint (which saves no pointer), would otherwise be invisible
+  // to resume. `checkpointRef` stays only as an optional fast-path cache hint.
+  const checkpoint = service.resolveResumeCheckpoint(runId);
   const fixRequests = st.phase === 'needs_remediation' ? latestT23FixRequests(db, runId) : undefined;
   const resume: ImplementVerifyResumeInput = {
     round,

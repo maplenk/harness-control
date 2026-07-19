@@ -44,5 +44,5 @@ export { DEFAULT_WINDOW_SECONDS, SqliteProcessSampleRepository } from './telemet
 export type { Database, OpenDatabaseOptions } from './database.js';
 export { openDatabase } from './database.js';
 
-export type { AppendWithProjectionResult, ProjectionUpdate } from './write-path.js';
+export type { AppendTriggerOptions, AppendWithProjectionResult, ProjectionUpdate } from './write-path.js';
 export { appendTriggerWithEffects } from './write-path.js';

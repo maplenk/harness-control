@@ -82,6 +82,7 @@ export function toEngineBounds(config: EngineConfig): EngineBounds {
       config.restarts.windowMax === RESTART_WINDOW_OFF
         ? Number.POSITIVE_INFINITY
         : config.restarts.windowMax,
+    windowMinutes: config.restarts.windowMinutes,
     lifetimeRestartMax: config.restarts.lifetimeCap,
     probeMax: config.limitProbe.maxProbesPerIncident,
     remediationMax: config.remediation.maxRounds,

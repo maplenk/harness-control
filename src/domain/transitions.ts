@@ -19,6 +19,7 @@
  * Non-table micro-flows (§11.2 model-switch confirm/fail bookkeeping) are
  * recorded via SUPPORTING events by their coordinators, not via this engine.
  */
+import type { IsoTimestamp } from '../lib/clock.js';
 import type { ProcessGenerationId, SegmentId, SpecHash } from './ids.js';
 import {
   DEFAULT_BOUNDS,
@@ -390,8 +391,13 @@ export const TRANSITION_TABLE: readonly TransitionRow[] = [
   {
     id: 'T14',
     event: 'restart.exhausted',
-    description: 'Restart bounds exhausted / no-progress detected: breaker_open; notify.',
-    preconditions: [],
+    description:
+      'Restart bounds exhausted / no-progress detected: breaker_open; notify. F4 (§5x): guarded like T13/T17 — generation-stamped so a stale/superseded/late report cannot open the breaker over a run that has moved on to a new generation, been paused for a limit, or reached a terminal phase (an unstamped `generation_matches_active` is a no-op, so the STAMP on `restart.exhausted` is what makes this guard bite).',
+    preconditions: [
+      { kind: 'suspension_in', suspensions: ['none'] },
+      { kind: 'phase_non_terminal' },
+      { kind: 'payload_check', check: 'generation_matches_active' },
+    ],
     effects: [
       { kind: 'open_breaker' },
       { kind: 'notify', topic: 'breaker_open', message: 'Breaker open: restart bounds exhausted or no progress.' },
@@ -742,6 +748,31 @@ function segmentIdOf(event: DomainEvent): SegmentId | undefined {
   return payload.segmentId;
 }
 
+/**
+ * F4 (§5x) DURABLE restart window fold (PURE): append `occurredAt` to the
+ * bounded, time-decayed window and drop entries older than
+ * `bounds.windowMinutes` — measured ONLY from `occurredAt` (the trigger
+ * event's own timestamp), never `Date.now`, so a full log replay reconstructs
+ * the exact same window. Hard-capped at `lifetimeRestartMax` (finite,
+ * non-disableable) so a `windowMax: 'off'` run can never grow the list without
+ * bound. A malformed persisted timestamp (`NaN`) is treated as fully decayed.
+ */
+function foldRestartWindow(
+  existing: readonly IsoTimestamp[] | undefined,
+  occurredAt: IsoTimestamp,
+  bounds: EngineBounds,
+): readonly IsoTimestamp[] {
+  const nowMs = Date.parse(occurredAt);
+  const spanMs = bounds.windowMinutes * 60_000;
+  const kept = (existing ?? []).filter((ts) => {
+    const tsMs = Date.parse(ts);
+    return Number.isFinite(tsMs) && nowMs - tsMs <= spanMs;
+  });
+  kept.push(occurredAt);
+  const cap = Number.isFinite(bounds.lifetimeRestartMax) ? bounds.lifetimeRestartMax : kept.length;
+  return kept.length > cap ? kept.slice(kept.length - cap) : kept;
+}
+
 function suspensionReasonDetail(event: DomainEvent): string {
   const classification = classificationOf(event);
   if (classification) return `${classification.kind}:${classification.provider}`;
@@ -994,6 +1025,12 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
           ...draft.counters,
           restartsInWindow: draft.counters.restartsInWindow + 1,
           lifetimeRestarts: draft.counters.lifetimeRestarts + 1,
+          // F4 (§5x) DURABLE window: append this restart's own occurredAt and
+          // PRUNE by it (never Date.now) against the configured span, then
+          // hard-cap at the lifetime max so the list is always bounded. This
+          // rides F1's single atomic T13 write — the RestartBreaker rehydrates
+          // its fast 5/10min deque from here in a fresh process.
+          restartWindow: foldRestartWindow(draft.counters.restartWindow, event.occurredAt, state.bounds),
         };
         if (draft.activeChild !== undefined && draft.activeChild.status !== 'stopped') {
           const { stopCause: _dropped, ...rest } = draft.activeChild;
@@ -1034,6 +1071,10 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
           ...draft.counters,
           restartsInWindow: 0,
           probeCount: 0,
+          // F4 (§5x): clear the DURABLE window too — T15 is the user's explicit
+          // "start the window fresh" (the breaker mirrors this into its
+          // in-memory deque via `RestartBreaker.reset`).
+          restartWindow: [],
         };
         break;
       case 'require_worktree_validation': {

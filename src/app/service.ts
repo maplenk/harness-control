@@ -81,6 +81,7 @@ import {
   type EngineState,
   type RejectionReason,
   type TransitionId,
+  type TransitionOutcome,
 } from '../domain/transitions.js';
 import {
   isLiveChild,
@@ -110,9 +111,9 @@ import { isErr, unwrap } from '../lib/result.js';
 import {
   appendTriggerWithEffects,
   registerRun,
+  type AppendWithProjectionResult,
   type Database,
   type ProjectionRecord,
-  type ProjectionUpdate,
 } from '../persistence/index.js';
 import {
   AdapterError,
@@ -1132,12 +1133,12 @@ export class OrchestrationService {
       // `recover()` replays them identically. All other supporting events
       // are plain durable facts.
       if (isEngineFoldedSupportingEvent(event.type)) {
-        const record = this.#loadEngineRecord(event.runId);
-        const written = appendTriggerWithEffects(this.#db, event, [], {
-          name: ENGINE_STATE_PROJECTION,
-          currentState: { ...record.state, bounds: this.#bounds },
-          reduceEvent: this.#engineReducer,
-        });
+        // F1: read fresh + fold in ONE transactionImmediate — a folded child
+        // lifecycle / re-entry ack must never fold a stale snapshot either.
+        const { written } = this.#atomicEngineWrite(event.runId, () => ({
+          trigger: event,
+          meta: undefined,
+        }));
         const appended = written.appended[0];
         if (appended === undefined) {
           throw new Error('ingest: appendTriggerWithEffects returned no outcome for a folded supporting event');
@@ -1151,27 +1152,28 @@ export class OrchestrationService {
       return { status: 'recorded', event: outcome.event, deduped: outcome.deduped };
     }
 
-    const record = this.#loadEngineRecord(event.runId);
-    const currentState: EngineState = { ...record.state, bounds: this.#bounds };
-    const outcome = applyTransition(currentState, event);
-    const projection: ProjectionUpdate<EngineState> = {
-      name: ENGINE_STATE_PROJECTION,
-      currentState,
-      reduceEvent: this.#engineReducer,
-    };
+    // F1 (§5x, Approach A): read + validate + append atomically. The read is
+    // INSIDE the write-locked transaction, so `applyTransition` sees any
+    // transition a concurrent CLI committed since this caller decided to
+    // ingest — an incompatible trigger is rejected against FRESH state, never
+    // appended folding a stale snapshot (the old lost-update/illegal-append).
+    const { written, meta: outcome } = this.#atomicEngineWrite<TransitionOutcome>(event.runId, (currentState) => {
+      const outcome = applyTransition(currentState, event);
+      if (outcome.status === 'rejected') {
+        return { trigger: outcome.rejectionEvent as DomainEvent, meta: outcome };
+      }
+      return { trigger: event, emitted: outcome.emitted, meta: outcome };
+    });
 
     if (outcome.status === 'rejected') {
-      const rejectionEvent = outcome.rejectionEvent as DomainEvent;
-      const written = appendTriggerWithEffects(this.#db, rejectionEvent, [], projection);
       return {
         status: 'rejected',
         reason: outcome.reason,
         detail: outcome.detail,
-        rejection: written.appended[0]?.event ?? rejectionEvent,
+        rejection: written.appended[0]?.event ?? (outcome.rejectionEvent as DomainEvent),
       };
     }
 
-    const written = appendTriggerWithEffects(this.#db, event, outcome.emitted, projection);
     const triggerOutcome = written.appended[0];
     if (triggerOutcome !== undefined && triggerOutcome.deduped) {
       // The trigger key was already consumed by an earlier append: the write
@@ -1220,25 +1222,25 @@ export class OrchestrationService {
         `A spec-draft ref rides only the coordinator completion advance (specifying -> awaiting_approval), not ${from} -> ${to} (W3-4)`,
       );
     }
-    const record = this.#loadEngineRecord(runId);
-    const state: EngineState = { ...record.state, bounds: this.#bounds };
-    if (state.phase !== from) {
-      throw new WorkflowAdvanceError(`Run ${runId} is at '${state.phase}', not '${from}'`);
-    }
-    if (state.suspension.kind !== 'none') {
-      throw new WorkflowAdvanceError(
-        `Run ${runId} is suspended (${state.suspension.kind}); cannot advance workflow`,
-      );
-    }
-    const advance = this.#trigger(runId, 'workflow.dispatch.advanced', {
-      from,
-      to,
-      ...(opts?.draft !== undefined ? { draft: opts.draft } : {}),
-    }) as DomainEvent;
-    const written = appendTriggerWithEffects(this.#db, advance, [], {
-      name: ENGINE_STATE_PROJECTION,
-      currentState: state,
-      reduceEvent: this.#engineReducer,
+    // F1: the phase/suspension guard reads FRESH state inside the write lock
+    // (a concurrent transition that changed the phase or suspended the run
+    // between decision and append is seen, and the advance is refused rather
+    // than folding a stale snapshot).
+    const { written } = this.#atomicEngineWrite(runId, (state) => {
+      if (state.phase !== from) {
+        throw new WorkflowAdvanceError(`Run ${runId} is at '${state.phase}', not '${from}'`);
+      }
+      if (state.suspension.kind !== 'none') {
+        throw new WorkflowAdvanceError(
+          `Run ${runId} is suspended (${state.suspension.kind}); cannot advance workflow`,
+        );
+      }
+      const advance = this.#trigger(runId, 'workflow.dispatch.advanced', {
+        from,
+        to,
+        ...(opts?.draft !== undefined ? { draft: opts.draft } : {}),
+      }) as DomainEvent;
+      return { trigger: advance, meta: undefined };
     });
     // Re-inject bounds (config, not state — can be Infinity, which JSON drops).
     return { ...written.projection.state, bounds: this.#bounds };
@@ -1379,7 +1381,11 @@ export class OrchestrationService {
     runId: RunId,
     opts?: CommandOptions & { readonly mode?: 'manual' | 'scheduled_probe' },
   ): IngestResult {
-    return this.#db.transaction(() => {
+    // F1: `BEGIN IMMEDIATE` (not a deferred `transaction`) so the
+    // eligibility read + the trigger append are one write-locked unit AND the
+    // inner `ingest` `transactionImmediate` nests as a shared no-op —
+    // IMMEDIATE stays outermost (the write lock is taken before the read).
+    return this.#db.transactionImmediate(() => {
       const suspension = this.#loadEngineRecord(runId).state.suspension.kind;
       if (suspension === 'none' || suspension === 'breaker_open') {
         throw new WorkflowAdvanceError(`resume: run ${runId} is not paused (suspension=${suspension})`);
@@ -1477,6 +1483,74 @@ export class OrchestrationService {
     return JSON.parse(Buffer.from(bytes).toString('utf8')) as CheckpointContent;
   }
 
+  /**
+   * F3 (§5x, Approach B) — DERIVE the checkpoint the resume path should adopt
+   * from the LOG, not from the separately-saved `round.checkpointRef` pointer.
+   *
+   * The old resume read only `round.checkpointRef` (saved AFTER the atomic
+   * `checkpoint.recorded` append), so a crash in that window lost the
+   * checkpoint, and cadence checkpoints — which never touch `checkpointRef` —
+   * were invisible to resume. This makes the "resume re-derives from the log"
+   * contract true: scan `checkpoint.recorded` for the LATEST-by-sequence one
+   * whose enriched binding is compatible with the CURRENT round.
+   *
+   * Compatibility REUSES `checkResumeEligibility`'s binding-equality chain
+   * (assignment open + non-stale, spec-hash chain) rather than reimplementing
+   * it: if the round is not resume-eligible, NO checkpoint may be resurrected.
+   * Among the eligible set, a checkpoint is compatible iff (a) it belongs to
+   * the current round's assignment (when the round has one), and (b) its
+   * `specHash` matches the round's binding — the empty sentinel `''` (no spec
+   * at checkpoint time) never counts as a mismatch, and a SUPERSEDED-spec
+   * checkpoint (different hash, post spec-revise) is excluded. `checkpointRef`
+   * remains only an optional fast-path cache hint — never authoritative,
+   * never made atomic.
+   *
+   * Note the ordering is by event sequence, so a cadence checkpoint recorded
+   * LATER than a verifier completion checkpoint wins — that regresses
+   * EVIDENCE (re-verify), not CORRECTNESS, which is the safe direction (§5x).
+   */
+  resolveResumeCheckpoint(runId: RunId): CheckpointContent | undefined {
+    const hash = this.resolveResumeCheckpointHash(runId);
+    return hash !== undefined ? this.getCheckpointContent(hash) : undefined;
+  }
+
+  /** The derived resume checkpoint's artifact hash (see
+   * `resolveResumeCheckpoint`); split out so callers that only need the hash
+   * (or want to compare it to the `checkpointRef` cache) avoid a CAS read. */
+  resolveResumeCheckpointHash(runId: RunId): ArtifactHash | undefined {
+    const round = this.getRoleRound(runId);
+    if (round === undefined) return undefined;
+    // Reuse the exact binding-equality chain: an ineligible round (stale
+    // assignment / superseded spec) can never resurrect ANY checkpoint.
+    if (!this.checkResumeEligibility(runId).eligible) return undefined;
+
+    const bindingSpecHash = round.specHash !== undefined ? String(round.specHash) : undefined;
+    const assignmentId = round.assignmentId;
+
+    let best: { readonly sequence: number; readonly hash: ArtifactHash } | undefined;
+    for (const event of this.#db.events.listByRun(runId)) {
+      if (event.type !== 'checkpoint.recorded') continue;
+      const payload = event.payload;
+      // Assignment filter: the checkpoint must belong to the current round's
+      // (open, non-stale) assignment. A round with no assignment (coordinator
+      // drafting before any assignment exists) skips this filter.
+      if (assignmentId !== undefined) {
+        if (payload.assignmentId === undefined || String(payload.assignmentId) !== String(assignmentId)) {
+          continue;
+        }
+      }
+      // Superseded-spec guard: a checkpoint bound to a DIFFERENT spec than the
+      // current round is never resurrected. The empty sentinel is not a spec.
+      const cpSpec = String(payload.specHash);
+      if (bindingSpecHash !== undefined && cpSpec !== '' && cpSpec !== bindingSpecHash) continue;
+      const sequence = Number(event.sequence);
+      if (best === undefined || sequence > best.sequence) {
+        best = { sequence, hash: payload.artifactHash };
+      }
+    }
+    return best?.hash;
+  }
+
   // ---- Role-flow SEAM ------------------------------------------------------
   /**
    * Coordinator drafting sub-flow (§7): dispatch the coordinator round
@@ -1544,7 +1618,10 @@ export class OrchestrationService {
    * approval-ready run whose draft is silently gone.
    */
   completeCoordinationRound(runId: RunId, draft: SpecDraftState): EngineState {
-    return this.#db.transaction(() => {
+    // F1: `BEGIN IMMEDIATE` so the draft persist + the final advance are one
+    // write-locked unit and the inner `advanceWorkflowPhase`
+    // `transactionImmediate` nests as a shared no-op (IMMEDIATE outermost).
+    return this.#db.transactionImmediate(() => {
       this.saveSpecDraft(runId, draft);
       return this.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval', {
         draft: {
@@ -1793,6 +1870,14 @@ export class OrchestrationService {
             ? { checkpointRef: current.checkpointRef }
             : {}),
         });
+        // F4 (§5x): a round reaching `completed` is durable, real forward
+        // progress — reset the breaker's recovery sequence so a LATER, unrelated
+        // crash starts a fresh no-progress / max-elapsed-recovery clock instead
+        // of inheriting stale history (without this reset an assignment that
+        // crashed once, recovered, then ran clean past maxElapsedRecoveryMs would
+        // false-trip the breaker on its next unrelated crash). The durable window
+        // deque is deliberately NOT cleared (real restarts still count).
+        this.#breaker.recordProgress(this.#breakerAssignmentKey(ctx));
       }
       completedNormally = true;
       return result;
@@ -2119,17 +2204,30 @@ export class OrchestrationService {
     // interrupt stays generation-matched (a stale generation's crash must never
     // interrupt a newer active child). T17 (orchestrator-restart) never reaches
     // here, so orchestrator crashes never feed this window/lifetime bookkeeping.
+    // F4 (§5x): feed the no-progress detector the latest checkpoint hash DERIVED
+    // from the log (F3's binding-compatible derivation) — without it no_progress
+    // could never fire. undefined (no eligible checkpoint yet) is the safe
+    // direction: no_progress simply cannot trip on this crash.
+    const latestCheckpointHash = this.resolveResumeCheckpointHash(ctx.runId);
     const advice = this.#breaker.evaluateCrash({
       runId: ctx.runId,
       assignmentId: this.#breakerAssignmentKey(ctx),
       segmentId: ctx.segmentId,
       occurredAt: this.#clock.nowIso(),
       classifiedAs: 'crash',
+      generationId: ctx.generationId,
+      ...(latestCheckpointHash !== undefined ? { latestCheckpointHash } : {}),
       counters: this.#loadEngineRecord(ctx.runId).state.counters,
     });
     if (advice.kind === 'breaker_open') {
       this.ingest(
-        this.#trigger(ctx.runId, 'restart.exhausted', { reason: advice.reason }) as DomainEvent,
+        // F4 (§5x): STAMP the generation so T14's `generation_matches_active`
+        // guard keeps a stale/late breaker-open off a moved-on/paused/terminal
+        // run (mirrors the T13 stamp below).
+        this.#trigger(ctx.runId, 'restart.exhausted', {
+          reason: advice.reason,
+          generationId: ctx.generationId,
+        }) as DomainEvent,
       );
     } else {
       this.ingest(
@@ -2207,16 +2305,26 @@ export class OrchestrationService {
       segmentId: ctx.segmentId,
       classification: limit,
     }) as DomainEvent;
-    const record = this.#loadEngineRecord(ctx.runId);
-    const currentState: EngineState = { ...record.state, bounds: this.#bounds };
-    const outcome = applyTransition(currentState, trigger);
-    const projection: ProjectionUpdate<EngineState> = {
-      name: ENGINE_STATE_PROJECTION,
-      currentState,
-      reduceEvent: this.#engineReducer,
-    };
+    // F1 (§5x): read + validate the pause trigger + append (trigger + engine
+    // effects + `checkpoint.recorded`) atomically. The read is inside the
+    // write lock, so a pause committed by a concurrent CLI since this call
+    // started is seen — the double-pause branch below decides off FRESH state
+    // (the checkpoint artifact was fsynced BEFORE this txn; on the rejected
+    // path it is simply left unreferenced and GC'd). The checkpoint extra is
+    // appended ONLY on the applied path (never with the rejection).
+    const { currentState, meta: outcome } = this.#atomicEngineWrite<TransitionOutcome>(ctx.runId, (state) => {
+      const outcome = applyTransition(state, trigger);
+      if (outcome.status === 'rejected') {
+        return { trigger: outcome.rejectionEvent as DomainEvent, meta: outcome };
+      }
+      return {
+        trigger,
+        emitted: outcome.emitted,
+        extraEvents: checkpoint.event !== undefined ? [checkpoint.event as DomainEvent] : [],
+        meta: outcome,
+      };
+    });
     if (outcome.status === 'rejected') {
-      appendTriggerWithEffects(this.#db, outcome.rejectionEvent as DomainEvent, [], projection);
       if (currentState.suspension.kind === 'paused_limit') {
         // Double-pause race: an earlier pause already won — the run IS
         // durably paused; this attempt's checkpoint artifact stays
@@ -2232,13 +2340,6 @@ export class OrchestrationService {
       }
       throw new PauseCompositionError(ctx.runId, outcome.detail);
     }
-    appendTriggerWithEffects(
-      this.#db,
-      trigger,
-      outcome.emitted,
-      projection,
-      checkpoint.event !== undefined ? [checkpoint.event as DomainEvent] : [],
-    );
     // Record the round's checkpoint ref (W2-5 resume reads it; a crash
     // before this save is fine — the committed `checkpoint.recorded` event
     // is the authoritative link and resume re-derives from the log).
@@ -2351,6 +2452,10 @@ export class OrchestrationService {
         ...(ctx.dispatch?.assignmentId !== undefined ? { assignmentId: ctx.dispatch.assignmentId } : {}),
         reason,
         content,
+        // F3 (§5x): denormalize the round binding onto `checkpoint.recorded`
+        // so resume derives the latest compatible checkpoint from the log.
+        role: ctx.role,
+        ...(ctx.dispatch?.round !== undefined ? { round: ctx.dispatch.round } : {}),
       },
     );
     if (isErr(written)) return {};
@@ -3309,6 +3414,68 @@ export class OrchestrationService {
       payload,
       idempotencyKey: opts?.idempotencyKey ?? newIdempotencyKey(this.#ids),
       occurredAt: opts?.occurredAt ?? this.#clock.nowIso(),
+    });
+  }
+
+  /**
+   * F1 (§5x, Approach A) — THE atomic engine-write primitive every state
+   * change funnels through. Runs `#loadEngineRecord` + the caller's `build`
+   * (which runs the pure `applyTransition` on the transition paths) +
+   * `appendTriggerWithEffects` INSIDE one `transactionImmediate` (BEGIN
+   * IMMEDIATE — the write lock is taken at BEGIN). Because the read happens
+   * inside the write-locked transaction, a trigger is ALWAYS validated
+   * against FRESH state: a second CLI that committed a transition between
+   * this caller's decision and its write is SEEN, so an incompatible trigger
+   * is REJECTED — never appended folding stale state (the old lost-update /
+   * illegal-append §5w/§5x bug), never a silent overwrite. All four legacy
+   * read→`appendTriggerWithEffects` sites route through here: `ingest`'s
+   * transition and engine-folded-supporting branches, `advanceWorkflowPhase`,
+   * and `#pauseForLimit`.
+   *
+   * `build` runs with the freshly-read state (bounds re-injected); it may
+   * THROW to abort (the transaction rolls back untouched) and returns the
+   * trigger to append plus its engine-emitted effects, any extra supporting
+   * events (only appended on the non-rejected path by the caller's choice),
+   * and an opaque `meta` handed straight back (the `applyTransition` outcome
+   * on the transition paths, so the caller can shape its result / detect a
+   * double-pause off the FRESH state). `appendTriggerWithEffects` runs with
+   * `alreadyInTransaction` so it joins THIS transaction rather than nesting a
+   * second BEGIN. These call sites are fully SYNCHRONOUS read→write (no await
+   * between load and append), which is what lets the whole sequence live
+   * inside one `transactionImmediate`; `ingest` is never invoked from within
+   * an already-open transaction except `resume`/`completeCoordinationRound`,
+   * which themselves open `transactionImmediate` so IMMEDIATE stays outermost.
+   *
+   * BOUNDARY: this does NOT cover `RoleRoundProjection` `#saveRoleRound`
+   * (no reducer/cursor, last-write-wins) — that is protected by the F2
+   * run-ownership lease, not by this primitive.
+   */
+  #atomicEngineWrite<M>(
+    runId: RunId,
+    build: (currentState: EngineState) => {
+      readonly trigger: DomainEvent;
+      readonly emitted?: readonly DomainEvent[];
+      readonly extraEvents?: readonly DomainEvent[];
+      readonly meta: M;
+    },
+  ): {
+    readonly currentState: EngineState;
+    readonly written: AppendWithProjectionResult<EngineState>;
+    readonly meta: M;
+  } {
+    return this.#db.transactionImmediate(() => {
+      const record = this.#loadEngineRecord(runId);
+      const currentState: EngineState = { ...record.state, bounds: this.#bounds };
+      const built = build(currentState);
+      const written = appendTriggerWithEffects(
+        this.#db,
+        built.trigger,
+        built.emitted ?? [],
+        { name: ENGINE_STATE_PROJECTION, currentState, reduceEvent: this.#engineReducer },
+        built.extraEvents ?? [],
+        { alreadyInTransaction: true },
+      );
+      return { currentState, written, meta: built.meta };
     });
   }
 

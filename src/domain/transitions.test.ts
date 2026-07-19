@@ -308,6 +308,56 @@ describe('T13 child crash: fold counters, mark generation stopped, interrupted (
   });
 });
 
+// F4 (§5x) — T14 (`restart.exhausted`) is GUARDED like T13/T17: a
+// stale/superseded/late breaker-open must NOT clobber a moved-on / paused_limit
+// / terminal run. These FAIL on the pre-fix table (T14 `preconditions: []`,
+// unstamped payload), where every restart.exhausted opened the breaker
+// unconditionally.
+describe('T14 restart.exhausted: generation-stamped + guarded (F4 §5x)', () => {
+  const exhausted = (
+    generationId = GEN,
+    reason: EventPayloads['restart.exhausted']['reason'] = 'window_bound',
+  ): EventOfType<'restart.exhausted'> => ev('restart.exhausted', { reason, generationId });
+
+  it('opens the breaker for the ACTIVE generation from a live, non-terminal, unsuspended run', () => {
+    const state = initialEngineState({ phase: 'implementing', activeChild: liveChild() });
+    const outcome = expectApplied(applyTransition(state, exhausted()));
+    expect(outcome.transitionId).toBe('T14');
+    expect(outcome.next.suspension.kind).toBe('breaker_open');
+    expect(outcome.emitted.find((e) => e.type === 'breaker.opened')?.payload).toEqual({ reason: 'window_bound' });
+  });
+
+  it('REJECTS a breaker-open stamped with a SUPERSEDED generation (the run already moved on to a new child)', () => {
+    const state = initialEngineState({
+      phase: 'implementing',
+      activeChild: { generationId: processGenerationId('pgen_000009'), segmentId: SEG, status: 'active' },
+    });
+    const outcome = expectRejected(applyTransition(state, exhausted(processGenerationId('pgen_stale_1'))));
+    expect(outcome.reason).toBe('precondition_failed');
+    expect(outcome.detail).toContain('not the active generation');
+    // The moved-on run is untouched — no breaker.
+    expect(outcome).not.toHaveProperty('next');
+  });
+
+  it('REJECTS a late breaker-open over a paused_limit run (a limit pause must never be converted to a breaker)', () => {
+    const state = initialEngineState({
+      phase: 'implementing',
+      suspension: { kind: 'paused_limit', reasonDetail: 'usage_limit:claude', returnPhase: 'implementing', enteredAt: AT },
+      activeChild: liveChild(),
+    });
+    const outcome = expectRejected(applyTransition(state, exhausted()));
+    expect(outcome.reason).toBe('precondition_failed');
+    expect(outcome.detail).toContain('suspension must be in [none]');
+  });
+
+  it('REJECTS a late breaker-open over a TERMINAL run (cancelled cannot be resurrected into breaker_open)', () => {
+    const state = initialEngineState({ phase: 'cancelled', activeChild: liveChild() });
+    const outcome = expectRejected(applyTransition(state, exhausted()));
+    expect(outcome.reason).toBe('precondition_failed');
+    expect(outcome.detail).toContain('phase must be non-terminal');
+  });
+});
+
 describe('T23 verification failure: bounded remediation, exhaustion → failed', () => {
   const failedEvent = ev('verification.completed.failed', {
     verificationId: verificationId('verif_000001'),
@@ -366,6 +416,7 @@ describe('rejection of illegal (state, event) pairs', () => {
           checkpointId: checkpointId('ckpt_000001'),
           artifactHash: artifactHash('deadbeef'),
           reason: 'cadence',
+          specHash: specHash(''),
         }),
       ),
     );

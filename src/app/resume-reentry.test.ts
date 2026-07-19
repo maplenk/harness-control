@@ -17,6 +17,9 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  artifactHash,
+  assignmentId,
+  checkpointId,
   criterionId,
   gitSha,
   idempotencyKey,
@@ -382,5 +385,142 @@ describe('W2-0 echo-mismatch pins (regression)', () => {
     expect(error).toBeInstanceOf(LimitPausedError);
     expect((error as LimitPausedError).operation).toBe('initial_config_pin');
     expect(modelAttempts).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 (§5x, Approach B) — resume DERIVES the checkpoint from the LOG, never
+// trusts the separately-saved `round.checkpointRef` pointer. These fail on
+// the pre-fix path (which read `round.checkpointRef` only).
+// ---------------------------------------------------------------------------
+describe('F3 (§5x) — resume derives the checkpoint from the log', () => {
+  /** Append a `checkpoint.recorded` fact to the log directly (mimics a cadence
+   * checkpoint / a superseded-spec checkpoint that never touches
+   * `checkpointRef`). The artifact hash need not resolve — the DERIVATION
+   * reads the enriched event payload, not the CAS. */
+  function appendCheckpointFact(
+    service: OrchestrationService,
+    runId: RunId,
+    opts: {
+      readonly reason: 'cadence' | 'pre_pause';
+      readonly specHash: string;
+      readonly hash: string;
+      readonly key: string;
+      readonly assignmentId?: string;
+    },
+  ): string {
+    service.ingest(
+      draftEvent({
+        type: 'checkpoint.recorded',
+        runId,
+        payload: {
+          checkpointId: checkpointId(`ckpt_${opts.key}`),
+          artifactHash: artifactHash(opts.hash),
+          reason: opts.reason,
+          specHash: specHash(opts.specHash),
+          role: 'implementor',
+          round: 1,
+          ...(opts.assignmentId !== undefined ? { assignmentId: assignmentId(opts.assignmentId) } : {}),
+        },
+        idempotencyKey: idempotencyKey(`ckpt_fact_${opts.key}`),
+        occurredAt: isoTimestamp('2026-07-20T00:00:00.000Z'),
+      }) as DomainEvent,
+    );
+    return opts.hash;
+  }
+
+  it('a crash AFTER the checkpoint.recorded append but BEFORE the checkpointRef save still resolves the checkpoint via derivation', async () => {
+    const { service, db } = await setup([LIMIT_TURN]);
+    const runId = await pauseImplementorRound(service);
+    const round = service.getRoleRound(runId)!;
+    const ref = round.checkpointRef!;
+    expect(ref).toBeDefined();
+
+    // Simulate the F3 crash window: the atomic `checkpoint.recorded` committed,
+    // but the process died BEFORE `#saveRoleRound` persisted `checkpointRef`.
+    const withoutRef: RoleRoundProjection = { ...round };
+    delete (withoutRef as { checkpointRef?: unknown }).checkpointRef;
+    db.projections.save(runId, ROLE_ROUND_PROJECTION, withoutRef);
+    expect(service.getRoleRound(runId)?.checkpointRef).toBeUndefined();
+
+    // Pre-fix (read `round.checkpointRef` only) → the checkpoint is lost. The
+    // derivation re-finds it from the committed log.
+    expect(service.resolveResumeCheckpointHash(runId)).toBe(ref);
+    const derived = service.resolveResumeCheckpoint(runId);
+    expect(derived).toBeDefined();
+    expect(String(derived!.specHash)).toBe('hash_1');
+  });
+
+  it('a cadence checkpoint (which never writes checkpointRef) is visible to resume', async () => {
+    const { service } = await setup([LIMIT_TURN]);
+    const runId = await pauseImplementorRound(service);
+    const pauseRef = service.getRoleRound(runId)!.checkpointRef!;
+
+    // A later cadence checkpoint on the same spec binding. Cadence NEVER
+    // touches `checkpointRef`, so the pre-fix path could never see it.
+    const cadenceHash = appendCheckpointFact(service, runId, {
+      reason: 'cadence',
+      specHash: 'hash_1',
+      hash: 'cadence00hash',
+      key: 'cadence1',
+    });
+    expect(cadenceHash).not.toBe(pauseRef);
+
+    // `checkpointRef` still points at the pause checkpoint (untouched)…
+    expect(service.getRoleRound(runId)?.checkpointRef).toBe(pauseRef);
+    // …but derivation adopts the LATEST-by-sequence compatible checkpoint.
+    expect(service.resolveResumeCheckpointHash(runId)).toBe(cadenceHash);
+  });
+
+  it('a superseded-spec checkpoint is NEVER resurrected, even when later by sequence (specHash filter)', async () => {
+    const { service } = await setup([LIMIT_TURN]);
+    const runId = await pauseImplementorRound(service);
+    const pauseRef = service.getRoleRound(runId)!.checkpointRef!; // bound to hash_1
+
+    // A checkpoint bound to a DIFFERENT (superseded) spec lands LATER by
+    // sequence. Latest-by-sequence alone would wrongly pick it; the specHash
+    // filter must exclude it — the round remains bound to hash_1.
+    appendCheckpointFact(service, runId, {
+      reason: 'cadence',
+      specHash: 'hash_2',
+      hash: 'superseded0hash',
+      key: 'superseded1',
+    });
+
+    // The superseded checkpoint is filtered out → the hash_1-bound pause
+    // checkpoint (earlier by sequence) still wins.
+    expect(service.resolveResumeCheckpointHash(runId)).toBe(pauseRef);
+  });
+
+  it('a same-spec checkpoint from a DIFFERENT assignment is NEVER resurrected (assignment filter)', async () => {
+    const { service, db } = await setup([LIMIT_TURN]);
+    const runId = await pauseImplementorRound(service);
+    // Bind the current round to assignment A1 (production dispatches always
+    // thread `assignmentId`; the pause helper omits it). The pause checkpoint
+    // fact this round already committed carries no assignmentId, so append an
+    // A1-bound checkpoint to serve as the correct resume target.
+    const round = service.getRoleRound(runId)!;
+    db.projections.save(runId, ROLE_ROUND_PROJECTION, { ...round, assignmentId: assignmentId('asg_A1') });
+
+    const a1Hash = appendCheckpointFact(service, runId, {
+      reason: 'cadence',
+      specHash: 'hash_1',
+      hash: 'a1000000hash',
+      key: 'a1',
+      assignmentId: 'asg_A1',
+    });
+    // A checkpoint on the SAME spec but a DIFFERENT assignment (A2) lands LATER
+    // by sequence. A bare latest-by-sequence (or spec-only) scan would wrongly
+    // pick it; the assignment filter must exclude it — resume must never adopt
+    // another assignment's worktree/evidence.
+    appendCheckpointFact(service, runId, {
+      reason: 'cadence',
+      specHash: 'hash_1',
+      hash: 'a2000000hash',
+      key: 'a2',
+      assignmentId: 'asg_A2',
+    });
+
+    expect(service.resolveResumeCheckpointHash(runId)).toBe(a1Hash);
   });
 });

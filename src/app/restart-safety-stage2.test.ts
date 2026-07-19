@@ -19,7 +19,9 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  artifactHash,
   assignmentId,
+  checkpointId,
   gitSha,
   idempotencyKey,
   processGenerationId,
@@ -28,6 +30,7 @@ import {
   specVersionId,
   type RunId,
 } from '../domain/ids.js';
+import { ManualClock, isoTimestamp } from '../lib/clock.js';
 import { draftEvent, type DomainEvent } from '../domain/events.js';
 import type { EngineState } from '../domain/transitions.js';
 import {
@@ -40,7 +43,7 @@ import {
   type SetConfigOptionResult,
 } from '../adapters/index.js';
 import type { ProcessIdentitySample, PsClient } from '../supervisor/index.js';
-import { DeterministicIdFactory } from '../lib/id-factory.js';
+import { DeterministicIdFactory, RandomIdFactory } from '../lib/id-factory.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../persistence/test-support.js';
 import { parseEngineConfig } from '../config/loader.js';
 import { LimitPausedError, OrchestrationService, type RoleAdapterFactory } from './service.js';
@@ -109,8 +112,13 @@ async function setup(opts?: {
   readonly factory?: FactoryOpts;
   readonly config?: Record<string, unknown>;
   readonly supervision?: { readonly ps: PsClient; readonly selfPid: number };
+  readonly clock?: ManualClock;
 }): Promise<{ service: OrchestrationService; db: TestDatabaseHandle['db'] }> {
-  handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+  handle = await openTestDatabase({
+    kind: 'better-sqlite3',
+    file: false,
+    ...(opts?.clock !== undefined ? { clock: opts.clock } : {}),
+  });
   const db = handle.db;
   const parsed = opts?.config !== undefined ? parseEngineConfig(opts.config) : undefined;
   if (parsed !== undefined && !parsed.ok) throw new Error(`bad test config: ${JSON.stringify(parsed.error)}`);
@@ -716,5 +724,163 @@ describe('W4-1 breaker wiring at the child-crash site', () => {
     // window-counter reset alone would not clear the breaker's own deque).
     const after = await crashOnce(service, runId);
     expect(after).toBe('interrupted');
+  });
+});
+
+// ===========================================================================
+// F4 (§5x) — durable restart window + no_progress / recordProgress WIRING
+// ===========================================================================
+describe('F4 (§5x) breaker: durable window + no_progress/recordProgress wiring', () => {
+  const crashOnPin: FactoryOpts['onSetConfigOption'] = () => {
+    throw new AdapterError('unexpected_eof', 'injected: child died during pin');
+  };
+
+  /** A factory whose Nth-created adapter for a role consumes the Nth turn
+   * script — so successive dispatches can crash / succeed / crash. */
+  function scriptedFactory(
+    scriptsByRole: Record<string, readonly (readonly InProcessTurnScript[])[]>,
+  ): RoleAdapterFactory {
+    const cursors: Record<string, number> = {};
+    return {
+      create(options) {
+        const role = options.role;
+        const scripts = scriptsByRole[role] ?? [[{}]];
+        const n = cursors[role] ?? 0;
+        cursors[role] = n + 1;
+        const adapter = new InProcessFakeAdapter({
+          harnessId: options.resolved.harness,
+          capabilities: { configOptions: configOptions(options.resolved.harness) },
+          turns: scripts[Math.min(n, scripts.length - 1)] ?? [{}],
+        });
+        return { adapter, dispose: (): Promise<void> => adapter.close() };
+      },
+    };
+  }
+
+  function serviceOn(
+    db: TestDatabaseHandle['db'],
+    factory: RoleAdapterFactory,
+    config?: Record<string, unknown>,
+    ids: DeterministicIdFactory | RandomIdFactory = new DeterministicIdFactory(),
+  ): OrchestrationService {
+    const parsed = config !== undefined ? parseEngineConfig(config) : undefined;
+    if (parsed !== undefined && !parsed.ok) throw new Error(`bad config: ${JSON.stringify(parsed.error)}`);
+    return new OrchestrationService({
+      db,
+      ids,
+      adapterFactory: factory,
+      ...(parsed?.ok === true ? { config: parsed.value } : {}),
+    });
+  }
+
+  async function coordCrash(service: OrchestrationService, runId: RunId): Promise<string> {
+    await service.runCoordination(runId, roleRunnerOnce('coordinator')).catch(() => undefined);
+    return service.status(runId).suspension;
+  }
+
+  it('durable window: a fast crash window trips breaker_open EVEN across a FRESH service (the window is folded into EngineState.counters, not lost with the process)', async () => {
+    // windowMax 3 → the 4th crash inside the 10-min window opens the breaker.
+    const clock = new ManualClock('2026-07-20T09:00:00.000Z');
+    const { service, db } = await setup({
+      factory: { onSetConfigOption: crashOnPin },
+      config: { restarts: { windowMax: 3 } },
+      clock,
+    });
+    const runId = approvedRun(service);
+    service.advanceWorkflowPhase(runId, 'approved', 'implementing');
+
+    // THREE crashes on the first service — each interrupts (window not yet full).
+    for (let i = 0; i < 3; i += 1) {
+      clock.advanceMs(1_000);
+      const suspension = await coordCrash(service, runId);
+      expect(suspension).toBe('interrupted');
+      service.resume(runId);
+    }
+    // The window is DURABLE: three occurredAt strings folded into the counters.
+    expect(engineState(db, runId).counters.restartWindow).toHaveLength(3);
+
+    // A FRESH service over the SAME store models a restarted CLI process: its
+    // RestartBreaker begins with an EMPTY in-memory deque, so ONLY the durable
+    // window can carry the prior three crashes. Pre-fix (window in-memory only)
+    // this fourth crash would merely interrupt.
+    const service2 = serviceOn(db, makeFactory({ onSetConfigOption: crashOnPin }), { restarts: { windowMax: 3 } }, new RandomIdFactory());
+    clock.advanceMs(1_000);
+    expect(await coordCrash(service2, runId)).toBe('breaker_open');
+    expect(eventTypes(db, runId)).toContain('restart.exhausted');
+  });
+
+  it('no_progress WIRING: an unchanged derived checkpoint hash across restarts opens the breaker (pre-fix latestCheckpointHash was never passed → no_progress could never fire)', async () => {
+    const clock = new ManualClock('2026-07-20T09:00:00.000Z');
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false, clock });
+    const db = handle.db;
+    const asg = assignmentId('asg_f4_np');
+    const service = serviceOn(db, scriptedFactory({ implementor: [[{ dieMidTurn: true }], [{ dieMidTurn: true }]] }));
+    const runId = approvedRun(service);
+    service.advanceWorkflowPhase(runId, 'approved', 'implementing');
+
+    // A checkpoint bound to THIS round's assignment+spec sits in the log — F3's
+    // derivation resolves its hash on every crash (never changes → no progress).
+    service.ingest(
+      draftEvent({
+        type: 'checkpoint.recorded',
+        runId,
+        payload: {
+          checkpointId: checkpointId('ckpt_f4_np'),
+          artifactHash: artifactHash('f4-no-progress-hash'),
+          reason: 'cadence',
+          specHash: SPEC,
+          role: 'implementor',
+          round: 1,
+          assignmentId: asg,
+        },
+        idempotencyKey: idempotencyKey('ckpt_fact_f4_np'),
+        occurredAt: isoTimestamp('2026-07-20T09:00:00.000Z'),
+      }) as DomainEvent,
+    );
+
+    const dispatch = { round: 1, specHash: SPEC, assignmentId: asg };
+    // Crash #1 → interrupt (no_progress needs a PRIOR hash to compare against).
+    clock.advanceMs(1_000);
+    await service.runRole(runId, roleRunnerOnce('implementor'), CLAUDE_LOW, '/ws', dispatch).catch(() => undefined);
+    expect(service.status(runId).suspension).toBe('interrupted');
+    service.resume(runId);
+
+    // Crash #2 with the SAME derived hash → no_progress opens the breaker.
+    clock.advanceMs(1_000);
+    await service.runRole(runId, roleRunnerOnce('implementor'), CLAUDE_LOW, '/ws', dispatch).catch(() => undefined);
+    expect(service.status(runId).suspension).toBe('breaker_open');
+    const exhausted = db.events.listByRun(runId).find((e) => e.type === 'restart.exhausted');
+    expect((exhausted?.payload as { reason?: string }).reason).toBe('no_progress');
+  });
+
+  it('recordProgress WIRING: a round reaching `completed` resets the recovery sequence so an UNRELATED later crash does not false-trip max_elapsed_recovery', async () => {
+    const clock = new ManualClock('2026-07-20T09:00:00.000Z');
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false, clock });
+    const db = handle.db;
+    const asg = assignmentId('asg_f4_rp');
+    // crash → success → crash, one turn-script per implementor spawn.
+    const service = serviceOn(db, scriptedFactory({ implementor: [[{ dieMidTurn: true }], [{}], [{ dieMidTurn: true }]] }));
+    const runId = approvedRun(service);
+    service.advanceWorkflowPhase(runId, 'approved', 'implementing');
+    const dispatch = { round: 1, specHash: SPEC, assignmentId: asg };
+
+    // Crash #1 at T0 → the recovery sequence's clock starts here.
+    await service.runRole(runId, roleRunnerOnce('implementor'), CLAUDE_LOW, '/ws', dispatch).catch(() => undefined);
+    expect(service.status(runId).suspension).toBe('interrupted');
+    service.resume(runId);
+
+    // A round runs to COMPLETION → recordProgress() at stage→completed resets it.
+    await service.runRole(runId, roleRunnerOnce('implementor'), CLAUDE_LOW, '/ws', dispatch);
+    expect(service.getRoleRound(runId)).toMatchObject({ stage: 'completed' });
+
+    // 31 minutes later (past the 30-min max-elapsed-recovery bound) an unrelated
+    // crash. Pre-fix (recordProgress never called) the sequence still measures
+    // from T0 → 31min elapsed → a FALSE max_elapsed_recovery breaker_open.
+    clock.advanceMs(31 * 60_000);
+    await service
+      .runRole(runId, roleRunnerOnce('implementor'), CLAUDE_LOW, '/ws', { round: 2, specHash: SPEC, assignmentId: asg })
+      .catch(() => undefined);
+    expect(service.status(runId).suspension).toBe('interrupted');
+    expect(eventTypes(db, runId)).not.toContain('restart.exhausted');
   });
 });

@@ -175,4 +175,39 @@ describe.each(DRIVER_KINDS)('appendTriggerWithEffects (%s) — one-transaction e
     expect(replay.appended.every((o) => o.deduped)).toBe(true);
     expect(db.events.countByRun(RUN)).toBe(3);
   });
+
+  it('F1: `alreadyInTransaction` JOINS the caller-owned BEGIN IMMEDIATE (no nested BEGIN) and commits/rolls back with it', async () => {
+    handle = await openTestDatabase({ kind, file: true });
+    const db = handle.db;
+    const projectionUpdate = {
+      name: PROJECTION_NAME,
+      currentState: { count: 0 } as CounterState,
+      reduceEvent: (state: CounterState) => ({ count: state.count + 1 }),
+    };
+
+    // Inside an outer transactionImmediate (the F1 primitive's shape), calling
+    // with `alreadyInTransaction` must NOT open a second BEGIN — it joins the
+    // caller's txn — and the whole unit commits atomically.
+    const result = db.transactionImmediate(() =>
+      appendTriggerWithEffects(db, trigger('t6'), [effect('e6')], projectionUpdate, [], {
+        alreadyInTransaction: true,
+      }),
+    );
+    expect(result.projection.state).toEqual({ count: 1 });
+    expect(db.events.countByRun(RUN)).toBe(2);
+    expect(db.projections.get(RUN, PROJECTION_NAME)?.state).toEqual({ count: 1 });
+
+    // And it rolls back WITH the caller's txn: an error thrown after the join
+    // aborts the append+fold too (nothing new committed).
+    expect(() =>
+      db.transactionImmediate(() => {
+        appendTriggerWithEffects(db, trigger('t7'), [effect('e7')], projectionUpdate, [], {
+          alreadyInTransaction: true,
+        });
+        throw new Error('abort the enclosing transaction');
+      }),
+    ).toThrow('abort the enclosing transaction');
+    expect(db.events.countByRun(RUN)).toBe(2); // t7/e7 rolled back with the outer txn
+    expect(db.projections.get(RUN, PROJECTION_NAME)?.state).toEqual({ count: 1 });
+  });
 });

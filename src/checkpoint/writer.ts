@@ -39,6 +39,7 @@ import type { Clock } from '../lib/clock.js';
 import type { IdFactory } from '../lib/id-factory.js';
 import { isErr, ok, unwrap, type Result } from '../lib/result.js';
 import { newCheckpointId, newIdempotencyKey, type AssignmentId, type RunId, type SegmentId } from '../domain/ids.js';
+import type { RoleName } from '../domain/state.js';
 import type { Checkpoint, CheckpointContent } from '../domain/entities.js';
 import type { CheckpointReason } from '../domain/state.js';
 import { draftEvent, type EventOfType } from '../domain/events.js';
@@ -60,6 +61,11 @@ export interface WriteCheckpointInput {
   readonly assignmentId?: AssignmentId;
   readonly reason: CheckpointReason;
   readonly content: CheckpointContent;
+  /** F3 (§5x): the role whose round produced this checkpoint — denormalized
+   * onto the `checkpoint.recorded` event so resume derives from the log. */
+  readonly role?: RoleName;
+  /** F3 (§5x): the 1-based dispatch round, when a role round is dispatched. */
+  readonly round?: number;
 }
 
 export interface WriteCheckpointResult {
@@ -111,6 +117,11 @@ export async function writeCheckpoint(
       artifactHash: artifact.hash,
       reason: input.reason,
       segmentId: input.segmentId,
+      // F3 (§5x): denormalize the binding so resume can filter the log alone.
+      specHash: input.content.specHash,
+      ...(input.role !== undefined ? { role: input.role } : {}),
+      ...(input.round !== undefined ? { round: input.round } : {}),
+      ...(input.assignmentId !== undefined ? { assignmentId: input.assignmentId } : {}),
     },
     idempotencyKey: newIdempotencyKey(deps.ids),
     occurredAt: createdAt,

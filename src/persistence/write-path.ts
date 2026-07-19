@@ -24,6 +24,21 @@ export interface AppendWithProjectionResult<S> {
   readonly projection: ProjectionRecord<S>;
 }
 
+export interface AppendTriggerOptions {
+  /**
+   * F1 (§5x, Approach A): the caller has ALREADY opened the enclosing
+   * (`BEGIN IMMEDIATE`) transaction — the atomic read-validate-append the
+   * service funnels every state change through. When true, this append+fold
+   * JOINS that outer transaction instead of nesting a second `db.transaction`
+   * (a needless SAVEPOINT on better-sqlite3, a shared-transaction no-op on
+   * node:sqlite). The read that produced `projection.currentState` MUST live
+   * inside the same write-locked transaction so a concurrently committed
+   * transition is seen and an incompatible trigger is rejected — hence the
+   * caller owns the `BEGIN` and this function must not re-wrap.
+   */
+  readonly alreadyInTransaction?: boolean;
+}
+
 /**
  * Appends `trigger` followed by `emitted` (matching `applyTransition`'s
  * `{transitionId, next, emitted}` output shape) and folds the trigger event
@@ -49,8 +64,9 @@ export function appendTriggerWithEffects<S>(
   emitted: readonly DomainEvent[],
   projection: ProjectionUpdate<S>,
   extraEvents: readonly DomainEvent[] = [],
+  options: AppendTriggerOptions = {},
 ): AppendWithProjectionResult<S> {
-  return db.transaction(() => {
+  const body = (): AppendWithProjectionResult<S> => {
     const appended = db.events.appendBatch([trigger, ...emitted, ...extraEvents]);
     const triggerOutcome = appended[0];
     const lastOutcome = appended[appended.length - 1];
@@ -83,5 +99,9 @@ export function appendTriggerWithEffects<S>(
       throw new Error('appendTriggerWithEffects: projection save/get round-trip failed unexpectedly');
     }
     return { appended, projection: saved };
-  });
+  };
+  // §6.3 "one transaction": when the caller already holds the enclosing
+  // `BEGIN IMMEDIATE` (F1's atomic read-validate-append), join it; otherwise
+  // open our own so a bare `appendTriggerWithEffects` stays self-contained.
+  return options.alreadyInTransaction ? body() : db.transaction(body);
 }
