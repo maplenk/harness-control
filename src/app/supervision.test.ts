@@ -66,7 +66,7 @@ import {
   type RoleAdapterFactory,
   type SupervisionOptions,
 } from './service.js';
-import { ENGINE_STATE_PROJECTION } from './projections.js';
+import { ENGINE_STATE_PROJECTION, ROLE_ROUND_PROJECTION } from './projections.js';
 import { DurableProcessRegistryStore } from './process-registry-store.js';
 import type { RoleRunner } from './role-runner.js';
 
@@ -483,6 +483,237 @@ describe('reapOrphanProcesses — §14 startup reaping over the durable registry
 });
 
 // ---------------------------------------------------------------------------
+// W4-0 peer safety + W4-4 T17 restart-safety producer (§14:139, §12.3, PLAN §5o)
+// ---------------------------------------------------------------------------
+describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () => {
+  const OWNER_A = 60_001;
+  const OWNER_B = 60_002;
+  const DEAD_OWNER = 59_999; // never in the fake ps identity table → provably dead
+
+  /** Drive the run's engine to an ACTIVE generation (spawn-initiated → spawned). */
+  function seedActiveChild(
+    service: OrchestrationService,
+    db: TestDatabaseHandle['db'],
+    runId: RunId,
+    generation: ProcessGenerationId,
+    segment: ReturnType<typeof segmentId>,
+  ): void {
+    const now = db.clock.nowIso();
+    service.ingest(
+      draftEvent({
+        type: 'child.spawn.initiated',
+        runId,
+        payload: { generationId: generation, segmentId: segment, role: 'coordinator' },
+        idempotencyKey: idempotencyKey(`${generation}-init`),
+        occurredAt: now,
+      }) as DomainEvent,
+    );
+    service.ingest(
+      draftEvent({
+        type: 'child.spawned',
+        runId,
+        payload: { generationId: generation, segmentId: segment, role: 'coordinator', pins: [] },
+        idempotencyKey: idempotencyKey(`${generation}-spawned`),
+        occurredAt: now,
+      }) as DomainEvent,
+    );
+  }
+
+  it('a LIVE PEER orchestrator\'s active child is NEVER reaped, signaled, or interrupted (regression: fails without the ownerPid gate)', async () => {
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+    const db = handle.db;
+    const ps = makeFakePs();
+    // Both orchestrator processes are alive; so is the peer's real child.
+    ps.identities.set(OWNER_A, sampleFor(OWNER_A));
+    ps.identities.set(OWNER_B, sampleFor(OWNER_B));
+    const childPid = 61_001;
+    ps.identities.set(childPid, sampleFor(childPid));
+
+    const signalsA: Array<{ pgid: number; signal: NodeJS.Signals }> = [];
+    const signalsB: Array<{ pgid: number; signal: NodeJS.Signals }> = [];
+    // Process A owns a live run + child, registered in the SHARED durable store.
+    const serviceA = new OrchestrationService({
+      db,
+      supervision: {
+        ps: ps.client,
+        selfPid: OWNER_A,
+        sendSignal: (pgid, signal) => signalsA.push({ pgid, signal }),
+        envNonce: { verifyNonce: () => 'match' },
+      },
+    });
+    const { runId } = serviceA.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const generation = processGenerationId('pgen_peer_live');
+    const segment = segmentId('seg_peer_live');
+    seedActiveChild(serviceA, db, runId, generation, segment);
+    serviceA.supervision.registry.registerCaptured(identityFor(childPid, generation), {
+      runId,
+      segmentId: segment,
+    });
+    expect(serviceA.supervision.registry.store.get(generation)?.ownerPid).toBe(OWNER_A);
+    expect(engineState(db, runId).activeChild).toMatchObject({ generationId: generation, status: 'active' });
+
+    // Process B (a DIFFERENT live orchestrator) reaps over the SAME store.
+    const serviceB = new OrchestrationService({
+      db,
+      supervision: {
+        ps: ps.client,
+        selfPid: OWNER_B,
+        sendSignal: (pgid, signal) => signalsB.push({ pgid, signal }),
+        envNonce: { verifyNonce: () => 'match' },
+      },
+    });
+    const summary = serviceB.reapOrphanProcesses();
+
+    // The peer's child was left entirely alone — the whole point of the gate.
+    expect(summary.ownerLiveSkippedCount).toBe(1);
+    expect(summary.killedCount).toBe(0);
+    expect(signalsA).toEqual([]);
+    expect(signalsB).toEqual([]);
+    expect(serviceB.supervision.registry.store.get(generation)).toBeDefined();
+    const state = engineState(db, runId);
+    expect(state.activeChild).toMatchObject({ generationId: generation, status: 'active' });
+    expect(state.suspension.kind).toBe('none'); // NOT interrupted
+    expect(eventTypes(db, runId)).not.toContain('recovery.initiated');
+    expect(eventTypes(db, runId)).not.toContain('child.exited.unexpectedly');
+  });
+
+  it('a dead-owner ACTIVE generation is reaped AND marked interrupted via T17 (recovery.initiated), never T13', async () => {
+    const { service, db, ps, signals } = await setup();
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const generation = processGenerationId('pgen_deadowner_active');
+    const segment = segmentId('seg_deadowner_active');
+    seedActiveChild(service, db, runId, generation, segment);
+    const childPid = 62_001;
+    ps.identities.set(childPid, sampleFor(childPid)); // child still alive → reapable
+    service.supervision.registry.store.put({
+      ...identityFor(childPid, generation),
+      runId,
+      segmentId: segment,
+      recordedAt: db.clock.nowIso(),
+      ownerPid: DEAD_OWNER, // the orchestrator that spawned it crashed
+    });
+    const before = engineState(db, runId).counters;
+
+    const summary = service.reapOrphanProcesses();
+
+    expect(summary.killedCount).toBe(1);
+    expect(signals).toEqual([{ pgid: childPid, signal: 'SIGKILL' }]);
+    const state = engineState(db, runId);
+    expect(state.suspension.kind).toBe('interrupted'); // T17
+    expect(state.activeChild?.status).toBe('stopped');
+    // T17, NOT T13: the recovery marker lands, no child-crash event, and the
+    // RestartBreaker/respawn counters are untouched (orchestrator crash ≠ child crash).
+    expect(eventTypes(db, runId)).toContain('recovery.initiated');
+    expect(eventTypes(db, runId)).not.toContain('child.exited.unexpectedly');
+    expect(state.counters).toEqual(before);
+  });
+
+  it('a COMPLETED-but-not-yet-stopped reaped generation is confirmed stopped — NO interrupt, NO counter', async () => {
+    const { service, db, ps, signals } = await setup();
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const generation = processGenerationId('pgen_completed_round');
+    const segment = segmentId('seg_completed_round');
+    seedActiveChild(service, db, runId, generation, segment);
+    const childPid = 63_001;
+    ps.identities.set(childPid, sampleFor(childPid));
+    service.supervision.registry.store.put({
+      ...identityFor(childPid, generation),
+      runId,
+      segmentId: segment,
+      recordedAt: db.clock.nowIso(),
+      ownerPid: DEAD_OWNER,
+    });
+    // The round had already SUCCEEDED when the orchestrator crashed.
+    db.projections.save(runId, ROLE_ROUND_PROJECTION, {
+      round: 1,
+      role: 'implementor',
+      stage: 'completed',
+    });
+    const before = engineState(db, runId).counters;
+
+    const summary = service.reapOrphanProcesses();
+
+    expect(summary.killedCount).toBe(1);
+    expect(signals).toEqual([{ pgid: childPid, signal: 'SIGKILL' }]);
+    const state = engineState(db, runId);
+    expect(state.activeChild?.status).toBe('stopped'); // confirmed stopped
+    expect(state.suspension.kind).toBe('none'); // NOT interrupted — the round succeeded
+    expect(eventTypes(db, runId)).not.toContain('recovery.initiated');
+    expect(eventTypes(db, runId)).not.toContain('child.exited.unexpectedly');
+    const stopped = db.events.listByRun(runId).find((e) => e.type === 'child.stopped');
+    expect(stopped?.payload).toMatchObject({ generationId: generation, reason: 'startup_cleanup' });
+    expect(state.counters).toEqual(before);
+  });
+
+  it('T17 is REJECTED (benign no-op) on a paused_limit run and on a terminal run', async () => {
+    const { service, db } = await setup();
+
+    // (1) paused_limit: an active generation driven to T4 (child STOPPING).
+    const paused = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const gen1 = processGenerationId('pgen_t17_paused');
+    const seg1 = segmentId('seg_t17_paused');
+    seedActiveChild(service, db, paused.runId, gen1, seg1);
+    const now = db.clock.nowIso();
+    service.ingest(
+      draftEvent({
+        type: 'turn.started',
+        runId: paused.runId,
+        payload: { segmentId: seg1, generationId: gen1 },
+        idempotencyKey: idempotencyKey('t17-paused-turn'),
+        occurredAt: now,
+      }) as DomainEvent,
+    );
+    const classification: LimitClassification = {
+      kind: 'usage_limit',
+      provider: 'claude',
+      source: 'structured',
+      confidence: 'high',
+      detectionTier: 'structured',
+    };
+    service.ingest(
+      draftEvent({
+        type: 'limit.classified.prompt_turn',
+        runId: paused.runId,
+        payload: { segmentId: seg1, classification },
+        idempotencyKey: idempotencyKey('t17-paused-t4'),
+        occurredAt: now,
+      }) as DomainEvent,
+    );
+    expect(engineState(db, paused.runId).suspension.kind).toBe('paused_limit');
+    const rejectedPaused = service.ingest(
+      draftEvent({
+        type: 'recovery.running_segment_found',
+        runId: paused.runId,
+        payload: { segmentId: seg1, generationId: gen1 },
+        idempotencyKey: idempotencyKey('t17-paused-reject'),
+        occurredAt: db.clock.nowIso(),
+      }) as DomainEvent,
+    );
+    expect(rejectedPaused.status).toBe('rejected');
+    expect(engineState(db, paused.runId).suspension.kind).toBe('paused_limit'); // unchanged
+
+    // (2) terminal: a cancelled run.
+    const terminal = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const gen2 = processGenerationId('pgen_t17_terminal');
+    const seg2 = segmentId('seg_t17_terminal');
+    seedActiveChild(service, db, terminal.runId, gen2, seg2);
+    service.cancel(terminal.runId);
+    expect(engineState(db, terminal.runId).phase).toBe('cancelled');
+    const rejectedTerminal = service.ingest(
+      draftEvent({
+        type: 'recovery.running_segment_found',
+        runId: terminal.runId,
+        payload: { segmentId: seg2, generationId: gen2 },
+        idempotencyKey: idempotencyKey('t17-terminal-reject'),
+        occurredAt: db.clock.nowIso(),
+      }) as DomainEvent,
+    );
+    expect(rejectedTerminal.status).toBe('rejected');
+    expect(engineState(db, terminal.runId).phase).toBe('cancelled'); // unchanged
+  });
+});
+
+// ---------------------------------------------------------------------------
 // RSS watchdog wired into runRole (T21 soft warn / T22 hard limit)
 // ---------------------------------------------------------------------------
 describe('runRole watchdog wiring — T21/T22 ingest through the service', () => {
@@ -615,6 +846,48 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
     expect((stop?.payload as { mode: string }).mode).toBe('terminate');
     expect(events.some((e) => e.type === 'worktree.tainted')).toBe(true);
   });
+
+  // W4-3 REGRESSION: aggregateWindow had NO production caller — the watchdog
+  // recorded raw RSS ticks but nothing folded or pruned them, so aggregates
+  // never appeared and raw_process_samples grew unbounded. The onSample hook
+  // must now BOTH record the raw tick AND drive aggregateClosedWindows. Neuter
+  // the aggregateClosedWindows call in service.ts#onSample and this fails:
+  // the raw row survives (countRawSamples === 1) and no aggregate is produced.
+  it('W4-3: onSample records the raw tick AND folds+prunes every closed window through the service', async () => {
+    // Clock sits 5 minutes past the fake ps sample timestamp (2026-07-19T00:00:00Z),
+    // so that sample's per-minute window has fully CLOSED and must be folded+pruned.
+    const clock = new ManualClock('2026-07-19T00:05:00.000Z');
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false, clock });
+    const db = handle.db;
+    const ps = makeFakePs();
+    const { factory } = makeSupervisedFactory(ps);
+    const service = new OrchestrationService({
+      db,
+      ids: new DeterministicIdFactory(),
+      adapterFactory: factory,
+      supervision: { ps: ps.client, sendSignal: () => undefined, envNonce: { verifyNonce: () => 'match' } },
+    });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+
+    ps.rssBytes = 12 * MB; // ~1% of the default 1024MB budget — no soft/hard crossing
+    await service.runRole(
+      runId,
+      runnerWith(async () => {
+        const generation = service.supervision.registry.store.list()[0]!.generationId;
+        await service.supervision.watchdog.sampleOnce(generation);
+      }),
+      CLAUDE_LOW,
+      '/ws',
+    );
+
+    // The raw tick was recorded (recordRawSample) then the closed window was
+    // folded into ONE aggregate and its raw rows PRUNED (bounded growth).
+    expect(db.telemetry.countRawSamples(runId)).toBe(0);
+    const aggregates = db.telemetry.listAggregates(runId);
+    expect(aggregates).toHaveLength(1);
+    expect(aggregates[0]!.rssMaxBytes).toBe(12 * MB);
+    expect(aggregates[0]!.sampleCount).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -690,8 +963,13 @@ describe('captureAcpProcessIdentity — real child process through the real tran
         process.kill(-pgid, signal);
       },
     });
-    registry.registerCaptured(identity!);
+    const captured = registry.registerCaptured(identity!);
     expect(registry.verify(generation).verdict).toBe('match');
+    // W4-0 (§14:139): startup reaping runs in a NEW process — the record it
+    // finds was written by the PRIOR, now-crashed orchestrator. Re-stamp a
+    // dead owner so the reaper treats this as a genuine orphan (a self-owned
+    // LIVE record is never reaped — the peer-kill safety gate).
+    registry.store.put({ ...captured, ownerPid: 999_999 });
 
     // The transport really stamped HARNESS_SPAWN_ID (§10.1): the REAL
     // best-effort env reader confirms it on this platform (darwin/linux).

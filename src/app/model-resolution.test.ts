@@ -15,6 +15,7 @@ import {
   asHarness,
   CLAUDE_REASONING_OPTION_ID,
   CODEX_REASONING_OPTION_ID,
+  UnadvertisedModelTargetError,
 } from './model-resolution.js';
 
 function setCalls(adapter: InProcessFakeAdapter): unknown[] {
@@ -92,6 +93,36 @@ describe('resolveOptionId', () => {
   });
 });
 
+describe('resolveOptionId — reject an explicit unadvertised MODEL target (§5t (5))', () => {
+  const modelIntent = (value: string) =>
+    ({ purpose: 'model', optionId: 'model', value, kind: 'model' }) as const;
+
+  it('accepts an advertised model slug', () => {
+    expect(resolveOptionId(modelIntent('gpt-5.6-terra'), CODEX_OPTIONS)).toBe('model');
+  });
+
+  it('THROWS UnadvertisedModelTargetError for a model slug not among the advertised values (no silent set)', () => {
+    expect(() => resolveOptionId(modelIntent('gpt-9-ghost'), CODEX_OPTIONS)).toThrow(
+      UnadvertisedModelTargetError,
+    );
+  });
+
+  it('does NOT silently fall back to the first advertised model option when the slug is unadvertised', () => {
+    // Exact id 'model' absent → old code swapped to the first model-kind option
+    // ('llm') and set the wrong slug. Now it rejects the unadvertised target.
+    expect(() =>
+      resolveOptionId(modelIntent('ghost'), [{ id: 'llm', kind: 'model', values: ['a', 'b'] }]),
+    ).toThrow(/not advertised/);
+  });
+
+  it('keeps the no-explicit-target default behavior when the option enumerates no values', () => {
+    // values: [] → cannot validate → attempted (fails loudly at the adapter), not rejected.
+    expect(resolveOptionId(modelIntent('anything'), [{ id: 'model', kind: 'model', values: [] }])).toBe(
+      'model',
+    );
+  });
+});
+
 describe('applyRoleModel (against the in-process fake)', () => {
   it('coordinator=claude/opus/low → setConfigOption(model=opus) then reasoning(low)', async () => {
     const { adapter, sessionId, advertised } = await fakeWith('claude', CLAUDE_OPTIONS);
@@ -136,6 +167,18 @@ describe('applyRoleModel (against the in-process fake)', () => {
     expect(applied[1]?.error).toContain('invalid_argument');
     // The call was still attempted (logged) even though the value was rejected.
     expect(setCalls(adapter)).toContainEqual({ optionId: 'thinking', value: 'low' });
+  });
+
+  it('captures an unadvertised MODEL target as ok:false WITHOUT attempting a set (typed rejection, no silent swap)', async () => {
+    const { adapter, sessionId, advertised } = await fakeWith('codex', CODEX_OPTIONS);
+    const resolved = resolveRoleModel({ harness: 'codex', model: 'gpt-9-ghost' });
+
+    const applied = await applyRoleModel(adapter, sessionId, resolved, advertised);
+
+    expect(applied[0]?.ok).toBe(false);
+    expect(applied[0]?.error).toContain('not advertised');
+    // The wrong model was NEVER set on the session — no silent swap/attempt.
+    expect(setCalls(adapter)).toEqual([]);
   });
 });
 

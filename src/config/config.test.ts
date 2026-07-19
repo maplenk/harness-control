@@ -176,6 +176,24 @@ describe('parseEngineConfig (deep partial overrides + validation)', () => {
     expect(isErr(result)).toBe(true);
   });
 
+  it('W4-1: rejects non-`wait` failover policies until P4b implements them (accepted config must act, not no-op)', () => {
+    // The vocabulary is defined for the domain, but only `wait` is
+    // implemented — the runtime + status output hardcode `wait`. Accepting a
+    // switch_model/switch_harness/ask override would silently no-op, so the
+    // schema refuses it at parse with a clear "not yet supported (P4b)" error.
+    for (const policy of ['switch_model', 'switch_harness', 'ask'] as const) {
+      const result = parseEngineConfig({ failoverPolicy: policy });
+      expect(isErr(result)).toBe(true);
+      if (isErr(result)) {
+        expect(issuePaths(result.error)).toContain('failoverPolicy');
+        expect(result.error.some((issue) => /P4b/.test(issue.message))).toBe(true);
+      }
+    }
+    // `wait` (and the default) still parse.
+    expect(isOk(parseEngineConfig({ failoverPolicy: 'wait' }))).toBe(true);
+    expect(isOk(parseEngineConfig({}))).toBe(true);
+  });
+
   it('W3-1: accepts explicit, non-credential verification env-allowlist additions', () => {
     const result = parseEngineConfig({ verification: { envAllowlist: ['NVM_DIR', 'JAVA_HOME'] } });
     expect(isOk(result)).toBe(true);

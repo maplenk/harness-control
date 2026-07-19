@@ -14,6 +14,9 @@
  * Deterministic: in-process fake adapters + injected fake `ps` (identity table
  * + liveness), mirroring supervision.test.ts.
  */
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { isoTimestamp } from '../lib/clock.js';
 import { DeterministicIdFactory, RandomIdFactory } from '../lib/id-factory.js';
@@ -37,14 +40,22 @@ import { parseEngineConfig } from '../config/loader.js';
 import { unwrap } from '../lib/result.js';
 import { OrchestrationService, type RoleAdapterFactory } from './service.js';
 import { DurableSpawnReservationStore } from './spawn-reservation-store.js';
+import type { Harness, RoleModelSpec } from './model-resolution.js';
 import type { RoleRunner } from './role-runner.js';
 
 const CLAUDE_LOW = { harness: 'claude', model: 'opus', effort: 'low' } as const;
+const CODEX_LOW: RoleModelSpec = { harness: 'codex', model: 'gpt-5.6-sol', effort: 'low' };
 
 /** W3-5(a) runs the atomic-admission regression on EVERY available driver. */
 const DRIVER_KINDS = await availableDriverKinds();
 
-function fakeConfigOptions(): ConfigOptionDescriptor[] {
+function fakeConfigOptions(harness: Harness = 'claude'): ConfigOptionDescriptor[] {
+  if (harness === 'codex') {
+    return [
+      { id: 'model', kind: 'model', values: ['gpt-5.6-terra', 'gpt-5.6-sol'], current: 'gpt-5.6-sol' },
+      { id: 'model_reasoning_effort', kind: 'reasoning', values: ['minimal', 'low', 'medium', 'high'], current: 'medium' },
+    ];
+  }
   return [
     { id: 'model', kind: 'model', values: ['opus', 'sonnet', 'haiku'], current: 'sonnet' },
     { id: 'thinking', kind: 'reasoning', values: ['minimal', 'low', 'medium', 'high'], current: 'medium' },
@@ -413,4 +424,110 @@ describe('W3-5(a) atomic cross-process admission (count-and-reserve)', () => {
       expect(remaining).not.toContain('gen-from-crashed-peer');
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// W4-8: admission is refused BEFORE any provider resource or durable round is
+// created. The regression the fix guarantees: `#admitSpawn` runs ahead of both
+// the pending-round save AND `#adapterFactory.create` (which, for the real
+// Codex path, prepares an isolated §17.1 H-1 `CODEX_HOME` at creation time).
+// A cap rejection therefore leaks NEITHER a temp home NOR a durable pending
+// round. Modelled with a factory whose `create()` allocates a real temp dir at
+// creation time (a faithful stand-in for the Codex `CODEX_HOME`) and removes it
+// on `dispose()`. Under the OLD ordering the refused Codex spawn would have had
+// its home created (and never disposed) and a pending round persisted.
+// ---------------------------------------------------------------------------
+describe('W4-8 admission refusal creates no provider resource and no durable round', () => {
+  it('a cap-exceeded rejection for a Codex role disposes no temp CODEX_HOME and leaves no pending round', async () => {
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+    const db = handle.db;
+    const ps = makeFakePs();
+
+    // Each spawn allocates a real temp dir at adapter-CREATION time (the H-1
+    // `CODEX_HOME` model), disposed on `handle.dispose()`. A leak — a refused
+    // spawn's dir created but never disposed — is observable on disk.
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'w4-8-'));
+    const createdHomes: { dir: string; disposed: boolean }[] = [];
+    let nextPid = 64_001;
+    const factory: RoleAdapterFactory = {
+      create(options) {
+        const adapter = new InProcessFakeAdapter({
+          harnessId: options.resolved.harness,
+          capabilities: { configOptions: fakeConfigOptions(options.resolved.harness) },
+        });
+        const pid = nextPid;
+        nextPid += 1;
+        ps.identities.set(pid, sampleFor(pid));
+        const dir = mkdtempSync(join(tmpRoot, 'codex-home-'));
+        const entry = { dir, disposed: false };
+        createdHomes.push(entry);
+        return {
+          adapter,
+          captureProcessIdentity: (generationId: ProcessGenerationId) => identityFor(pid, generationId),
+          dispose: async (): Promise<void> => {
+            await adapter.close();
+            rmSync(dir, { recursive: true, force: true });
+            entry.disposed = true;
+          },
+        };
+      },
+    };
+
+    const service = new OrchestrationService({
+      db,
+      ids: new DeterministicIdFactory(),
+      adapterFactory: factory,
+      config: unwrap(parseEngineConfig({ maxLiveChildren: 1 })),
+      supervision: { ps: ps.client, sendSignal: () => undefined, envNonce: { verifyNonce: () => 'match' } },
+    });
+
+    try {
+      let releaseBarrier!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        releaseBarrier = resolve;
+      });
+      let live = false;
+
+      const run1 = service.createRun({ goal: 'g1', workspacePath: '/ws', coordinator: CODEX_LOW }).runId;
+      const run2 = service.createRun({ goal: 'g2', workspacePath: '/ws', coordinator: CODEX_LOW }).runId;
+
+      // One Codex child goes live and holds the only slot (cap=1).
+      const p1 = service.runCoordination(
+        run1,
+        runnerWith(async () => {
+          live = true;
+          await barrier;
+        }),
+      );
+      await waitFor(() => live);
+
+      // The 2nd Codex spawn is refused — the cap is 1.
+      let refusal: unknown;
+      await service
+        .runCoordination(run2, runnerWith(async () => undefined))
+        .catch((e: unknown) => {
+          refusal = e;
+        });
+      expect(refusal).toBeInstanceOf(MaxLiveChildrenExceededError);
+
+      // No durable pending round leaked for the refused run (nothing was
+      // persisted before admission).
+      expect(service.getRoleRound(run2)).toBeUndefined();
+
+      // No temp CODEX_HOME leaked: the refused spawn never reached
+      // `#adapterFactory.create`, so ONLY the one live child's home exists on
+      // disk (under the old ordering a second, undisposed home would remain).
+      const onDisk = createdHomes.filter((h) => existsSync(h.dir));
+      expect(onDisk).toHaveLength(1);
+      expect(onDisk[0]!.disposed).toBe(false);
+      expect(createdHomes).toHaveLength(1); // create() was never called for the refusal
+
+      // Free the slot; the live child completes and its home is disposed.
+      releaseBarrier();
+      await p1;
+      expect(createdHomes.every((h) => !existsSync(h.dir))).toBe(true);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
 });

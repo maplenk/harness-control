@@ -163,18 +163,72 @@ export function resolveRoleModel(spec: RoleModelSpec): ResolvedRoleModel {
 // Application against a live session (§11.2 confirm-by-echo)
 // ---------------------------------------------------------------------------
 /**
+ * A typed rejection: the caller asked for a MODEL slug that the live session
+ * does NOT advertise (§5t (5)). BEFORE this guard `resolveOptionId` silently
+ * fell back to the first advertised option of the `model` kind, so an
+ * unadvertised target could be "set" against the wrong/default option and then
+ * "confirmed" by the echo — a wrong model presented as applied. An explicit
+ * unadvertised model target is now a loud, typed error (thrown at resolution,
+ * before any adapter call), never a silent swap. Affects `initial_config_pin` /
+ * F8 pinning TODAY, not just switch-model.
+ */
+export class UnadvertisedModelTargetError extends Error {
+  override readonly name: string = 'UnadvertisedModelTargetError';
+  readonly requestedModel: string;
+  readonly advertisedModels: readonly string[];
+
+  constructor(requestedModel: string, advertisedModels: readonly string[]) {
+    super(
+      `model '${requestedModel}' is not advertised by the live session ` +
+        `(advertised: ${advertisedModels.join(', ')}) — refusing to silently substitute a different model`,
+    );
+    this.requestedModel = requestedModel;
+    this.advertisedModels = [...advertisedModels];
+  }
+}
+
+/**
  * Resolve an intent's wire option id against a session's advertised options:
  * an exact id match wins; otherwise the first advertised option of the
  * intent's SPI kind; otherwise the preferred id verbatim (so a still-unlisted
  * option is at least attempted and fails loudly at the adapter).
+ *
+ * For a MODEL intent whose EXPLICIT target slug is not among the resolved
+ * option's advertised `values`, this THROWS `UnadvertisedModelTargetError`
+ * rather than silently swapping to a different/default model (§5t (5)). The
+ * no-explicit-target default behavior is preserved: an option that advertises
+ * NO enumerated values (`values: []`) cannot be validated, so the request is
+ * still attempted and fails loudly at the adapter if wrong.
  */
 export function resolveOptionId(
   intent: ConfigOptionIntent,
   advertised: readonly ConfigOptionDescriptor[],
 ): string {
-  if (advertised.some((option) => option.id === intent.optionId)) return intent.optionId;
+  const exact = advertised.find((option) => option.id === intent.optionId);
+  if (exact !== undefined) {
+    assertAdvertisedModelTarget(intent, exact);
+    return intent.optionId;
+  }
   const byKind = advertised.find((option) => option.kind === intent.kind);
-  return byKind?.id ?? intent.optionId;
+  if (byKind === undefined) return intent.optionId;
+  assertAdvertisedModelTarget(intent, byKind);
+  return byKind.id;
+}
+
+/**
+ * Reject an EXPLICIT unadvertised MODEL target. Only the `model` kind is guarded
+ * (a wrong model silently "confirmed" is the §5t (5) bug); reasoning-value
+ * mismatches stay captured as `ok:false` per-intent adapter failures (W1-F8).
+ * An option that enumerates NO values cannot be validated → not rejected.
+ */
+function assertAdvertisedModelTarget(
+  intent: ConfigOptionIntent,
+  option: ConfigOptionDescriptor,
+): void {
+  if (intent.kind !== 'model') return;
+  if (option.values.length === 0) return;
+  if (option.values.includes(intent.value)) return;
+  throw new UnadvertisedModelTargetError(intent.value, option.values);
 }
 
 /** One applied model/effort pin (the §11.2 echo outcome for one intent). */
@@ -200,6 +254,11 @@ export interface AppliedConfigOption {
  * a typed `ModelPinError` failing the spawn) lives in
  * `OrchestrationService.runRole` (W1-F8). An `ok:true` without an echo is an
  * unconfirmed pin (`echoed:false`), accepted — some adapters do not echo.
+ *
+ * A resolution-time rejection (§5t (5): an explicit unadvertised MODEL target,
+ * `UnadvertisedModelTargetError`) is likewise CAPTURED as `ok:false` before any
+ * adapter call — never a silent swap to a different model — so enforcement fails
+ * the spawn loudly instead of pinning the wrong model and "confirming" it.
  */
 export async function applyRoleModel(
   adapter: HarnessAdapter,
@@ -209,7 +268,22 @@ export async function applyRoleModel(
 ): Promise<readonly AppliedConfigOption[]> {
   const applied: AppliedConfigOption[] = [];
   for (const intent of resolved.configOptions) {
-    const resolvedOptionId = resolveOptionId(intent, advertised);
+    let resolvedOptionId: string;
+    try {
+      resolvedOptionId = resolveOptionId(intent, advertised);
+    } catch (error) {
+      // §5t (5): an explicit unadvertised model target is a typed rejection,
+      // not a silent fallback. Record it as a failed pin so W1-F8 enforcement
+      // fails the spawn rather than silently running a substituted model.
+      applied.push({
+        intent,
+        resolvedOptionId: intent.optionId,
+        ok: false,
+        error: redactText(isAdapterError(error) ? `${error.kind}: ${error.message}` : String(error)),
+        rawError: error,
+      });
+      continue;
+    }
     try {
       const result = await adapter.setConfigOption({
         sessionId,

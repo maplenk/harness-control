@@ -881,3 +881,60 @@ describe('pauseForLimit under artifact-quota exhaustion', () => {
     expect(types).toContain('limit.incident.recorded');
   });
 });
+
+// ---------------------------------------------------------------------------
+// W4-1 §12.2 — completed-turn cadence checkpoint (CadenceTracker WIRED)
+// ---------------------------------------------------------------------------
+/** A coordinator runner that drives exactly `n` successful prompt turns. */
+function promptNRunner(n: number): RoleRunner {
+  return {
+    role: 'coordinator',
+    run: async (session) => {
+      for (let i = 0; i < n; i += 1) await session.prompt({ prompt: 'go' });
+      return {};
+    },
+  };
+}
+
+function cadenceCheckpoints(db: TestDatabaseHandle['db'], runId: RunId) {
+  return db.events
+    .listByRun(runId)
+    .filter(
+      (e) => e.type === 'checkpoint.recorded' && (e.payload as { reason?: string }).reason === 'cadence',
+    );
+}
+
+describe('W4-1 §12.2 completed-turn cadence checkpoint', () => {
+  it('takes a `cadence` checkpoint every N completed turns (default 3) — fails without the CadenceTracker wiring', async () => {
+    // Three benign completed turns cross the default cadence window exactly
+    // once. Before W4-1 the CadenceTracker had no production caller, so ZERO
+    // cadence checkpoints were ever written — this expectation is the
+    // regression guard (0 !== 1 without the fix).
+    const { service, db } = await setup({ turns: [{}, {}, {}] });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    await service.runCoordination(runId, promptNRunner(3));
+
+    const cadence = cadenceCheckpoints(db, runId);
+    expect(cadence).toHaveLength(1);
+
+    // A completed-turn cadence checkpoint interrupts no work: idle operation,
+    // no `incompleteOperation` fabricated (§12.2 honesty).
+    const hash = (cadence[0]!.payload as { artifactHash: ArtifactHash }).artifactHash;
+    const content = readCheckpointContent(db, hash);
+    expect(content.incompleteOperation).toBeUndefined();
+  });
+
+  it('does NOT checkpoint before the window elapses (2 of 3 turns → no cadence checkpoint)', async () => {
+    const { service, db } = await setup({ turns: [{}, {}] });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    await service.runCoordination(runId, promptNRunner(2));
+    expect(cadenceCheckpoints(db, runId)).toHaveLength(0);
+  });
+
+  it('resets the window after each checkpoint (6 turns → exactly 2 cadence checkpoints)', async () => {
+    const { service, db } = await setup({ turns: [{}, {}, {}, {}, {}, {}] });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    await service.runCoordination(runId, promptNRunner(6));
+    expect(cadenceCheckpoints(db, runId)).toHaveLength(2);
+  });
+});

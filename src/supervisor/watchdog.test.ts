@@ -18,6 +18,7 @@ import type { DomainEvent } from '../domain/events.js';
 import type { WorktreeTaint } from '../domain/state.js';
 import { parseEngineConfig } from '../config/loader.js';
 import type { MemoryConfig } from '../config/schema.js';
+import type { PsClient, ProcessTreeSample } from './ps.js';
 import { createPsClient } from './ps.js';
 import { ProcessRegistry } from './registry.js';
 import { Watchdog, type GitOpLeaseObserver, type WatchdogTarget, type WorktreeTaintSink } from './watchdog.js';
@@ -317,6 +318,85 @@ describe('Watchdog: kill respects an active git-op lease (§14/§16.2) — waits
     expect(harness.taints).toEqual([{ assignmentId: target.assignmentId, taint: 'emergency_kill' }]);
     expect(hardLimitEvents(harness.events)).toEqual([{ escalation: 'emergency_kill' }]);
   }, 10_000);
+});
+
+describe('Watchdog: a throwing sample tick never becomes an unhandled rejection (§14 robustness)', () => {
+  it('a background tick whose ps.sampleProcessTree THROWS surfaces a durable supervision-failure alert, does not reject unhandled, and keeps supervising', async () => {
+    // A ps client that throws on the first N background sample ticks (an
+    // execFile/ps blow-up), then recovers — so we can prove supervision both
+    // survives the throw AND keeps running afterwards.
+    const failures: unknown[] = [];
+    let throwsRemaining = 3;
+    const realSample = ps.sampleProcessTree.bind(ps);
+    let sampleCalls = 0;
+    const flakyPs: PsClient = {
+      sampleProcessTree(pgid: number): ProcessTreeSample | undefined {
+        sampleCalls += 1;
+        if (throwsRemaining > 0) {
+          throwsRemaining -= 1;
+          throw new Error('synthetic ps/execFile failure');
+        }
+        return realSample(pgid);
+      },
+      sampleIdentity: (pid) => ps.sampleIdentity(pid),
+      isAlive: (pid) => ps.isAlive(pid),
+    };
+
+    // An unhandled rejection anywhere during this test fails it loudly.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const child = spawnWithExtraMb(120 - baselineMb); // well under the soft threshold: no escalation
+      await settle(300);
+      const registry = new ProcessRegistry({ clock, ps: flakyPs });
+      const watchdog = new Watchdog({
+        clock,
+        ids: new DeterministicIdFactory(),
+        registry,
+        ps: flakyPs,
+        memory: buildMemoryConfig(),
+        sampleIntervalMs: 20,
+        elevatedSampleIntervalMs: 20,
+        onEvent: () => undefined,
+        onSupervisionFailure: (_target, error) => failures.push(error),
+      });
+      watchdogsToStop.push(watchdog);
+      registry.register({
+        generationId: processGenerationId(`gen_flaky_${child.pid}`),
+        pid: child.pid!,
+        pgid: child.pid!,
+        spawnNonce: `nonce-${child.pid}`,
+      });
+      const target: WatchdogTarget = {
+        runId: runId(`run_${child.pid}`),
+        generationId: processGenerationId(`gen_flaky_${child.pid}`),
+        pgid: child.pid!,
+        segmentId: segmentId(`seg_${child.pid}`),
+        assignmentId: assignmentId(`asg_${child.pid}`),
+      };
+      watchdog.watch(target);
+
+      // The throwing ticks must each raise a durable alert (fail-open-with-alert)...
+      await waitUntil(() => failures.length >= 3, 3_000);
+      // ...and supervision must keep running past the throws (more ps calls
+      // than the number of thrown ticks proves it rescheduled and recovered).
+      await waitUntil(() => sampleCalls > 5, 3_000);
+      expect(watchdog.isWatching(target.generationId)).toBe(true);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+
+    // Give any stray rejection a microtask/tick to surface, then assert none did.
+    await settle(50);
+    expect(unhandled).toEqual([]);
+    expect(failures.length).toBeGreaterThanOrEqual(3);
+    for (const error of failures) {
+      expect((error as Error).message).toContain('synthetic ps/execFile failure');
+    }
+  }, 15_000);
 });
 
 describe('Watchdog: identity-gated kill (§14 bullet 1) — even the emergency path never bypasses it', () => {

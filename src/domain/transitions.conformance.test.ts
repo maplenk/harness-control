@@ -470,20 +470,20 @@ function violatingEventsFor(
       ];
     }
     case 'generation_matches_active': {
+      // Build the ROW'S OWN event type (T13 exit report, T17 recovery
+      // notice, …) from its canonical builder, then override the stamped
+      // generation to a superseded one — the state stays satisfying, the
+      // payload alone forces rejection ON THAT ROW.
+      const basePayload = BUILDERS[row.event](CTX) as Record<string, unknown>;
       const stale: DomainEvent = {
-        type: 'child.exited.unexpectedly',
+        type: row.event,
         runId: RUN,
         sequence: SEQUENCE_UNASSIGNED,
         idempotencyKey: idempotencyKey(`conf-${row.id}-payload-stalegen`),
         occurredAt: AT,
-        payload: {
-          segmentId: CTX.segment,
-          generationId: processGenerationId('pgen_conf_stale_1'),
-          exitCode: 1,
-          classifiedAs: 'crash',
-        },
+        payload: { ...basePayload, generationId: processGenerationId('pgen_conf_stale_1') },
       } as DomainEvent;
-      return [['exit report stamped with a superseded generation', stale]];
+      return [['event stamped with a superseded generation', stale]];
     }
     default: {
       const exhaustive: never = check;

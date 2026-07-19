@@ -96,11 +96,10 @@
  * blanket inherit (the full `process.env` is never inherited).
  */
 import * as path from 'node:path';
-import { exec } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import type { Dirent } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
-import { promisify } from 'node:util';
 import type { Clock } from '../../lib/clock.js';
 import type { IdFactory } from '../../lib/id-factory.js';
 import type { AcceptanceCriterion, AcpStopReason } from '../../domain/entities.js';
@@ -180,6 +179,12 @@ export interface DefaultVerificationRunnerOptions {
   /** Max captured bytes per stream before the OS buffer errors (default 16MiB). */
   readonly maxBufferBytes?: number;
   /**
+   * W4-7: grace between the SIGTERM and the forced SIGKILL when a timed-out
+   * command's process GROUP is torn down (default 2s — mirrors the ACP
+   * transport's `terminateGraceMs`, §10.2). Injected small in tests.
+   */
+  readonly terminateGraceMs?: number;
+  /**
    * W3-1: EXTRA env keys inherited from the orchestrator's environment
    * beyond `VERIFICATION_ENV_ALLOWLIST` — the per-run explicit allowlist
    * additions (config `verification.envAllowlist`). Credential-shaped names
@@ -195,12 +200,12 @@ export interface DefaultVerificationRunnerOptions {
   readonly env?: Readonly<Record<string, string>>;
 }
 
-const execAsync = promisify(exec);
-
-function asText(value: string | Buffer | undefined): string {
-  if (value === undefined) return '';
-  return typeof value === 'string' ? value : value.toString('utf8');
-}
+/**
+ * W4-7: default grace between the SIGTERM and the forced SIGKILL when a
+ * timed-out verification command's process group is reaped — mirrors the ACP
+ * transport's `terminateGraceMs` (§10.2).
+ */
+const DEFAULT_VERIFICATION_TERMINATE_GRACE_MS = 2000;
 
 /**
  * Default runner: executes the command line through the platform shell in the
@@ -212,53 +217,146 @@ function asText(value: string | Buffer | undefined): string {
  * is reported as exit 124, an un-launchable command as `launchFailed`.
  * Credential-shaped `inheritEnvKeys`/`env` keys are refused at construction
  * (`VerificationRunnerEnvError`).
+ *
+ * W4-7 — PROCESS-GROUP SUPERVISION. The command is `spawn`ed `detached:true`
+ * so the shell becomes the leader of its OWN process group. `exec()`'s
+ * built-in timeout only signals the immediate shell, so a verification command
+ * that starts a background server/watcher would ORPHAN that descendant and let
+ * it survive the reported timeout. Instead this runner arms its own timer and,
+ * on expiry, drives the SAME graceful-then-forced termination ladder the ACP
+ * transport uses (§10.2): SIGTERM the whole GROUP (negative pid) → `grace` →
+ * SIGKILL the group. A final SIGKILL sweep of the group also runs the moment
+ * the leader exits, so a detached descendant that outlives the shell is reaped
+ * rather than leaked (no survivors). The env-allowlist confinement (W3-1) is
+ * unchanged — the spawn env is built from `VERIFICATION_ENV_ALLOWLIST` exactly
+ * as before.
  */
 export function defaultVerificationRunner(
   options: DefaultVerificationRunnerOptions = {},
 ): VerificationRunner {
   const timeout = options.timeoutMs ?? 10 * 60 * 1000;
   const maxBuffer = options.maxBufferBytes ?? 16 * 1024 * 1024;
+  const grace = options.terminateGraceMs ?? DEFAULT_VERIFICATION_TERMINATE_GRACE_MS;
   const inheritEnvKeys = options.inheritEnvKeys ?? [];
   const explicitEnv = options.env ?? {};
   const refused = [...inheritEnvKeys, ...Object.keys(explicitEnv)].filter((key) =>
     isSecretKeyName(key),
   );
   if (refused.length > 0) throw new VerificationRunnerEnvError(refused);
-  return async (command, cwd) => {
-    // Built per call so the allowlisted view always reflects the CURRENT
-    // orchestrator env (same construction as the transport's spawn env).
-    const env: Record<string, string> = {};
-    for (const key of [...VERIFICATION_ENV_ALLOWLIST, ...inheritEnvKeys]) {
-      const value = process.env[key];
-      if (value !== undefined) env[key] = value;
-    }
-    Object.assign(env, explicitEnv);
-    try {
-      const { stdout, stderr } = await execAsync(command, {
-        cwd,
-        timeout,
-        maxBuffer,
-        env,
-      });
-      return { exitCode: 0, stdout: asText(stdout), stderr: asText(stderr), launchFailed: false };
-    } catch (error) {
-      const e = error as {
-        readonly code?: number | string;
-        readonly signal?: string | null;
-        readonly killed?: boolean;
-        readonly stdout?: string | Buffer;
-        readonly stderr?: string | Buffer;
-        readonly message?: string;
-      };
-      const stdout = asText(e.stdout);
-      const stderr = asText(e.stderr) || (e.message ?? String(error));
-      if (typeof e.code === 'number') {
-        return { exitCode: e.code, stdout, stderr, launchFailed: false };
+  return (command, cwd) =>
+    new Promise<VerificationCommandOutcome>((resolve) => {
+      // Built per call so the allowlisted view always reflects the CURRENT
+      // orchestrator env (same construction as the transport's spawn env).
+      const env: Record<string, string> = {};
+      for (const key of [...VERIFICATION_ENV_ALLOWLIST, ...inheritEnvKeys]) {
+        const value = process.env[key];
+        if (value !== undefined) env[key] = value;
       }
-      const killed = e.killed === true || (e.signal !== undefined && e.signal !== null);
-      return { exitCode: killed ? 124 : 127, stdout, stderr, launchFailed: !killed };
-    }
-  };
+      Object.assign(env, explicitEnv);
+
+      const child = spawn(command, {
+        cwd,
+        env,
+        shell: true, // full command lines (`a && b`, `npm test`) run through /bin/sh -c
+        detached: true, // own process GROUP so a timeout can reap the WHOLE tree (W4-7)
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const pid = child.pid;
+
+      /**
+       * Signal the whole process GROUP (negative pid), mirroring the transport
+       * `#killGroup`: a detached descendant a verification command spawned
+       * shares the leader's group and dies with it. ESRCH (group already gone)
+       * is swallowed — reaping is idempotent.
+       */
+      const killGroup = (signal: NodeJS.Signals): void => {
+        if (pid === undefined) return;
+        try {
+          process.kill(-pid, signal);
+        } catch {
+          /* ESRCH: group already gone */
+        }
+      };
+
+      let stdout = '';
+      let stderr = '';
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let overflow = false;
+      let timedOut = false;
+      let settled = false;
+      let exitCode: number | null = null;
+      let graceTimer: NodeJS.Timeout | undefined;
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        // Termination ladder (§10.2): SIGTERM the group → grace → SIGKILL group.
+        killGroup('SIGTERM');
+        graceTimer = setTimeout(() => killGroup('SIGKILL'), grace);
+        graceTimer.unref?.();
+      }, timeout);
+      timer.unref?.();
+
+      const settle = (outcome: VerificationCommandOutcome): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (graceTimer !== undefined) clearTimeout(graceTimer);
+        // Final sweep: reap any straggler still sharing the group (a detached
+        // grandchild survives the leader on POSIX) so nothing is leaked.
+        killGroup('SIGKILL');
+        resolve(outcome);
+      };
+
+      child.stdout.on('data', (chunk: Buffer) => {
+        if (stdoutBytes < maxBuffer) {
+          stdout += chunk.toString('utf8');
+          stdoutBytes += chunk.byteLength;
+          if (stdoutBytes > maxBuffer) {
+            overflow = true;
+            killGroup('SIGKILL');
+          }
+        }
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        if (stderrBytes < maxBuffer) {
+          stderr += chunk.toString('utf8');
+          stderrBytes += chunk.byteLength;
+          if (stderrBytes > maxBuffer) {
+            overflow = true;
+            killGroup('SIGKILL');
+          }
+        }
+      });
+
+      // A failed spawn (e.g. no shell) — un-launchable, mirrors the old
+      // `launchFailed` path. `close` may still follow; `settle` is idempotent.
+      child.once('error', (cause: Error) => {
+        settle({ exitCode: 127, stdout, stderr: stderr || String(cause), launchFailed: true });
+      });
+
+      // The leader exited: reap any straggler sharing the group NOW so the
+      // inherited stdio pipes close and `close` can fire (a detached child
+      // holding the pipe would otherwise stall it — and it is exactly the
+      // survivor W4-7 must not leak).
+      child.once('exit', (code) => {
+        exitCode = code;
+        killGroup('SIGKILL');
+      });
+
+      // `close` fires after all stdio EOF — every byte captured.
+      child.once('close', () => {
+        if (timedOut || overflow) {
+          settle({ exitCode: 124, stdout, stderr, launchFailed: false });
+        } else if (typeof exitCode === 'number') {
+          settle({ exitCode, stdout, stderr, launchFailed: false });
+        } else {
+          // Killed by a signal we did not send (no numeric code) — report as a
+          // termination, not a clean pass.
+          settle({ exitCode: 124, stdout, stderr, launchFailed: false });
+        }
+      });
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -55,6 +55,7 @@ import * as git from '../../worktree/git.js';
 import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import type { RoleModelSpec } from '../model-resolution.js';
 import type { OrchestrationService } from '../service.js';
+import { RunOwnershipConflictError } from '../run-ownership-store.js';
 import type { RoleRoundProjection } from '../projections.js';
 import {
   ImplementorFlow,
@@ -368,65 +369,83 @@ export async function runImplementVerifyLoop(
     );
   }
 
-  let handle: WorktreeHandle;
-  let destinationLabel: string;
-  if (resume === undefined) {
-    handle = await worktrees.createWorktree({
-      assignmentId: input.assignmentId,
-      ...(input.baseRef !== undefined ? { baseRef: input.baseRef } : {}),
-    });
-    // §16: the manual `git switch <dest>` hint targets the primary checkout's
-    // ACTUAL branch (read from the repo, never trusting a hardcoded 'main'); an
-    // explicit caller `destinationLabel` still wins, and a detached HEAD falls
-    // back to 'main'. Resolved once — the primary branch is stable across rounds.
-    destinationLabel = input.destinationLabel ?? (await git.currentBranch(handle.repoRoot)) ?? 'main';
-    // W2-5: persist the loop binding + worktree facts AT CREATION so a later,
-    // separate process can adopt the worktree and re-enter this loop.
-    service.saveImplementVerifyLoopState(input.runId, {
-      assignmentId: input.assignmentId,
-      implementor: input.implementor,
-      verifier: input.verifier,
-      specHash: input.specHash,
-      taskScope: input.taskScope,
-      destinationLabel,
-      destinationRef: input.destinationRef ?? 'HEAD',
-      worktree: {
-        assignmentId: input.assignmentId,
-        repoRoot: handle.repoRoot,
-        worktreePath: handle.worktreePath,
-        branch: handle.branch,
-        baseSha: handle.baseSha,
-        createdAt: handle.createdAt,
-      },
-    });
-  } else {
-    handle = await adoptWorktree(deps, input, resume);
-    const persisted = service.getImplementVerifyLoopState(input.runId);
-    destinationLabel =
-      input.destinationLabel ?? persisted?.destinationLabel ?? (await git.currentBranch(handle.repoRoot)) ?? 'main';
+  // W4-4 / review-6 F2: claim the EXCLUSIVE run-ownership lease BEFORE any
+  // worktree create/adopt or role work, and CHECK the compare-and-swap result.
+  // Acquisition must PRECEDE (not follow) the worktree I/O so a concurrent
+  // driver of the SAME run cannot race us through worktree setup; a `false`
+  // result means a still-LIVE peer already owns the run, so we WITHHOLD (an
+  // honest error) rather than double-drive its worktree (attack-e content
+  // double-write) — a plain fire-and-forget acquire could not close this. The
+  // lease is held ACROSS child rounds — surviving the between-rounds gap where an
+  // implementor's clean dispose has already removed the per-child registry record
+  // but the verifier is not yet dispatched — so a concurrent `harness resume`
+  // sees this LIVE owner and WITHHOLDS. Released in the outer `finally` on EVERY
+  // exit (completion, pause, error, worktree-setup failure, teardown); a crash
+  // leaves a dead-owner lease that a resuming process correctly reclaims.
+  if (!service.acquireRunOwnership(input.runId)) {
+    throw new RunOwnershipConflictError(String(input.runId));
   }
-  const destinationRef =
-    input.destinationRef ??
-    (resume !== undefined ? service.getImplementVerifyLoopState(input.runId)?.destinationRef : undefined) ??
-    'HEAD';
 
-  const entry: ResumeEntryPlan =
-    resume !== undefined ? resolveResumeEntry(resume.round, entryPhase) : { startRound: 1, first: 'implement' };
-
-  const maxRounds = Math.max(1, input.maxRounds ?? DEFAULT_MAX_LOOP_ROUNDS);
+  let handle!: WorktreeHandle;
   const rounds: LoopRound[] = [];
-  // A needs_remediation re-entry starts with the caller-rebuilt payload from
-  // the durable T23 facts (W2-5); everything else starts clean.
-  let fixRequests: readonly FixRequest[] = resume?.fixRequests ?? [];
   let mergeReadiness: MergeReadiness | undefined;
   let integrationBlocked = false;
-  let implementationCommit: GitSha = handle.baseSha;
-
-  // W2-6 (§14/§16.2-3): while this loop owns worktrees, the service's RSS
-  // watchdog must taint through THIS manager on an emergency kill and respect
-  // its git-op leases before a deadline termination.
-  service.attachWorktreeSupervision(worktrees);
+  let implementationCommit!: GitSha;
   try {
+    let destinationLabel: string;
+    if (resume === undefined) {
+      handle = await worktrees.createWorktree({
+        assignmentId: input.assignmentId,
+        ...(input.baseRef !== undefined ? { baseRef: input.baseRef } : {}),
+      });
+      // §16: the manual `git switch <dest>` hint targets the primary checkout's
+      // ACTUAL branch (read from the repo, never trusting a hardcoded 'main'); an
+      // explicit caller `destinationLabel` still wins, and a detached HEAD falls
+      // back to 'main'. Resolved once — the primary branch is stable across rounds.
+      destinationLabel = input.destinationLabel ?? (await git.currentBranch(handle.repoRoot)) ?? 'main';
+      // W2-5: persist the loop binding + worktree facts AT CREATION so a later,
+      // separate process can adopt the worktree and re-enter this loop.
+      service.saveImplementVerifyLoopState(input.runId, {
+        assignmentId: input.assignmentId,
+        implementor: input.implementor,
+        verifier: input.verifier,
+        specHash: input.specHash,
+        taskScope: input.taskScope,
+        destinationLabel,
+        destinationRef: input.destinationRef ?? 'HEAD',
+        worktree: {
+          assignmentId: input.assignmentId,
+          repoRoot: handle.repoRoot,
+          worktreePath: handle.worktreePath,
+          branch: handle.branch,
+          baseSha: handle.baseSha,
+          createdAt: handle.createdAt,
+        },
+      });
+    } else {
+      handle = await adoptWorktree(deps, input, resume);
+      const persisted = service.getImplementVerifyLoopState(input.runId);
+      destinationLabel =
+        input.destinationLabel ?? persisted?.destinationLabel ?? (await git.currentBranch(handle.repoRoot)) ?? 'main';
+    }
+    implementationCommit = handle.baseSha;
+    const destinationRef =
+      input.destinationRef ??
+      (resume !== undefined ? service.getImplementVerifyLoopState(input.runId)?.destinationRef : undefined) ??
+      'HEAD';
+
+    const entry: ResumeEntryPlan =
+      resume !== undefined ? resolveResumeEntry(resume.round, entryPhase) : { startRound: 1, first: 'implement' };
+
+    const maxRounds = Math.max(1, input.maxRounds ?? DEFAULT_MAX_LOOP_ROUNDS);
+    // A needs_remediation re-entry starts with the caller-rebuilt payload from
+    // the durable T23 facts (W2-5); everything else starts clean.
+    let fixRequests: readonly FixRequest[] = resume?.fixRequests ?? [];
+
+    // W2-6 (§14/§16.2-3): while this loop owns worktrees, the service's RSS
+    // watchdog must taint through THIS manager on an emergency kill and respect
+    // its git-op leases before a deadline termination.
+    service.attachWorktreeSupervision(worktrees);
     for (let round = entry.startRound; round <= maxRounds; round += 1) {
       const resumedRound = resume !== undefined && round === entry.startRound;
       const skipImplement = resumedRound && entry.first === 'verify';
@@ -624,6 +643,9 @@ export async function runImplementVerifyLoop(
       fixRequests = verification.fixRequests;
     }
   } finally {
+    // W4-4: release the RUN-ownership lease FIRST so a legitimate sequential
+    // resume after this driver returns is never blocked by our own stale lease.
+    service.releaseRunOwnership(input.runId);
     service.detachWorktreeSupervision();
     // Leave the worktree on disk for the verifier / human integration (§16);
     // just make sure the single-writer lease is not left dangling.

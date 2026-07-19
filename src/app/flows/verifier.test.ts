@@ -1019,6 +1019,34 @@ describe('buildMergeReadiness — §16 gate (§19 test 18)', () => {
     ).toBe(true);
     expect(mr.manualIntegrationCommands.join('\n')).toContain('NOT READY');
   });
+
+  it('W4-6: shell-quotes a repoRoot/ref with spaces into a valid copy-pasteable command', () => {
+    const mr = buildMergeReadiness({
+      runId: mkRunId('run_1'),
+      verification: verified('all_verified'),
+      binding: binding({
+        repoRoot: '/Users/me/My Repos/proj',
+        destinationRef: 'release candidate',
+        worktreeBranch: "harness/it's a branch",
+      }),
+      gitFacts: goodFacts(),
+      requiredTestsPassed: true,
+      approvedSpecHash: SPEC_HASH,
+      ids,
+      clock,
+    });
+    const text = mr.manualIntegrationCommands.join('\n');
+    // Each interpolated value is single-quoted so spaces/metacharacters survive copy-paste.
+    expect(text).toContain(`git -C '/Users/me/My Repos/proj' switch 'release candidate'`);
+    expect(text).toContain(`merge --no-ff 'harness/it'\\''s a branch'`);
+  });
+
+  it('W4-6: leaves normal paths/refs unquoted (unchanged in spirit)', () => {
+    const mr = readiness(verified('all_verified'), goodFacts());
+    const text = mr.manualIntegrationCommands.join('\n');
+    expect(text).toContain('git -C /repo switch main');
+    expect(text).toContain('merge --no-ff harness/asg_1');
+  });
 });
 
 // ===========================================================================

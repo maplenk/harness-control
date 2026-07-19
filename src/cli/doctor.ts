@@ -211,6 +211,8 @@ export interface DoctorOptions {
   readonly resolveFromDir?: string;
   /** Handshake bound for the fake-adapter check (default 15s, §10.2). */
   readonly handshakeTimeoutMs?: number;
+  /** Injectable for deterministic tests; defaults to `process.platform`. */
+  readonly platform?: NodeJS.Platform;
 }
 
 // ---------------------------------------------------------------------------
@@ -533,8 +535,17 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     (report) =>
       report.readiness === 'detected_but_unvalidated' || report.readiness === 'detected_but_unsupported',
   );
+  // Supervision (§14 ps process-group/RSS sampling) is macOS-only in MVP — the
+  // `ps` adapter targets BSD/macOS flags; a GNU/Linux adapter is roadmap
+  // (package.json `os: ["darwin"]`). Flag a non-darwin host so the limitation
+  // is observable rather than silently mis-supervising.
+  const supervisionSupported = (options.platform ?? process.platform) === 'darwin';
   const overall: DoctorOverall =
-    failures.length > 0 ? 'fail' : anySupportedAuth && hostConfig.codex.safe ? 'ok' : 'warn';
+    failures.length > 0
+      ? 'fail'
+      : anySupportedAuth && hostConfig.codex.safe && supervisionSupported
+        ? 'ok'
+        : 'warn';
 
   const notes: string[] = [...failures];
   if (failures.length === 0 && !anySupportedAuth) {
@@ -549,6 +560,13 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     notes.push(
       `host codex config flagged (H-1): ${hostConfig.codex.configPath} routes approvals to a provider-side ` +
         'reviewer — see hostConfig.codex.issues (read-only check; orchestrator spawns are isolated, nothing was mutated)',
+    );
+  }
+  if (!supervisionSupported) {
+    notes.push(
+      `memory supervision is macOS-only in MVP: this host is '${options.platform ?? process.platform}', but the ` +
+        'ps process-group/RSS adapter (PLAN §14) targets BSD/macOS flags (package.json os: ["darwin"]). A ' +
+        'GNU/Linux ps adapter is roadmap — supervision would mis-sample here until it lands.',
     );
   }
 

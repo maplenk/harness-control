@@ -15,6 +15,9 @@
   "engines": {
     "node": ">=22.14.0"
   },
+  "os": [
+    "darwin"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "postbuild": "node -e \"require('node:fs').chmodSync('dist/cli/index.js', 0o755)\"",

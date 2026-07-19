@@ -25,30 +25,25 @@
  * flow execution slots in behind these same commands without changing the surface.
  */
 import type { Database } from '../persistence/index.js';
-import {
-  draftEvent,
-  type DomainEvent,
-  type LimitClassification,
-  type SpecDraftRef,
-} from '../domain/events.js';
+import type { LimitClassification, SpecDraftRef } from '../domain/events.js';
 import {
   artifactHash,
   assignmentId,
   criterionId,
-  newIdempotencyKey,
-  segmentId,
   specHash as toSpecHash,
   type RunId,
 } from '../domain/ids.js';
 import type { AcceptanceCriterion, MergeReadiness, SpecVersion } from '../domain/entities.js';
 import type { RoleName } from '../domain/state.js';
 import type { Clock } from '../lib/clock.js';
-import { RandomIdFactory, type IdFactory } from '../lib/id-factory.js';
+import type { IdFactory } from '../lib/id-factory.js';
 import {
+  DurableDesiredModelStore,
   LimitPausedError,
   RUN_META_PROJECTION,
   ResumeEligibilityError,
   resolveRoleModel,
+  type DesiredModelRecord,
   type IngestResult,
   type OrchestrationService,
   type ResolvedRoleModel,
@@ -159,7 +154,8 @@ export interface CliFlowDeps {
 }
 
 export interface CommandDeps {
-  /** IdFactory for `switch-model` trigger idempotency keys; defaults to random. */
+  /** Injected IdFactory (tests use a deterministic one); currently unused by the
+   * dispatch itself — the flow runtime carries its own `ids`. */
   readonly ids?: IdFactory;
   /** The P3 flow runtime; the shipped CLI always injects it (see `CliFlowDeps`). */
   readonly flows?: CliFlowDeps;
@@ -182,7 +178,6 @@ export async function executeCommand(
   env: NodeJS.ProcessEnv,
   deps: CommandDeps = {},
 ): Promise<CommandOutput> {
-  const ids = deps.ids ?? new RandomIdFactory();
   try {
     switch (command.kind) {
       case 'start':
@@ -218,7 +213,7 @@ export async function executeCommand(
           rejectedHint: 'breaker reset applies only while the breaker is open (T15).',
         });
       case 'switch_model':
-        return handleSwitchModel(service, db, command, ids);
+        return handleSwitchModel(service, db, command);
       case 'cancel':
         return await handleCancel(service, command);
     }
@@ -1083,7 +1078,15 @@ async function handleResume(
   // W2-5 startup reclaim: T9/T12 already landed but the process died before
   // the round re-entered — drive the unacknowledged pending re-entry now,
   // idempotently (the ack lands inside runRole when the round goes active).
-  if (st.suspension === 'none' && st.resumeReentryPending !== undefined) {
+  // W4-4 / review-6 F2: GATED on §14 owner-liveness like every other resume
+  // carve-out — an unacknowledged pending re-entry can be double-driven too, so
+  // if a still-alive PEER orchestrator owns this run, WITHHOLD (the owner carries
+  // it; a later resume after that owner dies reclaims the stale lease).
+  if (
+    st.suspension === 'none' &&
+    st.resumeReentryPending !== undefined &&
+    !service.isRunClaimedByLiveProcess(cmd.runId)
+  ) {
     return withExtraJson(await driveReentry(service, db, 'resume', cmd.runId, deps), reapExtra);
   }
   // W3-4: an UNSUSPENDED run stranded mid-coordination — a crash before the
@@ -1093,10 +1096,42 @@ async function handleResume(
   // coordinator round directly (the re-drive completes atomically, W3-4).
   // Deliberately coordinator-only: implementor/verifier crash recovery goes
   // through the §12.3 interrupted/reclaim machinery above.
+  // W4-4: GATED on §14 owner-liveness (the run-ownership lease) — a coordinator
+  // round can be double-driven too, so if a still-alive PEER orchestrator owns
+  // this run, WITHHOLD (the owner carries it; a later resume after that owner
+  // dies reclaims the stale lease and re-drives).
   if (
     st.suspension === 'none' &&
     (st.phase === 'created' || st.phase === 'specifying') &&
-    service.getRoleRound(cmd.runId)?.role === 'coordinator'
+    service.getRoleRound(cmd.runId)?.role === 'coordinator' &&
+    !service.isRunClaimedByLiveProcess(cmd.runId)
+  ) {
+    return withExtraJson(await driveReentry(service, db, 'resume', cmd.runId, deps), reapExtra);
+  }
+  // W4-4 (restart-safety): an UNSUSPENDED implementor/verifier run stranded at
+  // a role-completion boundary — the orchestrator crashed AFTER the round's
+  // `child.stopped` folded but BEFORE the next dispatch/transition landed:
+  //   - implementor completed, verifier not yet dispatched (phase
+  //     `implementing`, round implementor/completed) → re-enter verify;
+  //   - verifier round completed, the T23/T24 merge-readiness transition never
+  //     landed (phase `verifying`, round verifier/completed) → re-enter verify
+  //     on the SAME immutable binding (§16.3 discards the read-only dirt).
+  // `resolveResumeEntry` derives the right next step from the durable stage;
+  // WITHOUT this gate the run has no suspension to lift → `resume` errored
+  // ("not paused") and the run was unreclaimable. GATED on §14 owner-liveness:
+  // if a still-alive PEER orchestrator owns this run (its live child would be
+  // double-driven), withhold — the peer will carry it (or a later resume,
+  // after that peer dies, reclaims it).
+  const boundaryRound = service.getRoleRound(cmd.runId);
+  if (
+    st.suspension === 'none' &&
+    (boundaryRound?.role === 'implementor' || boundaryRound?.role === 'verifier') &&
+    boundaryRound.stage === 'completed' &&
+    (st.activeChild === undefined || st.activeChild.status === 'stopped') &&
+    st.phase !== 'merge_ready' &&
+    st.phase !== 'cancelled' &&
+    st.phase !== 'failed' &&
+    !service.isRunClaimedByLiveProcess(cmd.runId)
   ) {
     return withExtraJson(await driveReentry(service, db, 'resume', cmd.runId, deps), reapExtra);
   }
@@ -1619,8 +1654,44 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
     },
     budget: st.budget,
     checkpoints,
+    // §5t (4): the effective (running) model per role AND, when set, a DISTINCT
+    // pending desired model — never conflated.
+    models: buildModelsView(db, runId),
   };
   return finish('status', view, renderStatusText(view, st.suspension), 0);
+}
+
+interface RoleModelView {
+  readonly effective?: string;
+  readonly desired?: { readonly harness: string; readonly model: string; readonly effort?: string };
+}
+
+/**
+ * §5t (4): per-role EFFECTIVE (running) model from `child.spawned` pins, plus a
+ * DISTINCT pending DESIRED model when `switch-model` recorded one — reported
+ * apart so status never presents a not-yet-applied switch as confirmed.
+ */
+function buildModelsView(db: Database, runId: RunId): Record<string, RoleModelView> {
+  const desired = new DurableDesiredModelStore(db).listForRun(runId);
+  const out: Record<string, RoleModelView> = {};
+  for (const role of ['coordinator', 'implementor', 'verifier'] as const) {
+    const effective = currentModelFor(db, runId, role);
+    const want = desired.find((record) => record.role === role);
+    if (effective === undefined && want === undefined) continue;
+    out[role] = {
+      ...(effective !== undefined ? { effective } : {}),
+      ...(want !== undefined
+        ? {
+            desired: {
+              harness: want.harness,
+              model: want.model,
+              ...(want.effort !== undefined ? { effort: want.effort } : {}),
+            },
+          }
+        : {}),
+    };
+  }
+  return out;
 }
 
 interface CheckpointEntry {
@@ -1645,51 +1716,102 @@ function collectCheckpoints(db: Database, runId: RunId): { count: number; entrie
 }
 
 function latestRssBytes(db: Database, runId: RunId): number | null {
+  // Prefer the newest signal: the in-progress window's raw ticks are more
+  // recent than any closed aggregate, so a raw sample newer than the latest
+  // aggregate window wins. W4-3: without the raw fallback RSS stayed null
+  // until a window closed (and null forever if none ever did).
   const aggregates = db.telemetry.listAggregates(runId);
-  const latest = aggregates.at(-1);
-  return latest?.rssMaxBytes ?? null;
+  const latestAggregate = aggregates.at(-1);
+  const latestRaw = db.telemetry.listRawSamples(runId).at(-1);
+  if (latestAggregate === undefined) return latestRaw?.rssBytes ?? null;
+  if (latestRaw === undefined) return latestAggregate.rssMaxBytes;
+  return Date.parse(latestRaw.sampledAt) >= Date.parse(latestAggregate.windowStart)
+    ? latestRaw.rssBytes
+    : latestAggregate.rssMaxBytes;
 }
 
 // ---------------------------------------------------------------------------
-// switch-model (T19; §11.2)
+// switch-model (§11.2 / §5t) — HONEST desired-model recording, never a
+// fabricated T19 segment, never a silent no-op.
 // ---------------------------------------------------------------------------
+// §5t: the old CLI path fabricated `segmentId(runId:pending)` and drove
+// `model.switch.requested` straight into `service.ingest`. T19 gates ONLY on
+// suspension=none & operation=idle & child_active (NO segment check), so with a
+// live idle child it ACCEPTED and set operation=model_switch — a segment the CLI
+// never owned, silently clobbered by the next turn fold: a false success. That
+// direct-ingest path is DELETED. `switch-model` now records a DISTINCT durable
+// desired-model record (mapping to NO transition) and reports it honestly; live
+// in-place apply at a completed-turn boundary is the deferred follow-up.
 function handleSwitchModel(
   service: OrchestrationService,
   db: Database,
   cmd: Extract<RunCommand, { kind: 'switch_model' }>,
-  ids: IdFactory,
 ): CommandOutput {
   const resolved = resolveRoleModel(cmd.target);
   const fromModel = currentModelFor(db, cmd.runId, cmd.role);
-  // T19 requires a live segment; the CLI holds no segment state, so the segment
-  // is a placeholder and the engine will reject when no session is active — the
-  // live segment/model is supplied by the P3 role flow at a completed-turn boundary.
-  const event = draftEvent({
-    type: 'model.switch.requested',
-    runId: cmd.runId,
-    payload: {
-      segmentId: segmentId(`${cmd.runId}:pending`),
-      fromModel: fromModel ?? '',
-      toModel: resolved.model,
-      mechanism: 'session_set_config_option',
-    },
-    idempotencyKey: newIdempotencyKey(ids),
-    occurredAt: db.clock.nowIso(),
-  }) as DomainEvent;
 
-  return ingestOutput('switch_model', cmd.runId, service.ingest(event), {
-    appliedText: `model switch requested for ${cmd.role} -> ${describeSpec(cmd.target)} (T19; §11.2 confirm-by-echo follows on the live session).`,
-    rejectedHint: `a model switch is only legal at a completed-turn boundary on a LIVE session (§11.2, T19); ${cmd.role} has no active session on run ${cmd.runId} yet.`,
-    extra: {
+  // Durable desired-model record: a distinct row per (runId, role) that maps to
+  // NO transition. Applied at the NEXT spawn via the existing
+  // initial_config_pin / model-pin (F8) machinery; visible in `status` as
+  // pending until then. NEVER an ingest, so it can never fabricate a segment.
+  const desired: DesiredModelRecord = {
+    runId: String(cmd.runId),
+    role: cmd.role,
+    harness: resolved.harness,
+    model: resolved.model,
+    ...(resolved.effort !== undefined ? { effort: resolved.effort } : {}),
+    requestedAt: db.clock.nowIso(),
+  };
+  new DurableDesiredModelStore(db).set(desired);
+
+  // Honest gate: a live child owning the run means the switch cannot apply until
+  // the next spawn/turn boundary (the live in-place apply loop is deferred); no
+  // live child means the desired model simply applies at the next spawn.
+  const liveOwner = service.isRunClaimedByLiveProcess(cmd.runId) || service.status(cmd.runId).childActive;
+  const boundaryText = liveOwner
+    ? `queued; applies at the next spawn/turn boundary (a live child currently owns run ${cmd.runId})`
+    : `pending; applies at the next spawn of ${cmd.role} on run ${cmd.runId}`;
+
+  return finish(
+    'switch_model',
+    {
+      runId: cmd.runId,
+      outcome: 'desired_recorded',
       role: cmd.role,
       target: resolvedView(resolved),
-      ...(fromModel !== undefined ? { fromModel } : {}),
+      desiredModel: resolved.model,
+      liveOwner,
+      ...(fromModel !== undefined ? { effectiveModel: fromModel } : {}),
     },
-  });
+    `desired model for ${cmd.role} set to ${describeSpec(cmd.target)} — ${boundaryText}. ` +
+      `Effective (running) model: ${fromModel ?? 'none yet'}.`,
+    0,
+  );
+}
+
+/**
+ * The EFFECTIVE (running) model per role, read from the durable `child.spawned`
+ * pins (§5t #1 / S6 — a READ-MODEL over F8 truth, no parallel store): the latest
+ * spawn's `model`-purpose pin, preferring the adapter-echoed effective value
+ * over the requested value. Coordinator falls back to the RunMeta pin (its
+ * durable source) when it has not spawned a child.
+ */
+function effectiveModelsFromPins(db: Database, runId: RunId): Partial<Record<RoleName, string>> {
+  const byRole: Partial<Record<RoleName, string>> = {};
+  for (const event of db.events.listByRun(runId)) {
+    if (event.type !== 'child.spawned') continue;
+    const modelPin = event.payload.pins.find((pin) => pin.purpose === 'model');
+    if (modelPin === undefined) continue;
+    // Later events win (the newest spawn's pin is the running model).
+    byRole[event.payload.role] = modelPin.effectiveValue ?? modelPin.value;
+  }
+  return byRole;
 }
 
 function currentModelFor(db: Database, runId: RunId, role: RoleName): string | undefined {
-  if (role !== 'coordinator') return undefined; // implementor/verifier models are not persisted until P3
+  const fromPins = effectiveModelsFromPins(db, runId)[role];
+  if (fromPins !== undefined) return fromPins;
+  if (role !== 'coordinator') return undefined;
   const meta = db.projections.get<RunMeta>(runId, RUN_META_PROJECTION);
   return meta?.state.coordinator.model;
 }
@@ -1826,5 +1948,15 @@ function renderStatusText(view: Record<string, unknown>, suspension: string): st
       `rss: ${vitals.rssBytes === null ? 'n/a' : `${vitals.rssBytes} bytes`}`,
     `  checkpoints: ${checkpoints.count}`,
   ];
+  const models = (view['models'] ?? {}) as Record<string, RoleModelView>;
+  for (const [role, model] of Object.entries(models)) {
+    const effective = model.effective ?? 'none yet';
+    const desired =
+      model.desired !== undefined
+        ? ` — pending desired: ${model.desired.harness}/${model.desired.model}` +
+          `${model.desired.effort !== undefined ? ` (effort ${model.desired.effort})` : ''}`
+        : '';
+    lines.push(`  model[${role}]: ${effective}${desired}`);
+  }
   return lines.join('\n');
 }

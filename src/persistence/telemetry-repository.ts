@@ -52,10 +52,33 @@ export interface AggregateWindowInput {
   readonly windowSeconds?: number;
 }
 
+export interface AggregateClosedWindowsInput {
+  readonly runId: RunId;
+  readonly segmentId?: SegmentId;
+  /**
+   * The current wall-clock time. Every per-minute window whose END is at or
+   * before `now` has fully closed and is folded + pruned; the in-progress
+   * window (end after `now`) is left untouched so a live sampler keeps writing
+   * into it.
+   */
+  readonly now: IsoTimestamp;
+  /** Default 60 (per-minute, §12.1). */
+  readonly windowSeconds?: number;
+}
+
 export interface ProcessSampleRepository {
   recordRawSample(input: RawProcessSample): void;
   /** Returns the folded `ProcessSample`, or `undefined` if no raw samples fell in the window. */
   aggregateWindow(input: AggregateWindowInput): ProcessSample | undefined;
+  /**
+   * §12.1 retention driver: fold + prune EVERY minute-aligned window for this
+   * (run, segment) that has fully closed relative to `now`. This is the
+   * production caller that keeps `raw_process_samples` bounded — without it
+   * raw ticks accumulate for the life of the run. Returns the aggregates it
+   * produced/merged (empty when nothing has closed yet). Idempotent: a second
+   * call re-folds nothing because the raw rows were pruned.
+   */
+  aggregateClosedWindows(input: AggregateClosedWindowsInput): readonly ProcessSample[];
   listAggregates(runId: RunId): readonly ProcessSample[];
   listRawSamples(runId: RunId): readonly RawProcessSample[];
   countRawSamples(runId: RunId): number;
@@ -124,6 +147,11 @@ const SELECT_RAW_WINDOW_SQL = `
 const DELETE_RAW_WINDOW_SQL = `
   DELETE FROM raw_process_samples
   WHERE run_id = ? AND segment_id IS ? AND sampled_at >= ? AND sampled_at < ?
+`;
+const SELECT_RAW_SAMPLED_AT_BY_SEGMENT_SQL = `
+  SELECT sampled_at FROM raw_process_samples
+  WHERE run_id = ? AND segment_id IS ?
+  ORDER BY sampled_at ASC
 `;
 const SELECT_RAW_BY_RUN_SQL = `
   SELECT run_id, segment_id, process_generation_id, sampled_at, rss_bytes
@@ -213,6 +241,34 @@ export class SqliteProcessSampleRepository implements ProcessSampleRepository {
         .get<AggregateRow>([input.runId, segmentKey, input.windowStart]);
       return merged ? rowToProcessSample(merged) : undefined;
     });
+  }
+
+  aggregateClosedWindows(input: AggregateClosedWindowsInput): readonly ProcessSample[] {
+    const windowSeconds = input.windowSeconds ?? DEFAULT_WINDOW_SECONDS;
+    const windowMs = windowSeconds * 1000;
+    const nowMs = Date.parse(input.now);
+    const segmentParam = input.segmentId ?? null;
+    const rows = this.#driver
+      .prepare(SELECT_RAW_SAMPLED_AT_BY_SEGMENT_SQL)
+      .all<{ sampled_at: string }>([input.runId, segmentParam]);
+    // Snap each raw tick to its minute-aligned window start; keep only windows
+    // whose END (start + windowSeconds) has already passed `now`.
+    const closedStarts = new Set<number>();
+    for (const row of rows) {
+      const start = Math.floor(Date.parse(row.sampled_at) / windowMs) * windowMs;
+      if (start + windowMs <= nowMs) closedStarts.add(start);
+    }
+    const folded: ProcessSample[] = [];
+    for (const start of [...closedStarts].sort((a, b) => a - b)) {
+      const result = this.aggregateWindow({
+        runId: input.runId,
+        windowStart: new Date(start).toISOString() as IsoTimestamp,
+        windowSeconds,
+        ...(input.segmentId !== undefined ? { segmentId: input.segmentId } : {}),
+      });
+      if (result !== undefined) folded.push(result);
+    }
+    return folded;
   }
 
   listAggregates(owner: RunId): readonly ProcessSample[] {

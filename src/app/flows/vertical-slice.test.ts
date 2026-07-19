@@ -921,9 +921,17 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
 
     // The AGENT's in-context progress is recovered ONLY from the checkpoint:
     // read it back from the CAS by its committed event — nothing else.
+    // Target the handoff checkpoint by reason: the §12.2 completed-turn
+    // cadence (W4-1) legitimately writes earlier `cadence` checkpoints as the
+    // slice drives its turns, so "the first checkpoint.recorded" is no longer
+    // unambiguous — the resume path wants the pre_verify_handoff one.
     const checkpointEvent = db.events
       .listByRun(runId)
-      .find((e) => e.type === 'checkpoint.recorded');
+      .find(
+        (e) =>
+          e.type === 'checkpoint.recorded' &&
+          (e.payload as { reason?: string }).reason === 'pre_verify_handoff',
+      );
     expect(checkpointEvent).toBeDefined();
     const storedHash = (checkpointEvent!.payload as { artifactHash: ArtifactHash }).artifactHash;
     expect(String(storedHash)).toBe(String(checkpointArtifactHash));

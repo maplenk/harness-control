@@ -64,6 +64,22 @@ export interface ProcessIdentityRecord extends ProcessIdentity {
   readonly segmentId?: SegmentId;
   readonly assignmentId?: AssignmentId;
   readonly recordedAt: IsoTimestamp;
+  /**
+   * W4-0 (§14:139): the OS pid of the orchestrator process that OWNS this
+   * child (the process that spawned + registered it), stamped at registration
+   * = the registry's `#selfPid`. `reapOrphans` NEVER reaps a record whose
+   * owner is still alive — a live PEER orchestrator's child (identity-
+   * unambiguous, so the withhold-on-ambiguity guard does not cover it) must
+   * never be cross-signaled. Absent on records written before W4-0 → treated
+   * as unowned = reapable (legacy behavior preserved). Mirrors
+   * `SpawnReservationRecord.ownerPid`.
+   */
+  readonly ownerPid?: number;
+  /** W4-0: the owner's §14 start-time (opaque `ps lstart` token) for
+   * recycled-owner-pid safety — a pid that resolves to a DIFFERENT start-time
+   * is an unrelated process that recycled the owner's pid (crashed owner).
+   * Absent when unreadable. Mirrors `SpawnReservationRecord.ownerStartedAt`. */
+  readonly ownerStartedAt?: string;
 }
 
 /** `nonce_mismatch` / `nonce_unverifiable` (W2-6): the ps identity matched
@@ -144,12 +160,27 @@ export interface ReapSummary {
   readonly entries: readonly ReapResultEntry[];
   readonly killedCount: number;
   readonly skippedCount: number;
+  /**
+   * W4-0: records left completely untouched because their owning orchestrator
+   * is still ALIVE (self or a live peer) — never identity-verified, never
+   * signaled, never removed, and NOT present in `entries`. A live peer's child
+   * is out of this reaper's jurisdiction (§14:139).
+   */
+  readonly ownerLiveSkippedCount: number;
 }
 
 export interface ProcessRegistryDeps {
   readonly clock: Clock;
   readonly store?: ProcessRegistryStore;
   readonly ps?: PsClient;
+  /**
+   * W4-0: the OWNING orchestrator process's pid, stamped onto every record at
+   * registration and consulted by `reapOrphans` (a record whose owner is a
+   * DIFFERENT still-alive orchestrator is never reaped). Defaults to
+   * `process.pid`; the application service threads its own `#selfPid` so a
+   * test can drive two logical orchestrators over one shared store.
+   */
+  readonly selfPid?: number;
   /**
    * W2-6 startup-reaping nonce re-verification (§14): where the platform
    * allows reading the child's env (darwin/linux best-effort, `./ps.ts`),
@@ -186,6 +217,7 @@ export class ProcessRegistry implements VerifiedSignaler {
   readonly #envNonce: EnvNonceVerifier | undefined;
   readonly #sendSignal: (pgid: number, signal: NodeJS.Signals) => void;
   readonly #onAlert: ((alert: IdentityAlert) => void) | undefined;
+  readonly #selfPid: number;
 
   constructor(deps: ProcessRegistryDeps) {
     this.#clock = deps.clock;
@@ -194,6 +226,36 @@ export class ProcessRegistry implements VerifiedSignaler {
     this.#envNonce = deps.envNonce;
     this.#sendSignal = deps.sendSignal ?? defaultSendSignal;
     this.#onAlert = deps.onAlert;
+    this.#selfPid = deps.selfPid ?? process.pid;
+  }
+
+  /** W4-0: this process's owner fields, stamped onto every registered record.
+   * `ownerStartedAt` is a best-effort `ps` sample of our OWN pid (absent when
+   * unreadable — matches the reservation store's owner capture). */
+  #ownerFields(): { readonly ownerPid: number; readonly ownerStartedAt?: string } {
+    const ownerStartedAt = this.#ps.sampleIdentity(this.#selfPid)?.startedAt;
+    return {
+      ownerPid: this.#selfPid,
+      ...(ownerStartedAt !== undefined ? { ownerStartedAt } : {}),
+    };
+  }
+
+  /**
+   * W4-0 (§14): is a record's OWNING orchestrator still alive? OUR OWN records
+   * are always live (we are running); a DIFFERENT process's record is live
+   * only while its owner pid resolves to the SAME start-time (a gone pid, or
+   * one recycled by an unrelated process, is a crashed owner whose child is
+   * reapable). A record with NO owner (`ownerPid` absent — written before
+   * W4-0) is treated as unowned = reapable, preserving legacy reaping.
+   * Mirrors `OrchestrationService.#reservationOwnerLive`.
+   */
+  #ownerLive(record: ProcessIdentityRecord): boolean {
+    if (record.ownerPid === undefined) return false; // legacy/unowned → reapable
+    if (record.ownerPid === this.#selfPid) return true; // our own child
+    if (!this.#ps.isAlive(record.ownerPid)) return false; // dead owner → reapable
+    if (record.ownerStartedAt === undefined) return true; // alive pid, can't disprove → withhold
+    const sample = this.#ps.sampleIdentity(record.ownerPid);
+    return sample !== undefined && sample.startedAt === record.ownerStartedAt;
   }
 
   get store(): ProcessRegistryStore {
@@ -222,6 +284,7 @@ export class ProcessRegistry implements VerifiedSignaler {
       executablePath: observed.executablePath,
       spawnNonce: input.spawnNonce,
       recordedAt: this.#clock.nowIso(),
+      ...this.#ownerFields(),
       ...(input.runId !== undefined ? { runId: input.runId } : {}),
       ...(input.segmentId !== undefined ? { segmentId: input.segmentId } : {}),
       ...(input.assignmentId !== undefined ? { assignmentId: input.assignmentId } : {}),
@@ -250,6 +313,7 @@ export class ProcessRegistry implements VerifiedSignaler {
     const record: ProcessIdentityRecord = {
       ...identity,
       recordedAt: this.#clock.nowIso(),
+      ...this.#ownerFields(),
       ...(links?.runId !== undefined ? { runId: links.runId } : {}),
       ...(links?.segmentId !== undefined ? { segmentId: links.segmentId } : {}),
       ...(links?.assignmentId !== undefined ? { assignmentId: links.assignmentId } : {}),
@@ -334,7 +398,17 @@ export class ProcessRegistry implements VerifiedSignaler {
    */
   reapOrphans(signal: NodeJS.Signals = 'SIGKILL'): ReapSummary {
     const entries: ReapResultEntry[] = [];
+    let ownerLiveSkipped = 0;
     for (const record of this.#store.list()) {
+      // W4-0 (§14:139): a record owned by a still-alive orchestrator — self OR
+      // a live peer — is OUT OF JURISDICTION. Skip it BEFORE any identity
+      // verify/kill: a live peer's child is identity-UNambiguous, so the
+      // withhold-on-ambiguity guard would still have killed it. Only records
+      // whose owner is provably dead (or absent = legacy/unowned) are reaped.
+      if (this.#ownerLive(record)) {
+        ownerLiveSkipped += 1;
+        continue;
+      }
       const verification = this.#verifyWithNonce(record);
       if (verification.verdict === 'match') {
         this.#sendSignal(record.pgid, signal);
@@ -349,6 +423,7 @@ export class ProcessRegistry implements VerifiedSignaler {
       entries,
       killedCount: entries.filter((e) => e.action === 'killed').length,
       skippedCount: entries.filter((e) => e.action === 'skipped').length,
+      ownerLiveSkippedCount: ownerLiveSkipped,
     };
   }
 

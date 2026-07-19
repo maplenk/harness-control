@@ -15,12 +15,19 @@ Client Protocol (ACP), through three host-enforced roles:
   bounded remediation loop.
 
 The run ends with a **merge-readiness report** — the harness never merges, never
-pushes, and never approves its own work. Every state change flows through a
+pushes, and never approves its own work; it only prints the exact manual
+integration commands (with repo paths/refs POSIX shell-quoted so they stay
+copy-pasteable even with spaces). Every state change flows through a
 single event-sourced application service (SQLite event log + projections), so a
 run survives process restarts and is inspectable after the fact.
 
 ## Requirements
 
+- **macOS only** in the MVP (`package.json` declares `"os": ["darwin"]`).
+  Memory supervision (§14) samples process-group RSS through BSD/macOS `ps`
+  flags; the GNU/Linux `ps` adapter is roadmap, so a Linux install is refused
+  rather than silently mis-supervising (`doctor` also warns on a non-darwin
+  host). Everything else is portable — only the supervisor is platform-bound.
 - Node.js **>= 22.14** (ESM, TypeScript strict; `better-sqlite3` is bundled as
   a dependency).
 - `git` on PATH (worktree isolation and the §16 merge-readiness probes).
@@ -77,7 +84,8 @@ harness-orchestrator run RUN_ID \
 
 # 5. Inspect: phase, suspension, honest ETA, vitals (rss / context window /
 #    measured + estimated cost with per-role and per-phase attribution),
-#    checkpoints, budget.
+#    checkpoints, budget. RSS = the newest closed per-minute aggregate, or the
+#    latest raw watchdog sample while the current window is still open.
 harness-orchestrator status RUN_ID --json
 
 # 6. Resume a paused/interrupted run (crash recovery AND limit/user resume).
@@ -86,7 +94,9 @@ harness-orchestrator resume RUN_ID
 
 Also available: `pause` (stop at a safe point), `cancel` (idempotent
 terminal), `breaker reset` (after the restart circuit-breaker opens),
-`switch-model` (confirmed model change at a completed-turn boundary).
+`switch-model` (records a durable per-role DESIRED model, applied at the
+next spawn; `status` shows it pending, distinct from the effective/running
+model. Live in-place switching at a completed-turn boundary is deferred).
 
 ## Safety posture
 
@@ -139,7 +149,13 @@ terminal), `breaker reset` (after the restart circuit-breaker opens),
   so those cross only if an operator explicitly opts them into
   `verification.envAllowlist` — an opt-in heuristic caveat, never a blanket
   inherit. Per-platform OS sandboxing (sandbox-exec / bwrap) is the roadmap
-  item that closes the remaining gap.
+  item that closes the remaining gap. **Timeout kills the process TREE (W4-7):**
+  the runner spawns each command `detached` in its own process group and, on
+  timeout, drives the same graceful-then-forced ladder the ACP transport uses
+  (SIGTERM the group → 2s grace → SIGKILL the group), so a verification command
+  that starts a background server/watcher cannot leave a descendant surviving
+  past the reported timeout (exit 124); a final group SIGKILL also sweeps any
+  straggler the moment the shell exits.
 - **Redaction before every sink.** Credentials/keys are scrubbed before
   anything reaches the DB, artifacts, logs, or checkpoints; artifact writes
   are quota-admitted (per-run/global) with a durable rejection audit trail.

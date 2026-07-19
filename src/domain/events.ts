@@ -208,9 +208,13 @@ export interface EventPayloads {
     readonly segmentId: SegmentId;
     readonly classification: LimitClassification;
   };
-  /** T17 — orchestrator restart found a `running` segment. */
+  /** T17 — orchestrator restart found a `running` segment. W4-4: the reap
+   * producer stamps the reaped generation so `generation_matches_active`
+   * gates the interrupt onto EXACTLY the run's active generation (a stale
+   * generation is a benign no-op — same rule as T13's exit report). */
   'recovery.running_segment_found': {
     readonly segmentId: SegmentId;
+    readonly generationId?: ProcessGenerationId;
   };
   /** T18 — cancel (idempotent, one terminal result). */
   'cancel.requested': Empty;

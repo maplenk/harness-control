@@ -111,6 +111,16 @@ export interface WatchdogDeps {
   readonly onEvent: (event: DomainEvent) => void;
   /** Raw RSS tick sink — wire to `ProcessSampleRepository.recordRawSample` (§12.1). Defaults to a no-op. */
   readonly onSample?: (target: WatchdogTarget, sample: ProcessTreeSample) => void;
+  /**
+   * Durable supervision-failure alert. Invoked when a background sample tick
+   * THROWS (e.g. `ps`/`execFile` blew up, not a routine "process gone"): the
+   * scheduler swallows the rejection — so a throwing tick can never become an
+   * unhandled rejection that crashes the host or silently kills supervision —
+   * surfaces it here, and (fail-open-with-alert) reschedules the next sample
+   * so supervision continues. Defaults to a no-op; a real deployment SHOULD
+   * wire this to an operator-visible sink so the degradation is observable.
+   */
+  readonly onSupervisionFailure?: (target: WatchdogTarget, error: unknown) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +159,7 @@ export class Watchdog {
   readonly #requestGracefulStop: (target: WatchdogTarget, sample: ProcessTreeSample) => void | Promise<void>;
   readonly #onEvent: (event: DomainEvent) => void;
   readonly #onSample: (target: WatchdogTarget, sample: ProcessTreeSample) => void;
+  readonly #onSupervisionFailure: (target: WatchdogTarget, error: unknown) => void;
 
   readonly #entries = new Map<ProcessGenerationId, TargetEntry>();
 
@@ -166,6 +177,7 @@ export class Watchdog {
     this.#requestGracefulStop = deps.requestGracefulStop ?? ((): void => undefined);
     this.#onEvent = deps.onEvent;
     this.#onSample = deps.onSample ?? ((): void => undefined);
+    this.#onSupervisionFailure = deps.onSupervisionFailure ?? ((): void => undefined);
   }
 
   /** Idempotent: watching an already-tracked generation id is a no-op. */
@@ -214,14 +226,27 @@ export class Watchdog {
     const entry = this.#entries.get(generationId);
     if (!entry) return;
     const timer = setTimeout(() => {
-      void this.#tick(generationId).then((sample) => {
-        const stillEntry = this.#entries.get(generationId);
-        if (!stillEntry) return; // unwatched / finished mid-tick
-        const ratio = sample ? this.#ratio(stillEntry.target, sample) : 0;
-        const nextDelay =
-          ratio >= this.#memory.softThresholdRatio ? this.#elevatedSampleIntervalMs : this.#sampleIntervalMs;
-        this.#scheduleNext(generationId, nextDelay);
-      });
+      void this.#tick(generationId)
+        .then((sample) => {
+          const stillEntry = this.#entries.get(generationId);
+          if (!stillEntry) return; // unwatched / finished mid-tick
+          const ratio = sample ? this.#ratio(stillEntry.target, sample) : 0;
+          const nextDelay =
+            ratio >= this.#memory.softThresholdRatio ? this.#elevatedSampleIntervalMs : this.#sampleIntervalMs;
+          this.#scheduleNext(generationId, nextDelay);
+        })
+        .catch((error: unknown) => {
+          // A throwing tick (ps/execFile failure) must NEVER become an
+          // unhandled rejection — that could crash the host or silently kill
+          // supervision. Surface a durable alert and reschedule at the base
+          // cadence so supervision keeps running (fail-open-with-alert §14).
+          const stillEntry = this.#entries.get(generationId);
+          if (!stillEntry) return; // unwatched / finished mid-tick — nothing to keep supervising
+          // The tick's own `finally` already cleared `tickInFlight`, so the
+          // rescheduled tick is free to run.
+          this.#onSupervisionFailure(stillEntry.target, error);
+          this.#scheduleNext(generationId, this.#sampleIntervalMs);
+        });
     }, delayMs);
     timer.unref?.();
     entry.runtime.sampleTimer = timer;

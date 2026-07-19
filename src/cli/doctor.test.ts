@@ -199,6 +199,31 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
     },
     GENEROUS_MS,
   );
+
+  it(
+    'flags a non-darwin host: supervision is macOS-only in MVP (W4-5) → warn + note; darwin stays unflagged',
+    async () => {
+      const home = await makeTempDir('doctor-platform-');
+
+      const onLinux = await runDoctor({ env: {}, homeDir: home, clock: CLOCK, platform: 'linux' });
+      expect(onLinux.overall).toBe('warn'); // never fail — supervision is the only degraded axis here
+      expect(onLinux.notes.join(' ')).toContain('supervision is macOS-only in MVP');
+      expect(renderDoctorText(onLinux)).toContain('supervision is macOS-only in MVP');
+
+      const onDarwin = await runDoctor({ env: {}, homeDir: home, clock: CLOCK, platform: 'darwin' });
+      expect(onDarwin.notes.join(' ')).not.toContain('supervision is macOS-only');
+    },
+    GENEROUS_MS,
+  );
+});
+
+describe('package.json os restriction (W4-5: supervision is macOS-only in MVP)', () => {
+  it('declares os: ["darwin"] so a Linux install is refused rather than silently mis-supervising', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const pkgRaw = await readFile(path.join(process.cwd(), 'package.json'), 'utf8');
+    const pkg = JSON.parse(pkgRaw) as { os?: readonly string[] };
+    expect(pkg.os).toEqual(['darwin']);
+  });
 });
 
 describe('cli arg parsing (hand-rolled, §18)', () => {

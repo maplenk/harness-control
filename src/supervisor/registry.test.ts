@@ -74,13 +74,28 @@ afterEach(async () => {
 function makeRegistry(
   onAlert?: (alert: IdentityAlert) => void,
   envNonce?: EnvNonceVerifier,
+  selfPid?: number,
 ): ProcessRegistry {
   return new ProcessRegistry({
     clock,
     ps: createPsClient(clock),
     ...(onAlert ? { onAlert } : {}),
     ...(envNonce ? { envNonce } : {}),
+    ...(selfPid !== undefined ? { selfPid } : {}),
   });
+}
+
+/**
+ * W4-0 (§14:139): startup reaping runs in a NEW orchestrator process — the
+ * records it finds were written by the PRIOR, now-crashed orchestrator, whose
+ * pid is DEAD. `register()` stamps THIS (live) process as owner, so a record
+ * fed to `reapOrphans` in the same test must be re-stamped with a dead owner
+ * to model the real orphan scenario; a self-owned LIVE record is deliberately
+ * never reaped (that is the peer-kill safety gate — covered by its own test).
+ */
+const CRASHED_OWNER_PID = 999_999; // never alive at reap time
+function asOrphanOfCrashedOwner(registry: ProcessRegistry, record: ProcessIdentityRecord): void {
+  registry.store.put({ ...record, ownerPid: CRASHED_OWNER_PID });
 }
 
 describe('ProcessRegistry.register + verify (baseline identity capture)', () => {
@@ -213,6 +228,7 @@ describe('ProcessRegistry.reapOrphans — PLAN §19 test 28', () => {
       pgid: orphan.pid!,
       spawnNonce: 'real-nonce',
     });
+    asOrphanOfCrashedOwner(registry, orphanRecord); // owner (prior orchestrator) is dead
 
     // A live, unrelated process a STALE record happens to point at (§14's
     // exact ambiguity scenario: a recorded pgid now owned by someone else).
@@ -267,6 +283,7 @@ describe('ProcessRegistry.reapOrphans — PLAN §19 test 28', () => {
       pgid: child.pid!,
       spawnNonce: 'nonce-5',
     });
+    asOrphanOfCrashedOwner(registry, record); // owner (prior orchestrator) is dead
     await waitExit(child);
     await settle();
 
@@ -295,6 +312,7 @@ describe('ProcessRegistry.reapOrphans — W2-6 env-nonce re-verification (§14)'
         pgid: child.pid!,
         spawnNonce: 'real-env-nonce-1',
       });
+      asOrphanOfCrashedOwner(registry, record); // owner (prior orchestrator) is dead
 
       const summary = registry.reapOrphans('SIGKILL');
       expect(summary.killedCount).toBe(1);
@@ -321,6 +339,7 @@ describe('ProcessRegistry.reapOrphans — W2-6 env-nonce re-verification (§14)'
         pgid: child.pid!,
         spawnNonce: 'claimed-but-unconfirmable',
       });
+      asOrphanOfCrashedOwner(registry, record); // owner (prior orchestrator) is dead
 
       const summary = registry.reapOrphans('SIGKILL');
       expect(summary.killedCount).toBe(0);
@@ -349,6 +368,7 @@ describe('ProcessRegistry.reapOrphans — W2-6 env-nonce re-verification (§14)'
       pgid: child.pid!,
       spawnNonce: 'recorded-nonce',
     });
+    asOrphanOfCrashedOwner(registry, record); // owner (prior orchestrator) is dead
 
     const summary = registry.reapOrphans('SIGKILL');
     expect(summary.killedCount).toBe(0);
@@ -357,6 +377,106 @@ describe('ProcessRegistry.reapOrphans — W2-6 env-nonce re-verification (§14)'
     expect(isAliveReal(child.pid!)).toBe(true);
     expect(registry.store.get(record.generationId)).toBeDefined();
     expect(alerts).toHaveLength(1);
+  });
+});
+
+describe('ProcessRegistry.reapOrphans — W4-0 owner-liveness gate (§14:139)', () => {
+  it('NEVER reaps a record owned by a still-alive PEER orchestrator — the child is left running and NOT in the summary', async () => {
+    // Two logical orchestrators over ONE shared store. Process A (selfPid = a
+    // real, LIVE pid) owns a real live child; process B does the reaping.
+    const store = new InMemoryProcessRegistryStore();
+    const peer = spawnDetachedNode(); // stands in for the LIVE peer orchestrator
+    await settle();
+    const child = spawnDetachedNode(); // A's live child
+    await settle();
+
+    const orchestratorA = new ProcessRegistry({ clock, ps: createPsClient(clock), store, selfPid: peer.pid! });
+    const registered = orchestratorA.register({
+      generationId: processGenerationId('gen_peer_child'),
+      pid: child.pid!,
+      pgid: child.pid!,
+      spawnNonce: 'peer-nonce',
+    });
+    expect(registered.ownerPid).toBe(peer.pid); // stamped with A's pid
+
+    const alerts: IdentityAlert[] = [];
+    const orchestratorB = new ProcessRegistry({
+      clock,
+      ps: createPsClient(clock),
+      store,
+      onAlert: (a) => alerts.push(a),
+      selfPid: process.pid, // B (the reaper) is a DIFFERENT live process
+    });
+
+    const summary = orchestratorB.reapOrphans('SIGKILL');
+
+    // The live peer's child was untouched: not killed, not signaled, not
+    // removed, not even identity-verified (no entry, no alert).
+    expect(summary.killedCount).toBe(0);
+    expect(summary.skippedCount).toBe(0);
+    expect(summary.ownerLiveSkippedCount).toBe(1);
+    expect(summary.entries).toEqual([]);
+    expect(alerts).toEqual([]);
+    await settle(150);
+    expect(isAliveReal(child.pid!)).toBe(true);
+    expect(store.get(registered.generationId)).toBeDefined();
+  });
+
+  it('DOES reap a dead-owner orphan even though the child itself is still alive (the crashed orchestrator can no longer manage it)', async () => {
+    const store = new InMemoryProcessRegistryStore();
+    const child = spawnDetachedNode();
+    await settle();
+    // The owning orchestrator already crashed: register through a registry
+    // whose selfPid is a dead pid, so the record carries a dead owner.
+    const prior = new ProcessRegistry({ clock, ps: createPsClient(clock), store, selfPid: CRASHED_OWNER_PID });
+    const record = prior.register({
+      generationId: processGenerationId('gen_deadowner_child'),
+      pid: child.pid!,
+      pgid: child.pid!,
+      spawnNonce: 'deadowner-nonce',
+    });
+    expect(record.ownerPid).toBe(CRASHED_OWNER_PID);
+
+    const reaper = new ProcessRegistry({ clock, ps: createPsClient(clock), store, selfPid: process.pid });
+    const summary = reaper.reapOrphans('SIGKILL');
+
+    expect(summary.ownerLiveSkippedCount).toBe(0);
+    expect(summary.killedCount).toBe(1);
+    expect(summary.entries[0]!.action).toBe('killed');
+    await waitExit(child);
+    expect(isAliveReal(child.pid!)).toBe(false);
+    expect(store.get(record.generationId)).toBeUndefined();
+  });
+
+  it('treats a RECYCLED owner pid (alive pid, different start-time) as a dead owner and reaps the orphan', async () => {
+    const store = new InMemoryProcessRegistryStore();
+    // The "owner" pid is a real, LIVE process — but the recorded owner
+    // start-time does not match it (the original owner exited and its pid was
+    // recycled by this unrelated process). Owner is therefore provably dead.
+    const recycled = spawnDetachedNode();
+    await settle();
+    const child = spawnDetachedNode();
+    await settle();
+
+    const childIdentity = new ProcessRegistry({ clock, ps: createPsClient(clock), store }).register({
+      generationId: processGenerationId('gen_recycled_owner'),
+      pid: child.pid!,
+      pgid: child.pid!,
+      spawnNonce: 'recycled-nonce',
+    });
+    // Overwrite the owner with the recycled pid + a start-time that will NOT
+    // match the live process now wearing it.
+    store.put({ ...childIdentity, ownerPid: recycled.pid!, ownerStartedAt: 'Mon Jan  1 00:00:00 2020' });
+
+    const reaper = new ProcessRegistry({ clock, ps: createPsClient(clock), store, selfPid: process.pid });
+    const summary = reaper.reapOrphans('SIGKILL');
+
+    expect(summary.ownerLiveSkippedCount).toBe(0);
+    expect(summary.killedCount).toBe(1);
+    await waitExit(child);
+    expect(isAliveReal(child.pid!)).toBe(false);
+    // The recycled owner process itself was never touched.
+    expect(isAliveReal(recycled.pid!)).toBe(true);
   });
 });
 

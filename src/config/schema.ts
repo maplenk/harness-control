@@ -260,8 +260,20 @@ export const engineConfigSchema = z
     restarts: restartsSchema.default(RESTARTS_DEFAULT),
     /** §14 concurrency: simple max-live-children guard (default 3). */
     maxLiveChildren: z.number().int().positive().default(3),
-    /** §13: per-assignment default; `wait|switch_model|switch_harness|ask`. */
-    failoverPolicy: z.literal(FAILOVER_POLICIES).default(DEFAULT_FAILOVER_POLICY),
+    /**
+     * §13: per-assignment default. The vocabulary (`wait|switch_model|
+     * switch_harness|ask`) is defined for the domain, but only `wait` is
+     * implemented — the runtime and status output hardcode `wait`. Non-`wait`
+     * failover (switch_model/switch_harness/ask) is P4b and unimplemented, so
+     * W4-1 rejects it at parse rather than silently accepting a no-op policy.
+     */
+    failoverPolicy: z
+      .literal(FAILOVER_POLICIES)
+      .refine((p) => p === DEFAULT_FAILOVER_POLICY, {
+        message:
+          "only 'wait' failoverPolicy is supported; 'switch_model', 'switch_harness', and 'ask' are not yet supported (P4b)",
+      })
+      .default(DEFAULT_FAILOVER_POLICY),
     limitProbe: limitProbeSchema.default(LIMIT_PROBE_DEFAULT),
     quotas: quotasSchema.default(QUOTAS_DEFAULT),
     remediation: remediationSchema.default(REMEDIATION_DEFAULT),

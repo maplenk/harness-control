@@ -21,3 +21,4 @@ export * from './model-resolution.js';
 export * from './cost.js';
 export * from './projections.js';
 export * from './process-registry-store.js';
+export * from './desired-model-store.js';

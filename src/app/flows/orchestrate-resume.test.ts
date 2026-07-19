@@ -54,6 +54,7 @@ import {
 } from '../service.js';
 import type { Harness, RoleModelSpec } from '../model-resolution.js';
 import { LoopCompositionError, runImplementVerifyLoop } from './orchestrate.js';
+import { RunOwnershipConflictError } from '../run-ownership-store.js';
 import { rebuildFixRequestsFromT23, type EvidenceRecorder } from './verifier.js';
 import type { VerificationRunner } from './implementor.js';
 
@@ -558,5 +559,136 @@ describe('resume mode — needs_remediation re-entry', () => {
     const round2Prompt = implementorAdapters[1]!.prompts[0]!;
     expect(round2Prompt).toContain('Remediation round');
     expect(round2Prompt).toContain('AC-2');
+  });
+});
+
+// ===========================================================================
+// W4-4 — the DRIVER's run-ownership lease LIFECYCLE (acquire on entry, release
+// in the outer `finally`).
+//
+// The store/CLI-gate tests (restart-safety-stage2, commands.draft-atomicity)
+// prove the resume GATE consults the lease. This proves the OTHER half the
+// between-rounds residual depends on: that `runImplementVerifyLoop` itself
+// actually HOLDS the lease for the whole drive (so a concurrent resume in the
+// dispose gap sees a live owner and withholds) and RELEASES it on exit (so a
+// legitimate SEQUENTIAL resume is never permanently blocked — attack (c),
+// including the self-deadlock where our OWN pid is always live). Observed from
+// INSIDE the drive via the evidence recorder (called during the verifier round,
+// after acquire and before the outer finally).
+//
+// Fails without the fix:
+//  - remove the `acquireRunOwnership` at loop entry → the mid-drive observation
+//    reads `false` → the `claimedMidDrive` assertion fails;
+//  - remove the `releaseRunOwnership` from the outer `finally` → our own lease
+//    (owner pid === self, always live) outlives the drive → the post-loop
+//    `isRunClaimedByLiveProcess` assertion fails (the sequential-resume deadlock
+//    the release exists to prevent).
+// ===========================================================================
+describe('W4-4 run-ownership lease — driver acquire/release lifecycle', () => {
+  it('holds the lease across the whole drive and releases it in the outer finally', async () => {
+    const rig = await openRig({
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [implementorTurn('round 1')],
+        },
+      ],
+      verifier: [{ turns: [PASS_BOTH] }],
+    });
+
+    // Before the driver runs, nobody owns the run.
+    expect(rig.service.isRunClaimedByLiveProcess(rig.runId)).toBe(false);
+
+    // Observe the lease from INSIDE the drive — the evidence recorder runs
+    // during the verifier round, strictly between acquire (loop entry) and the
+    // outer `finally`. Without the acquire this reads `false`.
+    let claimedMidDrive: boolean | undefined;
+    const observingEvidence: EvidenceRecorder = {
+      async record(input) {
+        claimedMidDrive ??= rig.service.isRunClaimedByLiveProcess(rig.runId);
+        return artifactHash(`ev_${String(input.criterionId)}`);
+      },
+    };
+
+    const result = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      evidence: observingEvidence,
+      maxRounds: 1,
+    });
+    expect(result.outcome).toBe('merge_ready');
+
+    // Held DURING the drive (self is the live owner) ...
+    expect(claimedMidDrive).toBe(true);
+    // ... and RELEASED after the outer `finally` — a later sequential resume is
+    // never blocked by our own stale lease.
+    expect(rig.service.isRunClaimedByLiveProcess(rig.runId)).toBe(false);
+  });
+});
+
+// ===========================================================================
+// W4-2 STAGE 1 / review-6 F2 — the driver acquires the EXCLUSIVE lease BEFORE
+// any worktree work AND checks the compare-and-swap result:
+//   - ORDERING: acquire strictly precedes worktree create (was AFTER it);
+//   - REFUSAL: a lost CAS (a still-live peer owns the run) makes the driver
+//     WITHHOLD with an honest error and create NO worktree — a fire-and-forget
+//     acquire could not close this concurrent-same-run double-drive.
+// ===========================================================================
+describe('W4-2 F2 — acquire-before-worktree ordering + refuse-on-lost-CAS', () => {
+  it('acquires the run-ownership lease BEFORE creating the worktree (fails without the fix: acquire ran AFTER worktree create/adopt)', async () => {
+    const rig = await openRig({
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [implementorTurn('round 1')],
+        },
+      ],
+      verifier: [{ turns: [PASS_BOTH] }],
+    });
+
+    // Record the interleaving of acquire vs. worktree creation.
+    const order: string[] = [];
+    const realAcquire = rig.service.acquireRunOwnership.bind(rig.service);
+    rig.service.acquireRunOwnership = (id): boolean => {
+      order.push('acquire');
+      return realAcquire(id);
+    };
+    const realCreate = rig.worktrees.createWorktree.bind(rig.worktrees);
+    rig.worktrees.createWorktree = async (opts) => {
+      // At worktree-create time the lease must ALREADY be held (acquire first).
+      order.push('worktree');
+      expect(rig.service.isRunClaimedByLiveProcess(rig.runId)).toBe(true);
+      return realCreate(opts);
+    };
+
+    const result = await runImplementVerifyLoop(loopDeps(rig), { ...loopInput(rig), maxRounds: 1 });
+    expect(result.outcome).toBe('merge_ready');
+    expect(order[0]).toBe('acquire'); // acquire STRICTLY before worktree create
+    expect(order).toEqual(['acquire', 'worktree']);
+  });
+
+  it('refuses to drive (RunOwnershipConflictError) and creates NO worktree when the CAS is LOST', async () => {
+    const rig = await openRig({
+      implementor: [{ writes: [], turns: [implementorTurn('unused')] }],
+      verifier: [{ turns: [PASS_BOTH] }],
+    });
+
+    // Simulate losing the compare-and-swap to a still-live peer owner.
+    let createCalled = false;
+    rig.service.acquireRunOwnership = (): boolean => false;
+    const realCreate = rig.worktrees.createWorktree.bind(rig.worktrees);
+    rig.worktrees.createWorktree = async (opts) => {
+      createCalled = true;
+      return realCreate(opts);
+    };
+
+    const thrown: unknown = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      maxRounds: 1,
+    }).catch((e: unknown) => e);
+
+    expect(thrown).toBeInstanceOf(RunOwnershipConflictError);
+    // WITHHELD before any worktree I/O — no worktree was created/adopted.
+    expect(createCalled).toBe(false);
+    expect(rig.worktrees.handleFor(assignmentId(`asg_${rig.runId}`))).toBeUndefined();
   });
 });

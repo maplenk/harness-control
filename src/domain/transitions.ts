@@ -434,8 +434,13 @@ export const TRANSITION_TABLE: readonly TransitionRow[] = [
     id: 'T17',
     event: 'recovery.running_segment_found',
     description:
-      'Orchestrator restart finds `running` segment: suspension=interrupted; recovery per §12.3 → resumed segment or successor; then suspension=none.',
-    preconditions: [],
+      'Orchestrator restart finds `running` segment: suspension=interrupted; recovery per §12.3 → resumed segment or successor; then suspension=none. W4-4: the PURPOSE-BUILT restart transition (distinct from T13, the child-crash row — using it keeps orchestrator restarts OUT of the RestartBreaker/respawn counters). Guarded like T13 so a reap can never clobber a paused_limit run or resurrect a terminal one.',
+    preconditions: [
+      { kind: 'suspension_in', suspensions: ['none'] },
+      { kind: 'phase_non_terminal' },
+      { kind: 'child_active', value: true },
+      { kind: 'payload_check', check: 'generation_matches_active' },
+    ],
     effects: [
       { kind: 'suspend', to: 'interrupted', recordInFlightOperation: true },
       { kind: 'set_operation_idle' },

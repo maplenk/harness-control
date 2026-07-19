@@ -46,6 +46,7 @@ import {
   type SpecDraftState,
 } from '../app/index.js';
 import { CoordinatorRunner, type CoordinatorReviseContext } from '../app/flows/coordinator.js';
+import { DurableRunOwnershipStore } from '../app/run-ownership-store.js';
 import type { EvidenceRecorder } from '../app/flows/verifier.js';
 import { artifactHash } from '../domain/ids.js';
 import { executeCommand, type CliFlowDeps } from './commands.js';
@@ -510,5 +511,80 @@ describe('W3-4: a draftless awaiting_approval run is detected and refused', () =
     );
     expect(approve.exitCode).toBe(0);
     expect(w.service.status(runId).approvedSpecHash).toBe(spec2.specHash);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4 — W4-4: the coordinator re-drive carve-out is §14 owner-liveness gated
+//
+// The W3-4 carve-out re-drives an UNSUSPENDED coordinator round stranded at
+// `specifying` (crash before the completion advance committed). Before W4-4 it
+// had NO owner-liveness check, so a concurrent `resume` in another process
+// could double-drive the same coordinator round. It is now gated on the durable
+// RUN-ownership lease (`isRunClaimedByLiveProcess`), exactly like the
+// implementor/verifier boundary gate.
+// ---------------------------------------------------------------------------
+describe('W4-4: the coordinator re-drive carve-out is owner-liveness gated', () => {
+  it('a LIVE owner holds the run lease → the carve-out WITHHOLDS (stays specifying, no draft) — fails without the gate: the ungated carve-out re-drove to awaiting_approval', async () => {
+    const w = await setup([[coordinatorTurn(validSpec())]]);
+    const crash = crashOnCompletionAdvance(w.db);
+    const start = await executeCommand(w.service, w.db, START_CMD, {}, w.deps);
+    crash.restore();
+    expect(start.exitCode).toBe(1);
+    // Stranded at the coordinator round, still specifying (the W3-4 dichotomy).
+    expect(w.service.status(RUN1).phase).toBe('specifying');
+    expect(w.service.getRoleRound(RUN1)).toMatchObject({ role: 'coordinator', round: 1 });
+
+    // A still-alive owner holds the RUN-ownership lease (self stands in for a
+    // live peer: `ownerPid === selfPid` is always live). The successor's
+    // carve-out must WITHHOLD.
+    new DurableRunOwnershipStore(w.db).acquire(
+      {
+        runId: RUN1,
+        ownerPid: process.pid,
+        acquiredAt: w.db.clock.nowIso(),
+      },
+      () => false, // seed into an empty store — land the lease unconditionally
+    );
+
+    const successor = w.successor([[coordinatorTurn(validSpec())]]);
+    expect(successor.isRunClaimedByLiveProcess(RUN1)).toBe(true);
+    const resume = await executeCommand(successor, w.db, { kind: 'resume', json: true, runId: RUN1 }, {}, w.deps);
+    // WITHHELD: NOT re-driven — falls through to the "not paused" error, the run
+    // stays specifying with no draft (the ungated carve-out would have reached
+    // awaiting_approval WITH a draft).
+    expect(resume.exitCode).toBe(1);
+    expect(resume.json.reentry).not.toBe('coordinator');
+    expect(w.service.status(RUN1).phase).toBe('specifying');
+    expect(w.service.getSpecDraft(RUN1)).toBeUndefined();
+  });
+
+  it('a DEAD owner lease → the carve-out PROCEEDS (re-drives to awaiting_approval) — the intended crash reclaim', async () => {
+    const w = await setup([[coordinatorTurn(validSpec())]]);
+    const crash = crashOnCompletionAdvance(w.db);
+    const start = await executeCommand(w.service, w.db, START_CMD, {}, w.deps);
+    crash.restore();
+    expect(start.exitCode).toBe(1);
+    expect(w.service.status(RUN1).phase).toBe('specifying');
+
+    // A stale lease from a since-crashed owner: a high pid the OS is not running
+    // (real `ps.isAlive` → false, same convention as ps.test.ts), so the owner
+    // is provably dead and the lease is reclaimable — the carve-out proceeds.
+    new DurableRunOwnershipStore(w.db).acquire(
+      {
+        runId: RUN1,
+        ownerPid: 999_999,
+        ownerStartedAt: 'lstart-crashed-owner',
+        acquiredAt: w.db.clock.nowIso(),
+      },
+      () => false, // seed into an empty store — land the lease unconditionally
+    );
+
+    const successor = w.successor([[coordinatorTurn(validSpec())]]);
+    expect(successor.isRunClaimedByLiveProcess(RUN1)).toBe(false);
+    const resume = await executeCommand(successor, w.db, { kind: 'resume', json: true, runId: RUN1 }, {}, w.deps);
+    expect(resume.exitCode).toBe(0);
+    expect(resume.json).toMatchObject({ outcome: 'resumed', reentry: 'coordinator', phase: 'awaiting_approval' });
+    expect(w.service.getSpecDraft(RUN1)).toBeDefined();
   });
 });

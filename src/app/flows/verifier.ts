@@ -842,9 +842,14 @@ function manualIntegrationCommands(
   ready: boolean,
   blockers: readonly string[],
 ): readonly string[] {
-  const c = binding.repoRoot !== undefined ? `git -C ${binding.repoRoot} ` : 'git ';
-  const dest = binding.destinationRef ?? 'main';
-  const ref = binding.worktreeBranch ?? String(verification.implementationCommit);
+  // W4-6: these commands are PRINTED, never executed by the harness — but a
+  // repoRoot/ref with spaces or shell metacharacters must still yield a valid,
+  // copy-pasteable line. Shell-quote each interpolated value (POSIX single-quote
+  // rules); values made only of safe chars pass through unchanged.
+  const c =
+    binding.repoRoot !== undefined ? `git -C ${shellQuote(binding.repoRoot)} ` : 'git ';
+  const dest = shellQuote(binding.destinationRef ?? 'main');
+  const ref = shellQuote(binding.worktreeBranch ?? String(verification.implementationCommit));
   const commands: string[] = [
     `# Manual integration for verified commit ${String(verification.implementationCommit)} (§16 — the harness never runs these).`,
   ];
@@ -854,6 +859,17 @@ function manualIntegrationCommands(
   }
   commands.push(`${c}switch ${dest}`, `${c}merge --no-ff ${ref}`);
   return commands;
+}
+
+/**
+ * POSIX shell single-quoting for a value interpolated into a printed command
+ * string (W4-6). Values consisting solely of shell-safe characters are returned
+ * verbatim (so a normal path/ref like `main` or `feature/x` is unchanged);
+ * anything else is wrapped in single quotes with embedded `'` escaped as `'\''`.
+ */
+function shellQuote(value: string): string {
+  if (value.length > 0 && /^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /** W1-F4: cap on the dirty-path list recorded in the probe's facts. */

@@ -84,6 +84,7 @@ import {
 } from '../domain/transitions.js';
 import {
   isLiveChild,
+  OPERATION_IDLE,
   type ActiveChild,
   type CheckpointReason,
   type ClassifiedErrorKind,
@@ -140,14 +141,17 @@ import {
 } from '../scheduler/limit-schedule.js';
 import { buildCheckpointContent, deriveIncompleteOperation } from '../checkpoint/content.js';
 import { writeCheckpoint } from '../checkpoint/writer.js';
+import { CadenceTracker } from '../checkpoint/cadence.js';
 import { redactFlattenedJson, redactText } from '../redaction/index.js';
 import { sha256Hex } from '../artifacts/hash.js';
 import * as git from '../worktree/git.js';
 import {
   HeartbeatEmitter,
+  DEFAULT_BREAKER_BOUNDS,
   MaxLiveChildrenGuard,
   MaxLiveChildrenExceededError,
   ProcessRegistry,
+  RestartBreaker,
   Watchdog,
   createEnvNonceVerifier,
   createPsClient,
@@ -166,6 +170,11 @@ import {
 import { BYTES_PER_MB } from '../config/schema.js';
 import { DurableProcessRegistryStore } from './process-registry-store.js';
 import { DurableSpawnReservationStore, type SpawnReservationRecord } from './spawn-reservation-store.js';
+import {
+  DurableRunOwnershipStore,
+  RunOwnershipConflictError,
+  type RunOwnershipRecord,
+} from './run-ownership-store.js';
 import {
   applyRoleModel,
   resolveRoleModel,
@@ -890,10 +899,29 @@ export class OrchestrationService {
   /** W3-5(a): durable spawn-slot reservations closing the cross-process
    * count-and-reserve TOCTOU (see `spawn-reservation-store.ts`). */
   readonly #reservations: DurableSpawnReservationStore;
+  /** W4-4: durable RUN-ownership leases held ACROSS child rounds for the whole
+   * time this process actively drives a run — the owner/control channel the
+   * consumer resume gates consult so a between-rounds gap (child record already
+   * disposed) never lets a concurrent `resume` double-drive a live owner's
+   * worktree (see `run-ownership-store.ts`). */
+  readonly #runOwnership: DurableRunOwnershipStore;
   /** W3-5(a): the pid this process stamps as the OWNER of its reservations
    * (its OWN reservations are always live — it is, by definition, running). */
   readonly #selfPid: number;
   readonly #watchdog: Watchdog;
+  /** W4-1 (§14 breaker): the supervision-owned crash evaluator wired into the
+   * CHILD-crash site (`#interruptOnChildDeath`). A real (non-orchestrator)
+   * child crash consults it for restart-window / lifetime exhaustion → the
+   * breaker opens (T14) instead of a plain interrupt (T13). Orchestrator
+   * restarts (the T17 reap producer) DELIBERATELY never reach it — they must
+   * not pollute the child-crash counters. */
+  readonly #breaker: RestartBreaker;
+  /** W4-1 (§12.2 cadence): per-run "completed turns since last checkpoint"
+   * bookkeeping. A cadence checkpoint fires once `checkpoint.cadenceTurns`
+   * completed turns elapse (the completed-turn boundary in the role session's
+   * `prompt` closure); the counter resets on ANY checkpoint write (cadence or
+   * a safe-boundary pause/stop) so the next window starts fresh. */
+  readonly #cadenceTrackers = new Map<RunId, CadenceTracker>();
   readonly #heartbeat: HeartbeatEmitter;
   readonly #heartbeatIntervalMs: number;
   readonly #onIdentityAlert: ((alert: IdentityAlert) => void) | undefined;
@@ -924,6 +952,10 @@ export class OrchestrationService {
     this.#config = options.config ?? DEFAULT_ENGINE_CONFIG;
     this.#bounds = toEngineBounds(this.#config);
     this.#engineReducer = makeEngineReducer(this.#bounds);
+    // W4-1: the breaker reads the SAME engine bounds (lifetime cap +
+    // restart-window max) the reducer folds against, so its exhaustion
+    // decision is consistent with the durable counters.
+    this.#breaker = new RestartBreaker(this.#ids, DEFAULT_BREAKER_BOUNDS, this.#bounds);
     this.#adapterFactory = options.adapterFactory ?? defaultRoleAdapterFactory();
 
     // W2-6 §14 assembly. The registry store is DURABLE by default (SQLite
@@ -934,12 +966,16 @@ export class OrchestrationService {
     this.#ps = ps;
     this.#concurrency = new MaxLiveChildrenGuard({ maxLiveChildren: this.#config.maxLiveChildren });
     this.#reservations = new DurableSpawnReservationStore(this.#db);
+    this.#runOwnership = new DurableRunOwnershipStore(this.#db);
     this.#selfPid = supervision.selfPid ?? process.pid;
     this.#onIdentityAlert = supervision.onIdentityAlert;
     this.#registry = new ProcessRegistry({
       clock: this.#clock,
       store: supervision.registryStore ?? new DurableProcessRegistryStore(this.#db),
       ps,
+      // W4-0: the registry stamps this owner pid on every record and reaps
+      // ONLY records whose owner is provably dead — never a live peer's child.
+      selfPid: this.#selfPid,
       envNonce: supervision.envNonce ?? createEnvNonceVerifier(),
       ...(supervision.sendSignal !== undefined ? { sendSignal: supervision.sendSignal } : {}),
       onAlert: (alert) => this.#recordIdentityAlert(alert),
@@ -979,6 +1015,16 @@ export class OrchestrationService {
             processGenerationId: target.generationId,
             sampledAt: sample.sampledAt,
             rssBytes: sample.rssBytes,
+            ...(target.segmentId !== undefined ? { segmentId: target.segmentId } : {}),
+          });
+          // W4-3 (§12.1): fold + prune every window that has fully closed
+          // relative to now. Without this the raw ticks recorded above grow
+          // unbounded and `status` never sees an aggregate. Each fold is its
+          // own transaction (aggregateWindow); the in-progress window is left
+          // for the raw-sample fallback in `status`.
+          this.#db.telemetry.aggregateClosedWindows({
+            runId: target.runId,
+            now: this.#clock.nowIso(),
             ...(target.segmentId !== undefined ? { segmentId: target.segmentId } : {}),
           });
         } catch {
@@ -1303,7 +1349,19 @@ export class OrchestrationService {
 
   /** T15 — `breaker reset`. */
   breakerReset(runId: RunId, opts?: CommandOptions): IngestResult {
-    return this.ingest(this.#trigger(runId, 'breaker.reset.requested', {}, opts) as DomainEvent);
+    const result = this.ingest(this.#trigger(runId, 'breaker.reset.requested', {}, opts) as DomainEvent);
+    // W4-1: T15 clears the durable window/probe counters (the lifetime cap is
+    // non-disableable, §14); mirror it into the in-memory breaker so a
+    // window-tripped breaker does not immediately re-open on the next crash.
+    // Clears BOTH possible bucket keys this run's crashes could have used (its
+    // implement→verify assignment, and the run-id fallback for assignment-less
+    // spawns) — `reset` on an untracked key is a harmless no-op.
+    if (result.status === 'applied') {
+      const assignment = this.getImplementVerifyLoopState(runId)?.assignmentId;
+      if (assignment !== undefined) this.#breaker.reset(assignment);
+      this.#breaker.reset(runId as unknown as AssignmentId);
+    }
+    return result;
   }
 
   /**
@@ -1443,18 +1501,33 @@ export class OrchestrationService {
     toDraft?: (outcome: T) => SpecDraftState,
   ): Promise<T> {
     const meta = this.#requireMeta(runId);
-    const result = await this.runRole(runId, runner, meta.coordinator, meta.workspacePath, {
-      round: 1,
-      advance: { from: 'created', to: 'specifying' },
-      completionAdvance: { from: 'specifying', to: 'awaiting_approval' },
-      inputs: JSON.stringify({ goal: meta.goal }),
-    });
-    if (toDraft !== undefined) {
-      this.completeCoordinationRound(runId, toDraft(result));
-    } else {
-      this.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
+    // W4-2 S4 / review-6 F2: a coordinator round DRIVES the run just like the
+    // implement/verify loop, so it must hold the same EXCLUSIVE run-ownership
+    // lease — acquired BEFORE any role work. Without this the lease was FALSE
+    // during a live coordinator round, so `isRunClaimedByLiveProcess` was a
+    // no-op and a concurrent `resume` carve-out could double-drive the same
+    // coordinator round. The CAS also serializes a true race: if a still-live
+    // PEER already owns the run, we lose the swap and WITHHOLD (honest error)
+    // rather than double-drive. Released in the `finally` on EVERY path.
+    if (!this.acquireRunOwnership(runId)) {
+      throw new RunOwnershipConflictError(String(runId));
     }
-    return result;
+    try {
+      const result = await this.runRole(runId, runner, meta.coordinator, meta.workspacePath, {
+        round: 1,
+        advance: { from: 'created', to: 'specifying' },
+        completionAdvance: { from: 'specifying', to: 'awaiting_approval' },
+        inputs: JSON.stringify({ goal: meta.goal }),
+      });
+      if (toDraft !== undefined) {
+        this.completeCoordinationRound(runId, toDraft(result));
+      } else {
+        this.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
+      }
+      return result;
+    } finally {
+      this.releaseRunOwnership(runId);
+    }
   }
 
   /**
@@ -1544,25 +1617,58 @@ export class OrchestrationService {
     const mediation = this.#mediation.get(runId) ?? DEFAULT_HEADLESS_MEDIATION;
     const permissions = toPermissionConfig(mediation, runner.role);
 
+    // The §14 identity for this spawn, allocated up front: `#admitSpawn` needs
+    // it to key the durable reservation, and it must be stable BEFORE admission
+    // so the same generation reconciles the reservation with the later
+    // `child.spawned` registry record. (`seg`/`pgen` are independent counters,
+    // so this allocation order is deterministic-ID-safe.)
+    const generationId = newProcessGenerationId(this.#ids);
+
+    // W3-5 (§14 concurrency) / W4-8: admit this spawn against `maxLiveChildren`
+    // or REFUSE (throws before ANYTHING durable OR any provider resource is
+    // created — BEFORE the pending round is persisted AND before
+    // `#adapterFactory.create` prepares resources, incl. the Codex §17.1 H-1
+    // isolated `CODEX_HOME`). This upholds "refuse before anything durable
+    // happens": a cap rejection leaks neither a durable pending round nor a
+    // temp `CODEX_HOME`. Enforced BOTH in-process (this service's guard) AND
+    // durably across concurrent CLI processes (the shared registry store counts
+    // every OTHER process's live children). The slot is released in this
+    // method's `finally` on every in-flight exit path (or the setup guard below
+    // if resource creation throws after admission was granted).
+    this.#admitSpawn(generationId);
+
     // W2-3: the intended round persists PENDING before any spawn, while the
     // workflow remains at its previous stable phase — a crash or pin failure
     // from here on leaves a retryable pending round, never a stranded phase.
-    // The record is built ONCE (with the W2-5 staleness watermark stamped at
-    // dispatch time) and re-staged from it, so assignment binding and
+    // Persisted AFTER admission (W4-8) so a REFUSED spawn leaves nothing durable
+    // to unwind. The record is built ONCE (with the W2-5 staleness watermark
+    // stamped at dispatch time) and re-staged from it, so assignment binding and
     // watermark survive the pending→active→completed re-saves.
     const baseRound =
       dispatch !== undefined ? this.#roundRecord(runId, runner.role, dispatch, spec) : undefined;
-    if (baseRound !== undefined) {
-      this.#saveRoleRound(runId, { ...baseRound, stage: 'pending' });
+    let handle: RoleAdapterHandle;
+    try {
+      if (baseRound !== undefined) {
+        this.#saveRoleRound(runId, { ...baseRound, stage: 'pending' });
+      }
+      handle = this.#adapterFactory.create({
+        role: runner.role,
+        cwd,
+        clock: this.#clock,
+        permissions,
+        resolved,
+      });
+    } catch (error) {
+      // W4-8: resource setup failed AFTER admission was granted (e.g. the
+      // factory could not prepare the Codex isolated `CODEX_HOME` — the factory
+      // disposes its OWN temp home on a failed build, H-1). Release the durable
+      // reservation + in-process mirror so the failed setup holds no slot, then
+      // rethrow. No handle to dispose (creation threw) and no heartbeat has been
+      // started yet, so the `finally` machinery below never runs for this path.
+      this.#releaseSpawnReservation(generationId);
+      this.#concurrency.release(generationId);
+      throw error;
     }
-
-    const handle = this.#adapterFactory.create({
-      role: runner.role,
-      cwd,
-      clock: this.#clock,
-      permissions,
-      resolved,
-    });
     const ctx: SpawnContext = {
       runId,
       role: runner.role,
@@ -1570,18 +1676,11 @@ export class OrchestrationService {
       adapter: handle.adapter,
       handle,
       segmentId: newSegmentId(this.#ids),
-      generationId: newProcessGenerationId(this.#ids),
+      generationId,
       cwd,
       mediation,
       ...(dispatch !== undefined ? { dispatch } : {}),
     };
-
-    // W3-5 (§14 concurrency): admit this spawn against `maxLiveChildren` or
-    // REFUSE (throws before anything durable happens). Enforced BOTH in-process
-    // (this service's guard) AND durably across concurrent CLI processes (the
-    // shared registry store counts every OTHER process's live children). The
-    // slot is released in this method's `finally`, on every exit path.
-    this.#admitSpawn(ctx.generationId);
 
     let completedNormally = false;
     // §14 self-supervision: heartbeat for this run while any spawn is in
@@ -2011,14 +2110,48 @@ export class OrchestrationService {
    * for the caller to throw (typed unwind reaches CLI output).
    */
   async #interruptOnChildDeath(ctx: SpawnContext, raw: unknown): Promise<unknown> {
-    this.ingest(
-      this.#trigger(ctx.runId, 'child.exited.unexpectedly', {
-        segmentId: ctx.segmentId,
-        generationId: ctx.generationId,
-        classifiedAs: 'crash',
-      }) as DomainEvent,
-    );
+    // W4-1: consult the breaker for THIS child crash. `evaluateCrash` folds the
+    // crash into the time-decayed restart window and reads the authoritative
+    // lifetime counter from the durable projection — on exhaustion it returns
+    // `breaker_open` and we open the breaker (T14) instead of a plain interrupt.
+    // The breaker's own trigger event is UNSTAMPED (no generationId); we consult
+    // it only for the DECISION and build the transition ourselves so the T13
+    // interrupt stays generation-matched (a stale generation's crash must never
+    // interrupt a newer active child). T17 (orchestrator-restart) never reaches
+    // here, so orchestrator crashes never feed this window/lifetime bookkeeping.
+    const advice = this.#breaker.evaluateCrash({
+      runId: ctx.runId,
+      assignmentId: this.#breakerAssignmentKey(ctx),
+      segmentId: ctx.segmentId,
+      occurredAt: this.#clock.nowIso(),
+      classifiedAs: 'crash',
+      counters: this.#loadEngineRecord(ctx.runId).state.counters,
+    });
+    if (advice.kind === 'breaker_open') {
+      this.ingest(
+        this.#trigger(ctx.runId, 'restart.exhausted', { reason: advice.reason }) as DomainEvent,
+      );
+    } else {
+      this.ingest(
+        this.#trigger(ctx.runId, 'child.exited.unexpectedly', {
+          segmentId: ctx.segmentId,
+          generationId: ctx.generationId,
+          classifiedAs: 'crash',
+        }) as DomainEvent,
+      );
+    }
     return toSinkSafeTypedError(raw);
+  }
+
+  /**
+   * W4-1: the per-assignment key the breaker's sliding restart window is
+   * bucketed by. A role round carries its assignment on the dispatch; a spawn
+   * with no assignment (a coordinator round, a throwaway probe) falls back to
+   * the run id so its crashes still bucket together — the non-disableable
+   * lifetime cap (read from the durable per-run counters) bounds it regardless.
+   */
+  #breakerAssignmentKey(ctx: SpawnContext): AssignmentId {
+    return ctx.dispatch?.assignmentId ?? (ctx.runId as unknown as AssignmentId);
   }
 
   // ---- W2-3 pause spine (crash-safe by construction) -----------------------
@@ -2156,11 +2289,13 @@ export class OrchestrationService {
   }
 
   /**
-   * Step (1) of `pauseForLimit` — and (W2-6) the T22 graceful-stop
-   * checkpoint: assemble + write the §12.2 mechanical checkpoint (redact →
-   * CAS → fsync happen inside the artifact repository) under the given
-   * reason (`pre_pause` | `pre_graceful_stop`), recording the interrupted
-   * operation honestly. A §12.1 quota admission rejection is a REAL possible
+   * Step (1) of `pauseForLimit` — the T22 graceful-stop checkpoint (W2-6) and
+   * the W4-1 completed-turn cadence checkpoint: assemble + write the §12.2
+   * mechanical checkpoint (redact → CAS → fsync happen inside the artifact
+   * repository) under the given reason (`pre_pause` | `pre_graceful_stop` |
+   * `cadence`), recording the interrupted operation honestly (a cadence
+   * checkpoint passes the idle operation — a completed turn interrupts
+   * nothing). A §12.1 quota admission rejection is a REAL possible
    * outcome: the repository already appended `artifact.admission.rejected`,
    * and the PAUSE/stop still proceeds — hammering a limited provider (or
    * holding an over-budget process alive) because the checkpoint could not
@@ -2220,7 +2355,35 @@ export class OrchestrationService {
     );
     if (isErr(written)) return {};
     const ok = unwrap(written);
+    // W4-1 (§12.2): ANY written checkpoint — a safe-boundary pause/stop as
+    // much as a cadence one — restarts the turn-count window so cadence does
+    // not fire a few turns early right after a boundary checkpoint.
+    this.#cadenceTrackers.get(ctx.runId)?.recordCheckpointWritten();
     return { event: ok.event, hash: ok.checkpoint.artifactHash };
+  }
+
+  /**
+   * W4-1 (§12.2 "every N completed turns"): the completed-turn cadence hook.
+   * Called once per completed prompt turn from the role session's `prompt`
+   * closure. A `CadenceTracker` (policy = `checkpoint.cadenceTurns`) counts
+   * turns since the last checkpoint of ANY reason; when the window elapses a
+   * `cadence` mechanical checkpoint is written (idle operation — a completed
+   * turn leaves no interrupted work) and its `checkpoint.recorded` fact
+   * committed. `cadenceTurns <= 0` disables turn-based cadence (the tracker
+   * never returns `shouldCheckpoint` for a turn), leaving only the safe
+   * boundaries. A failed checkpoint write (quota admission) is non-fatal — the
+   * turn already completed; the next window simply carries on.
+   */
+  async #maybeCadenceCheckpoint(ctx: SpawnContext): Promise<void> {
+    let tracker = this.#cadenceTrackers.get(ctx.runId);
+    if (tracker === undefined) {
+      tracker = new CadenceTracker({ everyNTurns: this.#config.checkpoint.cadenceTurns });
+      this.#cadenceTrackers.set(ctx.runId, tracker);
+    }
+    const decision = tracker.recordCompletedTurn();
+    if (!decision.shouldCheckpoint) return;
+    const checkpoint = await this.#writeStopCheckpoint(ctx, 'cadence', OPERATION_IDLE);
+    if (checkpoint.event !== undefined) this.ingest(checkpoint.event as DomainEvent);
   }
 
   /**
@@ -2581,6 +2744,84 @@ export class OrchestrationService {
    * confirm NOTHING — the process wearing that pid may still be live.
    * Call at CLI startup (`resume` does) before re-entering any run.
    */
+  /**
+   * W4-4 (§14:139): is `runId` currently claimed by a still-alive orchestrator
+   * (this process or a live peer)? The consumer resume-routing gates consult
+   * this before re-driving a run stranded at a role-completion boundary — or a
+   * coordinator round (W3-4) — so a peer genuinely still driving the run is
+   * never double-driven by a concurrent `harness resume`.
+   *
+   * Reads the durable RUN-ownership lease (NOT the per-child registry): the
+   * lease is held for the WHOLE duration a process drives the run, ACROSS child
+   * rounds, so it survives the between-rounds gap where a clean child dispose
+   * has already removed the child record. A lease whose owner pid is gone or
+   * recycled (a crashed owner) does NOT count — that run is freely reclaimable,
+   * which is the intended crash recovery.
+   */
+  isRunClaimedByLiveProcess(runId: RunId): boolean {
+    return this.#runOwnership
+      .list()
+      .some((record) => record.runId === String(runId) && this.#runOwnershipOwnerLive(record));
+  }
+
+  /**
+   * W4-4 / review-6 F2: acquire this process's EXCLUSIVE durable RUN-ownership
+   * lease via a compare-and-swap — called at the outer entry of every execution
+   * driver (the implement/verify loop AND `runCoordination`), BEFORE any
+   * worktree or role work, on both a fresh start-that-drives and a
+   * resume-that-drives. Returns `true` when this process now holds the lease
+   * (the run was unclaimed, already ours, or held by a provably dead/recycled
+   * owner it reclaims); returns `false` when a still-LIVE peer already owns the
+   * run — the caller must then WITHHOLD (not double-drive). §14 owner-liveness
+   * is evaluated INSIDE the CAS transaction. MUST be paired with
+   * `releaseRunOwnership` in the driver's outer `finally`.
+   */
+  acquireRunOwnership(runId: RunId): boolean {
+    return this.#runOwnership.acquire(this.#selfRunOwnership(runId), (existing) =>
+      this.#runOwnershipOwnerLive(existing),
+    );
+  }
+
+  /** W4-4: release this process's RUN-ownership lease (driver's outer
+   * `finally` — normal completion, pause, error, or process-exit path).
+   * Best-effort: a failure here must never mask the flow outcome — a stranded
+   * lease from this LIVE process still (correctly) claims the run and is
+   * reclaimed if the process later dies (§14 owner-liveness). Only removes the
+   * lease when THIS process still owns it. */
+  releaseRunOwnership(runId: RunId): void {
+    try {
+      this.#runOwnership.release(runId, this.#selfPid);
+    } catch {
+      // swallow — see doc comment
+    }
+  }
+
+  /** This process's run-ownership lease record for `runId` (§14 owner identity). */
+  #selfRunOwnership(runId: RunId): RunOwnershipRecord {
+    const startedAt = this.#ps.sampleIdentity(this.#selfPid)?.startedAt;
+    return {
+      runId: String(runId),
+      ownerPid: this.#selfPid,
+      ...(startedAt !== undefined ? { ownerStartedAt: startedAt } : {}),
+      acquiredAt: this.#clock.nowIso(),
+    };
+  }
+
+  /**
+   * §14 liveness of a run-ownership lease's OWNER (the orchestrator process):
+   * OUR OWN lease is always live (we are running); another process's lease is
+   * live only while its pid resolves to the SAME start-time (a gone pid, or one
+   * recycled by an unrelated process, is a crashed holder whose run is
+   * reclaimable). Mirrors `#reservationOwnerLive` / registry `#ownerLive`.
+   */
+  #runOwnershipOwnerLive(record: RunOwnershipRecord): boolean {
+    if (record.ownerPid === this.#selfPid) return true;
+    if (!this.#ps.isAlive(record.ownerPid)) return false;
+    if (record.ownerStartedAt === undefined) return true;
+    const sample = this.#ps.sampleIdentity(record.ownerPid);
+    return sample !== undefined && sample.startedAt === record.ownerStartedAt;
+  }
+
   reapOrphanProcesses(): ReapSummary {
     const store = this.#registry.store;
     // Snapshot before reaping: killed entries are removed from the store by
@@ -2598,8 +2839,46 @@ export class OrchestrationService {
       if (record.runId === undefined) continue;
       const child = this.#db.projections.get<EngineState>(record.runId, ENGINE_STATE_PROJECTION)?.state
         .activeChild;
-      if (child?.status === 'stopping' && child.generationId === entry.generationId) {
+      // Only the run's OWN active generation is reconciled (a late/superseded
+      // generation clears nothing).
+      if (child === undefined || child.generationId !== entry.generationId || !isLiveChild(child)) {
+        continue;
+      }
+      if (child.status === 'stopping') {
+        // W2-3 pause-spine crash window: a committed stop-intent with no
+        // matching child.stopped — confirm the stop (idempotent). NO
+        // interrupt: the pause is intentional, the suspension already holds.
         this.confirmStopIntentAfterCleanup(record.runId);
+        continue;
+      }
+      // W4-4: an `active`/`spawning` generation whose OWNER was DEAD (only
+      // dead-owner records reach here — W4-0 skips live-owner ones) is a
+      // segment that was running when the orchestrator died. Stage-aware
+      // recovery via the run's RoleRoundProjection:
+      //  - completed  → the round SUCCEEDED before the crash; just confirm the
+      //    stop (generation-matched child.stopped). NO interrupt, NO counter.
+      //  - pending/active (or no round) → T17 `recovery.running_segment_found`
+      //    (interrupted; manual resume). T17 (NOT T13) keeps orchestrator
+      //    restarts out of the child-crash breaker/respawn counters.
+      // A T17 rejected by its preconditions (e.g. a run that is actually
+      // paused/terminal) is a benign no-op — ingest records a
+      // `transition.rejected` and never throws in this loop.
+      const round = this.getRoleRound(record.runId);
+      if (round?.stage === 'completed') {
+        this.ingest(
+          this.#trigger(record.runId, 'child.stopped', {
+            generationId: child.generationId,
+            segmentId: child.segmentId,
+            reason: 'startup_cleanup',
+          }) as DomainEvent,
+        );
+      } else {
+        this.ingest(
+          this.#trigger(record.runId, 'recovery.running_segment_found', {
+            generationId: child.generationId,
+            segmentId: child.segmentId,
+          }) as DomainEvent,
+        );
       }
     }
     return summary;
@@ -2947,6 +3226,9 @@ export class OrchestrationService {
           }) as DomainEvent,
         );
         if (result.usage !== undefined) this.#foldTurnUsage(runId, role, sessionKey, result.usage);
+        // W4-1 (§12.2): a completed turn is the cadence boundary — take a
+        // checkpoint once `checkpoint.cadenceTurns` turns have elapsed.
+        await this.#maybeCadenceCheckpoint(ctx);
         return result;
       },
     };

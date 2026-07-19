@@ -130,4 +130,42 @@ describe.each(DRIVER_KINDS)('ProcessSampleRepository (%s) — §19 test 31 telem
     expect(aggregate).toMatchObject({ rssMaxBytes: 42, sampleCount: 1 });
     expect(aggregate?.segmentId).toBeUndefined();
   });
+
+  // W4-3 REGRESSION: aggregateClosedWindows is the PRODUCTION driver that keeps
+  // raw_process_samples bounded — before it existed, aggregateWindow had no
+  // production caller, so raw ticks grew forever and no aggregate was ever
+  // produced. This exercises the retention contract the watchdog relies on.
+  it('aggregateClosedWindows folds + prunes every CLOSED minute window and leaves the in-progress one for the raw fallback', async () => {
+    handle = await openTestDatabase({ kind, file: true });
+    const telemetry = handle.db.telemetry;
+
+    // Two fully-closed windows (10:00 + 10:01) plus an in-progress window (10:02).
+    telemetry.recordRawSample({ runId: RUN, segmentId: SEG_A, processGenerationId: PGEN, sampledAt: isoTimestamp('2026-07-18T10:00:05.000Z'), rssBytes: 100 });
+    telemetry.recordRawSample({ runId: RUN, segmentId: SEG_A, processGenerationId: PGEN, sampledAt: isoTimestamp('2026-07-18T10:00:45.000Z'), rssBytes: 300 });
+    telemetry.recordRawSample({ runId: RUN, segmentId: SEG_A, processGenerationId: PGEN, sampledAt: isoTimestamp('2026-07-18T10:01:30.000Z'), rssBytes: 500 });
+    telemetry.recordRawSample({ runId: RUN, segmentId: SEG_A, processGenerationId: PGEN, sampledAt: isoTimestamp('2026-07-18T10:02:10.000Z'), rssBytes: 700 });
+    expect(telemetry.countRawSamples(RUN)).toBe(4);
+
+    // "now" is inside the 10:02 window: 10:00 and 10:01 have closed; 10:02 has not.
+    const folded = telemetry.aggregateClosedWindows({
+      runId: RUN,
+      segmentId: SEG_A,
+      now: isoTimestamp('2026-07-18T10:02:15.000Z'),
+    });
+
+    expect(folded.map((f) => f.windowStart)).toEqual([WINDOW_1_START, WINDOW_2_START]);
+    expect(folded[0]).toMatchObject({ rssMaxBytes: 300, sampleCount: 2 });
+    expect(folded[1]).toMatchObject({ rssMaxBytes: 500, sampleCount: 1 });
+
+    // Bounded growth: only the in-progress window's single raw tick remains.
+    expect(telemetry.countRawSamples(RUN)).toBe(1);
+    expect(telemetry.listRawSamples(RUN)[0]).toMatchObject({ sampledAt: '2026-07-18T10:02:10.000Z', rssBytes: 700 });
+    expect(telemetry.listAggregates(RUN)).toHaveLength(2);
+
+    // Idempotent: a re-run with the same `now` folds nothing new (raw already pruned).
+    const again = telemetry.aggregateClosedWindows({ runId: RUN, segmentId: SEG_A, now: isoTimestamp('2026-07-18T10:02:15.000Z') });
+    expect(again).toHaveLength(0);
+    expect(telemetry.listAggregates(RUN)).toHaveLength(2);
+    expect(telemetry.countRawSamples(RUN)).toBe(1);
+  });
 });

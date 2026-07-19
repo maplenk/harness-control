@@ -477,6 +477,84 @@ describe('W3-1 — defaultVerificationRunner env confinement (§17.1)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// W4-7 — verification timeout reaps the descendant process TREE
+// ---------------------------------------------------------------------------
+describe('W4-7 — verification timeout kills the descendant process group', () => {
+  let scratch: string;
+  let survivorPid: number | undefined;
+
+  beforeEach(() => {
+    scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-w4-7-'));
+    survivorPid = undefined;
+  });
+
+  afterEach(() => {
+    // Safety net: if the fix regressed and the descendant leaked, do not let it
+    // outlive the test run. SYNTHETIC pid from THIS test only.
+    if (survivorPid !== undefined) {
+      try {
+        process.kill(survivorPid, 'SIGKILL');
+      } catch {
+        /* already gone — the intended outcome */
+      }
+    }
+    fs.rmSync(scratch, { recursive: true, force: true });
+  });
+
+  /** True once `pid` is gone (ESRCH from a signal-0 probe). */
+  function isDead(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ESRCH';
+    }
+  }
+
+  async function waitDead(pid: number, budgetMs: number): Promise<boolean> {
+    const deadline = Date.now() + budgetMs;
+    while (Date.now() < deadline) {
+      if (isDead(pid)) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return isDead(pid);
+  }
+
+  it('a detached descendant that outlives the shell is ALSO terminated on timeout (no survivor), exit still 124', async () => {
+    // A background child that records its pid then stays alive far longer than
+    // the runner timeout — the "background server/watcher" of the finding. It
+    // is spawned via shell `&`, so it shares the shell's process GROUP.
+    const bg = [
+      'const fs = require("fs");',
+      'fs.writeFileSync(process.argv[2], String(process.pid));',
+      'setTimeout(() => {}, 60000);',
+    ].join('\n');
+    // The FOREGROUND command also blocks past the timeout, so the runner's own
+    // timer fires (rather than the command exiting on its own).
+    const hang = 'setTimeout(() => {}, 60000);';
+    fs.writeFileSync(path.join(scratch, 'bg.cjs'), bg, 'utf8');
+    fs.writeFileSync(path.join(scratch, 'hang.cjs'), hang, 'utf8');
+    const pidFile = path.join(scratch, 'survivor.pid');
+
+    const runner = defaultVerificationRunner({ timeoutMs: 300, terminateGraceMs: 100 });
+    const command = `node bg.cjs ${JSON.stringify(pidFile)} & node hang.cjs`;
+    const outcome = await runner(command, scratch);
+
+    // The timeout is still reported honestly.
+    expect(outcome.exitCode).toBe(124);
+    expect(outcome.launchFailed).toBe(false);
+
+    // The descendant recorded its pid and — with the process-GROUP reap — is
+    // gone. Without the fix (`exec` signalling only the immediate shell) this
+    // orphan survives and the assertion fails.
+    expect(fs.existsSync(pidFile)).toBe(true);
+    survivorPid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+    expect(Number.isInteger(survivorPid)).toBe(true);
+    expect(await waitDead(survivorPid, 3000)).toBe(true);
+  });
+});
+
 describe('W3-1 — primary-checkout mutation guard', () => {
   it('an out-of-worktree write into the PRIMARY checkout is a typed violation and fails verification honestly', async () => {
     const { service, worktrees: wt, repo: r } = await setup({
