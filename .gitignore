@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.harness-orchestrator/
+*.db
+*.db-shm
+*.db-wal
+coverage/
+.claude/

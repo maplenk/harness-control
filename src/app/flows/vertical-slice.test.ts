@@ -1,0 +1,1004 @@
+/**
+ * OFFLINE VERTICAL SLICE (PLAN §19, §20 P3 exit gate) — the full loop composed
+ * end-to-end against the IN-PROCESS FAKE adapter + a REAL temp git repo, with no
+ * real spawns. This file owns the two §19 rows that are pure COMPOSITION (the
+ * per-flow rows 12/17/18/30 are proven in their own flows' suites):
+ *
+ *  - test 19: `goal → spec → approve → implement → verify → merge_ready`, the
+ *    whole post-`start` slice threaded through `OrchestrationService`,
+ *    `CoordinatorRunner`, `runImplementVerifyLoop`, and the verifier driver —
+ *    plus the REMEDIATION branch (round 1 blocks → `needs_remediation` → round 2
+ *    passes → `merge_ready`) to prove that seam composes too;
+ *  - test 22: mechanical checkpoint sufficiency — a predecessor verifies one
+ *    criterion, writes a MECHANICAL checkpoint (no LLM), and is "killed"; a
+ *    fresh successor service recovers phase from the event log, reads the
+ *    checkpoint back from the CAS ALONE, and completes verification without
+ *    replaying any predecessor turn;
+ *  - W1-F1/W1-F4 composition: a verification command that mutates the
+ *    worktree dirties it AFTER the recorded commit → the §16 gate blocks →
+ *    T23 rounds (bounded), never a false merge_ready.
+ *
+ * Every §6.3 verdict transition (T1/T23/T24) goes through the service's single
+ * authoritative `ingest`; the §6.2 linear dispatch advances go through
+ * `advanceWorkflowPhase` inside the orchestrator; and the primary checkout is
+ * asserted byte-for-byte untouched throughout (§16 / §19 test 17 invariant).
+ */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  artifactHash,
+  assignmentId,
+  criterionId,
+  eventSequence,
+  segmentId as mkSegmentId,
+  type ArtifactHash,
+  type CriterionId,
+  type RunId,
+} from '../../domain/ids.js';
+import type { CriterionCheckpointState, WorktreeState } from '../../domain/entities.js';
+import { DeterministicIdFactory, RandomIdFactory } from '../../lib/id-factory.js';
+import { unwrap } from '../../lib/result.js';
+import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
+import { ArtifactStore } from '../../artifacts/store.js';
+import { loadProfileFile, type Profile } from '../../config/profile.js';
+import { buildCheckpointContent } from '../../checkpoint/content.js';
+import { writeCheckpoint } from '../../checkpoint/writer.js';
+import {
+  InProcessFakeAdapter,
+  type ConfigOptionDescriptor,
+  type InProcessTurnScript,
+  type PromptInput,
+  type PromptResult,
+} from '../../adapters/index.js';
+import { GitWorktreeManager } from '../../worktree/index.js';
+import * as git from '../../worktree/git.js';
+import {
+  assertPrimaryCheckoutUntouched,
+  makeTempGitRepo,
+  snapshotPrimaryCheckout,
+  type TempGitRepo,
+} from '../../worktree/test-support.js';
+import {
+  OrchestrationService,
+  type RoleAdapterFactory,
+  type RoleAdapterOptions,
+} from '../service.js';
+import type { Harness, RoleModelSpec } from '../model-resolution.js';
+import { CoordinatorRunner, type CoordinatorOutcome } from './coordinator.js';
+import { runImplementVerifyLoop } from './orchestrate.js';
+import {
+  gitMergeReadinessProbe,
+  runVerification,
+  VerifierRunner,
+  type EvidenceRecorder,
+  type VerificationBinding,
+  type VerifierResumeState,
+} from './verifier.js';
+import type { VerificationRunner } from './implementor.js';
+
+// ---------------------------------------------------------------------------
+// Role model specs (mirrors the P3 live smoke: coordinator=Claude, impl=Codex)
+// ---------------------------------------------------------------------------
+const COORDINATOR: RoleModelSpec = { harness: 'claude', model: 'opus', effort: 'low' };
+const IMPLEMENTOR: RoleModelSpec = { harness: 'codex', model: 'gpt-5.6-terra', effort: 'medium' };
+const VERIFIER: RoleModelSpec = { harness: 'claude', model: 'sonnet', effort: 'medium' };
+const PROFILE_PATH = fileURLToPath(new URL('../../../profiles/coordinator.md', import.meta.url));
+
+function configOptionsFor(harness: Harness): ConfigOptionDescriptor[] {
+  if (harness === 'claude') {
+    return [
+      { id: 'model', kind: 'model', values: ['opus', 'sonnet', 'haiku'], current: 'sonnet' },
+      { id: 'thinking', kind: 'reasoning', values: ['minimal', 'low', 'medium', 'high'], current: 'medium' },
+    ];
+  }
+  return [
+    { id: 'model', kind: 'model', values: ['gpt-5.6-terra', 'gpt-5.6-sol'], current: 'gpt-5.6-sol' },
+    { id: 'model_reasoning_effort', kind: 'reasoning', values: ['minimal', 'low', 'medium', 'high'], current: 'medium' },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Spec fixture (§7) — two concretely-testable criteria (AC-1, AC-2)
+// ---------------------------------------------------------------------------
+const GOAL = 'Add a --verbose flag to the CLI so debug lines print to stderr.';
+
+function validSpec(): Record<string, unknown> {
+  return {
+    goal: GOAL,
+    assumptions: ['The CLI entrypoint is src/cli/index.ts.'],
+    openQuestions: [],
+    constraints: ['Touch only files under src/cli'],
+    permissions: ['read and write within the assigned worktree'],
+    nonGoals: ['No change to the existing log format'],
+    tasks: [
+      { id: 'T1', description: 'Recognize --verbose in the arg parser', dependsOn: [] },
+      { id: 'T2', description: 'Gate debug output on the flag', dependsOn: ['T1'] },
+    ],
+    acceptanceCriteria: [
+      {
+        id: 'AC-1',
+        description: 'The --verbose flag enables debug output',
+        verificationCommands: ['echo check-ac1'],
+        expectedEvidence: 'exits with code 0 and stderr contains the debug prefix',
+      },
+      {
+        id: 'AC-2',
+        description: 'Without the flag no debug output is printed',
+        verificationCommands: ['echo check-ac2'],
+        expectedEvidence: 'exit code is 0 and stdout has no line matching the debug prefix',
+      },
+    ],
+    rollback: 'Revert the single commit on the worktree branch.',
+    proposedImplementorProfile: 'implementor',
+    proposedVerifierProfile: 'verifier',
+    explorationNotes: 'The arg parser lives in src/cli/index.ts around lines 20 to 40.',
+  };
+}
+
+const fence = (o: unknown): string => '```json\n' + JSON.stringify(o, null, 2) + '\n```';
+
+function coordinatorTurn(spec: unknown): InProcessTurnScript {
+  return {
+    updates: [{ kind: 'agent_message_chunk', text: `Here is the specification.\n\n${fence(spec)}` }],
+    result: { stopReason: 'end_turn' },
+  };
+}
+
+const implementorTurn = (text: string): InProcessTurnScript => ({
+  updates: [
+    { kind: 'agent_message_chunk', text },
+    { kind: 'usage_update', usedTokens: 500, contextWindowSize: 200_000, cost: { amount: 0.05, currency: 'USD' } },
+  ],
+  result: { stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 40, source: 'adapter' } },
+});
+
+function verifierTurn(
+  rows: ReadonlyArray<{ id: string; verdict: string; evidence?: string; fix?: string }>,
+): InProcessTurnScript {
+  const payload = {
+    criteria: rows.map((r) => ({
+      id: r.id,
+      verdict: r.verdict,
+      ...(r.evidence !== undefined ? { evidence: r.evidence } : {}),
+      ...(r.fix !== undefined ? { fix: r.fix } : {}),
+    })),
+  };
+  return { updates: [{ kind: 'agent_message_chunk', text: JSON.stringify(payload) }], result: { stopReason: 'end_turn' } };
+}
+
+const PASS_VERIFY: VerificationRunner = async (command) => ({
+  exitCode: 0,
+  stdout: `ran ${command}`,
+  stderr: '',
+  launchFailed: false,
+});
+
+// ---------------------------------------------------------------------------
+// Slice adapter factory: routes by role, applies per-adapter worktree writes,
+// records prompt text. Each role has an ordered queue of adapter scripts (the
+// Nth adapter of that role gets the Nth entry).
+// ---------------------------------------------------------------------------
+interface AdapterScript {
+  /** Files the "agent" writes into its worktree cwd on each prompt (implementor). */
+  readonly writes?: ReadonlyArray<{ readonly relPath: string; readonly content: string }>;
+  readonly turns: readonly InProcessTurnScript[];
+}
+
+interface CreatedAdapter {
+  readonly role: string;
+  readonly options: RoleAdapterOptions;
+  readonly adapter: InProcessFakeAdapter;
+  readonly prompts: string[];
+}
+
+function makeSliceFactory(scripts: {
+  readonly coordinator?: readonly AdapterScript[];
+  readonly implementor?: readonly AdapterScript[];
+  readonly verifier?: readonly AdapterScript[];
+}): { factory: RoleAdapterFactory; created: CreatedAdapter[] } {
+  const created: CreatedAdapter[] = [];
+  const cursors: Record<string, number> = {};
+  const factory: RoleAdapterFactory = {
+    create(options) {
+      const role = options.role;
+      const idx = cursors[role] ?? 0;
+      cursors[role] = idx + 1;
+      const queue = scripts[role as keyof typeof scripts] ?? [];
+      const script: AdapterScript = queue[idx] ?? { turns: [] };
+      const adapter = new InProcessFakeAdapter({
+        harnessId: options.resolved.harness,
+        capabilities: { configOptions: configOptionsFor(options.resolved.harness) },
+        turns: script.turns,
+      });
+      const prompts: string[] = [];
+      const orig = adapter.prompt.bind(adapter);
+      (adapter as unknown as { prompt: (input: PromptInput) => Promise<PromptResult> }).prompt = async (
+        input,
+      ) => {
+        prompts.push(input.prompt);
+        for (const write of script.writes ?? []) {
+          const target = path.join(options.cwd, write.relPath);
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.writeFileSync(target, write.content, 'utf8');
+        }
+        return orig(input);
+      };
+      created.push({ role, options, adapter, prompts });
+      return { adapter, dispose: (): Promise<void> => adapter.close() };
+    },
+  };
+  return { factory, created };
+}
+
+/** Deterministic in-memory evidence sink (records every gathered evidence). */
+function fakeEvidence(): {
+  recorder: EvidenceRecorder;
+  records: Array<{ criterionId: string; content: string; hash: string }>;
+} {
+  const records: Array<{ criterionId: string; content: string; hash: string }> = [];
+  let n = 0;
+  const recorder: EvidenceRecorder = {
+    async record(input) {
+      n += 1;
+      const hash = `ev_${String(input.criterionId)}_${n}`;
+      records.push({ criterionId: String(input.criterionId), content: input.content, hash });
+      return artifactHash(hash);
+    },
+  };
+  return { recorder, records };
+}
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+let dbHandle: TestDatabaseHandle | undefined;
+let repo: TempGitRepo | undefined;
+let worktrees: GitWorktreeManager | undefined;
+let casDir: string | undefined;
+
+afterEach(async () => {
+  if (worktrees !== undefined) {
+    try {
+      fs.rmSync(worktrees.baseDir, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+  worktrees = undefined;
+  dbHandle?.close();
+  dbHandle?.cleanup();
+  dbHandle = undefined;
+  await repo?.cleanup();
+  repo = undefined;
+  if (casDir !== undefined) await rm(casDir, { recursive: true, force: true });
+  casDir = undefined;
+});
+
+interface Slice {
+  readonly service: OrchestrationService;
+  readonly worktrees: GitWorktreeManager;
+  readonly repo: TempGitRepo;
+  readonly store: ArtifactStore;
+  readonly ids: DeterministicIdFactory;
+  readonly flowIds: DeterministicIdFactory;
+  readonly created: CreatedAdapter[];
+  readonly profile: Profile;
+}
+
+async function openSlice(scripts: {
+  readonly coordinator?: readonly AdapterScript[];
+  readonly implementor?: readonly AdapterScript[];
+  readonly verifier?: readonly AdapterScript[];
+}): Promise<Slice> {
+  repo = await makeTempGitRepo('harness-slice-');
+  dbHandle = await openTestDatabase({ kind: 'better-sqlite3', file: true });
+  casDir = await mkdtemp(path.join(tmpdir(), 'harness-slice-cas-'));
+  worktrees = await GitWorktreeManager.open({ primaryRepoRoot: repo.dir, clock: dbHandle.db.clock });
+  const ids = new DeterministicIdFactory();
+  const flowIds = new DeterministicIdFactory();
+  const store = new ArtifactStore({ rootDir: casDir, clock: dbHandle.db.clock, ids: flowIds });
+  const { factory, created } = makeSliceFactory(scripts);
+  const service = new OrchestrationService({ db: dbHandle.db, ids, adapterFactory: factory });
+  const profileResult = loadProfileFile(PROFILE_PATH);
+  if (!profileResult.ok) throw new Error(`coordinator profile failed to load: ${JSON.stringify(profileResult.error)}`);
+  return { service, worktrees, repo, store, ids, flowIds, created, profile: profileResult.value };
+}
+
+/** created → specifying → awaiting_approval (coordinator) → approved (human T1). */
+async function coordinateAndApprove(slice: Slice): Promise<{ runId: RunId; outcome: CoordinatorOutcome }> {
+  const { runId } = slice.service.createRun({ goal: GOAL, workspacePath: slice.repo.dir, coordinator: COORDINATOR });
+  const runner = new CoordinatorRunner({
+    goal: GOAL,
+    profile: slice.profile,
+    artifactStore: slice.store,
+    ids: slice.flowIds,
+    clock: dbHandle!.db.clock,
+    explorationContext: 'src/cli/index.ts (base deadbeef): a hand-rolled arg parser.',
+  });
+  const outcome = await slice.service.runCoordination(runId, runner);
+  expect(slice.service.status(runId).phase).toBe('awaiting_approval');
+  const approved = slice.service.approve(runId, {
+    specVersionId: outcome.specVersion.id,
+    specHash: outcome.specVersion.contentHash,
+  });
+  expect(approved.status).toBe('applied');
+  expect(slice.service.status(runId).phase).toBe('approved');
+  return { runId, outcome };
+}
+
+// ===========================================================================
+// PLAN §19 test 19 — full offline slice → merge_ready
+// ===========================================================================
+describe('PLAN §19 test 19 — goal → spec → approve → implement → verify → merge_ready (offline, fakes)', () => {
+  it('composes the whole loop end to end and reaches a READY merge-readiness in one round', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose. Risk: no integration test added.')],
+        },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0, stderr has debug prefix' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0, no debug line on stdout' },
+            ]),
+          ],
+        },
+      ],
+    });
+
+    const before = await snapshotPrimaryCheckout(slice.repo.dir);
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder, records } = fakeEvidence();
+    const asg = assignmentId('asg_slice_happy');
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag end to end in the CLI.',
+        criteria: outcome.specVersion.criteria,
+        constraints: ['Touch only files under src/cli'],
+        explorationArtifact: 'The arg parser lives in src/cli/index.ts (bound to base deadbeef).',
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+      },
+    );
+
+    // --- The whole loop converged to merge_ready in one round (T24) ---------
+    expect(result.outcome).toBe('merge_ready');
+    expect(result.finalPhase).toBe('merge_ready');
+    expect(result.rounds).toHaveLength(1);
+    expect(slice.service.status(runId).phase).toBe('merge_ready');
+    expect(slice.service.status(runId).uiState).toBe('done');
+
+    // --- §16 MergeReadiness: ready, binds spec hash + base + verified commit
+    const mr = result.mergeReadiness;
+    expect(mr).toBeDefined();
+    expect(mr!.ready).toBe(true);
+    expect(mr!.specHash).toBe(outcome.specVersion.contentHash);
+    expect(String(mr!.verifiedCommit)).toBe(String(result.implementationCommit));
+    expect(mr!.manualIntegrationCommands.some((c) => c.includes('merge --no-ff'))).toBe(true);
+
+    // --- The verifier bound to the EXACT worktree HEAD (host-read) ----------
+    const worktreeHead = await git.resolveSha(result.worktree.worktreePath, 'HEAD');
+    expect(worktreeHead).toBe(String(result.implementationCommit));
+    expect(result.rounds[0]!.implementation!.commitSha).toBeDefined();
+
+    // --- Every criterion is backed by the verifier's OWN evidence (§8) ------
+    expect(records.map((r) => r.criterionId).sort()).toEqual(['AC-1', 'AC-2']);
+    for (const c of result.rounds[0]!.verification.verification.criteria) {
+      expect(c.verdict).toBe('passed');
+      expect(c.evidenceRefs).toHaveLength(1);
+    }
+
+    // --- Every §6.3 verdict transition went through the authoritative log ---
+    const types = dbHandle!.db.events.listByRun(runId).map((e) => e.type);
+    expect(types).toContain('spec.approved'); // T1
+    expect(types).toContain('verification.completed.passed'); // T24
+    expect(types).toContain('merge.readiness.recorded');
+    expect(types).not.toContain('verification.completed.failed');
+
+    // --- §11.2 pins actually applied on both spawned roles ------------------
+    const impl = slice.created.find((c) => c.role === 'implementor')!;
+    const implPins = impl.adapter.log.filter((e) => e.op === 'setConfigOption').map((e) => e.detail);
+    expect(implPins).toEqual([
+      { optionId: 'model', value: 'gpt-5.6-terra' },
+      { optionId: 'model_reasoning_effort', value: 'medium' },
+    ]);
+    expect(path.resolve(impl.options.cwd)).toBe(path.resolve(result.worktree.worktreePath));
+    const verifier = slice.created.find((c) => c.role === 'verifier')!;
+    expect(path.resolve(verifier.options.cwd)).toBe(path.resolve(result.worktree.worktreePath));
+
+    // --- §16/§19 test 17: the primary checkout is byte-for-byte untouched ---
+    await assertPrimaryCheckoutUntouched(slice.repo.dir, before);
+    expect(String(result.implementationCommit)).not.toBe(await slice.repo.headSha());
+
+    await slice.worktrees.removeWorktree(asg);
+  });
+
+  it('§16: the merge-readiness switch command targets the repo\'s ACTUAL branch (master), not a hardcoded main', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+            ]),
+          ],
+        },
+      ],
+    });
+
+    // Rename the primary checkout's branch main → master BEFORE the loop, so the
+    // §16 destination hint must be resolved from the repo (not defaulted to main).
+    await slice.repo.run(['branch', '-m', 'master']);
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_slice_master');
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag end to end in the CLI.',
+        criteria: outcome.specVersion.criteria,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+        // NB: no destinationLabel — the loop must read the branch from the repo.
+      },
+    );
+
+    expect(result.outcome).toBe('merge_ready');
+    const commands = result.mergeReadiness!.manualIntegrationCommands;
+    expect(commands.some((c) => /\bswitch master\b/.test(c))).toBe(true);
+    expect(commands.some((c) => /\bswitch main\b/.test(c))).toBe(false);
+
+    await slice.worktrees.removeWorktree(asg);
+  });
+
+  it('composes the REMEDIATION branch: round 1 blocks (T23 → needs_remediation) → round 2 passes (T24 → merge_ready)', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        // Round 1: only AC-1 is satisfied.
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Wired --verbose. AC-2 (no-flag path) still open.')],
+        },
+        // Round 2: the remediation commit closes AC-2 (new file → HEAD advances).
+        {
+          writes: [{ relPath: 'src/cli/quiet.ts', content: 'export const quietByDefault = true;\n' }],
+          turns: [implementorTurn('Addressed the verifier fix-request for AC-2.')],
+        },
+      ],
+      verifier: [
+        // Round 1: AC-2 fails with a structured fix-request.
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+              { id: 'AC-2', verdict: 'failed', evidence: 'ran check-ac2: debug line leaked', fix: 'gate debug on the flag' },
+            ]),
+          ],
+        },
+        // Round 2: both pass.
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0, quiet by default' },
+            ]),
+          ],
+        },
+      ],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_slice_remediate');
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag end to end in the CLI.',
+        criteria: outcome.specVersion.criteria,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+      },
+    );
+
+    // --- Two rounds; ended at merge_ready ----------------------------------
+    expect(result.rounds).toHaveLength(2);
+    expect(result.outcome).toBe('merge_ready');
+    expect(slice.service.status(runId).phase).toBe('merge_ready');
+    // Round 1 blocked; round 2 all-verified.
+    expect(result.rounds[0]!.verification.verification.outcome).toBe('blocked');
+    expect(result.rounds[1]!.verification.verification.outcome).toBe('all_verified');
+    expect(result.mergeReadiness!.ready).toBe(true);
+
+    // --- The engine drove T23 (needs_remediation) then T24 (merge_ready) ----
+    const types = dbHandle!.db.events.listByRun(runId).map((e) => e.type);
+    expect(types).toContain('verification.completed.failed'); // T23
+    expect(types).toContain('remediation.started');
+    expect(types).toContain('verification.completed.passed'); // T24
+    expect(slice.service.status(runId).counters.remediationRounds).toBe(1);
+
+    // --- Round 2's implementor prompt carried the structured fix-request ----
+    const implAdapters = slice.created.filter((c) => c.role === 'implementor');
+    expect(implAdapters).toHaveLength(2);
+    const round2Prompt = implAdapters[1]!.prompts[0] ?? '';
+    expect(round2Prompt).toContain('Remediation');
+    expect(round2Prompt).toContain('AC-2');
+    expect(round2Prompt).toContain('gate debug on the flag');
+
+    // --- The final verified commit advanced past round 1 (remediation commit)
+    expect(String(result.rounds[1]!.implementationCommit)).not.toBe(
+      String(result.rounds[0]!.implementationCommit),
+    );
+
+    await slice.worktrees.removeWorktree(asg);
+  });
+});
+
+// ===========================================================================
+// W1-F1 + W1-F4 composition — §16 readiness gates merge_ready end to end
+// ===========================================================================
+describe('W1-F1/W1-F4 — a mutating verification command never yields merge_ready', () => {
+  it('criteria verify every round but the §16 worktree-dirty blocker forces T23 rounds (bounded) — never a false merge_ready', async () => {
+    const allPass = verifierTurn([
+      { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+      { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+    ]);
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+        {
+          writes: [{ relPath: 'src/cli/quiet.ts', content: 'export const quietByDefault = true;\n' }],
+          turns: [implementorTurn('Round 2: addressed the integration blocker as far as in-scope.')],
+        },
+      ],
+      // BOTH rounds: every criterion verifies — only §16 readiness blocks.
+      verifier: [{ turns: [allPass] }, { turns: [allPass] }],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_slice_mutating');
+
+    // A verification command that MUTATES the worktree on every run (unique
+    // content per call, so a later round's commit never masks it).
+    let calls = 0;
+    const mutatingVerify: VerificationRunner = async (command, cwd) => {
+      calls += 1;
+      fs.writeFileSync(path.join(cwd, 'verify-side-effect.txt'), `verification run ${calls}\n`);
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag end to end in the CLI.',
+        criteria: outcome.specVersion.criteria,
+        evidence: recorder,
+        runVerificationCommands: mutatingVerify,
+        maxRounds: 2,
+      },
+    );
+
+    // --- NEVER a false merge_ready: both rounds blocked on §16 (W1-F1) -----
+    expect(result.outcome).toBe('needs_remediation');
+    expect(result.finalPhase).toBe('needs_remediation');
+    expect(slice.service.status(runId).phase).toBe('needs_remediation');
+    expect(result.rounds).toHaveLength(2);
+    expect(slice.service.status(runId).counters.remediationRounds).toBe(2);
+
+    // --- W1-F4: the implementor report caught the post-commit dirt ----------
+    expect(result.rounds[0]!.implementation!.postVerificationDirty).toBe(true);
+    expect(result.rounds[0]!.implementation!.postVerificationDirtyFiles).toContain('verify-side-effect.txt');
+
+    // --- The §16 report is honest: not ready, blocker names the file --------
+    const mr = result.mergeReadiness!;
+    expect(mr).toBeDefined();
+    expect(mr.ready).toBe(false);
+    expect(mr.worktreeClean).toBe(false);
+    expect(mr.blockers.some((b) => b.includes('verify-side-effect.txt'))).toBe(true);
+
+    // --- The engine saw ONLY T23 (readiness-blocked shape), never T24 -------
+    const events = dbHandle!.db.events.listByRun(runId);
+    const failedEvents = events.filter((e) => e.type === 'verification.completed.failed');
+    expect(failedEvents.length).toBe(2);
+    for (const e of failedEvents) {
+      const payload = e.payload as unknown as {
+        failedCriteria: readonly string[];
+        readinessBlockers?: readonly string[];
+      };
+      expect(payload.failedCriteria).toEqual([]); // criteria verified — §16 blocked
+      expect(payload.readinessBlockers?.some((b) => b.includes('verify-side-effect.txt'))).toBe(true);
+    }
+    expect(events.map((e) => e.type)).not.toContain('verification.completed.passed');
+    expect(events.map((e) => e.type)).not.toContain('merge.readiness.recorded');
+
+    // --- Round 2's implementor prompt carried the integration blocker + the
+    // --- W1-F4 guidance (make verification side-effect-free / commit files).
+    const implAdapters = slice.created.filter((c) => c.role === 'implementor');
+    expect(implAdapters).toHaveLength(2);
+    const round2Prompt = implAdapters[1]!.prompts[0] ?? '';
+    expect(round2Prompt).toContain('§16 integration blocker');
+    expect(round2Prompt).toContain('verify-side-effect.txt');
+    expect(round2Prompt).toMatch(/side-effect-free/);
+
+    await slice.worktrees.removeWorktree(asg); // force-removes the dirty worktree
+  });
+});
+
+// ===========================================================================
+// W3-1 composition — a verification command that ESCAPES into the PRIMARY
+// checkout: typed violation, durable incident event, §16 readiness blocked
+// (T23), never merge_ready.
+// ===========================================================================
+describe('W3-1 — a verification command that writes into the PRIMARY checkout never yields merge_ready', () => {
+  it('records the typed violation + durable incident and blocks §16 readiness (T23) despite all criteria verifying', async () => {
+    const allPass = verifierTurn([
+      { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+      { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+    ]);
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+      ],
+      verifier: [{ turns: [allPass] }],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_slice_w3_escape');
+
+    // The reviewer-proven probe: the verification command writes OUTSIDE the
+    // worktree, into the primary checkout, and still exits 0.
+    const escapingVerify: VerificationRunner = async (command) => {
+      fs.writeFileSync(
+        path.join(slice.repo.dir, 'planted-by-verification.txt'),
+        'escaped the worktree\n',
+      );
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag end to end in the CLI.',
+        criteria: outcome.specVersion.criteria,
+        evidence: recorder,
+        runVerificationCommands: escapingVerify,
+        maxRounds: 1,
+      },
+    );
+
+    // --- NEVER merge_ready: the poisoned round fails verification (T23) -----
+    expect(result.outcome).toBe('needs_remediation');
+    expect(result.finalPhase).toBe('needs_remediation');
+    expect(slice.service.status(runId).phase).toBe('needs_remediation');
+
+    // --- The round report carries the typed violation, self-check failed ----
+    const impl = result.rounds[0]!.implementation!;
+    expect(impl.runnerViolation).toBeDefined();
+    expect(impl.runnerViolation!.kind).toBe('verification_runner_violation');
+    expect(impl.runnerViolation!.changedPaths).toContain('planted-by-verification.txt');
+    expect(impl.verificationPassed).toBe(false); // commands exited 0; the guard failed it
+
+    // --- The durable incident event landed BEFORE the verifier verdict ------
+    const events = dbHandle!.db.events.listByRun(runId);
+    const incidents = events.filter((e) => e.type === 'verification.runner.violation');
+    expect(incidents).toHaveLength(1);
+    const incidentPayload = incidents[0]!.payload as unknown as {
+      assignmentId: string;
+      changedPaths: readonly string[];
+      headBefore: string;
+      detail: string;
+    };
+    expect(incidentPayload.assignmentId).toBe(String(asg));
+    expect(incidentPayload.changedPaths).toContain('planted-by-verification.txt');
+    expect(incidentPayload.headBefore).toMatch(/^[0-9a-f]{40}$/);
+    const incidentSeq = Number(incidents[0]!.sequence);
+    const verdictSeq = Number(
+      events.find((e) => e.type === 'verification.completed.failed')!.sequence,
+    );
+    expect(incidentSeq).toBeLessThan(verdictSeq);
+
+    // --- §16 blocked: criteria ALL verified, the violation blocker forced T23
+    const failed = events.filter((e) => e.type === 'verification.completed.failed');
+    expect(failed).toHaveLength(1);
+    const t23Payload = failed[0]!.payload as unknown as {
+      failedCriteria: readonly string[];
+      unprovenCriteria: readonly string[];
+      readinessBlockers?: readonly string[];
+    };
+    expect(t23Payload.failedCriteria).toEqual([]);
+    expect(t23Payload.unprovenCriteria).toEqual([]);
+    expect(
+      t23Payload.readinessBlockers?.some((b) => b.startsWith('verification-runner violation')),
+    ).toBe(true);
+    expect(events.map((e) => e.type)).not.toContain('verification.completed.passed');
+
+    // --- The readiness report is honest: not ready, both blockers present ---
+    const mr = result.mergeReadiness!;
+    expect(mr.ready).toBe(false);
+    expect(mr.blockers.some((b) => b.startsWith('verification-runner violation'))).toBe(true);
+    expect(mr.destinationClean).toBe(false); // the planted file also dirtied the destination
+
+    // --- The remediation payload tells the next round exactly what happened -
+    expect(
+      result.rounds[0]!.verification.fixRequests.some(
+        (fr) =>
+          fr.kind === 'integration_blocker' &&
+          fr.summary.startsWith('verification-runner violation') &&
+          fr.requestedChange !== undefined &&
+          /strictly inside the assignment worktree/.test(fr.requestedChange),
+      ),
+    ).toBe(true);
+
+    await slice.worktrees.removeWorktree(asg);
+  });
+});
+
+// ===========================================================================
+// PLAN §19 test 22 — mechanical checkpoint sufficiency across a kill
+// ===========================================================================
+describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpoint ALONE and completes', () => {
+  it('predecessor checkpoints AC-1=passed and dies; a fresh successor recovers, reads the CAS checkpoint, and reaches merge_ready without replay', async () => {
+    // The predecessor implements + commits, then verifies only AC-1 before the
+    // "crash"; the successor gets its own verifier adapter (scripted for AC-2).
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+      ],
+      // Predecessor verifier (AC-1 only) + successor verifier (AC-2 only).
+      verifier: [
+        { turns: [verifierTurn([{ id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' }])] },
+        { turns: [verifierTurn([{ id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' }])] },
+      ],
+    });
+    const db = dbHandle!.db;
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const criteria = outcome.specVersion.criteria;
+    const specHash = outcome.specVersion.contentHash;
+    const asg = assignmentId('asg_slice_kill');
+
+    // --- Predecessor implements + commits (real worktree, real commit) ------
+    const handle = await slice.worktrees.createWorktree({ assignmentId: asg });
+    slice.service.advanceWorkflowPhase(runId, 'approved', 'implementing');
+    // Reuse the implementor flow via the loop's own machinery is overkill here;
+    // drive it directly for the one predecessor round.
+    const { ImplementorFlow } = await import('./implementor.js');
+    const implFlow = new ImplementorFlow(
+      handle,
+      {
+        goal: GOAL,
+        specHash,
+        specDocument: outcome.canonicalSpec,
+        criteria,
+        taskScope: 'Implement --verbose.',
+      },
+      { runVerification: PASS_VERIFY },
+    );
+    const implResult = await slice.service.runRole(runId, implFlow, IMPLEMENTOR, handle.worktreePath);
+    slice.worktrees.releaseLease(asg);
+    const implCommit = implResult.commitSha!;
+    expect(implCommit).toBeDefined();
+    slice.service.advanceWorkflowPhase(runId, 'implementing', 'verifying');
+
+    // --- Predecessor verifies AC-1 (its own evidence), then checkpoints -----
+    const { recorder, records } = fakeEvidence();
+    const ac1Runner = new VerifierRunner({
+      criteria: [criteria[0]!], // AC-1 only
+      implementationCommit: implCommit,
+      evidence: recorder,
+    });
+    const ac1Gathering = await slice.service.runRole(runId, ac1Runner, VERIFIER, handle.worktreePath);
+    expect(ac1Gathering.criteria[0]!.verdict).toBe('passed');
+    const ac1EvidenceRef = ac1Gathering.criteria[0]!.evidenceRefs[0]!;
+    expect(records).toHaveLength(1); // AC-1 evidence gathered by the predecessor
+
+    // Mechanical checkpoint (§12.2 — no LLM): AC-1 passed w/ its evidence,
+    // AC-2 still pending. Written to the CAS, event appended via `ingest`.
+    const worktreeState: WorktreeState = {
+      headSha: implCommit,
+      statusPorcelain: '',
+      diffHash: artifactHash('diff_pred'),
+      lockfileCleanupPerformed: false,
+      taintFlags: [],
+    };
+    const criterionStates: ReadonlyArray<{ criterionId: CriterionId; state: CriterionCheckpointState }> = [
+      { criterionId: criteria[0]!.id, state: 'passed' },
+      { criterionId: criteria[1]!.id, state: 'pending' },
+    ];
+    const checkpointContent = buildCheckpointContent({
+      lineage: { harnessId: VERIFIER.harness, model: VERIFIER.model },
+      eventCursor: eventSequence(1),
+      specHash,
+      criterionStates,
+      permissionPolicy: { mode: 'headless', allowlist: [] },
+      worktree: worktreeState,
+      artifactRefs: [ac1EvidenceRef],
+    });
+    const written = unwrap(
+      await writeCheckpoint(
+        { artifacts: db.artifacts, clock: db.clock, ids: slice.ids },
+        {
+          runId,
+          segmentId: mkSegmentId('seg_predecessor'),
+          assignmentId: asg,
+          reason: 'pre_verify_handoff',
+          content: checkpointContent,
+        },
+      ),
+    );
+    const recorded = slice.service.ingest(written.event);
+    expect(recorded.status).toBe('recorded');
+    const checkpointArtifactHash = written.checkpoint.artifactHash;
+
+    // ===== KILL: drop the predecessor service; build a FRESH successor on the
+    // ===== same durable store (fresh in-memory engine state, §12.3). A real
+    // ===== restarted process gets UUID-based ids (RandomIdFactory), so its
+    // ===== idempotency keys never collide with the predecessor's — modeling
+    // ===== that faithfully here rather than reusing a deterministic counter.
+    const successorIds = new RandomIdFactory();
+    const { factory: successorFactory, created: successorCreated } = makeSliceFactory({
+      // The successor gets its own verifier adapter, scripted for AC-2 only.
+      verifier: [
+        { turns: [verifierTurn([{ id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' }])] },
+      ],
+    });
+    const successor = new OrchestrationService({ db, ids: successorIds, adapterFactory: successorFactory });
+
+    // §12.3: ORCHESTRATOR state is recovered from the event log (phase=verifying).
+    const recovered = successor.recover(runId);
+    expect(recovered.phase).toBe('verifying');
+
+    // The AGENT's in-context progress is recovered ONLY from the checkpoint:
+    // read it back from the CAS by its committed event — nothing else.
+    const checkpointEvent = db.events
+      .listByRun(runId)
+      .find((e) => e.type === 'checkpoint.recorded');
+    expect(checkpointEvent).toBeDefined();
+    const storedHash = (checkpointEvent!.payload as { artifactHash: ArtifactHash }).artifactHash;
+    expect(String(storedHash)).toBe(String(checkpointArtifactHash));
+    const bytes = db.artifacts.readBytes(storedHash);
+    expect(bytes).toBeDefined();
+    const parsed = JSON.parse(Buffer.from(bytes!).toString('utf8')) as {
+      criterionStates: ReadonlyArray<{ criterionId: string; state: CriterionCheckpointState }>;
+      artifactRefs: readonly string[];
+    };
+    const resumeFrom: VerifierResumeState = {
+      criterionStates: parsed.criterionStates.map((s) => ({
+        criterionId: criterionId(s.criterionId),
+        state: s.state,
+      })),
+      evidenceRefs: parsed.artifactRefs.map((r) => artifactHash(r)),
+    };
+    // The checkpoint alone establishes AC-1=passed with the predecessor's evidence.
+    expect(resumeFrom.criterionStates).toContainEqual({ criterionId: criteria[0]!.id, state: 'passed' });
+    expect(resumeFrom.evidenceRefs.map(String)).toEqual([String(ac1EvidenceRef)]);
+
+    // --- Successor completes verification from the checkpoint ALONE ----------
+    const { recorder: successorRecorder } = fakeEvidence();
+    const binding: VerificationBinding = {
+      assignmentId: asg,
+      specHash,
+      baseCommit: handle.baseSha,
+      implementationCommit: implCommit,
+      repoRoot: handle.repoRoot,
+      worktreeBranch: handle.branch,
+      destinationRef: 'main',
+    };
+    const probe = gitMergeReadinessProbe({
+      repoRoot: handle.repoRoot,
+      worktreePath: handle.worktreePath,
+      baseCommit: handle.baseSha,
+      verifiedCommit: implCommit,
+      destinationRef: 'HEAD',
+    });
+    const successorResult = await runVerification({
+      engine: successor,
+      runId,
+      verifierSpec: VERIFIER,
+      cwd: handle.worktreePath,
+      binding,
+      criteria,
+      evidence: successorRecorder,
+      resumeFrom,
+      mergeReadinessProbe: probe,
+      approvedSpecHash: specHash,
+      ids: successorIds,
+      clock: db.clock,
+    });
+
+    // AC-1 was carried from the checkpoint (NOT re-verified); only AC-2 ran.
+    expect(successorResult.gathering.carriedCriterionIds.map(String)).toEqual([String(criteria[0]!.id)]);
+    expect(successorResult.gathering.verifiedCriterionIds.map(String)).toEqual([String(criteria[1]!.id)]);
+    const ac1 = successorResult.verification.criteria.find((c) => String(c.criterionId) === String(criteria[0]!.id))!;
+    expect(ac1.verdict).toBe('passed');
+    expect(ac1.evidenceRefs.map(String)).toEqual([String(ac1EvidenceRef)]); // the checkpoint's own evidence
+
+    // Exactly ONE successor verifier turn ran — no predecessor turn replayed.
+    const successorVerifier = successorCreated.find((c) => c.role === 'verifier')!;
+    expect(successorVerifier.prompts).toHaveLength(1);
+    expect(successorVerifier.prompts[0]).toContain('AC-2');
+    expect(successorVerifier.prompts[0]).not.toContain('[AC-1]'); // AC-1 not re-verified
+
+    // The successor reached merge_ready from the checkpoint alone (T24, §16).
+    expect(successorResult.gathering.outcome).toBe('all_verified');
+    expect(successorResult.transition.status).toBe('applied');
+    if (successorResult.transition.status === 'applied') {
+      expect(successorResult.transition.transitionId).toBe('T24');
+    }
+    expect(successorResult.mergeReadiness?.ready).toBe(true);
+    expect(successor.status(runId).phase).toBe('merge_ready');
+
+    await slice.worktrees.removeWorktree(asg);
+  });
+});
