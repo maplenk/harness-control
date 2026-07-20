@@ -1,0 +1,1624 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+:root{
+ --bg-0:#0b0e13; --bg-1:#0f1319; --bg-2:#141922; --bg-3:#1a2029; --bg-hover:#212834;
+ --bd:#242b35; --bd-2:#323b47;
+ --tx-1:#e6eaf0; --tx-2:#97a2b1; --tx-3:#616c7e;
+ --accent:#35b0b5; --accent-bg:#0f2625; --accent-bd:#1f4d4e;
+ --amber:#e0a641; --amber-bg:#282010; --amber-bd:#4d3c15;
+ --red:#e0655a; --red-bg:#281410; --red-bd:#4d211c;
+ --green:#4fb87e; --green-bg:#0f2318; --green-bd:#1f4531;
+ --purple:#9a86ff; --purple-bg:#181630; --purple-bd:#2f2a52;
+ --row-pad:9px 12px;
+}
+*{box-sizing:border-box;}
+html,body{margin:0;height:100%;}
+#root,#root>x-dc{height:100%;display:block;}
+body{background:var(--bg-0);color:var(--tx-1);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:13px;line-height:1.45;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased;}
+a{color:var(--accent);text-decoration:none;}
+a:hover{color:#4fc9ce;text-decoration:underline;}
+::selection{background:rgba(53,176,181,.32);}
+@keyframes hcpulse{0%,100%{opacity:1;}50%{opacity:.3;}}
+@media (prefers-reduced-motion: reduce){*{animation:none!important;}}
+::-webkit-scrollbar{width:10px;height:10px;}
+::-webkit-scrollbar-thumb{background:#28303b;border-radius:6px;border:2px solid var(--bg-1);}
+::-webkit-scrollbar-track{background:transparent;}
+</style>
+</helmet>
+<div style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--bg-0);color:var(--tx-1);overflow:hidden;{{ rootVars }}">
+
+  <!-- ===== TOP BAR ===== -->
+  <header style="flex:0 0 auto;height:48px;display:flex;align-items:center;gap:16px;padding:0 14px;border-bottom:1px solid var(--bd);background:var(--bg-1);">
+    <div style="display:flex;align-items:center;gap:9px;padding-right:14px;border-right:1px solid var(--bd);">
+      <div style="width:16px;height:16px;border:1.5px solid var(--accent);border-radius:3px;position:relative;">
+        <div style="position:absolute;inset:3px;background:var(--accent);border-radius:1px;opacity:.85;"></div>
+      </div>
+      <span style="font-weight:650;letter-spacing:.2px;">Harness&nbsp;Control</span>
+    </div>
+    <sc-if value="{{ wide }}" hint-placeholder-val="{{ true }}">
+      <button onClick="{{ noop }}" style="flex:0 0 auto;display:flex;align-items:center;gap:7px;background:transparent;border:1px solid var(--bd);color:var(--tx-2);padding:5px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit;">
+        <span style="width:6px;height:6px;border-radius:50%;background:var(--tx-3);"></span>
+        <span style="font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--tx-1);">harness-orchestration</span>
+        <span style="color:var(--tx-3);">▾</span>
+      </button>
+    </sc-if>
+
+    <nav style="display:flex;align-items:center;gap:2px;flex:0 0 auto;">
+      <sc-for list="{{ nav }}" as="item" hint-placeholder-count="5">
+        <button onClick="{{ item.onClick }}" style="{{ item.style }}">
+          <span>{{ item.label }}</span>
+          <sc-if value="{{ item.badge }}" hint-placeholder-val="">
+            <span style="{{ item.badgeStyle }}">{{ item.badge }}</span>
+          </sc-if>
+        </button>
+      </sc-for>
+    </nav>
+
+    <div style="flex:1;min-width:8px;"></div>
+
+    <sc-if value="{{ wide }}" hint-placeholder-val="{{ true }}">
+      <button onClick="{{ openPalette }}" style="flex:0 1 auto;display:flex;align-items:center;gap:8px;background:var(--bg-2);border:1px solid var(--bd);color:var(--tx-3);padding:5px 9px 5px 11px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit;min-width:150px;">
+        <span style="flex:1;text-align:left;">Search runs, commands…</span>
+        <kbd style="font-family:ui-monospace,Menlo,monospace;font-size:11px;border:1px solid var(--bd-2);border-radius:4px;padding:1px 5px;color:var(--tx-2);">⌘K</kbd>
+      </button>
+    </sc-if>
+    <sc-if value="{{ narrow }}" hint-placeholder-val="">
+      <button onClick="{{ openPalette }}" title="Search / command palette (⌘K)" style="flex:0 0 auto;background:var(--bg-2);border:1px solid var(--bd);color:var(--tx-2);width:30px;height:30px;border-radius:6px;cursor:pointer;font-size:13px;font-family:inherit;">⌕</button>
+    </sc-if>
+
+    <sc-if value="{{ wide }}" hint-placeholder-val="{{ true }}">
+      <div style="flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:0 12px;border-left:1px solid var(--bd);border-right:1px solid var(--bd);height:28px;">
+        <span title="Live child processes vs configured limit" style="font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--tx-1);">2&thinsp;/&thinsp;3</span>
+        <span style="font-size:11px;color:var(--tx-3);">live</span>
+      </div>
+    </sc-if>
+    <div style="flex:0 0 auto;display:flex;align-items:center;gap:7px;" title="Daemon connection · 2/3 live children">
+      <span style="width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(79,184,126,.14);"></span>
+      <sc-if value="{{ wide }}" hint-placeholder-val="{{ true }}"><span style="font-size:12px;color:var(--tx-2);">Connected</span></sc-if>
+    </div>
+    <sc-if value="{{ narrow }}" hint-placeholder-val="">
+      <button onClick="{{ toggleInsp }}" title="Toggle context inspector" style="flex:0 0 auto;background:{{ inspBtnBg }};border:1px solid var(--bd);color:var(--tx-2);width:30px;height:30px;border-radius:6px;cursor:pointer;font-size:13px;font-family:inherit;">◨</button>
+    </sc-if>
+    <button onClick="{{ newRun }}" style="flex:0 0 auto;display:flex;align-items:center;gap:6px;background:var(--accent);color:#04211f;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-weight:650;font-size:12px;font-family:inherit;">
+      <span style="font-size:14px;line-height:1;">+</span> New run
+    </button>
+  </header>
+
+  <!-- ===== RECONNECT BANNER ===== -->
+  <sc-if value="{{ reconnect }}" hint-placeholder-val="">
+    <div role="status" style="flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:8px 16px;background:var(--amber-bg);border-bottom:1px solid var(--amber-bd);font-size:12px;color:var(--amber);">
+      <span style="width:8px;height:8px;border-radius:50%;background:var(--amber);animation:hcpulse 1.4s ease-in-out infinite;"></span>
+      <span style="color:var(--tx-1);font-weight:600;">Reconnecting to daemon…</span>
+      <span style="color:var(--tx-2);">Showing the last durable snapshot. Data may be stale; commands are disabled until the command channel is confirmed safe.</span>
+      <div style="flex:1;"></div>
+      <span style="font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--tx-3);">cursor (run-a, seq 27)</span>
+      <button onClick="{{ toggleReconnect }}" style="background:transparent;border:1px solid var(--amber-bd);color:var(--tx-1);padding:3px 10px;border-radius:5px;font-size:11px;cursor:pointer;font-family:inherit;">Dismiss (demo)</button>
+    </div>
+  </sc-if>
+
+  <!-- ===== RUNS VIEW (rail | main | inspector + terminal) ===== -->
+  <sc-if value="{{ isRuns }}" hint-placeholder-val="{{ true }}">
+  <div style="flex:1;min-height:0;display:flex;flex-direction:column;">
+  <!-- ===== BODY: rail | main | inspector ===== -->
+  <div style="flex:1;min-height:0;display:flex;">
+
+    <!-- RUN RAIL -->
+    <aside aria-label="Run rail" style="flex:0 0 264px;border-right:1px solid var(--bd);background:var(--bg-1);display:flex;flex-direction:column;min-height:0;">
+      <div style="flex:0 0 auto;padding:10px 12px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;">
+        <span style="font-size:11px;font-weight:650;letter-spacing:.6px;text-transform:uppercase;color:var(--tx-3);">Runs</span>
+        <span style="font-size:11px;color:var(--tx-3);">{{ totalRuns }} total</span>
+      </div>
+      <div style="flex:1;overflow-y:auto;min-height:0;">
+        <sc-for list="{{ groups }}" as="group" hint-placeholder-count="4">
+          <div style="padding:11px 12px 5px;display:flex;align-items:center;gap:7px;">
+            <span style="width:6px;height:6px;border-radius:50%;background:{{ group.dot }};"></span>
+            <span style="font-size:10.5px;font-weight:650;letter-spacing:.5px;text-transform:uppercase;color:var(--tx-3);">{{ group.title }}</span>
+            <span style="font-size:10.5px;color:var(--tx-3);">{{ group.count }}</span>
+          </div>
+          <sc-for list="{{ group.runs }}" as="run" hint-placeholder-count="2">
+            <div onClick="{{ run.onOpen }}" role="button" tabindex="0" style="{{ run.rowStyle }}" style-hover="background:var(--bg-hover);">
+              <div style="display:flex;align-items:flex-start;gap:8px;">
+                <span title="{{ run.status.label }}" style="flex:0 0 auto;margin-top:1px;font-size:12px;line-height:1.1;color:{{ run.status.color }};{{ run.status.anim }}">{{ run.status.glyph }}</span>
+                <div style="flex:1;min-width:0;">
+                  <div style="font-size:12.5px;color:var(--tx-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ run.goal }}</div>
+                  <div style="display:flex;align-items:center;gap:6px;margin-top:3px;">
+                    <span style="font-size:11px;color:{{ run.status.color }};">{{ run.status.label }}</span>
+                    <sc-if value="{{ run.roleTag }}" hint-placeholder-val="">
+                      <span style="font-size:10.5px;color:var(--tx-3);">·</span>
+                      <span style="font-size:10.5px;color:var(--tx-3);">{{ run.roleTag }}</span>
+                    </sc-if>
+                  </div>
+                </div>
+                <sc-if value="{{ run.attention }}" hint-placeholder-val="">
+                  <span title="Needs attention" style="flex:0 0 auto;width:16px;height:16px;border-radius:4px;background:var(--amber-bg);border:1px solid var(--amber-bd);color:var(--amber);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;">{{ run.attention }}</span>
+                </sc-if>
+              </div>
+            </div>
+          </sc-for>
+        </sc-for>
+        <div style="height:14px;"></div>
+      </div>
+    </aside>
+
+    <!-- MAIN WORK AREA -->
+    <main aria-label="Run work area" style="flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg-0);min-height:0;">
+
+      <!-- run header -->
+      <div style="flex:0 0 auto;padding:14px 20px 0;border-bottom:1px solid var(--bd);">
+        <div style="display:flex;align-items:flex-start;gap:16px;">
+          <div style="flex:1;min-width:0;">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <h1 style="margin:0;font-size:17px;font-weight:650;color:var(--tx-1);">{{ sel.goal }}</h1>
+              <span style="font-size:11px;color:var(--tx-3);font-family:ui-monospace,Menlo,monospace;">{{ sel.id }}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:6px;font-size:12px;color:var(--tx-2);flex-wrap:wrap;">
+              <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">{{ sel.workspace }}</span>
+              <span style="color:var(--tx-3);">·</span>
+              <span style="color:var(--tx-3);">base</span>
+              <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ sel.base }}</span>
+              <sc-if value="{{ sel.branch }}" hint-placeholder-val="">
+                <span style="color:var(--tx-3);">·</span>
+                <span style="color:var(--tx-3);">worktree</span>
+                <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ sel.branch }}</span>
+              </sc-if>
+            </div>
+          </div>
+          <div style="flex:0 0 auto;text-align:right;">
+            <div style="display:flex;align-items:center;gap:7px;justify-content:flex-end;">
+              <span style="font-size:12px;line-height:1;color:{{ sel.status.color }};{{ sel.status.anim }}">{{ sel.status.glyph }}</span>
+              <span style="font-weight:600;font-size:13.5px;color:var(--tx-1);">{{ sel.phaseLabel }}</span>
+            </div>
+            <div style="margin-top:3px;font-size:11.5px;color:{{ sel.detailColor }};">{{ sel.detailLine }}</div>
+            <div style="margin-top:2px;font-size:10.5px;color:var(--tx-3);">Last operation: {{ sel.opLabel }}</div>
+          </div>
+        </div>
+
+        <!-- action bar -->
+        <div style="display:flex;align-items:center;gap:8px;margin-top:14px;">
+          <sc-for list="{{ sel.actions }}" as="act" hint-placeholder-count="2">
+            <button onClick="{{ act.onClick }}" style="{{ act.style }}">{{ act.label }}</button>
+          </sc-for>
+          <div style="flex:1;"></div>
+          <div style="display:flex;align-items:center;gap:14px;font-size:11.5px;color:var(--tx-3);">
+            <sc-if value="{{ sel.costMeasured }}" hint-placeholder-val="">
+              <span title="Measured + estimated cost, kept separate"><span style="color:var(--tx-2);">Cost</span> <span style="color:var(--tx-1);font-family:ui-monospace,Menlo,monospace;">${{ sel.costMeasured }}</span> measured <span style="color:var(--tx-3);">+</span> <span style="color:var(--amber);font-family:ui-monospace,Menlo,monospace;">${{ sel.costEstimated }}</span> est</span>
+            </sc-if>
+            <span>{{ sel.elapsed }}</span>
+          </div>
+        </div>
+
+        <!-- workflow rail -->
+        <div role="group" aria-label="{{ sel.railSummary }}" style="display:flex;align-items:center;gap:0;margin:16px 0 2px;padding:2px 0;">
+          <sc-for list="{{ sel.nodes }}" as="node" hint-placeholder-count="5">
+            <div style="display:flex;align-items:center;">
+              <div style="display:flex;flex-direction:column;align-items:center;gap:6px;min-width:78px;">
+                <span style="{{ node.dotStyle }}">{{ node.glyph }}</span>
+                <span style="{{ node.labelStyle }}">{{ node.label }}</span>
+              </div>
+              <sc-if value="{{ node.hasConn }}" hint-placeholder-val="{{ true }}">
+                <div style="{{ node.connStyle }}"></div>
+              </sc-if>
+            </div>
+          </sc-for>
+          <div style="flex:1;"></div>
+          <sc-if value="{{ sel.remediation }}" hint-placeholder-val="">
+            <div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--amber);border:1px solid var(--amber-bd);background:var(--amber-bg);padding:3px 9px;border-radius:20px;">
+              <span>↺</span><span>Remediation loop · Verify → Implement · round {{ sel.remediation }}</span>
+            </div>
+          </sc-if>
+        </div>
+
+        <!-- tabs -->
+        <div role="tablist" style="display:flex;align-items:center;gap:2px;margin-top:14px;">
+          <sc-for list="{{ tabs }}" as="tab" hint-placeholder-count="6">
+            <button role="tab" aria-selected="{{ tab.selected }}" onClick="{{ tab.onClick }}" style="{{ tab.style }}">
+              {{ tab.label }}
+              <sc-if value="{{ tab.count }}" hint-placeholder-val="">
+                <span style="{{ tab.countStyle }}">{{ tab.count }}</span>
+              </sc-if>
+            </button>
+          </sc-for>
+        </div>
+      </div>
+
+      <!-- tab body -->
+      <div style="flex:1;overflow-y:auto;min-height:0;padding:18px 20px 28px;">
+
+        <!-- suspension / state banners -->
+        <sc-if value="{{ sel.pausedPanel }}" hint-placeholder-val="">
+          <section aria-label="Paused by provider limit" style="border:1px solid var(--amber-bd);background:linear-gradient(180deg,var(--amber-bg),transparent 140%);border-radius:10px;padding:16px 18px;margin-bottom:18px;">
+            <div style="display:flex;align-items:flex-start;gap:12px;">
+              <span style="flex:0 0 auto;width:26px;height:26px;border-radius:7px;background:var(--amber-bg);border:1px solid var(--amber-bd);color:var(--amber);display:flex;align-items:center;justify-content:center;font-size:13px;">‖</span>
+              <div style="flex:1;">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <h2 style="margin:0;font-size:14px;font-weight:650;color:var(--tx-1);">Paused — provider limit</h2>
+                  <span style="font-size:11px;color:var(--amber);border:1px solid var(--amber-bd);border-radius:20px;padding:1px 8px;">Implementing · paused—limit</span>
+                </div>
+                <p style="margin:6px 0 0;font-size:12.5px;color:var(--tx-2);max-width:640px;">Detected on <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">Codex / gpt-5.6-terra</span> during the implementor turn. Work was checkpointed before the child stopped — no progress lost.</p>
+                <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 28px;margin-top:14px;max-width:640px;">
+                  <div><div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Reset time</div><div style="font-size:13px;color:var(--tx-1);margin-top:2px;">Reset time unavailable</div><div style="font-size:11px;color:var(--tx-3);">provider did not supply a retry-after</div></div>
+                  <div><div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Probe ladder</div><div style="font-size:13px;color:var(--tx-1);margin-top:2px;">1 of 6 probes used</div><div style="font-size:11px;color:var(--tx-3);">next probe scheduled for 14:30</div></div>
+                  <div><div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Checkpoint</div><div style="font-size:13px;color:var(--tx-1);margin-top:2px;font-family:ui-monospace,Menlo,monospace;">ckpt-0007 · written</div></div>
+                  <div><div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Failover ladder</div><div style="font-size:13px;color:var(--tx-1);margin-top:2px;">Configured · not yet used</div><div style="font-size:11px;color:var(--tx-3);">Codex → Claude / Sonnet</div></div>
+                </div>
+                <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap;">
+                  <button onClick="{{ noop }}" style="background:var(--amber);color:#241a04;border:none;padding:6px 13px;border-radius:6px;font-weight:650;font-size:12px;cursor:pointer;font-family:inherit;">Resume now</button>
+                  <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Wait for probe</button>
+                  <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Switch model…</button>
+                  <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-2);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Edit failover policy</button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </sc-if>
+
+        <sc-if value="{{ sel.mergePanel }}" hint-placeholder-val="">
+          <section aria-label="Verified and ready for manual integration" style="border:1px solid var(--green-bd);background:linear-gradient(180deg,var(--green-bg),transparent 140%);border-radius:10px;padding:16px 18px;margin-bottom:18px;">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <span style="width:26px;height:26px;border-radius:7px;background:var(--green-bg);border:1px solid var(--green-bd);color:var(--green);display:flex;align-items:center;justify-content:center;font-size:14px;">✓</span>
+              <h2 style="margin:0;font-size:14px;font-weight:650;color:var(--tx-1);">Verified and ready for manual integration</h2>
+              <span style="font-size:11px;color:var(--green);border:1px solid var(--green-bd);border-radius:20px;padding:1px 8px;">3 of 3 criteria verified</span>
+            </div>
+            <p style="margin:8px 0 0;font-size:12.5px;color:var(--tx-2);max-width:680px;">Harness Control has <strong style="color:var(--tx-1);">not merged, pushed, or changed</strong> your destination branch. Review the commands below and integrate manually.</p>
+            <div style="margin-top:14px;background:var(--bg-0);border:1px solid var(--bd);border-radius:8px;overflow:hidden;">
+              <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 10px;border-bottom:1px solid var(--bd);background:var(--bg-2);">
+                <span style="font-size:11px;color:var(--tx-3);">Manual integration · run in your workspace shell</span>
+                <button onClick="{{ copyCmds }}" style="background:transparent;border:1px solid var(--bd-2);color:var(--tx-2);padding:3px 9px;border-radius:5px;font-size:11px;cursor:pointer;font-family:inherit;">{{ copyLabel }}</button>
+              </div>
+              <pre style="margin:0;padding:11px 12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--tx-1);line-height:1.7;overflow-x:auto;">git -C <span style="color:var(--tx-2);">'/repos/harness-orchestration'</span> merge --no-ff <span style="color:var(--accent);">'hc/cli-docs'</span>
+git -C <span style="color:var(--tx-2);">'/repos/harness-orchestration'</span> log --oneline -1 <span style="color:var(--accent);">c9f0d31</span></pre>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;">
+              <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Open workspace terminal</button>
+              <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Open worktree</button>
+              <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-2);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Recheck readiness</button>
+            </div>
+          </section>
+        </sc-if>
+
+        <sc-if value="{{ sel.breakerPanel }}" hint-placeholder-val="">
+          <section aria-label="Breaker open" style="border:1px solid var(--red-bd);background:linear-gradient(180deg,var(--red-bg),transparent 140%);border-radius:10px;padding:16px 18px;margin-bottom:18px;">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <span style="width:26px;height:26px;border-radius:7px;background:var(--red-bg);border:1px solid var(--red-bd);color:var(--red);display:flex;align-items:center;justify-content:center;font-size:13px;">▲</span>
+              <h2 style="margin:0;font-size:14px;font-weight:650;color:var(--tx-1);">Breaker open — automated recovery stopped</h2>
+              <span style="font-size:11px;color:var(--red);border:1px solid var(--red-bd);border-radius:20px;padding:1px 8px;">Implementing · breaker open</span>
+            </div>
+            <p style="margin:8px 0 0;font-size:12.5px;color:var(--tx-2);max-width:680px;"><strong style="color:var(--tx-1);">No progress</strong> across repeated restarts. Auto-respawn bounds were exhausted after 3 generations, so Harness Control stopped restarting to avoid burning budget on a stuck run.</p>
+            <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 24px;margin-top:14px;max-width:680px;">
+              <div><div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Work preserved</div><div style="font-size:13px;color:var(--tx-1);margin-top:2px;font-family:ui-monospace,Menlo,monospace;">ckpt-0004</div></div>
+              <div><div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Worktree</div><div style="font-size:13px;color:var(--tx-1);margin-top:2px;">tainted → revalidated</div></div>
+              <div><div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Generations</div><div style="font-size:13px;color:var(--tx-1);margin-top:2px;">gen-1 · gen-2 · gen-3</div></div>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:16px;">
+              <button onClick="{{ noop }}" style="background:var(--red);color:#fff;border:none;padding:6px 13px;border-radius:6px;font-weight:650;font-size:12px;cursor:pointer;font-family:inherit;">Inspect &amp; reset breaker…</button>
+              <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">View generation history</button>
+            </div>
+            <div style="font-size:11px;color:var(--tx-3);margin-top:10px;">Reset validates the worktree before the next spawn. It does not guarantee success, and the incident history is kept.</div>
+          </section>
+        </sc-if>
+
+        <sc-if value="{{ sel.recoverPanel }}" hint-placeholder-val="">
+          <section aria-label="Auto-recovering" style="border:1px solid var(--amber-bd);background:linear-gradient(180deg,var(--amber-bg),transparent 140%);border-radius:10px;padding:16px 18px;margin-bottom:18px;">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <span style="width:26px;height:26px;border-radius:7px;background:var(--amber-bg);border:1px solid var(--amber-bd);color:var(--amber);display:flex;align-items:center;justify-content:center;font-size:14px;animation:hcpulse 1.8s ease-in-out infinite;">↻</span>
+              <h2 style="margin:0;font-size:14px;font-weight:650;color:var(--tx-1);">Auto-recovering · attempt 2</h2>
+              <span style="font-size:11px;color:var(--amber);border:1px solid var(--amber-bd);border-radius:20px;padding:1px 8px;">Implementing · interrupted</span>
+            </div>
+            <p style="margin:8px 0 0;font-size:12.5px;color:var(--tx-2);max-width:680px;">The child exited unexpectedly. Harness Control recorded the crash and is spawning a successor from the last checkpoint. Restart counters are folded, not reset.</p>
+            <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 24px;margin-top:14px;max-width:680px;">
+              <div><div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Attempt</div><div style="font-size:13px;color:var(--tx-1);margin-top:2px;">2 of 5</div></div>
+              <div><div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Next attempt</div><div style="font-size:13px;color:var(--tx-1);margin-top:2px;">backoff · 0:18</div></div>
+              <div><div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Resuming from</div><div style="font-size:13px;color:var(--tx-1);margin-top:2px;font-family:ui-monospace,Menlo,monospace;">ckpt-0009</div></div>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:16px;">
+              <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Pause recovery</button>
+              <button onClick="{{ noop }}" style="background:transparent;color:var(--red);border:1px solid var(--red-bd);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Cancel run</button>
+            </div>
+          </section>
+        </sc-if>
+
+        <sc-if value="{{ sel.blockedPanel }}" hint-placeholder-val="">
+          <section aria-label="Integration blocked" style="border:1px solid var(--amber-bd);background:linear-gradient(180deg,var(--amber-bg),transparent 140%);border-radius:10px;padding:16px 18px;margin-bottom:18px;">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <span style="width:26px;height:26px;border-radius:7px;background:var(--amber-bg);border:1px solid var(--amber-bd);color:var(--amber);display:flex;align-items:center;justify-content:center;font-size:13px;">◫</span>
+              <h2 style="margin:0;font-size:14px;font-weight:650;color:var(--tx-1);">All criteria verified — integration is blocked</h2>
+              <span style="font-size:11px;color:var(--green);border:1px solid var(--green-bd);border-radius:20px;padding:1px 8px;">4 of 4 verified</span>
+            </div>
+            <p style="margin:8px 0 0;font-size:12.5px;color:var(--tx-2);max-width:680px;">This is <strong style="color:var(--tx-1);">not</strong> a verification failure and no remediation round is consumed. The verified commit <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">b7710dd</span> is ready; your local environment needs attention first.</p>
+            <div style="margin-top:14px;border:1px solid var(--bd);border-radius:8px;overflow:hidden;">
+              <div style="padding:9px 12px;background:var(--bg-2);border-bottom:1px solid var(--bd);font-size:11px;color:var(--tx-3);">Blockers · your responsibility</div>
+              <div style="padding:10px 12px;border-bottom:1px solid var(--bd);font-size:12.5px;color:var(--tx-1);display:flex;gap:9px;"><span style="color:var(--amber);">◫</span>Destination checkout <span style="font-family:ui-monospace,Menlo,monospace;">main</span> is dirty — 2 uncommitted files.</div>
+              <div style="padding:10px 12px;font-size:12.5px;color:var(--tx-1);display:flex;gap:9px;"><span style="color:var(--amber);">◫</span>Base branch drifted 4 commits ahead of the run base.</div>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:16px;">
+              <button onClick="{{ noop }}" style="background:var(--amber);color:#241a04;border:none;padding:6px 13px;border-radius:6px;font-weight:650;font-size:12px;cursor:pointer;font-family:inherit;">Recheck readiness</button>
+              <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Open workspace terminal</button>
+            </div>
+          </section>
+        </sc-if>
+
+        <!-- ============ OVERVIEW ============ -->
+        <sc-if value="{{ isOverview }}" hint-placeholder-val="{{ true }}">
+          <div>
+            <div style="font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase;color:var(--tx-3);margin-bottom:10px;">Role lanes</div>
+            <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;">
+              <sc-for list="{{ sel.lanes }}" as="lane" hint-placeholder-count="3">
+                <div style="border:1px solid {{ lane.borderColor }};background:var(--bg-1);border-radius:10px;overflow:hidden;">
+                  <div style="padding:10px 12px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;background:{{ lane.headBg }};">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                      <span style="width:7px;height:7px;border-radius:50%;background:{{ lane.dot }};{{ lane.anim }}"></span>
+                      <span style="font-weight:650;font-size:12.5px;color:var(--tx-1);">{{ lane.role }}</span>
+                    </div>
+                    <span style="font-size:10.5px;color:{{ lane.stateColor }};">{{ lane.stateLabel }}</span>
+                  </div>
+                  <div style="padding:11px 12px;">
+                    <div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;">
+                      <span style="font-size:10.5px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);background:var(--bg-3);border:1px solid var(--bd);border-radius:5px;padding:2px 6px;">{{ lane.harness }}</span>
+                      <span style="font-size:10.5px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);background:var(--bg-3);border:1px solid var(--bd);border-radius:5px;padding:2px 6px;">{{ lane.model }}</span>
+                      <span style="font-size:10.5px;color:var(--tx-3);background:var(--bg-3);border:1px solid var(--bd);border-radius:5px;padding:2px 6px;">{{ lane.effort }}</span>
+                    </div>
+                    <sc-for list="{{ lane.facts }}" as="f" hint-placeholder-count="3">
+                      <div style="display:flex;justify-content:space-between;gap:10px;padding:3px 0;font-size:11.5px;">
+                        <span style="color:var(--tx-3);">{{ f.k }}</span>
+                        <span style="{{ f.vStyle }}">{{ f.v }}</span>
+                      </div>
+                    </sc-for>
+                    <sc-if value="{{ lane.current }}" hint-placeholder-val="">
+                      <div style="margin-top:10px;padding-top:9px;border-top:1px dashed var(--bd);font-size:11.5px;color:var(--tx-2);">
+                        <span style="color:var(--tx-3);">Current · </span>{{ lane.current }}
+                      </div>
+                    </sc-if>
+                    <sc-if value="{{ lane.indep }}" hint-placeholder-val="">
+                      <div style="margin-top:9px;font-size:10.5px;color:var(--purple);display:flex;align-items:center;gap:5px;"><span>◇</span>Independent · read-only worktree access</div>
+                    </sc-if>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+
+            <div style="font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase;color:var(--tx-3);margin:20px 0 10px;">Activity summary</div>
+            <div style="border:1px solid var(--bd);border-radius:10px;background:var(--bg-1);overflow:hidden;">
+              <sc-for list="{{ sel.summary }}" as="ev" hint-placeholder-count="4">
+                <div style="display:flex;gap:12px;padding:9px 14px;border-bottom:1px solid var(--bd);align-items:baseline;">
+                  <span style="flex:0 0 52px;font-size:11px;color:var(--tx-3);font-family:ui-monospace,Menlo,monospace;">{{ ev.time }}</span>
+                  <span style="flex:0 0 78px;font-size:10.5px;color:{{ ev.roleColor }};">{{ ev.role }}</span>
+                  <span style="flex:1;font-size:12.5px;color:var(--tx-1);">{{ ev.text }}</span>
+                  <sc-if value="{{ ev.tag }}" hint-placeholder-val="">
+                    <span style="{{ ev.tagStyle }}">{{ ev.tag }}</span>
+                  </sc-if>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </sc-if>
+
+        <!-- ============ SPEC ============ -->
+        <sc-if value="{{ isSpec }}" hint-placeholder-val="">
+          <div style="max-width:820px;">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+              <span style="font-size:15px;font-weight:650;">Specification {{ sel.specRev }}</span>
+              <span style="font-size:11px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);background:var(--bg-2);border:1px solid var(--bd);border-radius:5px;padding:2px 7px;">sha256:{{ sel.specHash }}</span>
+              <sc-if value="{{ sel.specImmutable }}" hint-placeholder-val="{{ true }}">
+                <span style="font-size:11px;color:var(--tx-3);">immutable · copy full hash</span>
+              </sc-if>
+            </div>
+            <div style="border:1px solid var(--bd);border-radius:10px;background:var(--bg-1);padding:16px 18px;">
+              <div style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Summary</div>
+              <p style="margin:5px 0 16px;font-size:13px;color:var(--tx-1);">{{ sel.specSummary }}</p>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+                <div>
+                  <div style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--green);">In scope</div>
+                  <ul style="margin:6px 0 0;padding-left:16px;font-size:12.5px;color:var(--tx-2);line-height:1.7;">
+                    <sc-for list="{{ sel.inScope }}" as="s" hint-placeholder-count="3"><li>{{ s }}</li></sc-for>
+                  </ul>
+                </div>
+                <div>
+                  <div style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Out of scope</div>
+                  <ul style="margin:6px 0 0;padding-left:16px;font-size:12.5px;color:var(--tx-3);line-height:1.7;">
+                    <sc-for list="{{ sel.outScope }}" as="s" hint-placeholder-count="2"><li>{{ s }}</li></sc-for>
+                  </ul>
+                </div>
+              </div>
+              <div style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);margin-bottom:8px;">Acceptance criteria</div>
+              <div style="border:1px solid var(--bd);border-radius:8px;overflow:hidden;">
+                <sc-for list="{{ sel.criteria }}" as="c" hint-placeholder-count="3">
+                  <div style="display:flex;gap:11px;padding:10px 12px;border-bottom:1px solid var(--bd);align-items:baseline;">
+                    <span style="flex:0 0 44px;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--tx-3);">{{ c.id }}</span>
+                    <span style="flex:1;font-size:12.5px;color:var(--tx-1);">{{ c.text }}</span>
+                    <span style="flex:0 0 auto;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--tx-3);">{{ c.cmd }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+
+            <sc-if value="{{ specDiff }}" hint-placeholder-val="">
+              <div style="margin-top:16px;border:1px solid var(--bd);border-radius:10px;background:var(--bg-1);padding:15px 18px;">
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+                  <h3 style="margin:0;font-size:13.5px;color:var(--tx-1);">Acceptance criteria · v2 → v3</h3>
+                  <span style="font-size:11px;color:var(--tx-3);">immutable revisions · earlier versions retained</span>
+                </div>
+                <p style="margin:0 0 12px;font-size:11.5px;color:var(--tx-3);">Editing the approved version in place is never allowed. Your feedback produced a new immutable v3.</p>
+                <div style="display:flex;flex-direction:column;gap:7px;">
+                  <sc-for list="{{ specDiffData }}" as="d" hint-placeholder-count="4">
+                    <div style="display:flex;align-items:center;gap:10px;">
+                      <span style="{{ d.tagStyle }}">{{ d.tag }}</span>
+                      <span style="flex:1;{{ d.style }}">{{ d.txt }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-if>
+            <sc-if value="{{ sel.approvalPanel }}" hint-placeholder-val="">
+              <div style="margin-top:16px;border:1px solid var(--accent-bd);background:var(--accent-bg);border-radius:10px;padding:15px 18px;">
+                <div style="display:flex;align-items:center;gap:8px;"><span style="color:var(--accent);">◐</span><h3 style="margin:0;font-size:13.5px;color:var(--tx-1);">Waiting for your approval</h3></div>
+                <p style="margin:7px 0 0;font-size:12.5px;color:var(--tx-2);max-width:640px;">Approving pins this exact revision and hash. Implementation will occur in an isolated worktree only after you approve — no automatic merge or push. Proposed profiles: <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">Codex / gpt-5.6-terra / medium</span> (implementor), <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">Claude / Sonnet / medium</span> (verifier).</p>
+                <div style="display:flex;gap:8px;margin-top:14px;">
+                  <button onClick="{{ noop }}" style="background:var(--accent);color:#04211f;border:none;padding:7px 15px;border-radius:6px;font-weight:650;font-size:12.5px;cursor:pointer;font-family:inherit;">Approve spec {{ sel.specRev }}</button>
+                  <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:7px 15px;border-radius:6px;font-size:12.5px;cursor:pointer;font-family:inherit;">Request revision…</button>
+                  <button onClick="{{ toggleSpecDiff }}" style="background:transparent;color:var(--tx-2);border:1px solid var(--bd-2);padding:7px 15px;border-radius:6px;font-size:12.5px;cursor:pointer;font-family:inherit;">{{ specDiffLabel }}</button>
+                </div>
+              </div>
+            </sc-if>
+          </div>
+        </sc-if>
+
+        <!-- ============ ACTIVITY ============ -->
+        <sc-if value="{{ isActivity }}" hint-placeholder-val="">
+          <div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+              <sc-for list="{{ activityFilters }}" as="fl" hint-placeholder-count="5">
+                <button onClick="{{ fl.onClick }}" style="{{ fl.style }}">{{ fl.label }}</button>
+              </sc-for>
+              <div style="flex:1;"></div>
+              <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--tx-2);cursor:pointer;"><span style="width:26px;height:15px;border-radius:9px;background:var(--accent);position:relative;"><span style="position:absolute;top:1.5px;right:1.5px;width:12px;height:12px;border-radius:50%;background:#fff;"></span></span>Follow live</label>
+            </div>
+            <div style="border-left:2px solid var(--bd);margin-left:8px;">
+              <sc-for list="{{ sel.activity }}" as="ev" hint-placeholder-count="6">
+                <div style="position:relative;padding:8px 0 8px 20px;">
+                  <span style="position:absolute;left:-6px;top:12px;width:9px;height:9px;border-radius:{{ ev.nodeRadius }};background:var(--bg-0);border:2px solid {{ ev.nodeColor }};"></span>
+                  <div style="display:flex;gap:10px;align-items:baseline;">
+                    <span style="flex:0 0 52px;font-size:11px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-3);">{{ ev.time }}</span>
+                    <span style="flex:0 0 74px;font-size:10.5px;color:{{ ev.roleColor }};">{{ ev.role }}</span>
+                    <div style="flex:1;">
+                      <div style="font-size:12.5px;color:var(--tx-1);">{{ ev.text }}</div>
+                      <sc-if value="{{ ev.detail }}" hint-placeholder-val="">
+                        <div style="font-size:11.5px;color:var(--tx-3);font-family:ui-monospace,Menlo,monospace;margin-top:2px;">{{ ev.detail }}</div>
+                      </sc-if>
+                    </div>
+                    <sc-if value="{{ ev.tag }}" hint-placeholder-val="">
+                      <span style="{{ ev.tagStyle }}">{{ ev.tag }}</span>
+                    </sc-if>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </sc-if>
+
+        <!-- ============ CHANGES ============ -->
+        <sc-if value="{{ isChanges }}" hint-placeholder-val="">
+          <div>
+            <sc-if value="{{ sel.hasChanges }}" hint-placeholder-val="{{ true }}">
+              <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap;font-size:12px;">
+                <span style="color:var(--tx-3);">base</span><span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ sel.base }}</span>
+                <span style="color:var(--tx-3);">→ impl</span><span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ sel.commit }}</span>
+                <span style="color:var(--green);font-family:ui-monospace,Menlo,monospace;">+{{ sel.diffAdd }}</span>
+                <span style="color:var(--red);font-family:ui-monospace,Menlo,monospace;">−{{ sel.diffDel }}</span>
+                <sc-if value="{{ sel.liveWorktree }}" hint-placeholder-val="">
+                  <span style="font-size:11px;color:var(--amber);border:1px solid var(--amber-bd);background:var(--amber-bg);border-radius:20px;padding:1px 9px;">Live worktree changes — not yet verified</span>
+                </sc-if>
+                <div style="flex:1;"></div>
+                <span style="font-size:11px;color:var(--tx-3);">read-only viewer · no merge / push</span>
+              </div>
+              <div style="display:grid;grid-template-columns:210px 1fr;gap:12px;">
+                <div style="border:1px solid var(--bd);border-radius:8px;background:var(--bg-1);overflow:hidden;height:fit-content;">
+                  <sc-for list="{{ sel.files }}" as="file" hint-placeholder-count="4">
+                    <div onClick="{{ file.onClick }}" style="{{ file.style }}" style-hover="background:var(--bg-hover);">
+                      <span style="font-size:11.5px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ file.name }}</span>
+                      <span style="font-size:10.5px;font-family:ui-monospace,Menlo,monospace;"><span style="color:var(--green);">+{{ file.add }}</span> <span style="color:var(--red);">−{{ file.del }}</span></span>
+                    </div>
+                  </sc-for>
+                </div>
+                <div style="border:1px solid var(--bd);border-radius:8px;background:var(--bg-0);overflow:hidden;">
+                  <div style="padding:7px 12px;border-bottom:1px solid var(--bd);background:var(--bg-2);font-size:11.5px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">{{ sel.activeFile }}</div>
+                  <pre style="margin:0;padding:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.65;overflow-x:auto;">
+<sc-for list="{{ sel.diff }}" as="ln" hint-placeholder-count="8"><div style="{{ ln.style }}"><span style="display:inline-block;width:34px;text-align:right;padding-right:10px;color:var(--tx-3);user-select:none;">{{ ln.n }}</span><span style="color:{{ ln.mark }};display:inline-block;width:12px;">{{ ln.sign }}</span>{{ ln.text }}</div></sc-for></pre>
+                </div>
+              </div>
+            </sc-if>
+            <sc-if value="{{ sel.noChanges }}" hint-placeholder-val="">
+              <div style="border:1px dashed var(--bd);border-radius:10px;padding:38px;text-align:center;color:var(--tx-3);">
+                <div style="font-size:13px;color:var(--tx-2);">No implementation changes yet</div>
+                <div style="font-size:12px;margin-top:5px;">Changes appear once the spec is approved and the implementor writes in its isolated worktree.</div>
+              </div>
+            </sc-if>
+          </div>
+        </sc-if>
+
+        <!-- ============ VERIFY ============ -->
+        <sc-if value="{{ isVerify }}" hint-placeholder-val="">
+          <div>
+            <sc-if value="{{ sel.hasVerify }}" hint-placeholder-val="{{ true }}">
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
+                <span style="font-size:13.5px;font-weight:600;">{{ sel.critSummary }}</span>
+                <span style="color:var(--tx-3);">·</span>
+                <span style="font-size:12px;color:var(--tx-3);">verifier checking commit <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ sel.commit }}</span></span>
+              </div>
+              <div style="border:1px solid var(--bd);border-radius:10px;overflow:hidden;">
+                <div style="display:grid;grid-template-columns:56px 1fr 120px 90px;gap:0;padding:8px 14px;background:var(--bg-2);border-bottom:1px solid var(--bd);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">
+                  <span>ID</span><span>Criterion</span><span>Verdict</span><span style="text-align:right;">Evidence</span>
+                </div>
+                <sc-for list="{{ sel.criteria }}" as="c" hint-placeholder-count="3">
+                  <div onClick="{{ c.onClick }}" style="{{ c.rowStyle }}" style-hover="background:var(--bg-hover);">
+                    <span style="font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--tx-3);">{{ c.id }}</span>
+                    <div style="padding-right:12px;">
+                      <div style="font-size:12.5px;color:var(--tx-1);">{{ c.text }}</div>
+                      <div style="font-size:11px;color:var(--tx-3);font-family:ui-monospace,Menlo,monospace;margin-top:2px;">{{ c.cmd }}</div>
+                    </div>
+                    <span style="align-self:center;"><span style="{{ c.verdictStyle }}">{{ c.verdictGlyph }} {{ c.verdict }}</span></span>
+                    <span style="align-self:center;text-align:right;font-size:12px;color:var(--tx-2);font-family:ui-monospace,Menlo,monospace;">{{ c.evidence }}</span>
+                  </div>
+                </sc-for>
+              </div>
+              <div style="margin-top:12px;font-size:11.5px;color:var(--tx-3);display:flex;gap:16px;flex-wrap:wrap;">
+                <span><span style="color:var(--green);">✓ Verified</span> — evidence attached</span>
+                <span><span style="color:var(--red);">✕ Failed</span> — routes to remediation</span>
+                <span><span style="color:var(--tx-2);">○ Unproven</span> — distinct from failed; no evidence</span>
+                <span><span style="color:var(--accent);">◐ Running</span></span>
+              </div>
+            </sc-if>
+            <sc-if value="{{ sel.noVerify }}" hint-placeholder-val="">
+              <div style="border:1px dashed var(--bd);border-radius:10px;padding:38px;text-align:center;color:var(--tx-3);">
+                <div style="font-size:13px;color:var(--tx-2);">Verification has not started</div>
+                <div style="font-size:12px;margin-top:5px;">Independent verification runs after implementation produces a commit.</div>
+              </div>
+            </sc-if>
+          </div>
+        </sc-if>
+
+        <!-- ============ EVENTS ============ -->
+        <sc-if value="{{ isEvents }}" hint-placeholder-val="">
+          <div>
+            <div style="font-size:11.5px;color:var(--tx-3);margin-bottom:10px;">Ordered per-run event sequence — technical inspector. Read-only; no mutation from this screen.</div>
+            <div style="border:1px solid var(--bd);border-radius:10px;overflow:hidden;">
+              <div style="display:grid;grid-template-columns:44px 130px 150px 1fr 90px;padding:8px 14px;background:var(--bg-2);border-bottom:1px solid var(--bd);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">
+                <span>Seq</span><span>Time</span><span>Type</span><span>Refs</span><span style="text-align:right;">Payload</span>
+              </div>
+              <sc-for list="{{ sel.events }}" as="e" hint-placeholder-count="8">
+                <div style="display:grid;grid-template-columns:44px 130px 150px 1fr 90px;padding:7px 14px;border-bottom:1px solid var(--bd);font-family:ui-monospace,Menlo,monospace;font-size:11.5px;align-items:center;">
+                  <span style="color:var(--tx-3);">{{ e.seq }}</span>
+                  <span style="color:var(--tx-2);">{{ e.time }}</span>
+                  <span style="color:{{ e.color }};">{{ e.type }}</span>
+                  <span style="color:var(--tx-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ e.refs }}</span>
+                  <span style="text-align:right;color:var(--tx-3);">{{ e.size }}</span>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </sc-if>
+
+      </div>
+    </main>
+
+    <!-- CONTEXT INSPECTOR -->
+    <sc-if value="{{ inspBackdrop }}" hint-placeholder-val="">
+      <div onClick="{{ toggleInsp }}" style="position:fixed;inset:48px 0 26px 0;background:rgba(5,7,10,.5);z-index:35;"></div>
+    </sc-if>
+    <aside aria-label="Context inspector" style="{{ inspStyle }}">
+      <sc-if value="{{ insp.isCriterion }}" hint-placeholder-val="">
+        <div style="flex:0 0 auto;padding:11px 14px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:8px;">
+          <button onClick="{{ clearInsp }}" style="background:transparent;border:1px solid var(--bd-2);color:var(--tx-2);border-radius:5px;width:22px;height:22px;cursor:pointer;font-family:inherit;">←</button>
+          <span style="font-size:12px;font-weight:650;">Criterion {{ insp.crit.id }}</span>
+          <span style="{{ insp.crit.verdictStyle }}">{{ insp.crit.verdictGlyph }} {{ insp.crit.verdict }}</span>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:14px;min-height:0;">
+          <p style="margin:0 0 14px;font-size:12.5px;color:var(--tx-1);">{{ insp.crit.text }}</p>
+          <div style="display:flex;flex-direction:column;gap:9px;">
+            <div style="font-size:11px;color:var(--tx-3);">Spec hash <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">sha256:{{ sel.specHash }}</span></div>
+            <div style="font-size:11px;color:var(--tx-3);">Commit verified <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ sel.commit }}</span></div>
+            <div style="font-size:11px;color:var(--tx-3);">Verifier session <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">seg-2 · gen-1</span></div>
+          </div>
+          <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);margin:16px 0 8px;">Evidence · {{ insp.crit.evidence }} artifacts</div>
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            <sc-for list="{{ insp.crit.evidenceItems }}" as="ev" hint-placeholder-count="2">
+              <div style="border:1px solid var(--bd);border-radius:7px;padding:9px 10px;background:var(--bg-2);">
+                <div style="display:flex;align-items:center;justify-content:space-between;"><span style="font-size:11.5px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ ev.name }}</span><span style="font-size:10.5px;color:var(--tx-3);">{{ ev.kind }}</span></div>
+                <div style="font-size:11px;color:var(--tx-3);margin-top:4px;">{{ ev.note }}</div>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ insp.isRun }}" hint-placeholder-val="{{ true }}">
+        <div style="flex:1;overflow-y:auto;min-height:0;">
+          <!-- operator inbox -->
+          <sc-if value="{{ sel.inbox }}" hint-placeholder-val="{{ true }}">
+            <div style="padding:12px 14px;border-bottom:1px solid var(--bd);">
+              <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);margin-bottom:9px;">Operator inbox</div>
+              <sc-for list="{{ sel.inbox }}" as="it" hint-placeholder-count="1">
+                <div style="border:1px solid {{ it.border }};background:{{ it.bg }};border-radius:8px;padding:11px;">
+                  <div style="display:flex;align-items:center;gap:7px;"><span style="color:{{ it.color }};">{{ it.glyph }}</span><span style="font-size:12px;font-weight:650;color:var(--tx-1);">{{ it.title }}</span></div>
+                  <div style="font-size:11.5px;color:var(--tx-2);margin-top:6px;">{{ it.body }}</div>
+                  <sc-if value="{{ it.mono }}" hint-placeholder-val="">
+                    <div style="font-size:11px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);background:var(--bg-0);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;margin-top:8px;">{{ it.mono }}</div>
+                  </sc-if>
+                  <sc-if value="{{ it.actions }}" hint-placeholder-val="">
+                    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;">
+                      <sc-for list="{{ it.actions }}" as="a" hint-placeholder-count="2">
+                        <button onClick="{{ noop }}" style="{{ a.style }}">{{ a.label }}</button>
+                      </sc-for>
+                    </div>
+                  </sc-if>
+                </div>
+              </sc-for>
+            </div>
+          </sc-if>
+
+          <div style="padding:12px 14px;border-bottom:1px solid var(--bd);">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;"><span style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Acceptance criteria</span><span style="font-size:11px;color:var(--tx-2);">{{ sel.critSummary }}</span></div>
+            <sc-for list="{{ sel.criteria }}" as="c" hint-placeholder-count="3">
+              <div onClick="{{ c.onClick }}" style="display:flex;gap:8px;padding:5px 0;cursor:pointer;align-items:baseline;">
+                <span style="color:{{ c.dotColor }};font-size:11px;">{{ c.verdictGlyph }}</span>
+                <span style="flex:1;font-size:11.5px;color:var(--tx-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ c.text }}</span>
+                <span style="font-size:10.5px;color:var(--tx-3);">{{ c.evidence }}◆</span>
+              </div>
+            </sc-for>
+          </div>
+
+          <div style="padding:12px 14px;border-bottom:1px solid var(--bd);">
+            <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);margin-bottom:10px;">Vitals</div>
+            <div style="font-size:11px;color:var(--tx-3);display:flex;justify-content:space-between;"><span>Context window</span><span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ sel.ctxUsed }} / {{ sel.ctxMax }}</span></div>
+            <div style="height:6px;background:var(--bg-3);border-radius:4px;margin:6px 0 12px;overflow:hidden;"><div style="height:100%;width:{{ sel.ctxPct }};background:var(--accent);"></div></div>
+            <div style="font-size:11px;color:var(--tx-3);display:flex;justify-content:space-between;"><span>Resident memory (RSS)</span><span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ sel.rss }}</span></div>
+            <div style="height:6px;background:var(--bg-3);border-radius:4px;margin:6px 0 4px;overflow:hidden;position:relative;"><div style="height:100%;width:{{ sel.rssPct }};background:var(--green);"></div><span style="position:absolute;top:-2px;left:72%;width:1px;height:10px;background:var(--amber);"></span></div>
+            <div style="font-size:10px;color:var(--tx-3);">soft threshold at 72%</div>
+          </div>
+
+          <div style="padding:12px 14px;border-bottom:1px solid var(--bd);">
+            <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);margin-bottom:9px;">Models</div>
+            <sc-for list="{{ sel.models }}" as="m" hint-placeholder-count="3">
+              <div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;font-size:11.5px;">
+                <span style="color:var(--tx-3);">{{ m.role }}</span>
+                <div style="text-align:right;">
+                  <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ m.running }}</span>
+                  <sc-if value="{{ m.desired }}" hint-placeholder-val="">
+                    <div style="font-size:10px;color:var(--amber);">desired: {{ m.desired }} · next spawn</div>
+                  </sc-if>
+                </div>
+              </div>
+            </sc-for>
+          </div>
+
+          <div style="padding:12px 14px;border-bottom:1px solid var(--bd);">
+            <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);margin-bottom:8px;">Latest checkpoint</div>
+            <div style="font-size:11.5px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ sel.checkpoint }}</div>
+            <div style="font-size:11px;color:var(--tx-3);margin-top:3px;">{{ sel.checkpointNote }}</div>
+          </div>
+
+          <div style="padding:12px 14px;">
+            <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);margin-bottom:9px;">Alerts</div>
+            <sc-if value="{{ sel.alerts }}" hint-placeholder-val="{{ true }}">
+              <sc-for list="{{ sel.alerts }}" as="al" hint-placeholder-count="1">
+                <div style="display:flex;gap:8px;padding:6px 0;align-items:flex-start;">
+                  <span style="color:{{ al.color }};font-size:11px;margin-top:1px;">{{ al.glyph }}</span>
+                  <div><div style="font-size:11.5px;color:var(--tx-1);">{{ al.title }}</div><div style="font-size:10.5px;color:var(--tx-3);">{{ al.meta }}</div></div>
+                </div>
+              </sc-for>
+            </sc-if>
+            <sc-if value="{{ sel.noAlerts }}" hint-placeholder-val="">
+              <div style="font-size:11.5px;color:var(--tx-3);">No incidents recorded.</div>
+            </sc-if>
+          </div>
+        </div>
+      </sc-if>
+    </aside>
+  </div>
+
+  <!-- ===== TERMINAL DRAWER ===== -->
+  <sc-if value="{{ termOpen }}" hint-placeholder-val="">
+    <div style="flex:0 0 auto;height:236px;border-top:1px solid var(--bd-2);background:var(--bg-0);display:flex;flex-direction:column;">
+      <div style="flex:0 0 auto;display:flex;align-items:center;gap:2px;padding:0 8px;height:34px;border-bottom:1px solid var(--bd);background:var(--bg-1);">
+        <sc-for list="{{ termTabs }}" as="t" hint-placeholder-count="3">
+          <button onClick="{{ t.onClick }}" style="{{ t.style }}">
+            {{ t.label }}
+            <sc-if value="{{ t.locked }}" hint-placeholder-val="">
+              <span title="Input locked — automated run owns the worktree" style="color:var(--amber);font-size:10px;">🔒</span>
+            </sc-if>
+          </button>
+        </sc-for>
+        <div style="flex:1;"></div>
+        <span style="font-size:10.5px;color:var(--tx-3);font-family:ui-monospace,Menlo,monospace;">{{ termMeta }}</span>
+        <button onClick="{{ toggleTerm }}" style="background:transparent;border:none;color:var(--tx-3);cursor:pointer;font-size:15px;padding:0 8px;font-family:inherit;">✕</button>
+      </div>
+      <sc-if value="{{ termLocked }}" hint-placeholder-val="">
+        <div style="flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:7px 12px;background:var(--amber-bg);border-bottom:1px solid var(--amber-bd);font-size:11.5px;color:var(--amber);">
+          <span>🔒</span><span style="color:var(--tx-2);">Input locked — the automated run owns this worktree. <span style="color:var(--tx-1);">Take over</span> will pause, checkpoint, and safely stop the child first.</span>
+          <div style="flex:1;"></div>
+          <button onClick="{{ noop }}" style="background:var(--amber);color:#241a04;border:none;padding:4px 11px;border-radius:5px;font-size:11px;font-weight:650;cursor:pointer;font-family:inherit;">Take over…</button>
+        </div>
+      </sc-if>
+      <div style="flex:1;overflow-y:auto;padding:10px 12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.6;color:var(--tx-2);min-height:0;">
+        <sc-for list="{{ termLines }}" as="l" hint-placeholder-count="5">
+          <div style="{{ l.style }}">{{ l.text }}</div>
+        </sc-for>
+      </div>
+    </div>
+  </sc-if>
+  </div>
+  </sc-if>
+
+  <!-- ===== ATTENTION ===== -->
+  <sc-if value="{{ isAttention }}" hint-placeholder-val="">
+    <div style="flex:1;min-height:0;overflow-y:auto;padding:22px 28px;">
+      <div style="max-width:900px;margin:0 auto;">
+        <h1 style="margin:0;font-size:19px;font-weight:650;">Attention</h1>
+        <p style="margin:5px 0 20px;font-size:13px;color:var(--tx-2);">Every item that needs a human decision, newest first. Nothing here auto-resolves — an item stays until you act on it or the run moves on.</p>
+        <div style="display:flex;flex-direction:column;gap:10px;">
+          <sc-for list="{{ attnItems }}" as="it" hint-placeholder-count="5">
+            <div onClick="{{ it.onClick }}" style="border:1px solid var(--bd);border-left:3px solid {{ it.color }};border-radius:9px;background:var(--bg-1);padding:14px 16px;cursor:pointer;" style-hover="background:var(--bg-2);">
+              <div style="display:flex;align-items:center;gap:9px;">
+                <span style="color:{{ it.color }};font-size:12px;">{{ it.glyph }}</span>
+                <span style="{{ it.sevStyle }}">{{ it.kind }}</span>
+                <span style="font-size:13px;font-weight:600;color:var(--tx-1);">{{ it.run }}</span>
+                <sc-if value="{{ it.blocked }}" hint-placeholder-val="">
+                  <span style="font-size:10px;color:var(--red);border:1px solid var(--red-bd);background:var(--red-bg);border-radius:20px;padding:1px 7px;">run blocked</span>
+                </sc-if>
+                <div style="flex:1;"></div>
+                <span style="font-size:11px;color:var(--tx-3);">{{ it.when }}</span>
+              </div>
+              <p style="margin:9px 0 0;font-size:12.5px;color:var(--tx-2);padding-left:21px;">{{ it.text }}</p>
+              <div style="padding-left:21px;margin-top:11px;"><button onClick="{{ noop }}" style="background:var(--accent);color:#04211f;border:none;padding:6px 13px;border-radius:6px;font-weight:650;font-size:12px;cursor:pointer;font-family:inherit;">{{ it.action }}</button></div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ===== WORKSPACES ===== -->
+  <sc-if value="{{ isWorkspaces }}" hint-placeholder-val="">
+    <div style="flex:1;min-height:0;overflow-y:auto;padding:22px 28px;">
+      <div style="max-width:900px;margin:0 auto;">
+        <div style="display:flex;align-items:center;justify-content:space-between;">
+          <h1 style="margin:0;font-size:19px;font-weight:650;">Workspaces</h1>
+          <button onClick="{{ newRun }}" style="background:transparent;border:1px solid var(--bd-2);color:var(--tx-1);padding:6px 12px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">+ Add repository</button>
+        </div>
+        <p style="margin:5px 0 20px;font-size:13px;color:var(--tx-2);">Known local repositories and their run history. A run is always bound to one workspace at a fixed base commit.</p>
+        <div style="display:flex;flex-direction:column;gap:10px;">
+          <sc-for list="{{ workspaces }}" as="w" hint-placeholder-count="3">
+            <div onClick="{{ w.onClick }}" style="border:1px solid var(--bd);border-radius:9px;background:var(--bg-1);padding:14px 16px;cursor:pointer;" style-hover="background:var(--bg-2);">
+              <div style="display:flex;align-items:center;gap:10px;">
+                <span style="font-size:14px;font-weight:600;">{{ w.name }}</span>
+                <span style="{{ w.dirtyStyle }}">{{ w.dirtyLabel }}</span>
+                <div style="flex:1;"></div>
+                <span style="font-size:11px;color:var(--tx-3);">{{ w.last }}</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:14px;margin-top:8px;font-size:11.5px;color:var(--tx-3);flex-wrap:wrap;">
+                <span style="font-family:ui-monospace,Menlo,monospace;">{{ w.path }}</span>
+                <span>branch <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ w.branch }}</span></span>
+                <span>HEAD <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ w.head }}</span></span>
+                <span><span style="color:var(--accent);">{{ w.active }}</span> active · <span style="color:var(--tx-2);">{{ w.done }}</span> completed</span>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ===== MODELS & HARNESSES ===== -->
+  <sc-if value="{{ isModels }}" hint-placeholder-val="">
+    <div style="flex:1;min-height:0;overflow-y:auto;padding:22px 28px;">
+      <div style="max-width:940px;margin:0 auto;">
+        <h1 style="margin:0;font-size:19px;font-weight:650;">Models &amp; harnesses</h1>
+        <p style="margin:5px 0 8px;font-size:13px;color:var(--tx-2);">Adapter capability, auth readiness, and failover order per harness.</p>
+        <div style="display:flex;gap:16px;margin:0 0 20px;font-size:11px;color:var(--tx-3);flex-wrap:wrap;">
+          <span><span style="color:var(--accent);">Running</span> = effective pin</span>
+          <span><span style="color:var(--amber);">Desired</span> = applies next spawn</span>
+          <span><span style="color:var(--tx-2);">Proposed</span> = for a not-yet-started role</span>
+          <span><span style="color:var(--purple);">Failover</span> = successor target</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+          <sc-for list="{{ harnesses }}" as="h" hint-placeholder-count="4">
+            <div style="border:1px solid var(--bd);border-radius:10px;background:var(--bg-1);padding:15px 16px;">
+              <div style="display:flex;align-items:center;gap:9px;">
+                <span style="width:8px;height:8px;border-radius:50%;background:{{ h.dot }};"></span>
+                <span style="font-size:14px;font-weight:650;">{{ h.name }}</span>
+                <div style="flex:1;"></div>
+                <span style="{{ h.authStyle }}">{{ h.authLabel }}</span>
+              </div>
+              <div style="display:flex;gap:14px;margin-top:10px;font-size:11px;color:var(--tx-3);flex-wrap:wrap;">
+                <span>{{ h.ver }}</span><span>{{ h.proto }}</span>
+              </div>
+              <sc-if value="{{ h.models }}" hint-placeholder-val="">
+                <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:11px;">
+                  <sc-for list="{{ h.models }}" as="m" hint-placeholder-count="2">
+                    <span style="font-size:10.5px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);background:var(--bg-3);border:1px solid var(--bd);border-radius:5px;padding:2px 7px;">{{ m }}</span>
+                  </sc-for>
+                </div>
+              </sc-if>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;margin-top:12px;font-size:11.5px;">
+                <div style="display:flex;justify-content:space-between;"><span style="color:var(--tx-3);">Limit reporting</span><span style="color:var(--tx-1);">{{ h.limitQ }}</span></div>
+                <div style="display:flex;justify-content:space-between;"><span style="color:var(--tx-3);">Retry-after</span><span style="color:var(--tx-1);">{{ h.retry }}</span></div>
+              </div>
+              <div style="margin-top:11px;padding-top:9px;border-top:1px solid var(--bd);font-size:11px;color:{{ h.warn }};">
+                <span style="color:var(--tx-3);">{{ h.note }}</span>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ===== SETTINGS ===== -->
+  <sc-if value="{{ isSettings }}" hint-placeholder-val="">
+    <div style="flex:1;min-height:0;overflow-y:auto;padding:22px 28px;">
+      <div style="max-width:760px;margin:0 auto;">
+        <div style="display:flex;align-items:center;justify-content:space-between;">
+          <h1 style="margin:0;font-size:19px;font-weight:650;">Settings</h1>
+          <button onClick="{{ openDoctor }}" style="background:transparent;border:1px solid var(--bd-2);color:var(--tx-1);padding:6px 12px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Environment doctor</button>
+        </div>
+        <p style="margin:5px 0 20px;font-size:13px;color:var(--tx-2);">Local single-user configuration. Values shown are demo defaults.</p>
+        <div style="display:flex;flex-direction:column;gap:18px;">
+          <sc-for list="{{ settings }}" as="s" hint-placeholder-count="6">
+            <div>
+              <div style="font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase;color:var(--tx-3);margin-bottom:8px;">{{ s.group }}</div>
+              <div style="border:1px solid var(--bd);border-radius:9px;background:var(--bg-1);overflow:hidden;">
+                <sc-for list="{{ s.items }}" as="row" hint-placeholder-count="4">
+                  <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;padding:11px 14px;border-bottom:1px solid var(--bd);">
+                    <span style="font-size:12.5px;color:var(--tx-1);">{{ row.label }}</span>
+                    <span style="{{ row.valStyle }}">{{ row.val }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ===== DOCTOR ===== -->
+  <sc-if value="{{ isDoctor }}" hint-placeholder-val="">
+    <div style="flex:1;min-height:0;overflow-y:auto;padding:22px 28px;">
+      <div style="max-width:720px;margin:0 auto;">
+        <h1 style="margin:0;font-size:19px;font-weight:650;">Environment readiness</h1>
+        <p style="margin:5px 0 20px;font-size:13px;color:var(--tx-2);">What Harness Control detected before your first run. Auth labels are honest: “detected” never implies a provider turn has succeeded.</p>
+        <div style="display:flex;flex-direction:column;gap:16px;">
+          <div style="border:1px solid var(--bd);border-radius:10px;background:var(--bg-1);overflow:hidden;">
+            <div style="padding:10px 14px;border-bottom:1px solid var(--bd);font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase;color:var(--tx-3);">Platform</div>
+            <sc-for list="{{ doctor.platform }}" as="d" hint-placeholder-count="4">
+              <div style="display:flex;align-items:center;gap:11px;padding:10px 14px;border-bottom:1px solid var(--bd);">
+                <span style="{{ d.chipStyle }}">{{ d.glyph }}</span>
+                <span style="flex:0 0 130px;font-size:12.5px;color:var(--tx-1);">{{ d.name }}</span>
+                <span style="font-size:12px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">{{ d.val }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div style="border:1px solid var(--bd);border-radius:10px;background:var(--bg-1);overflow:hidden;">
+            <div style="padding:10px 14px;border-bottom:1px solid var(--bd);font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase;color:var(--tx-3);">Harnesses</div>
+            <sc-for list="{{ doctor.harnesses }}" as="d" hint-placeholder-count="4">
+              <div style="display:flex;align-items:flex-start;gap:11px;padding:10px 14px;border-bottom:1px solid var(--bd);">
+                <span style="{{ d.chipStyle }}">{{ d.glyph }}</span>
+                <div style="flex:1;"><div style="font-size:12.5px;color:var(--tx-1);">{{ d.name }}</div><div style="font-size:11.5px;color:var(--tx-2);margin-top:1px;">{{ d.val }}</div><sc-if value="{{ d.note }}" hint-placeholder-val=""><div style="font-size:11px;color:var(--tx-3);margin-top:3px;">{{ d.note }}</div></sc-if></div>
+              </div>
+            </sc-for>
+          </div>
+          <div style="border:1px solid var(--bd);border-radius:10px;background:var(--bg-1);overflow:hidden;">
+            <div style="padding:10px 14px;border-bottom:1px solid var(--bd);font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase;color:var(--tx-3);">Storage</div>
+            <sc-for list="{{ doctor.storage }}" as="d" hint-placeholder-count="2">
+              <div style="display:flex;align-items:center;gap:11px;padding:10px 14px;border-bottom:1px solid var(--bd);">
+                <span style="{{ d.chipStyle }}">{{ d.glyph }}</span>
+                <span style="flex:0 0 130px;font-size:12.5px;color:var(--tx-1);">{{ d.name }}</span>
+                <span style="font-size:12px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">{{ d.val }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:18px;">
+          <button onClick="{{ startFromDoctor }}" style="background:var(--accent);color:#04211f;border:none;padding:8px 15px;border-radius:6px;font-weight:650;font-size:12.5px;cursor:pointer;font-family:inherit;">Continue with available harnesses</button>
+          <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:8px 15px;border-radius:6px;font-size:12.5px;cursor:pointer;font-family:inherit;">Re-run checks</button>
+          <button onClick="{{ noop }}" style="background:transparent;color:var(--tx-2);border:1px solid var(--bd-2);padding:8px 15px;border-radius:6px;font-size:12.5px;cursor:pointer;font-family:inherit;">Open terminal</button>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ===== NEW RUN ===== -->
+  <sc-if value="{{ isNewRun }}" hint-placeholder-val="">
+    <div style="flex:1;min-height:0;overflow-y:auto;padding:22px 28px;">
+      <div style="max-width:680px;margin:0 auto;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <h1 style="margin:0;font-size:19px;font-weight:650;">New run</h1>
+          <button onClick="{{ backToRuns }}" style="background:transparent;border:none;color:var(--tx-3);font-size:12px;cursor:pointer;font-family:inherit;">← back to runs</button>
+        </div>
+        <p style="margin:5px 0 20px;font-size:13px;color:var(--tx-2);">The coordinator turns your goal into a testable specification. You approve it before any code is written.</p>
+
+        <div style="border:1px solid var(--bd);border-radius:10px;background:var(--bg-1);padding:18px 20px;display:flex;flex-direction:column;gap:18px;">
+          <div>
+            <label style="font-size:12px;font-weight:600;color:var(--tx-1);">Workspace</label>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:7px;padding:9px 11px;border:1px solid var(--bd-2);border-radius:7px;background:var(--bg-0);">
+              <span style="font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:var(--tx-1);flex:1;">/repos/harness-orchestration</span>
+              <span style="font-size:10.5px;color:var(--green);border:1px solid var(--green-bd);background:var(--green-bg);border-radius:20px;padding:1px 8px;">git · clean</span>
+              <button onClick="{{ noop }}" style="background:transparent;border:1px solid var(--bd-2);color:var(--tx-2);padding:3px 9px;border-radius:5px;font-size:11px;cursor:pointer;font-family:inherit;">Choose folder…</button>
+            </div>
+            <div style="font-size:11px;color:var(--tx-3);margin-top:5px;">branch <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">main</span> · HEAD <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">a1f9c02</span></div>
+          </div>
+          <div>
+            <label style="font-size:12px;font-weight:600;color:var(--tx-1);">Goal</label>
+            <div style="margin-top:7px;padding:11px;border:1px solid var(--bd-2);border-radius:7px;background:var(--bg-0);font-size:13px;color:var(--tx-2);min-height:64px;">Add a <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">--verbose</span> flag to the CLI that prints per-request debug lines to stderr.</div>
+            <div style="font-size:11px;color:var(--tx-3);margin-top:5px;">Keep it outcome-focused. The coordinator will explore the repo and draft acceptance criteria.</div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+            <div>
+              <label style="font-size:12px;font-weight:600;color:var(--tx-1);">Coordinator profile</label>
+              <div style="margin-top:7px;padding:9px 11px;border:1px solid var(--bd-2);border-radius:7px;background:var(--bg-0);font-size:12.5px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">Claude / Opus / low</div>
+              <div style="font-size:11px;color:var(--green);margin-top:5px;">auth validated · default from config</div>
+            </div>
+            <div>
+              <label style="font-size:12px;font-weight:600;color:var(--tx-1);">Budget cap (estimated)</label>
+              <div style="margin-top:7px;padding:9px 11px;border:1px solid var(--bd-2);border-radius:7px;background:var(--bg-0);font-size:12.5px;font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">$5.00 · 3 live children</div>
+              <div style="font-size:11px;color:var(--tx-3);margin-top:5px;">measured + estimated tracked separately</div>
+            </div>
+          </div>
+
+          <div style="border-top:1px solid var(--bd);padding-top:14px;">
+            <div style="font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase;color:var(--tx-3);margin-bottom:8px;">Before you submit</div>
+            <ul style="margin:0;padding-left:18px;font-size:12px;color:var(--tx-2);line-height:1.8;">
+              <li>Approval will be required before implementation begins.</li>
+              <li>Implementation happens in an isolated git worktree.</li>
+              <li>No automatic merge, push, or PR — integration stays manual.</li>
+            </ul>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <button onClick="{{ backToRuns }}" style="background:var(--accent);color:#04211f;border:none;padding:9px 18px;border-radius:7px;font-weight:650;font-size:13px;cursor:pointer;font-family:inherit;">Draft specification</button>
+            <button onClick="{{ backToRuns }}" style="background:transparent;color:var(--tx-2);border:1px solid var(--bd-2);padding:9px 18px;border-radius:7px;font-size:13px;cursor:pointer;font-family:inherit;">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ===== STATUS FOOTER ===== -->
+  <footer style="flex:0 0 auto;height:26px;display:flex;align-items:center;gap:14px;padding:0 14px;border-top:1px solid var(--bd);background:var(--bg-1);font-size:11px;color:var(--tx-3);">
+    <button onClick="{{ toggleTerm }}" style="background:transparent;border:none;color:var(--tx-2);cursor:pointer;font-size:11px;font-family:inherit;display:flex;align-items:center;gap:5px;">▤ Terminal <kbd style="font-family:ui-monospace,Menlo,monospace;border:1px solid var(--bd-2);border-radius:3px;padding:0 4px;">⌘J</kbd></button>
+    <span style="color:var(--bd-2);">|</span>
+    <span>Loopback only · session token active</span>
+    <div style="flex:1;"></div>
+    <span style="font-family:ui-monospace,Menlo,monospace;">daemon v0.4.2 · read models ready</span>
+    <span style="color:var(--bd-2);">|</span>
+    <span style="display:flex;align-items:center;gap:5px;"><span style="width:6px;height:6px;border-radius:50%;background:var(--green);"></span>durable snapshot current</span>
+  </footer>
+
+  <!-- ===== COMMAND PALETTE ===== -->
+  <sc-if value="{{ paletteOpen }}" hint-placeholder-val="">
+    <div onClick="{{ closePalette }}" style="position:fixed;inset:0;background:rgba(5,7,10,.55);display:flex;align-items:flex-start;justify-content:center;padding-top:12vh;z-index:50;">
+      <div onClick="{{ stop }}" style="width:560px;max-width:92vw;background:var(--bg-2);border:1px solid var(--bd-2);border-radius:12px;box-shadow:0 24px 64px rgba(0,0,0,.5);overflow:hidden;">
+        <input autofocus placeholder="Type a command or run name…" style="width:100%;border:none;border-bottom:1px solid var(--bd);background:transparent;color:var(--tx-1);padding:14px 16px;font-size:14px;font-family:inherit;outline:none;" />
+        <div style="max-height:340px;overflow-y:auto;padding:6px;">
+          <sc-for list="{{ paletteItems }}" as="p" hint-placeholder-count="6">
+            <div onClick="{{ p.onClick }}" style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:7px;cursor:pointer;" style-hover="background:var(--bg-hover);">
+              <span style="width:18px;text-align:center;color:{{ p.iconColor }};">{{ p.icon }}</span>
+              <span style="flex:1;font-size:13px;color:var(--tx-1);">{{ p.label }}</span>
+              <span style="font-size:11px;color:var(--tx-3);">{{ p.hint }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ===== DESKTOP MENU-BAR / TRAY ===== -->
+  <sc-if value="{{ tray }}" hint-placeholder-val="">
+    <div onClick="{{ closeTray }}" style="position:fixed;inset:0;z-index:55;">
+      <div onClick="{{ stop }}" style="position:absolute;top:8px;right:14px;width:300px;background:var(--bg-2);border:1px solid var(--bd-2);border-radius:12px;box-shadow:0 24px 64px rgba(0,0,0,.55);overflow:hidden;font-size:12.5px;">
+        <div style="padding:11px 14px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:8px;">
+          <span style="width:14px;height:14px;border:1.5px solid var(--accent);border-radius:3px;position:relative;"><span style="position:absolute;inset:3px;background:var(--accent);border-radius:1px;"></span></span>
+          <span style="font-weight:650;">Harness Control</span>
+          <div style="flex:1;"></div>
+          <span style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--tx-2);"><span style="width:6px;height:6px;border-radius:50%;background:var(--green);"></span>running</span>
+        </div>
+        <div style="padding:9px 14px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;color:var(--tx-2);">
+          <span>Daemon <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-3);">v0.4.2</span></span>
+          <span><span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">2 / 3</span> live children</span>
+        </div>
+        <div style="padding:10px 14px;border-bottom:1px solid var(--bd);">
+          <div style="font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);margin-bottom:7px;">Needs attention · 3</div>
+          <div style="display:flex;align-items:center;gap:8px;padding:3px 0;"><span style="color:var(--amber);">◐</span><span style="flex:1;color:var(--tx-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Spec approval — retry behavior</span></div>
+          <div style="display:flex;align-items:center;gap:8px;padding:3px 0;"><span style="color:var(--red);">▲</span><span style="flex:1;color:var(--tx-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Breaker open — config loader</span></div>
+          <div style="display:flex;align-items:center;gap:8px;padding:3px 0;"><span style="color:var(--amber);">◫</span><span style="flex:1;color:var(--tx-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Blocked — session tokens</span></div>
+        </div>
+        <div style="padding:6px;">
+          <div onClick="{{ closeTray }}" style="padding:7px 9px;border-radius:6px;cursor:pointer;color:var(--tx-1);" style-hover="background:var(--bg-hover);">Open Harness Control</div>
+          <div onClick="{{ closeTray }}" style="padding:7px 9px;border-radius:6px;cursor:pointer;color:var(--tx-1);" style-hover="background:var(--bg-hover);">New run…</div>
+          <div style="padding:7px 9px;border-radius:6px;cursor:pointer;color:var(--tx-2);" style-hover="background:var(--bg-hover);">Mute notifications</div>
+          <div style="padding:7px 9px;border-radius:6px;cursor:pointer;color:var(--tx-2);" style-hover="background:var(--bg-hover);">Quit UI · keep service running</div>
+          <div style="height:1px;background:var(--bd);margin:5px 9px;"></div>
+          <div style="padding:7px 9px;border-radius:6px;cursor:pointer;color:var(--red);" style-hover="background:var(--red-bg);">Stop service…</div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ===== MOBILE INSPECTION VARIANT ===== -->
+  <sc-if value="{{ mobile }}" hint-placeholder-val="">
+    <div onClick="{{ closeMobile }}" style="position:fixed;inset:0;background:rgba(5,7,10,.6);z-index:55;display:flex;align-items:center;justify-content:center;gap:22px;">
+      <div onClick="{{ stop }}" style="width:390px;height:min(760px,90vh);background:var(--bg-0);border:8px solid #05070a;border-radius:38px;box-shadow:0 30px 80px rgba(0,0,0,.6);overflow:hidden;display:flex;flex-direction:column;">
+        <div style="flex:0 0 auto;height:40px;display:flex;align-items:center;justify-content:space-between;padding:0 22px;font-size:12px;color:var(--tx-2);"><span style="font-weight:650;">9:41</span><span>Harness</span><span>▪▪▪ ▮</span></div>
+        <div style="flex:0 0 auto;padding:10px 16px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:9px;">
+          <span style="font-size:15px;font-weight:650;color:var(--tx-1);">Runs</span>
+          <span style="font-size:10px;font-weight:700;background:var(--amber-bg);color:var(--amber);border:1px solid var(--amber-bd);border-radius:10px;padding:1px 7px;">3</span>
+          <div style="flex:1;"></div>
+          <span style="font-size:11px;color:var(--tx-2);display:flex;align-items:center;gap:5px;"><span style="width:6px;height:6px;border-radius:50%;background:var(--green);"></span>2/3 live</span>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:12px 14px;">
+          <div style="font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);margin:0 0 8px;">Waiting on you</div>
+          <div style="border:1px solid var(--amber-bd);background:var(--amber-bg);border-radius:10px;padding:13px;margin-bottom:10px;">
+            <div style="display:flex;align-items:center;gap:8px;"><span style="color:var(--amber);">◐</span><span style="font-size:13px;font-weight:600;">Add a --verbose flag</span></div>
+            <div style="font-size:11.5px;color:var(--tx-2);margin-top:6px;">Verifying · waiting for permission. Verifier requests <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">fs.read</span> outside the worktree.</div>
+            <div style="display:flex;gap:6px;margin-top:11px;">
+              <button onClick="{{ noop }}" style="flex:1;min-height:44px;background:var(--accent);color:#04211f;border:none;border-radius:8px;font-weight:650;font-size:12.5px;cursor:pointer;font-family:inherit;">Allow once</button>
+              <button onClick="{{ noop }}" style="flex:1;min-height:44px;background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);border-radius:8px;font-size:12.5px;cursor:pointer;font-family:inherit;">Deny once</button>
+            </div>
+          </div>
+          <div style="border:1px solid var(--bd);background:var(--bg-1);border-radius:10px;padding:13px;margin-bottom:10px;">
+            <div style="display:flex;align-items:center;gap:8px;"><span style="color:var(--amber);">◐</span><span style="font-size:13px;font-weight:600;">Fix retry behavior</span></div>
+            <div style="font-size:11.5px;color:var(--tx-2);margin-top:6px;">Awaiting spec approval · v3</div>
+            <div style="display:flex;gap:6px;margin-top:11px;">
+              <button onClick="{{ noop }}" style="flex:1;min-height:44px;background:var(--accent);color:#04211f;border:none;border-radius:8px;font-weight:650;font-size:12.5px;cursor:pointer;font-family:inherit;">Approve v3</button>
+              <button onClick="{{ noop }}" style="flex:1;min-height:44px;background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);border-radius:8px;font-size:12.5px;cursor:pointer;font-family:inherit;">Request revision</button>
+            </div>
+          </div>
+          <div style="font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);margin:14px 0 8px;">Active</div>
+          <div style="border:1px solid var(--bd);background:var(--bg-1);border-radius:10px;padding:12px;display:flex;align-items:center;gap:9px;">
+            <span style="color:var(--accent);">●</span><div style="flex:1;"><div style="font-size:12.5px;">Migrate auth to session tokens</div><div style="font-size:11px;color:var(--amber);">Integration blocked</div></div>
+          </div>
+          <div style="margin-top:16px;padding:11px;border:1px dashed var(--bd);border-radius:9px;font-size:11px;color:var(--tx-3);text-align:center;">Mobile is inspection-first. Terminal takeover, diff review, and breaker repair require desktop.</div>
+        </div>
+      </div>
+      <button onClick="{{ closeMobile }}" style="position:absolute;top:20px;right:24px;background:var(--bg-2);border:1px solid var(--bd-2);color:var(--tx-1);width:32px;height:32px;border-radius:8px;cursor:pointer;font-family:inherit;">✕</button>
+    </div>
+  </sc-if>
+
+  <!-- toast -->
+  <sc-if value="{{ toast }}" hint-placeholder-val="">
+    <div style="position:fixed;bottom:40px;left:50%;transform:translateX(-50%);background:var(--bg-3);border:1px solid var(--bd-2);color:var(--tx-1);padding:9px 16px;border-radius:8px;font-size:12.5px;box-shadow:0 12px 32px rgba(0,0,0,.4);z-index:60;">{{ toast }}</div>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:&quot;100%&quot;,&quot;height&quot;:&quot;100%&quot;},&quot;density&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;comfortable&quot;,&quot;compact&quot;],&quot;default&quot;:&quot;comfortable&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Display&quot;},&quot;accent&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:[&quot;#35b0b5&quot;,&quot;#5b8def&quot;,&quot;#8a86ff&quot;,&quot;#8a929e&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;}}">
+class Component extends DCLogic {
+  state = { view:'runs', runId:'run-a', tab:'overview', crit:null, file:0, filter:'all', termOpen:false, termTab:'worktree', paletteOpen:false, copyLabel:'Copy', toast:'', vw: (typeof window!=='undefined'?window.innerWidth:1440), inspOpen:false, reconnect:false, wizard:0, specDiff:false, mobile:false, tray:false };
+  go(view){ this.setState({view, paletteOpen:false}); }
+
+  componentDidMount(){
+    this._key = (e)=>{
+      const tag=(e.target&&e.target.tagName)||'';
+      const typing = tag==='INPUT'||tag==='TEXTAREA';
+      if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){ e.preventDefault(); this.setState(s=>({paletteOpen:!s.paletteOpen})); return; }
+      if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='j'){ e.preventDefault(); this.setState(s=>({termOpen:!s.termOpen})); return; }
+      if(e.key==='Escape'){ this.setState({paletteOpen:false, crit:null}); return; }
+      if(typing) return;
+      if(e.key===']'||e.key==='['){ e.preventDefault(); this.cycleRun(e.key===']'?1:-1); }
+    };
+    window.addEventListener('keydown', this._key);
+    this._rz = ()=>this.setState({vw:window.innerWidth});
+    window.addEventListener('resize', this._rz);
+  }
+  componentWillUnmount(){ window.removeEventListener('keydown', this._key); window.removeEventListener('resize', this._rz); }
+
+  cycleRun(d){ const ids=this.RUNS.map(r=>r.id); const i=ids.indexOf(this.state.runId); const n=(i+d+ids.length)%ids.length; this.setState({runId:ids[n], tab:'overview', crit:null}); }
+  flash(t){ this.setState({toast:t}); clearTimeout(this._t); this._t=setTimeout(()=>this.setState({toast:''}),1800); }
+
+  get RUNS(){ return [
+    { id:'run-a', ui:'attention', goal:'Add a --verbose flag to the CLI', workspace:'harness-orchestration',
+      phase:'verifying', suspension:'none', operation:'prompt_turn', roleTag:'Verifier · Sonnet', attention:1,
+      base:'a1f9c02', commit:'c254435', branch:'hc/verbose-flag', cm:'0.55', ce:'0.50', elapsed:'18m elapsed', remediation:0 },
+    { id:'run-b', ui:'attention', goal:'Fix retry behavior in the job queue', workspace:'harness-orchestration',
+      phase:'awaiting_approval', suspension:'none', operation:'idle', roleTag:'Coordinator', attention:'!',
+      base:'7b30e1a', branch:'', cm:'0.12', ce:'0.08', elapsed:'4m elapsed', remediation:0 },
+    { id:'run-c', ui:'paused', goal:'Refactor import boundaries', workspace:'harness-orchestration',
+      phase:'implementing', suspension:'paused_limit', operation:'idle', roleTag:'Implementor · Codex',
+      base:'55c0a9d', commit:'—', branch:'hc/import-boundaries', cm:'0.83', ce:'0.40', elapsed:'32m · paused 6m', remediation:1 },
+    { id:'run-d', ui:'breaker', goal:'Replace legacy config loader', workspace:'harness-orchestration',
+      phase:'implementing', suspension:'breaker_open', operation:'idle', roleTag:'Implementor · Codex', attention:'!',
+      base:'2ad81f0', commit:'—', branch:'hc/config-loader', cm:'1.24', ce:'0.30', elapsed:'47m · breaker 3m', remediation:0 },
+    { id:'run-f', ui:'recovering', goal:'Add rate-limit headers to API', workspace:'billing-service',
+      phase:'implementing', suspension:'interrupted', operation:'resume_probe', roleTag:'Implementor · Claude',
+      base:'9c02f1a', commit:'—', branch:'hc/rate-limit', cm:'0.61', ce:'0.35', elapsed:'22m · attempt 2', remediation:0 },
+    { id:'run-g', ui:'blocked', goal:'Migrate auth to session tokens', workspace:'harness-orchestration',
+      phase:'verifying', suspension:'none', operation:'git_op', roleTag:'Verified · blocked', attention:'!',
+      base:'44a9c3e', commit:'b7710dd', branch:'hc/session-tokens', cm:'0.92', ce:'0.00', elapsed:'done · 34m', remediation:0 },
+    { id:'run-e', ui:'done', goal:'Update CLI documentation', workspace:'harness-orchestration',
+      phase:'merge_ready', suspension:'none', operation:'idle', roleTag:'Merge-ready',
+      base:'e4a7712', commit:'c9f0d31', branch:'hc/cli-docs', cm:'0.34', ce:'0.00', elapsed:'done · 11m', remediation:0 },
+  ]; }
+
+  statusMeta(ui){ const m={
+    attention:{label:'Waiting on you', glyph:'◐', color:'var(--amber)', anim:''},
+    working:{label:'Working', glyph:'●', color:'var(--accent)', anim:'animation:hcpulse 1.8s ease-in-out infinite;'},
+    verifying:{label:'Verifying', glyph:'●', color:'var(--accent)', anim:'animation:hcpulse 1.8s ease-in-out infinite;'},
+    paused:{label:'Paused—limit', glyph:'‖', color:'var(--amber)', anim:''},
+    breaker:{label:'Breaker open', glyph:'▲', color:'var(--red)', anim:''},
+    done:{label:'Merge-ready', glyph:'✓', color:'var(--green)', anim:''},
+    recovering:{label:'Auto-recovering', glyph:'↻', color:'var(--amber)', anim:'animation:hcpulse 1.8s ease-in-out infinite;'},
+    interrupted:{label:'Interrupted', glyph:'◇', color:'var(--amber)', anim:''},
+    blocked:{label:'Integration blocked', glyph:'◫', color:'var(--amber)', anim:''},
+  }; return m[ui]||m.working; }
+
+  phaseLabel(p){ return {created:'Created',specifying:'Specifying',awaiting_approval:'Awaiting approval',approved:'Approved',implementing:'Implementing',verifying:'Verifying',needs_remediation:'Needs remediation',merge_ready:'Merge-ready',cancelled:'Cancelled',failed:'Failed'}[p]||p; }
+  opLabel(o){ return {idle:'idle',prompt_turn:'prompt turn',model_switch:'model switch',checkpoint_write:'checkpoint write',git_op:'git op',resume_probe:'resume probe',initial_config_pin:'config pin'}[o]||o; }
+
+  detailLine(r){
+    if(r.suspension==='paused_limit') return 'Paused—limit · reset time unavailable';
+    if(r.suspension==='breaker_open') return 'Breaker open · manual reset required';
+    if(r.suspension==='interrupted') return 'Auto-recovering · attempt 2';
+    if(r.ui==='blocked') return 'Integration blocked by your destination checkout';
+    if(r.phase==='awaiting_approval') return 'Waiting for spec approval';
+    if(r.phase==='verifying') return 'waiting for permission';
+    if(r.phase==='merge_ready') return 'manual integration';
+    return 'working';
+  }
+  detailColor(r){ return (r.suspension!=='none'||r.ui==='blocked')?'var(--amber)':(r.phase==='merge_ready')?'var(--green)':(r.phase==='awaiting_approval')?'var(--amber)':'var(--accent)'; }
+
+  buildNodes(r){
+    const order=[['spec','Spec'],['approval','Approval'],['implement','Implement'],['verify','Verify'],['merge','Merge-ready']];
+    const idx={created:0,specifying:0,awaiting_approval:1,approved:1,implementing:2,needs_remediation:2,verifying:3,merge_ready:4}[r.phase]??0;
+    const suspended=r.suspension!=='none';
+    return order.map(([k,label],i)=>{
+      let state = i<idx?'done':(i===idx?'current':'todo');
+      let color = state==='done'?'var(--accent)':state==='current'?(suspended?'var(--amber)':(r.phase==='merge_ready'?'var(--green)':'var(--accent)')):'var(--tx-3)';
+      let fill = state==='todo'?'var(--bg-0)':color;
+      let txt = state==='todo'?'#04211f':( (r.phase==='merge_ready'&&i===4)?'#04211f':'#04211f');
+      const glyph = state==='done'?'✓':(state==='current'? (suspended?'‖':(r.phase==='merge_ready'?'✓':'●')) : (i+1));
+      const dotStyle = `width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;border:2px solid ${color};`+
+        (state==='todo'?`background:var(--bg-0);color:var(--tx-3);`:`background:${color};color:#04211f;`)+
+        (state==='current'&&!suspended&&r.phase!=='merge_ready'?'animation:hcpulse 1.8s ease-in-out infinite;':'');
+      const labelStyle = `font-size:10.5px;color:${state==='todo'?'var(--tx-3)':(state==='current'?color:'var(--tx-2)')};`;
+      const connColor = i<idx?'var(--accent)':'var(--bd)';
+      const connStyle = `width:34px;height:2px;background:${connColor};margin:0 2px;align-self:flex-start;margin-top:10px;`;
+      return { label, glyph, dotStyle, labelStyle, connStyle, hasConn: i<order.length-1 };
+    });
+  }
+
+  laneColor(role){ return {Coordinator:'var(--accent)',Implementor:'var(--purple)',Verifier:'var(--green)'}[role]||'var(--tx-2)'; }
+
+  buildLanes(r){
+    const active=(cond,c)=> cond?{stateLabel:'active',stateColor:c,dot:c,anim:'animation:hcpulse 1.8s ease-in-out infinite;'}:null;
+    const done={stateLabel:'complete',stateColor:'var(--tx-3)',dot:'var(--tx-3)',anim:''};
+    const idle={stateLabel:'not started',stateColor:'var(--tx-3)',dot:'var(--bg-3)',anim:''};
+    const paused={stateLabel:'paused—limit',stateColor:'var(--amber)',dot:'var(--amber)',anim:''};
+    const mk=(role,harness,model,effort,st,facts,current,indep)=>({role,harness,model,effort,indep:!!indep,
+      borderColor:st.stateColor==='var(--tx-3)'?'var(--bd)':st.dot, headBg:'var(--bg-2)',
+      stateLabel:st.stateLabel, stateColor:st.stateColor, dot:st.dot, anim:st.anim,
+      facts:facts.map(f=>({k:f[0],v:f[1],vStyle:`color:var(--tx-1);${f[2]?'font-family:ui-monospace,Menlo,monospace;':''}`})), current });
+    if(r.id==='run-b') return [
+      mk('Coordinator','Claude','Opus','low',{stateLabel:'complete',stateColor:'var(--tx-3)',dot:'var(--tx-3)',anim:''},[['Spec produced','v3',1],['Validation retries','1'],['Segment','seg-1 · gen-1',1]],'Awaiting your approval of v3',false),
+      mk('Implementor','Codex','gpt-5.6-terra','medium',idle,[['Proposed','yes'],['Worktree','on approval']],'',false),
+      mk('Verifier','Claude','Sonnet','medium',idle,[['Proposed','yes'],['Mode','read-only']],'',true),
+    ];
+    if(r.id==='run-c') return [
+      mk('Coordinator','Claude','Opus','low',done,[['Spec produced','v1',1],['Segment','seg-1 · gen-1',1]],'',false),
+      mk('Implementor','Codex','gpt-5.6-terra','medium',paused,[['Worktree','hc/import-boundaries',1],['Checkpoint','ckpt-0007',1],['Round','remediation 1']],'Paused at checkpoint — provider limit',false),
+      mk('Verifier','Claude','Sonnet','medium',idle,[['Waiting','for impl commit']],'',true),
+    ];
+    if(r.id==='run-e') return [
+      mk('Coordinator','Claude','Opus','low',done,[['Spec produced','v1',1],['Segment','seg-1 · gen-1',1]],'',false),
+      mk('Implementor','Codex','gpt-5.6-terra','medium',done,[['Commit','c9f0d31',1],['Files changed','2'],['Worktree','clean']],'',false),
+      mk('Verifier','Claude','Sonnet','medium',done,[['Commit','c9f0d31',1],['Verified','3 / 3'],['Evidence','5 artifacts']],'',true),
+    ];
+    if(r.id==='run-d'){ const breaker={stateLabel:'breaker open',stateColor:'var(--red)',dot:'var(--red)',anim:''}; return [
+      mk('Coordinator','Claude','Opus','low',done,[['Spec produced','v1',1],['Segment','seg-1 · gen-1',1]],'',false),
+      mk('Implementor','Codex','gpt-5.6-terra','medium',breaker,[['Worktree','validated',1],['Generations','3'],['Last checkpoint','ckpt-0004',1]],'Stopped — breaker open after repeated crashes',false),
+      mk('Verifier','Claude','Sonnet','medium',idle,[['Waiting','for impl commit']],'',true),
+    ]; }
+    if(r.id==='run-f'){ const rec={stateLabel:'auto-recovering',stateColor:'var(--amber)',dot:'var(--amber)',anim:'animation:hcpulse 1.8s ease-in-out infinite;'}; return [
+      mk('Coordinator','Claude','Opus','low',done,[['Spec produced','v2',1],['Segment','seg-1 · gen-1',1]],'',false),
+      mk('Implementor','Claude','Sonnet','medium',rec,[['Attempt','2 of 5'],['Last checkpoint','ckpt-0009',1],['Backoff','next in 0:18']],'Interrupted — spawning successor from checkpoint',false),
+      mk('Verifier','Claude','Sonnet','medium',idle,[['Waiting','for impl commit']],'',true),
+    ]; }
+    if(r.id==='run-g') return [
+      mk('Coordinator','Claude','Opus','low',done,[['Spec produced','v1',1],['Segment','seg-1 · gen-1',1]],'',false),
+      mk('Implementor','Codex','gpt-5.6-terra','medium',done,[['Commit','b7710dd',1],['Files changed','9'],['Worktree','clean']],'',false),
+      mk('Verifier','Claude','Sonnet','medium',done,[['Commit','b7710dd',1],['Verified','4 / 4'],['Evidence','7 artifacts']],'All criteria verified — integration blocked downstream',true),
+    ];
+    // run-a
+    return [
+      mk('Coordinator','Claude','Opus','low',done,[['Spec produced','v2',1],['Started','13:52'],['Ended','13:58'],['Segment','seg-1 · gen-1',1]],'',false),
+      mk('Implementor','Codex','gpt-5.6-terra','medium',done,[['Commit','c254435',1],['Files changed','4'],['Checks run','2 passed'],['Worktree','committed']],'',false),
+      mk('Verifier','Claude','Sonnet','medium',active(true,'var(--green)'),[['Verifying','c254435',1],['Verified','2 / 3'],['Evidence','5 artifacts'],['Criterion','AC-3']],'Checking AC-3 · running help snapshot',true),
+    ];
+  }
+
+  criteriaFor(r){
+    const V={verified:{g:'✓',c:'var(--green)',s:'color:var(--green);background:var(--green-bg);border:1px solid var(--green-bd);'},
+             failed:{g:'✕',c:'var(--red)',s:'color:var(--red);background:var(--red-bg);border:1px solid var(--red-bd);'},
+             running:{g:'◐',c:'var(--accent)',s:'color:var(--accent);background:var(--accent-bg);border:1px solid var(--accent-bd);'},
+             unproven:{g:'○',c:'var(--tx-2)',s:'color:var(--tx-2);background:var(--bg-3);border:1px solid var(--bd);'}};
+    let list=[];
+    if(r.id==='run-a') list=[
+      {id:'AC-1',text:'`--verbose` prints per-request debug lines to stderr',verdict:'verified',evidence:3,cmd:'npm test -- verbose',ev:[{name:'stderr-capture.log',kind:'log',note:'DEBUG lines present for each of 12 requests'},{name:'test-report.json',kind:'report',note:'suite "verbose" 8/8 passing'},{name:'diff-snippet',kind:'diff',note:'flag wired to logger.level'}]},
+      {id:'AC-2',text:'Default output is unchanged when the flag is absent',verdict:'verified',evidence:2,cmd:'npm test -- cli-default',ev:[{name:'baseline.txt',kind:'artifact',note:'byte-identical to pre-change output'},{name:'test-report.json',kind:'report',note:'suite "cli-default" 4/4 passing'}]},
+      {id:'AC-3',text:'`--verbose` is documented in `--help`',verdict:'running',evidence:0,cmd:'npm run help:snapshot',ev:[]},
+    ];
+    else if(r.id==='run-e') list=[
+      {id:'AC-1',text:'README documents every CLI subcommand',verdict:'verified',evidence:2,cmd:'npm run docs:check',ev:[{name:'coverage.json',kind:'report',note:'12/12 subcommands documented'}]},
+      {id:'AC-2',text:'Examples in docs execute without error',verdict:'verified',evidence:2,cmd:'npm run docs:examples',ev:[{name:'example-run.log',kind:'log',note:'all 6 examples exited 0'}]},
+      {id:'AC-3',text:'No broken internal links',verdict:'verified',evidence:1,cmd:'npm run docs:links',ev:[{name:'linkcheck.txt',kind:'log',note:'0 broken of 34 links'}]},
+    ];
+    else if(r.id==='run-b') list=[
+      {id:'AC-1',text:'Failed jobs retry with exponential backoff (cap 5)',verdict:'unproven',evidence:0,cmd:'npm test -- retry-backoff',ev:[]},
+      {id:'AC-2',text:'Permanent failures move to the dead-letter queue',verdict:'unproven',evidence:0,cmd:'npm test -- dlq',ev:[]},
+      {id:'AC-3',text:'Retry counters survive a daemon restart',verdict:'unproven',evidence:0,cmd:'npm test -- retry-durable',ev:[]},
+    ];
+    else if(r.id==='run-g') list=[
+      {id:'AC-1',text:'All routes accept a session token in the Authorization header',verdict:'verified',evidence:2,cmd:'npm test -- auth-header',ev:[{name:'auth-suite.json',kind:'report',note:'22/22 routes covered'}]},
+      {id:'AC-2',text:'Legacy API keys are rejected with 401',verdict:'verified',evidence:2,cmd:'npm test -- legacy-reject',ev:[{name:'reject.log',kind:'log',note:'all legacy keys 401'}]},
+      {id:'AC-3',text:'Tokens expire and refresh correctly',verdict:'verified',evidence:2,cmd:'npm test -- token-expiry',ev:[{name:'expiry.json',kind:'report',note:'refresh window verified'}]},
+      {id:'AC-4',text:'Session store survives restart',verdict:'verified',evidence:1,cmd:'npm test -- session-durable',ev:[{name:'durable.log',kind:'log',note:'sessions restored'}]},
+    ];
+    else if(r.id==='run-d') list=[{id:'AC-1',text:'Config loads from the new schema with fallback',verdict:'unproven',evidence:0,cmd:'npm test -- config-loader',ev:[]}];
+    else list=[{id:'AC-1',text:'Import boundaries enforced by lint rule',verdict:'unproven',evidence:0,cmd:'npm run lint:boundaries',ev:[]}];
+    return list.map((c,i)=>{ const v=V[c.verdict]; return {...c, verdictGlyph:v.g, dotColor:v.c, verdictStyle:`font-size:10.5px;padding:2px 8px;border-radius:20px;${v.s}`,
+      verdict: c.verdict.charAt(0).toUpperCase()+c.verdict.slice(1),
+      evidenceItems:c.ev,
+      onClick:()=>this.setState({crit:i}),
+      rowStyle:`display:grid;grid-template-columns:56px 1fr 120px 90px;gap:0;padding:11px 14px;border-bottom:1px solid var(--bd);cursor:pointer;${this.state.tab==='verify'?'':''}` }; });
+  }
+
+  summaryFor(r){
+    const rc={Coordinator:'var(--accent)',Implementor:'var(--purple)',Verifier:'var(--green)',System:'var(--tx-3)'};
+    const tag=(t,color,bg,bd)=>({tag:t,tagStyle:`font-size:10px;padding:1px 7px;border-radius:20px;color:${color};background:${bg};border:1px solid ${bd};`});
+    const mk=(time,role,text,tg)=>({time,role,roleColor:rc[role]||'var(--tx-2)',text,...(tg||{tag:''})});
+    if(r.id==='run-b') return [
+      mk('14:02','Coordinator','Drafted specification v3 (immutable)',tag('spec','var(--accent)','var(--accent-bg)','var(--accent-bd)')),
+      mk('14:01','Coordinator','Incorporated your v2 revision feedback'),
+      mk('13:58','System','Awaiting approval — no work will start until you approve',tag('attention','var(--amber)','var(--amber-bg)','var(--amber-bd)')),
+    ];
+    if(r.id==='run-c') return [
+      mk('13:36','System','Paused — provider limit detected on Codex',tag('limit','var(--amber)','var(--amber-bg)','var(--amber-bd)')),
+      mk('13:36','Implementor','Checkpoint ckpt-0007 written before stop'),
+      mk('13:30','Implementor','Remediation round 1 started on same worktree'),
+      mk('13:12','Verifier','AC-1 failed — routed back to implementor',tag('remediation','var(--red)','var(--red-bg)','var(--red-bd)')),
+    ];
+    if(r.id==='run-e') return [
+      mk('11:20','Verifier','All 3 criteria verified',tag('verified','var(--green)','var(--green-bg)','var(--green-bd)')),
+      mk('11:12','Implementor','Committed c9f0d31 · worktree clean'),
+      mk('11:02','Coordinator','Spec v1 approved by you'),
+      mk('10:58','System','Merge-ready — manual integration only',tag('handoff','var(--green)','var(--green-bg)','var(--green-bd)')),
+    ];
+    return [
+      mk('14:11','Verifier','Started AC-3 · running help snapshot'),
+      mk('14:09','Verifier','AC-2 verified — 2 evidence artifacts',tag('verified','var(--green)','var(--green-bg)','var(--green-bd)')),
+      mk('14:07','System','Permission requested: read outside worktree',tag('permission','var(--amber)','var(--amber-bg)','var(--amber-bd)')),
+      mk('14:03','Verifier','AC-1 verified — 3 evidence artifacts',tag('verified','var(--green)','var(--green-bg)','var(--green-bd)')),
+      mk('13:59','Implementor','Committed c254435 · 4 files · checks passed'),
+    ];
+  }
+
+  activityFor(r){
+    const rc={Coordinator:'var(--accent)',Implementor:'var(--purple)',Verifier:'var(--green)',System:'var(--tx-3)'};
+    const tag=(t,color,bg,bd)=>({tag:t,tagStyle:`font-size:10px;padding:1px 7px;border-radius:20px;color:${color};background:${bg};border:1px solid ${bd};`});
+    const mk=(time,role,text,detail,node,tg)=>({time,role,roleColor:rc[role]||'var(--tx-2)',text,detail:detail||'',nodeColor:node||'var(--bd-2)',nodeRadius:'50%',...(tg||{tag:''})});
+    if(r.id!=='run-a') return this.summaryFor(r).map(s=>({...s,detail:'',nodeColor:'var(--bd-2)',nodeRadius:'50%'}));
+    return [
+      mk('14:11','Verifier','Turn started · AC-3','tool_call: run help:snapshot','var(--accent)'),
+      mk('14:09','Verifier','AC-2 verified','2 evidence artifacts attached','var(--green)',tag('verified','var(--green)','var(--green-bg)','var(--green-bd)')),
+      mk('14:07','System','Permission request','tool: fs.read · path outside worktree','var(--amber)',tag('permission','var(--amber)','var(--amber-bg)','var(--amber-bd)')),
+      mk('14:05','Verifier','Checkpoint written','ckpt-0011 · seg-2 gen-1','var(--tx-3)',tag('checkpoint','var(--tx-2)','var(--bg-3)','var(--bd)')),
+      mk('14:03','Verifier','AC-1 verified','3 evidence artifacts attached','var(--green)',tag('verified','var(--green)','var(--green-bg)','var(--green-bd)')),
+      mk('14:00','System','Phase change → verifying','implement → verify','var(--accent)',tag('phase','var(--accent)','var(--accent-bg)','var(--accent-bd)')),
+      mk('13:59','Implementor','Committed c254435','4 files · +182 −34','var(--purple)'),
+      mk('13:44','Implementor','Plan updated','5 steps · 4 complete','var(--purple)',tag('plan','var(--purple)','var(--purple-bg)','var(--purple-bd)')),
+      mk('13:58','Coordinator','Produced spec v2','sha256:9f3c… · immutable','var(--accent)'),
+    ];
+  }
+
+  filesFor(r){
+    if(r.id==='run-e') return [{name:'README.md',add:64,del:12},{name:'docs/cli.md',add:38,del:6}];
+    return [{name:'src/cli/index.ts',add:52,del:8},{name:'src/cli/flags.ts',add:74,del:2},{name:'src/logger.ts',add:41,del:19},{name:'test/verbose.test.ts',add:15,del:5}];
+  }
+  diffFor(){
+    const L=(n,sign,text,kind)=>({n:n||'',sign,text,mark:kind==='add'?'var(--green)':kind==='del'?'var(--red)':'var(--tx-3)',
+      style:`padding:0 8px;${kind==='add'?'background:rgba(79,184,126,.08);':kind==='del'?'background:rgba(224,101,90,.08);':''}white-space:pre;`});
+    return [
+      L('','','@@ -18,6 +18,14 @@ export function parseArgs(argv) {','h'),
+      L(18,' ','  const opts = { verbose: false };'),
+      L(19,'+','  if (argv.includes("--verbose")) {','add'),
+      L(20,'+','    opts.verbose = true;','add'),
+      L(21,'+','    logger.level = "debug";','add'),
+      L(22,'+','  }','add'),
+      L(23,' ','  return opts;'),
+      L(24,'-','  // TODO: wire debug flag','del'),
+      L(25,' ','}'),
+    ];
+  }
+  eventsFor(r){
+    const C={run:'var(--accent)',turn:'var(--tx-2)',tool:'var(--purple)',permission:'var(--amber)',checkpoint:'var(--green)',verification:'var(--green)',phase:'var(--accent)',limit:'var(--amber)',crash:'var(--red)'};
+    const mk=(seq,time,type,refs,size,c)=>({seq,time,type,refs,size,color:C[c]||'var(--tx-2)'});
+    if(r.id!=='run-a') return [
+      mk('0001','13:52:04','run.created','run · seg-0','0.4 kB','run'),
+      mk('0002','13:52:41','turn.completed','coordinator · gen-1','2.1 kB','turn'),
+      mk('0003','13:58:12','spec.produced','seg-1 · gen-1','5.8 kB','run'),
+    ];
+    return [
+      mk('0027','14:11:02','turn.started','verifier · seg-2 gen-1','0.3 kB','turn'),
+      mk('0026','14:07:55','permission.requested','fs.read · idem:9c1a','1.2 kB','permission'),
+      mk('0025','14:05:10','checkpoint.written','ckpt-0011','0.9 kB','checkpoint'),
+      mk('0024','14:03:33','verification.result','AC-1 · verified','3.4 kB','verification'),
+      mk('0023','14:00:01','phase.changed','implementing→verifying','0.5 kB','phase'),
+      mk('0022','13:59:12','child.spawned','verifier · sonnet','0.7 kB','run'),
+      mk('0021','13:59:00','commit.recorded','c254435','1.1 kB','run'),
+      mk('0020','13:44:20','tool.call','edit_file · flags.ts','2.6 kB','tool'),
+    ];
+  }
+
+  inboxFor(r){
+    const btn=(label,kind)=>({label,style: kind==='p'?'background:var(--accent);color:#04211f;border:none;padding:5px 11px;border-radius:5px;font-size:11px;font-weight:650;cursor:pointer;font-family:inherit;':'background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:5px 11px;border-radius:5px;font-size:11px;cursor:pointer;font-family:inherit;'});
+    if(r.id==='run-a') return [{title:'Permission request',glyph:'◐',color:'var(--amber)',border:'var(--amber-bd)',bg:'var(--amber-bg)',
+      body:'Verifier requests fs.read for a path outside the worktree to compare help output.',
+      mono:'fs.read  ./docs/cli.md', actions:[btn('Allow once','p'),btn('Allow always'),btn('Deny once'),btn('Deny always')]}];
+    if(r.id==='run-b') return [{title:'Spec approval needed',glyph:'◐',color:'var(--amber)',border:'var(--amber-bd)',bg:'var(--amber-bg)',
+      body:'Coordinator drafted spec v3. Approve the exact revision to allow implementation in an isolated worktree.',
+      mono:'', actions:[btn('Review spec v3','p'),btn('Request revision')]}];
+    if(r.id==='run-c') return [{title:'Paused — provider limit',glyph:'‖',color:'var(--amber)',border:'var(--amber-bd)',bg:'var(--amber-bg)',
+      body:'Codex hit a provider limit. Work is checkpointed. Reset time unavailable; next probe at 14:30.',
+      mono:'', actions:[btn('Resume now','p'),btn('Switch model')]}];
+    if(r.id==='run-d') return [{title:'Breaker open',glyph:'▲',color:'var(--red)',border:'var(--red-bd)',bg:'var(--red-bg)',
+      body:'Opened after repeated crashes with no progress across 3 generations. Work preserved at ckpt-0004. Reset requires inspection and does not guarantee success.',
+      mono:'', actions:[btn('Inspect & reset breaker','p')]}];
+    if(r.id==='run-g') return [{title:'Integration blocked',glyph:'◫',color:'var(--amber)',border:'var(--amber-bd)',bg:'var(--amber-bg)',
+      body:'All 4 criteria verified, but your destination checkout is dirty. This is not a verification failure — no remediation round is consumed.',
+      mono:'', actions:[btn('Recheck readiness','p')]}];
+    return null;
+  }
+  modelsFor(r){
+    const base=[{role:'Coordinator',running:'Opus'},{role:'Implementor',running:'gpt-5.6-terra'},{role:'Verifier',running:'Sonnet'}];
+    if(r.id==='run-c'){ base[1]={role:'Implementor',running:'gpt-5.6-terra',desired:'Sonnet'}; }
+    return base;
+  }
+  alertsFor(r){
+    if(r.id==='run-c') return [{glyph:'‖',color:'var(--amber)',title:'Limit paused',meta:'Codex · gen-2 · 13:36 · in-product + native'}];
+    if(r.id==='run-a') return [{glyph:'◐',color:'var(--amber)',title:'Permission pending',meta:'verifier · 14:07 · delivered'}];
+    if(r.id==='run-d') return [{glyph:'▲',color:'var(--red)',title:'Breaker opened',meta:'Codex · gen-3 · no progress · critical'},{glyph:'↻',color:'var(--amber)',title:'Auto-respawn ×3',meta:'gen-1→3 · exhausted bounds'},{glyph:'✕',color:'var(--red)',title:'Crash',meta:'child exit 139 · 13:41'}];
+    if(r.id==='run-f') return [{glyph:'↻',color:'var(--amber)',title:'Auto-recovering',meta:'attempt 2 · backoff 0:18 · warning'},{glyph:'◇',color:'var(--amber)',title:'Interrupted',meta:'child exit · seg-2 · 14:02'}];
+    if(r.id==='run-g') return [{glyph:'◫',color:'var(--amber)',title:'Integration blocked',meta:'destination dirty · git readiness'}];
+    return null;
+  }
+
+  enrich(r){
+    const st=this.statusMeta(r.ui==='attention'&&r.phase==='verifying'?'verifying':r.ui);
+    const crit=this.criteriaFor(r);
+    const ver=crit.filter(c=>c.verdict==='Verified').length;
+    const critSummary = crit.length?`${ver} of ${crit.length} verified`:'—';
+    const models=this.modelsFor(r);
+    const alerts=this.alertsFor(r);
+    const inbox=this.inboxFor(r);
+    // action bar
+    const A=(label,kind)=>({label,style: kind==='p'?'background:var(--accent);color:#04211f;border:none;padding:6px 13px;border-radius:6px;font-weight:650;font-size:12px;cursor:pointer;font-family:inherit;':kind==='d'?'background:transparent;color:var(--red);border:1px solid var(--red-bd);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;':'background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;',onClick:()=>this.flash(label+' — demo action')});
+    let actions=[A('Pause')];
+    if(r.phase==='awaiting_approval') actions=[A('Approve spec v3','p'),A('Request revision'),A('Pause')];
+    else if(r.phase==='verifying') actions=[A('Recheck','p'),A('Pause'),A('Cancel','d')];
+    else if(r.suspension==='paused_limit') actions=[A('Resume now','p'),A('Switch model'),A('Cancel','d')];
+    else if(r.phase==='merge_ready') actions=[A('Copy integration commands','p'),A('Recheck readiness'),A('Cancel','d')];
+
+    return { ...r,
+      status:st, phaseLabel:this.phaseLabel(r.phase), opLabel:this.opLabel(r.operation),
+      detailLine:this.detailLine(r), detailColor:this.detailColor(r),
+      nodes:this.buildNodes(r), railSummary:`Workflow: spec, approval, implement, verify, merge-ready. Current phase ${this.phaseLabel(r.phase)}.`,
+      lanes:this.buildLanes(r), summary:this.summaryFor(r), activity:this.activityFor(r),
+      criteria:crit, critSummary, hasVerify:['verifying','merge_ready','needs_remediation'].includes(r.phase), noVerify:!['verifying','merge_ready','needs_remediation'].includes(r.phase),
+      actions, costMeasured:r.cm, costEstimated:r.ce,
+      remediation:r.remediation,
+      pausedPanel: r.suspension==='paused_limit'?1:'', mergePanel: r.phase==='merge_ready'?1:'',
+      breakerPanel: r.suspension==='breaker_open'?1:'', recoverPanel: r.suspension==='interrupted'?1:'', blockedPanel: r.ui==='blocked'?1:'',
+      specRev: r.id==='run-b'?'v3':(r.id==='run-a'?'v2':'v1'), specHash: r.id==='run-b'?'a71c…e0':(r.id==='run-a'?'9f3c…b2':'44d0…1a'), specImmutable:1,
+      specSummary: r.id==='run-b'?'Make queue retries bounded and durable: exponential backoff with a cap, a dead-letter path for permanent failures, and retry state that survives daemon restarts.':'Add a --verbose flag that raises the logger to debug level and prints per-request diagnostics to stderr, leaving default output byte-identical.',
+      inScope: r.id==='run-b'?['Backoff schedule + cap','Dead-letter queue','Restart-durable counters']:['New --verbose flag','stderr debug output','Help text entry'],
+      outScope: r.id==='run-b'?['Queue backend swap','Metrics dashboard']:['Log file rotation','Structured JSON logs'],
+      approvalPanel: r.phase==='awaiting_approval'?1:'',
+      hasChanges:['verifying','merge_ready','needs_remediation','implementing'].includes(r.phase)&&r.commit!=='—', noChanges:!(['verifying','merge_ready','needs_remediation','implementing'].includes(r.phase)&&r.commit!=='—'),
+      liveWorktree: r.phase==='implementing'?1:'',
+      files:this.filesFor(r).map((f,i)=>({...f,onClick:()=>this.setState({file:i}),style:`display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-bottom:1px solid var(--bd);cursor:pointer;${this.state.file===i?'background:var(--accent-bg);border-left:2px solid var(--accent);':'border-left:2px solid transparent;'}`})),
+      activeFile:(this.filesFor(r)[this.state.file]||this.filesFor(r)[0]).name, diff:this.diffFor(),
+      diffAdd: this.filesFor(r).reduce((a,f)=>a+f.add,0), diffDel:this.filesFor(r).reduce((a,f)=>a+f.del,0),
+      events:this.eventsFor(r),
+      inbox, models, alerts, noAlerts:!alerts,
+      ctxUsed: r.id==='run-a'?'92k':'41k', ctxMax:'200k', ctxPct: r.id==='run-a'?'46%':'20%',
+      rss:'412 MB', rssPct:'58%',
+      checkpoint: r.suspension==='paused_limit'?'ckpt-0007':(r.phase==='merge_ready'?'ckpt-0021':'ckpt-0011'),
+      checkpointNote: r.suspension==='paused_limit'?'written before safe stop · no incomplete op':'bound to seg-2 · gen-1 · complete',
+    };
+  }
+
+  attentionItems(){
+    const S={critical:{c:'var(--red)',bg:'var(--red-bg)',bd:'var(--red-bd)',g:'▲'},warning:{c:'var(--amber)',bg:'var(--amber-bg)',bd:'var(--amber-bd)',g:'‖'},attention:{c:'var(--amber)',bg:'var(--amber-bg)',bd:'var(--amber-bd)',g:'◐'},info:{c:'var(--accent)',bg:'var(--accent-bg)',bd:'var(--accent-bd)',g:'●'}};
+    const mk=(sev,kind,run,rid,text,action,blocked,when)=>{const s=S[sev];return{sev,kind,run,rid,text,action,blocked:blocked?1:'',when,glyph:s.g,color:s.c,bg:s.bg,bd:s.bd,
+      sevStyle:`font-size:9.5px;text-transform:uppercase;letter-spacing:.5px;color:${s.c};border:1px solid ${s.bd};border-radius:20px;padding:1px 7px;`,
+      onClick:()=>this.setState({view:'runs',runId:rid,tab: kind==='Spec approval'?'spec':'overview',crit:null})};};
+    return [
+      mk('warning','Spec approval','Fix retry behavior in the job queue','run-b','Coordinator drafted spec v3. Approve the exact revision to allow implementation.','Review & approve v3',1,'4m ago'),
+      mk('attention','Permission request','Add a --verbose flag to the CLI','run-a','Verifier requests fs.read for a path outside the worktree.','Resolve permission',1,'just now'),
+      mk('critical','Breaker open','Replace legacy config loader','run-d','Breaker opened after repeated crashes with no progress. Work preserved at checkpoint.','Inspect & reset breaker',1,'3m ago'),
+      mk('warning','Integration blocker','Migrate auth to session tokens','run-g','All criteria verified, but your destination checkout is dirty. No remediation consumed.','Recheck readiness',0,'12m ago'),
+      mk('warning','Limit paused','Refactor import boundaries','run-c','Codex hit a provider limit. Reset time unavailable; next probe 14:30.','Open paused panel',0,'6m ago'),
+      mk('info','Merge-ready','Update CLI documentation','run-e','Verified and ready for manual integration. Nothing merged or pushed.','Review handoff',0,'2h ago'),
+    ];
+  }
+  workspacesData(){
+    const mk=(name,path,branch,head,dirty,active,done,last)=>({name,path,branch,head,dirty:dirty?1:'',clean:dirty?'':1,active,done,last,
+      dirtyStyle:`font-size:10.5px;color:${dirty?'var(--amber)':'var(--green)'};border:1px solid ${dirty?'var(--amber-bd)':'var(--green-bd)'};background:${dirty?'var(--amber-bg)':'var(--green-bg)'};border-radius:20px;padding:1px 8px;`,
+      dirtyLabel: dirty?'dirty':'clean', onClick:()=>this.flash(name+' — open workspace')});
+    return [
+      mk('harness-orchestration','/repos/harness-orchestration','main','a1f9c02',false,5,12,'active now'),
+      mk('billing-service','/repos/billing-service','develop','9c02f1a',true,1,3,'22m ago'),
+      mk('web-dashboard','/repos/web-dashboard','main','3fa7c10',false,0,7,'yesterday'),
+    ];
+  }
+  harnessesData(){
+    const A={validated:{c:'var(--green)',l:'Validated'},detected:{c:'var(--amber)',l:'Detected, not validated'},unsupported:{c:'var(--red)',l:'Detected, unsupported'},none:{c:'var(--tx-3)',l:'Not detected'}};
+    const mk=(name,ver,proto,auth,models,limitQ,retry,note,warn)=>{const a=A[auth];return{name,ver,proto,models,limitQ,retry,note,warn:warn?1:'',
+      authLabel:a.l, authStyle:`font-size:11px;color:${a.c};border:1px solid ${a.c};border-radius:20px;padding:2px 9px;`,
+      dot:a.c};};
+    return [
+      mk('Claude Code','adapter 1.4.0','ACP 0.3','validated',['Opus','Sonnet','Haiku'],'exact retry-after','yes','Last validated 13:58 today',false),
+      mk('Codex','adapter 0.9.2','ACP 0.3','validated',['gpt-5.6-terra','gpt-5.6-mini'],'heuristic only','no','Reset times not provided by API',true),
+      mk('Gemini CLI','adapter 0.2.0','ACP 0.2','detected',['gemini-3-pro'],'unknown','unknown','Credentials found, no successful turn yet',true),
+      mk('Aider','—','—','none',[],'—','—','Not installed on this machine',false),
+    ];
+  }
+  settingsData(){
+    const raw=[
+      {group:'General',items:[['Appearance','Dark'],['Open on launch','Last run'],['Density','Comfortable'],['Keyboard shortcuts','Enabled']]},
+      {group:'Runtime',items:[['Maximum live children','3'],['Restart bounds','5 per run · 20 lifetime'],['Memory soft / hard','512 MB / 768 MB'],['Auto-respawn','Bounded (on)']]},
+      {group:'Limits & failover',items:[['Default limit policy','Ask'],['Coordinator ladder','Claude → —'],['Implementor ladder','Codex → Claude/Sonnet'],['Maximum probes','6']]},
+      {group:'Budget',items:[['Maximum estimated budget','$5.00'],['Per-turn reservation','$0.15 (conservative)'],['Show measured & estimated','Separately']]},
+      {group:'Verification',items:[['Allowed env additions','CI=1, NODE_ENV'],['Credential-shaped vars','Refused'],['Command timeout','120s']]},
+      {group:'Terminal',items:[['Shell','/bin/zsh'],['Session backing','Direct PTY'],['Scrollback','10,000 lines'],['Takeover while owned','Require explicit']]},
+      {group:'Notifications',items:[['Spec approval','Native + in-product'],['Permission request','Native + in-product'],['Limit pause','In-product'],['Merge-ready','Native + in-product']]},
+      {group:'Storage & privacy',items:[['HARNESS_HOME','~/.harness'],['Event + artifact usage','1.2 GB of 5 GB'],['Retention','Keep 30 days'],['Clear completed artifacts','6 runs · 340 MB']]},
+    ];
+    const danger=v=>/Clear|Refused|explicit/.test(v);
+    return raw.map(g=>({group:g.group, items:g.items.map(([k,v])=>({0:k,1:v,label:k,val:v,
+      valStyle:`font-size:12px;color:${danger(v)?'var(--amber)':'var(--tx-2)'};font-family:${/[0-9$~/]/.test(v)?'ui-monospace,Menlo,monospace':'inherit'};`}))}));
+  }
+  doctorData(){
+    const S={ok:{c:'var(--green)',g:'✓'},warn:{c:'var(--amber)',g:'!'},bad:{c:'var(--red)',g:'✕'}};
+    const mk=(name,val,st,note)=>{const s=S[st];return{name,val,note:note||'',glyph:s.g,color:s.c,
+      chipStyle:`width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;background:${s.c==='var(--green)'?'var(--green-bg)':s.c==='var(--amber)'?'var(--amber-bg)':'var(--red-bg)'};color:${s.c};border:1px solid ${s.c};`};};
+    return {
+      platform:[mk('Node.js','v20.11.0','ok'),mk('git','2.44.0','ok'),mk('SQLite','3.45.1','ok'),mk('Platform','macOS 15.2 · arm64','ok')],
+      harnesses:[mk('Claude Code','adapter 1.4.0 · validated','ok'),mk('Codex','adapter 0.9.2 · validated','ok','usage-limit reset times unavailable'),mk('Gemini CLI','detected, not validated','warn','credentials found, no successful provider turn yet'),mk('Aider','not detected','bad','install to enable this harness')],
+      storage:[mk('HARNESS_HOME','~/.harness','ok'),mk('Available quota','3.8 GB of 5 GB free','ok')],
+    };
+  }
+  wizardData(){
+    return { steps:['Workspace','Goal','Coordinator','Budget & limits','Review'] };
+  }
+  specDiffData(){
+    const L=(t,k,txt)=>({t,txt,style:`padding:6px 12px;border-radius:6px;font-size:12.5px;${k==='add'?'background:var(--green-bg);border:1px solid var(--green-bd);color:var(--tx-1);':k==='del'?'background:var(--red-bg);border:1px solid var(--red-bd);color:var(--tx-2);text-decoration:line-through;':k==='chg'?'background:var(--amber-bg);border:1px solid var(--amber-bd);color:var(--tx-1);':'background:var(--bg-2);border:1px solid var(--bd);color:var(--tx-2);'}`,
+      tag:t, tagStyle:`font-size:9.5px;text-transform:uppercase;letter-spacing:.5px;flex:0 0 54px;color:${k==='add'?'var(--green)':k==='del'?'var(--red)':k==='chg'?'var(--amber)':'var(--tx-3)'};`});
+    return [
+      L('same','same','Failed jobs retry with exponential backoff (cap 5)'),
+      L('changed','chg','Permanent failures move to the dead-letter queue after 5 attempts'),
+      L('added','add','Retry counters survive a daemon restart'),
+      L('removed','del','Jobs older than 24h are silently dropped'),
+    ];
+  }
+
+  renderVals(){
+    const runs=this.RUNS;
+    const sel=this.enrich(runs.find(r=>r.id===this.state.runId)||runs[0]);
+    // rail groups
+    const viewRun=(r)=>{ const s=this.statusMeta(r.ui==='attention'&&r.phase==='verifying'?'verifying':r.ui); const selected=r.id===this.state.runId;
+      return { id:r.id, goal:r.goal, roleTag:r.roleTag, attention:r.attention,
+        status:s,
+        rowStyle:`padding:var(--row-pad);cursor:pointer;border-left:2px solid ${selected?'var(--accent)':'transparent'};background:${selected?'var(--bg-3)':'transparent'};`,
+        onOpen:()=>this.setState({runId:r.id, tab:'overview', crit:null}) }; };
+    const grp=(title,dot,pred)=>{ const rs=runs.filter(pred).map(viewRun); return rs.length?{title,dot,count:rs.length,runs:rs}:null; };
+    const attn=r=>r.ui==='attention'||r.ui==='breaker'||r.ui==='blocked';
+    const groups=[
+      grp('Needs attention','var(--amber)',attn),
+      grp('Active','var(--accent)',r=>r.ui==='working'||r.ui==='verifying'),
+      grp('Paused / recovering','var(--amber)',r=>r.ui==='paused'||r.ui==='recovering'||r.ui==='interrupted'),
+      grp('Recently completed','var(--tx-3)',r=>r.ui==='done'||r.ui==='stopped'),
+    ].filter(Boolean);
+    const attnCount=String(runs.filter(attn).length);
+
+    // nav
+    const V=this.state.view;
+    const navItem=(key,label,badge)=>{ const on=V===key; return {label,badge:badge||'',onClick:()=>this.go(key),
+      style:`display:flex;align-items:center;gap:6px;background:${on?'var(--bg-3)':'transparent'};border:none;color:${on?'var(--tx-1)':'var(--tx-2)'};padding:6px 11px;border-radius:6px;cursor:pointer;font-size:12.5px;font-family:inherit;${on?'font-weight:600;':''}`,
+      badgeStyle:`font-size:10px;font-weight:700;background:var(--amber-bg);color:var(--amber);border:1px solid var(--amber-bd);border-radius:10px;padding:0 6px;`}; };
+    const nav=[navItem('runs','Runs'),navItem('attention','Attention',attnCount),navItem('workspaces','Workspaces'),navItem('models','Models & harnesses'),navItem('settings','Settings')];
+
+    // tabs
+    const tabDefs=[['overview','Overview'],['spec','Spec'],['activity','Activity'],['changes','Changes'],['verify','Verify',sel.criteria.length?sel.criteria.length:0],['events','Events']];
+    const tabs=tabDefs.map(([k,label,count])=>{ const on=this.state.tab===k;
+      return {label,selected:on,count: (k==='verify'&&sel.hasVerify)?String(count):'', onClick:()=>this.setState({tab:k, crit:null}),
+        style:`background:transparent;border:none;border-bottom:2px solid ${on?'var(--accent)':'transparent'};color:${on?'var(--tx-1)':'var(--tx-3)'};padding:8px 12px;cursor:pointer;font-size:12.5px;font-family:inherit;${on?'font-weight:600;':''}display:flex;align-items:center;gap:6px;`,
+        countStyle:`font-size:10px;color:var(--tx-3);border:1px solid var(--bd);border-radius:9px;padding:0 6px;`}; });
+
+    // activity filters
+    const filt=(k,label)=>({label,onClick:()=>this.setState({filter:k}),style:`background:${this.state.filter===k?'var(--bg-3)':'transparent'};border:1px solid ${this.state.filter===k?'var(--bd-2)':'var(--bd)'};color:${this.state.filter===k?'var(--tx-1)':'var(--tx-3)'};padding:4px 10px;border-radius:20px;cursor:pointer;font-size:11.5px;font-family:inherit;`});
+    const activityFilters=[filt('all','All'),filt('milestones','Milestones'),filt('agent','Agent activity'),filt('tools','Tools'),filt('permissions','Permissions'),filt('recovery','Recovery')];
+
+    // inspector
+    let insp={isRun:1,isCriterion:''};
+    if(this.state.crit!=null && sel.criteria[this.state.crit]){ insp={isRun:'',isCriterion:1,crit:sel.criteria[this.state.crit]}; }
+
+    // terminal
+    const tTab=(k,label,locked)=>({label,locked: locked?1:'', onClick:()=>this.setState({termTab:k}),
+      style:`background:${this.state.termTab===k?'var(--bg-3)':'transparent'};border:none;color:${this.state.termTab===k?'var(--tx-1)':'var(--tx-3)'};padding:6px 12px;border-radius:6px 6px 0 0;cursor:pointer;font-size:11.5px;font-family:inherit;display:flex;align-items:center;gap:6px;${this.state.termTab===k?'border-bottom:2px solid var(--accent);':''}`});
+    const termTabs=[tTab('worktree','Worktree shell',true),tTab('workspace','Workspace shell',false),tTab('log','Orchestrator log',false)];
+    const TL=(text,c)=>({text,style:`color:${c||'var(--tx-2)'};white-space:pre-wrap;`});
+    let termLines,termLocked='',termMeta='';
+    if(this.state.termTab==='worktree'){ termLocked=1; termMeta='cwd: /worktrees/hc-verbose-flag · run-a'; termLines=[TL('$ git status','var(--tx-3)'),TL('On branch hc/verbose-flag'),TL('Changes to be committed:'),TL('  modified:   src/cli/flags.ts','var(--green)'),TL('  modified:   src/logger.ts','var(--green)'),TL('# input locked — automated run owns this worktree','var(--amber)')]; }
+    else if(this.state.termTab==='workspace'){ termMeta='cwd: /repos/harness-orchestration · PTY'; termLines=[TL('$ git status','var(--tx-3)'),TL('On branch main'),TL('nothing to commit, working tree clean','var(--green)'),TL('$ ','var(--tx-1)')]; }
+    else { termMeta='output-only · redacted'; termLines=[TL('[daemon] serve listening on 127.0.0.1:7717','var(--tx-3)'),TL('[supervisor] run-a verifier gen-1 healthy'),TL('[adapter:codex] stderr summary: 0 warnings'),TL('[limit] run-c probe 1/6 scheduled 14:30','var(--amber)'),TL('[checkpoint] run-a ckpt-0011 flushed','var(--green)')]; }
+
+    // palette
+    const pi=(icon,label,hint,fn,ic)=>({icon,label,hint,iconColor:ic||'var(--tx-3)',onClick:()=>{ this.setState({paletteOpen:false}); fn&&fn(); }});
+    const paletteItems=[
+      pi('+','New run','⌘N',()=>this.flash('New run — demo'),'var(--accent)'),
+      pi('▤','Toggle terminal','⌘J',()=>this.setState(s=>({termOpen:!s.termOpen}))),
+      pi('→','Next run',']',()=>this.cycleRun(1)),
+      pi('←','Previous run','[',()=>this.cycleRun(-1)),
+      pi('✓','Approve spec (Run B)','',()=>{ this.setState({view:'runs',runId:'run-b',tab:'spec'}); },'var(--green)'),
+      pi('▲','Go to breaker-open run (Run D)','',()=>this.setState({view:'runs',runId:'run-d',tab:'overview'}),'var(--red)'),
+      pi('◫','Go to integration-blocked run (Run G)','',()=>this.setState({view:'runs',runId:'run-g',tab:'verify'}),'var(--amber)'),
+      pi('◇','Attention inbox','',()=>this.go('attention')),
+      pi('◈','Models & harnesses','',()=>this.go('models')),
+      pi('⚙','Settings','',()=>this.go('settings')),
+      pi('✚','Environment doctor','',()=>this.go('doctor'),'var(--accent)'),
+      pi('↯','Simulate daemon reconnect','',()=>this.setState({reconnect:true}),'var(--amber)'),
+      pi('▾','Desktop menu-bar / tray','',()=>this.setState({tray:true})),
+      pi('▢','Mobile inspection view','',()=>this.setState({mobile:true})),
+    ];
+
+    const dens=this.props.density||'comfortable';
+    const accent=Array.isArray(this.props.accent)?this.props.accent[0]:(this.props.accent||'#35b0b5');
+    const rootVars=`--accent:${accent};--row-pad:${dens==='compact'?'5px 12px':'9px 12px'};`;
+
+    const narrow = this.state.vw < 1180;
+    const inspOpen = this.state.inspOpen;
+    const inspStyle = !narrow
+      ? 'flex:0 0 328px;border-left:1px solid var(--bd);background:var(--bg-1);display:flex;flex-direction:column;min-height:0;'
+      : ('position:fixed;top:48px;bottom:26px;right:0;width:min(360px,92vw);z-index:40;border-left:1px solid var(--bd-2);background:var(--bg-1);flex-direction:column;min-height:0;box-shadow:-24px 0 60px rgba(0,0,0,.5);'+(inspOpen?'display:flex;':'display:none;'));
+
+    return { rootVars, groups, totalRuns:runs.length, nav, sel, tabs,
+      wide: !narrow, narrow: narrow?1:'', inspStyle, inspBackdrop: (narrow&&inspOpen)?1:'', toggleInsp:()=>this.setState(s=>({inspOpen:!s.inspOpen})), inspBtnBg: inspOpen?'var(--bg-3)':'transparent',
+      isOverview:this.state.tab==='overview', isSpec:this.state.tab==='spec', isActivity:this.state.tab==='activity', isChanges:this.state.tab==='changes', isVerify:this.state.tab==='verify', isEvents:this.state.tab==='events',
+      activityFilters, insp,
+      termOpen:this.state.termOpen?1:'', termTabs, termLines, termLocked, termMeta, toggleTerm:()=>this.setState(s=>({termOpen:!s.termOpen})),
+      paletteOpen:this.state.paletteOpen?1:'', paletteItems, openPalette:()=>this.setState({paletteOpen:true}), closePalette:()=>this.setState({paletteOpen:false}), stop:(e)=>e.stopPropagation(),
+      clearInsp:()=>this.setState({crit:null}),
+      isRuns:V==='runs', isAttention:V==='attention', isWorkspaces:V==='workspaces', isModels:V==='models', isSettings:V==='settings', isDoctor:V==='doctor', isNewRun:V==='newrun',
+      go:(v)=>this.go(v),
+      attnItems:this.attentionItems(), workspaces:this.workspacesData(), harnesses:this.harnessesData(), settings:this.settingsData(), doctor:this.doctorData(),
+      wizard:this.wizardData(),
+      openDoctor:()=>this.go('doctor'), startFromDoctor:()=>this.go('runs'), backToRuns:()=>this.go('runs'),
+      tray:this.state.tray?1:'', closeTray:()=>this.setState({tray:false}),
+      mobile:this.state.mobile?1:'', closeMobile:()=>this.setState({mobile:false}),
+      reconnect:this.state.reconnect?1:'', toggleReconnect:()=>this.setState(s=>({reconnect:!s.reconnect})),
+      specDiff:this.state.specDiff?1:'', specDiffLabel:this.state.specDiff?'Hide comparison':'Compare with v2', toggleSpecDiff:()=>this.setState(s=>({specDiff:!s.specDiff})), specDiffData:this.specDiffData(),
+      newRun:()=>this.go('newrun'),
+      copyCmds:()=>{ try{navigator.clipboard&&navigator.clipboard.writeText("git merge --no-ff 'hc/cli-docs'");}catch(e){} this.setState({copyLabel:'Copied ✓'}); setTimeout(()=>this.setState({copyLabel:'Copy'}),1500); },
+      copyLabel:this.state.copyLabel,
+      toast:this.state.toast, noop:()=>this.flash('Demo — action wired in prototype') };
+  }
+}
+</script>
+</body>
+</html>
