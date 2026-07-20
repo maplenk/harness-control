@@ -349,6 +349,16 @@ git -C <span style="color:var(--tx-2);">'/repos/harness-orchestration'</span> lo
         <!-- ============ OVERVIEW ============ -->
         <sc-if value="{{ isOverview }}" hint-placeholder-val="{{ true }}">
           <div>
+            <sc-if value="{{ sel.chat }}" hint-placeholder-val="">
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:10px 12px;border:1px solid var(--accent-bd);background:var(--accent-bg);border-radius:9px;">
+                <span style="color:var(--accent);font-size:13px;">◎</span>
+                <div style="flex:1;">
+                  <div style="font-size:12.5px;color:var(--tx-1);font-weight:600;">Planning chat · Room <span style="font-family:ui-monospace,Menlo,monospace;color:var(--accent);">{{ sel.roomId }}</span></div>
+                  <div style="font-size:11px;color:var(--tx-2);">Spec drafted collaboratively in a local Agent Room — humans and local agents challenged the coordinator before synthesis.</div>
+                </div>
+                <button onClick="{{ openRoom }}" style="background:transparent;border:1px solid var(--accent-bd);color:var(--tx-1);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Open room</button>
+              </div>
+            </sc-if>
             <div style="font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase;color:var(--tx-3);margin-bottom:10px;">Role lanes</div>
             <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;">
               <sc-for list="{{ sel.lanes }}" as="lane" hint-placeholder-count="3">
@@ -973,6 +983,14 @@ git -C <span style="color:var(--tx-2);">'/repos/harness-orchestration'</span> lo
             </div>
           </div>
 
+          <div style="border-top:1px solid var(--bd);padding-top:14px;display:flex;align-items:flex-start;gap:12px;">
+            <span style="flex:0 0 auto;width:30px;height:17px;border-radius:9px;background:var(--accent);position:relative;margin-top:1px;"><span style="position:absolute;top:2px;right:2px;width:13px;height:13px;border-radius:50%;background:#fff;"></span></span>
+            <div style="flex:1;">
+              <div style="font-size:12.5px;font-weight:600;color:var(--tx-1);">Enable planning chat</div>
+              <div style="font-size:11.5px;color:var(--tx-2);margin-top:3px;">Draft the spec collaboratively in a local Agent Room — humans and other local agents join via an invitation; the default path stays solo and dependency-free.</div>
+              <div style="font-size:11px;color:var(--tx-3);margin-top:4px;">Loopback 127.0.0.1 · Agent Room v0.5.1 · persists in run metadata · <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">status --json</span> reports <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">planningChatEnabled</span></div>
+            </div>
+          </div>
           <div style="border-top:1px solid var(--bd);padding-top:14px;">
             <div style="font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase;color:var(--tx-3);margin-bottom:8px;">Before you submit</div>
             <ul style="margin:0;padding-left:18px;font-size:12px;color:var(--tx-2);line-height:1.8;">
@@ -984,6 +1002,63 @@ git -C <span style="color:var(--tx-2);">'/repos/harness-orchestration'</span> lo
           <div style="display:flex;gap:8px;">
             <button onClick="{{ backToRuns }}" style="background:var(--accent);color:#04211f;border:none;padding:9px 18px;border-radius:7px;font-weight:650;font-size:13px;cursor:pointer;font-family:inherit;">Draft specification</button>
             <button onClick="{{ backToRuns }}" style="background:transparent;color:var(--tx-2);border:1px solid var(--bd-2);padding:9px 18px;border-radius:7px;font-size:13px;cursor:pointer;font-family:inherit;">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ===== AGENT ROOM (planning chat) ===== -->
+  <sc-if value="{{ isRoom }}" hint-placeholder-val="">
+    <div style="flex:1;min-height:0;overflow-y:auto;padding:22px 28px;">
+      <div style="max-width:900px;margin:0 auto;">
+        <div style="display:flex;align-items:flex-start;gap:12px;">
+          <div style="flex:1;">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <h1 style="margin:0;font-size:19px;font-weight:650;">Agent Room</h1>
+              <span style="font-size:11px;font-family:ui-monospace,Menlo,monospace;color:var(--accent);background:var(--accent-bg);border:1px solid var(--accent-bd);border-radius:5px;padding:2px 8px;">Room {{ roomId }}</span>
+              <span style="font-size:10.5px;color:var(--tx-3);">Agent Room v0.5.1 · loopback 127.0.0.1</span>
+            </div>
+            <p style="margin:6px 0 0;font-size:13px;color:var(--tx-2);max-width:660px;">Opt-in planning chat for the coordinator / specifying phase. Humans and other local agents join via the invitation and challenge the draft; the coordinator revises, then synthesizes a spec. The default path stays solo and dependency-free.</p>
+          </div>
+          <div style="flex:0 0 auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px;">
+            <button onClick="{{ copyInvite }}" style="background:var(--accent);color:#04211f;border:none;padding:6px 13px;border-radius:6px;font-weight:650;font-size:12px;cursor:pointer;font-family:inherit;">Copy invitation</button>
+            <span style="font-size:11px;color:var(--tx-3);font-family:ui-monospace,Menlo,monospace;">harness room join {{ roomId }}</span>
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:16px 0 14px;">
+          <span style="font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--tx-3);">Participants</span>
+          <sc-for list="{{ roomParticipants }}" as="p" hint-placeholder-count="3">
+            <span style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--tx-1);background:var(--bg-2);border:1px solid var(--bd);border-radius:20px;padding:2px 10px;">
+              <span style="width:6px;height:6px;border-radius:50%;background:{{ p.color }};"></span>{{ p.name }} <span style="color:var(--tx-3);">· {{ p.role }}</span>
+            </span>
+          </sc-for>
+          <div style="flex:1;"></div>
+          <span style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--tx-1);border:1px solid var(--bd-2);border-radius:20px;padding:2px 9px;"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);"></span>Only when addressed</span>
+          <span style="font-size:11px;color:var(--tx-2);">Unread <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-1);">{{ roomUnread }}</span></span>
+        </div>
+
+        <div style="border:1px solid var(--bd);border-radius:10px;background:var(--bg-1);overflow:hidden;">
+          <div style="padding:8px 14px;border-bottom:1px solid var(--bd);background:var(--bg-2);font-size:11px;color:var(--tx-3);">Room transcript · newest last · untrusted planning input</div>
+          <sc-for list="{{ roomMessages }}" as="m" hint-placeholder-count="3">
+            <div style="display:flex;gap:12px;padding:11px 14px;border-bottom:1px solid var(--bd);align-items:flex-start;">
+              <span style="flex:0 0 46px;font-size:11px;color:var(--tx-3);font-family:ui-monospace,Menlo,monospace;">{{ m.time }}</span>
+              <span style="flex:0 0 96px;font-size:11.5px;font-weight:600;color:{{ m.authorColor }};">{{ m.author }}</span>
+              <div style="flex:1;font-size:12.5px;color:var(--tx-1);">{{ m.text }}</div>
+              <sc-if value="{{ m.tag }}" hint-placeholder-val="">
+                <span style="{{ m.tagStyle }}">{{ m.tag }}</span>
+              </sc-if>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="margin-top:14px;border:1px solid var(--accent-bd);background:var(--accent-bg);border-radius:10px;padding:14px 16px;">
+          <div style="display:flex;align-items:center;gap:8px;"><span style="color:var(--accent);">◎</span><h3 style="margin:0;font-size:13px;color:var(--tx-1);">Coordinator synthesized spec v3 from this room</h3></div>
+          <p style="margin:7px 0 0;font-size:12px;color:var(--tx-2);max-width:680px;">A first draft is never accepted before at least one external contribution. Room input is <strong style="color:var(--tx-1);">untrusted</strong>; the synthesized spec still passes the schema / testability validator and stops at your exact-hash approval before any implementation. The choice persists in run metadata · <span style="font-family:ui-monospace,Menlo,monospace;">status --json</span> reports <span style="font-family:ui-monospace,Menlo,monospace;color:var(--tx-2);">planningChatEnabled: true</span>.</p>
+          <div style="display:flex;gap:8px;margin-top:12px;">
+            <button onClick="{{ openApproval }}" style="background:var(--accent);color:#04211f;border:none;padding:6px 13px;border-radius:6px;font-weight:650;font-size:12px;cursor:pointer;font-family:inherit;">Review spec for approval</button>
+            <button onClick="{{ backToRuns }}" style="background:transparent;color:var(--tx-1);border:1px solid var(--bd-2);padding:6px 13px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;">Back to runs</button>
           </div>
         </div>
       </div>
@@ -1127,7 +1202,7 @@ class Component extends DCLogic {
       base:'a1f9c02', commit:'c254435', branch:'hc/verbose-flag', cm:'0.55', ce:'0.50', elapsed:'18m elapsed', remediation:0 },
     { id:'run-b', ui:'attention', goal:'Fix retry behavior in the job queue', workspace:'harness-orchestration',
       phase:'awaiting_approval', suspension:'none', operation:'idle', roleTag:'Coordinator', attention:'!',
-      base:'7b30e1a', branch:'', cm:'0.12', ce:'0.08', elapsed:'4m elapsed', remediation:0 },
+      base:'7b30e1a', branch:'', cm:'0.12', ce:'0.08', elapsed:'4m elapsed', remediation:0, chat:1, roomId:'AM-6S2L' },
     { id:'run-c', ui:'paused', goal:'Refactor import boundaries', workspace:'harness-orchestration',
       phase:'implementing', suspension:'paused_limit', operation:'idle', roleTag:'Implementor · Codex',
       base:'55c0a9d', commit:'—', branch:'hc/import-boundaries', cm:'0.83', ce:'0.40', elapsed:'32m · paused 6m', remediation:1 },
@@ -1516,6 +1591,24 @@ class Component extends DCLogic {
       L('removed','del','Jobs older than 24h are silently dropped'),
     ];
   }
+  roomData(){
+    const rc={Coordinator:'var(--accent)',You:'var(--tx-1)',Reviewer:'var(--purple)',System:'var(--tx-3)'};
+    const tag=(t,c,bg,bd)=>({tag:t,tagStyle:`font-size:9.5px;text-transform:uppercase;letter-spacing:.5px;padding:2px 8px;border-radius:20px;color:${c};background:${bg};border:1px solid ${bd};`});
+    const mk=(time,author,text,tg)=>({time,author,authorColor:rc[author]||'var(--tx-2)',text,...(tg||{tag:''})});
+    return {
+      roomId:'AM-6S2L', unread:'0', addressedOnly:1,
+      participants:[
+        {name:'Coordinator',role:'Claude · Opus',color:'var(--accent)'},
+        {name:'You',role:'human reviewer',color:'var(--tx-1)'},
+        {name:'reviewer-agent',role:'local · optional',color:'var(--purple)'},
+      ],
+      messages:[
+        mk('13:48','Coordinator','Opening position: bound queue retries — exponential backoff capped at 5, a dead-letter path for permanent failures, and drop jobs older than 24h to keep the queue small.',tag('position','var(--accent)','var(--accent-bg)','var(--accent-bd)')),
+        mk('13:51','You','Challenge: silently dropping jobs after 24h loses work with no audit — remove it. And "durable retries" must be proven — add a criterion that retry counters survive a daemon restart, not just a claim.',tag('challenge','var(--amber)','var(--amber-bg)','var(--amber-bd)')),
+        mk('13:55','Coordinator','Revised and synthesized spec v3 (immutable): dropped the 24h silent-drop; dead-letter after 5 attempts; added a criterion that retry counters survive a daemon restart. Still requires schema/testability validation and your exact-hash approval before implementation.',tag('spec v3','var(--accent)','var(--accent-bg)','var(--accent-bd)')),
+      ],
+    };
+  }
 
   renderVals(){
     const runs=this.RUNS;
@@ -1582,6 +1675,7 @@ class Component extends DCLogic {
       pi('◈','Models & harnesses','',()=>this.go('models')),
       pi('⚙','Settings','',()=>this.go('settings')),
       pi('✚','Environment doctor','',()=>this.go('doctor'),'var(--accent)'),
+      pi('◎','Agent Room · planning chat','',()=>this.go('room'),'var(--accent)'),
       pi('↯','Simulate daemon reconnect','',()=>this.setState({reconnect:true}),'var(--amber)'),
       pi('▾','Desktop menu-bar / tray','',()=>this.setState({tray:true})),
       pi('▢','Mobile inspection view','',()=>this.setState({mobile:true})),
@@ -1597,6 +1691,7 @@ class Component extends DCLogic {
       ? 'flex:0 0 328px;border-left:1px solid var(--bd);background:var(--bg-1);display:flex;flex-direction:column;min-height:0;'
       : ('position:fixed;top:48px;bottom:26px;right:0;width:min(360px,92vw);z-index:40;border-left:1px solid var(--bd-2);background:var(--bg-1);flex-direction:column;min-height:0;box-shadow:-24px 0 60px rgba(0,0,0,.5);'+(inspOpen?'display:flex;':'display:none;'));
 
+    const room = this.roomData();
     return { rootVars, groups, totalRuns:runs.length, nav, sel, tabs,
       wide: !narrow, narrow: narrow?1:'', inspStyle, inspBackdrop: (narrow&&inspOpen)?1:'', toggleInsp:()=>this.setState(s=>({inspOpen:!s.inspOpen})), inspBtnBg: inspOpen?'var(--bg-3)':'transparent',
       isOverview:this.state.tab==='overview', isSpec:this.state.tab==='spec', isActivity:this.state.tab==='activity', isChanges:this.state.tab==='changes', isVerify:this.state.tab==='verify', isEvents:this.state.tab==='events',
@@ -1604,7 +1699,7 @@ class Component extends DCLogic {
       termOpen:this.state.termOpen?1:'', termTabs, termLines, termLocked, termMeta, toggleTerm:()=>this.setState(s=>({termOpen:!s.termOpen})),
       paletteOpen:this.state.paletteOpen?1:'', paletteItems, openPalette:()=>this.setState({paletteOpen:true}), closePalette:()=>this.setState({paletteOpen:false}), stop:(e)=>e.stopPropagation(),
       clearInsp:()=>this.setState({crit:null}),
-      isRuns:V==='runs', isAttention:V==='attention', isWorkspaces:V==='workspaces', isModels:V==='models', isSettings:V==='settings', isDoctor:V==='doctor', isNewRun:V==='newrun',
+      isRuns:V==='runs', isAttention:V==='attention', isWorkspaces:V==='workspaces', isModels:V==='models', isSettings:V==='settings', isDoctor:V==='doctor', isNewRun:V==='newrun', isRoom:V==='room',
       go:(v)=>this.go(v),
       attnItems:this.attentionItems(), workspaces:this.workspacesData(), harnesses:this.harnessesData(), settings:this.settingsData(), doctor:this.doctorData(),
       wizard:this.wizardData(),
@@ -1613,7 +1708,9 @@ class Component extends DCLogic {
       mobile:this.state.mobile?1:'', closeMobile:()=>this.setState({mobile:false}),
       reconnect:this.state.reconnect?1:'', toggleReconnect:()=>this.setState(s=>({reconnect:!s.reconnect})),
       specDiff:this.state.specDiff?1:'', specDiffLabel:this.state.specDiff?'Hide comparison':'Compare with v2', toggleSpecDiff:()=>this.setState(s=>({specDiff:!s.specDiff})), specDiffData:this.specDiffData(),
-      newRun:()=>this.go('newrun'),
+      newRun:()=>this.go('newrun'), openRoom:()=>this.go('room'), openApproval:()=>this.setState({view:'runs',runId:'run-b',tab:'spec',crit:null}),
+      roomId:room.roomId, roomParticipants:room.participants, roomMessages:room.messages, roomUnread:room.unread,
+      copyInvite:()=>{ try{navigator.clipboard&&navigator.clipboard.writeText('harness room join AM-6S2L');}catch(e){} this.flash('Invitation copied'); },
       copyCmds:()=>{ try{navigator.clipboard&&navigator.clipboard.writeText("git merge --no-ff 'hc/cli-docs'");}catch(e){} this.setState({copyLabel:'Copied ✓'}); setTimeout(()=>this.setState({copyLabel:'Copy'}),1500); },
       copyLabel:this.state.copyLabel,
       toast:this.state.toast, noop:()=>this.flash('Demo — action wired in prototype') };
