@@ -636,6 +636,8 @@ export interface CreateRunInput {
   /** The coordinator's resolved harness/model/effort (PLAN §7 proposes the
    * implementor/verifier profiles; those become `run` defaults later). */
   readonly coordinator: RoleModelSpec;
+  /** Keep the coordinator's planning/revision rounds attached to an Agent Room. */
+  readonly planningChatEnabled?: boolean;
   /** Default `{mode:'headless'}` (deny-all, §10.2). */
   readonly mediation?: PermissionMediation;
 }
@@ -1252,6 +1254,7 @@ export class OrchestrationService {
       goal: input.goal,
       workspacePath: input.workspacePath,
       coordinator: input.coordinator,
+      ...(input.planningChatEnabled === true ? { planningChatEnabled: true } : {}),
     };
     this.#db.transaction(() => {
       registerRun(this.#db.driver, this.#clock, runId);

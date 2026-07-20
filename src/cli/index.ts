@@ -53,6 +53,7 @@ import { isErr } from '../lib/result.js';
 import { runDoctor, renderDoctorText, type DoctorOptions } from './doctor.js';
 import { CLI_USAGE, parseCliArgs, type ParsedCliCommand, type RunCommand } from './args.js';
 import { executeCommand, type CliFlowDeps } from './commands.js';
+import { createAgentRoomPlanningChatFactory } from './agent-room.js';
 
 // Keep the historical entry-point surface importable from `./index.js` (the
 // arg parser + usage string are unit-tested there).
@@ -230,10 +231,17 @@ export function buildCliFlows(db: Database, config: EngineConfig = DEFAULT_ENGIN
   const ids = new RandomIdFactory();
   const artifacts = quotaAwareArtifactSink(db);
   const coordinatorProfilePath = fileURLToPath(new URL('../../profiles/coordinator.md', import.meta.url));
+  const planningChat = createAgentRoomPlanningChatFactory({
+    onReady: ({ invitation }) => {
+      process.stderr.write(
+        `Planning chat enabled. Planning remains active in this localhost room until a valid spec is synthesized:\n\n${invitation}\n\n`,
+      );
+    },
+  });
   return {
     ids,
     clock: db.clock,
-    buildCoordinatorRunner: ({ goal, revise }) => {
+    buildCoordinatorRunner: ({ goal, revise, enableChat }) => {
       const profile = loadProfileFile(coordinatorProfilePath);
       if (isErr(profile)) {
         throw new Error(
@@ -247,6 +255,7 @@ export function buildCliFlows(db: Database, config: EngineConfig = DEFAULT_ENGIN
         ids,
         clock: db.clock,
         ...(revise !== undefined ? { revise } : {}),
+        ...(enableChat === true ? { planningChat } : {}),
       });
     },
     openWorktrees: (workspacePath) => GitWorktreeManager.open({ primaryRepoRoot: workspacePath, clock: db.clock }),

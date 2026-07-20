@@ -35,8 +35,10 @@ commands:
       environment diagnosis: adapter binaries + versions, auth (4-state),
       host provider-config safety, ACP handshake (fake), git, sqlite, quotas.
 
-  start --workspace PATH --goal TEXT --coordinator PROFILE [--model ID] [--effort E] [--config FILE] [--no-wait]
+  start --workspace PATH --goal TEXT --coordinator PROFILE [--model ID] [--effort E] [--config FILE] [--enable-chat] [--no-wait]
       create a run (phase=created) with the coordinator profile pinned (§11.2).
+      --enable-chat opens an Agent Room for peer/human discussion during planning;
+      the coordinator synthesizes the same validated spec before approval.
 
   spec revise RUN_ID --feedback TEXT [--no-wait]   T2: coordinator re-drafts; back to approval
   approve RUN_ID --spec-version ID [--spec-hash HASH]
@@ -67,7 +69,7 @@ global options:
 
 /** Commands that need the engine (everything but help/usage_error/doctor). */
 export type RunCommand =
-  | { readonly kind: 'start'; readonly json: boolean; readonly workspace: string; readonly goal: string; readonly coordinator: RoleModelSpec; readonly configPath?: string; readonly noWait?: boolean }
+  | { readonly kind: 'start'; readonly json: boolean; readonly workspace: string; readonly goal: string; readonly coordinator: RoleModelSpec; readonly configPath?: string; readonly enableChat?: boolean; readonly noWait?: boolean }
   | { readonly kind: 'spec_revise'; readonly json: boolean; readonly runId: RunId; readonly feedback: string; readonly noWait?: boolean }
   | {
       readonly kind: 'approve';
@@ -251,7 +253,7 @@ function parseDoctor(rest: readonly string[]): ParsedCliCommand {
 
 function parseStart(rest: readonly string[]): ParsedCliCommand {
   const collected = collectOptions(rest, {
-    booleans: ['json', 'no-wait'],
+    booleans: ['json', 'no-wait', 'enable-chat'],
     values: ['workspace', 'goal', 'coordinator', 'model', 'effort', 'config'],
   });
   if (isErr(collected)) return usage(collected.error);
@@ -281,6 +283,7 @@ function parseStart(rest: readonly string[]): ParsedCliCommand {
     goal,
     coordinator: spec.value,
     ...(configPath !== undefined ? { configPath } : {}),
+    ...(bools.has('enable-chat') ? { enableChat: true } : {}),
     ...(bools.has('no-wait') ? { noWait: true } : {}),
   };
 }

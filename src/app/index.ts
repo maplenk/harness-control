@@ -18,6 +18,7 @@
 export * from './service.js';
 export * from './alerts.js';
 export * from './role-runner.js';
+export * from './planning-chat.js';
 export * from './model-resolution.js';
 export * from './cost.js';
 export * from './projections.js';

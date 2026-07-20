@@ -51,7 +51,9 @@ import {
 import {
   ENGINE_STATE_PROJECTION,
   RUN_CONFIG_PROJECTION,
+  RUN_META_PROJECTION,
   WorkflowDispatchReplayError,
+  type RunMeta,
 } from './projections.js';
 import type { RoleRunner } from './role-runner.js';
 import type { AppliedConfigOption, Harness } from './model-resolution.js';
@@ -168,6 +170,20 @@ function readyMergeReadiness(forRunId: Parameters<OrchestrationService['status']
 // Run lifecycle + role-flow seam
 // ---------------------------------------------------------------------------
 describe('OrchestrationService — run lifecycle', () => {
+  it('persists the opt-in planning-chat choice in immutable run metadata', async () => {
+    const { service, db } = await setup();
+    const { runId } = service.createRun({
+      goal: 'Discuss the plan',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+      planningChatEnabled: true,
+    });
+
+    expect(db.projections.get<RunMeta>(runId, RUN_META_PROJECTION)?.state).toMatchObject({
+      planningChatEnabled: true,
+    });
+  });
+
   it('advances created → specifying → awaiting_approval on a fake coordinator turn (§6.2, §20 P3)', async () => {
     const { service, created } = await setup();
     const { runId } = service.createRun({ goal: 'Add a flag', workspacePath: '/ws', coordinator: CLAUDE_LOW });

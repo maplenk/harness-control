@@ -144,6 +144,8 @@ export interface CliFlowDeps {
     readonly goal: string;
     readonly coordinator: RoleModelSpec;
     readonly workspacePath: string;
+    /** Opt-in Agent Room discussion before final spec synthesis. */
+    readonly enableChat?: boolean;
     /** T2 revision context (prior version + human feedback); absent for the initial draft. */
     readonly revise?: CoordinatorReviseContext;
   }): RoleRunner<CoordinatorOutcome>;
@@ -383,6 +385,7 @@ async function handleStart(
     goal: cmd.goal,
     workspacePath: cmd.workspace,
     coordinator: cmd.coordinator,
+    ...(cmd.enableChat === true ? { planningChatEnabled: true } : {}),
   });
 
   // DRIVE the coordinator FLOW through the service: created → specifying →
@@ -397,6 +400,7 @@ async function handleStart(
     goal: cmd.goal,
     coordinator: cmd.coordinator,
     workspacePath: cmd.workspace,
+    ...(cmd.enableChat === true ? { enableChat: true } : {}),
   });
   const outcome = await service.runCoordination(runId, runner, (o) =>
     draftFromOutcome(cmd.goal, o),
@@ -410,6 +414,7 @@ async function handleStart(
     goal: cmd.goal,
     workspacePath: cmd.workspace,
     coordinator: resolvedView(resolveRoleModel(cmd.coordinator)),
+    ...(cmd.enableChat === true ? { planningChat: outcome.planningChat ?? { enabled: true } } : {}),
     spec: {
       specVersionId: outcome.specVersion.id,
       specHash: outcome.specVersion.contentHash,
@@ -424,6 +429,9 @@ async function handleStart(
   const text = [
     `run ${runId} coordinated (phase ${st.phase}).`,
     `coordinator: ${describeSpec(cmd.coordinator)} drafted spec ${outcome.specVersion.id} (rev ${outcome.specVersion.revision}) in ${outcome.rounds} round(s).`,
+    ...(outcome.planningChat !== undefined
+      ? [`planning chat: ${outcome.planningChat.viewerUrl} (${outcome.planningChat.roomCode}, closed after synthesis)`]
+      : []),
     `spec hash: ${outcome.specVersion.contentHash}`,
     `acceptance criteria: ${outcome.specVersion.criteria.map((c) => String(c.id)).join(', ')}`,
     '',
@@ -516,6 +524,7 @@ async function handleSpecRevise(
     goal,
     coordinator: meta.coordinator,
     workspacePath: meta.workspacePath,
+    ...(meta.planningChatEnabled === true ? { enableChat: true } : {}),
     revise,
   });
   // W2-3 pending/active split: the revise round dispatches at `specifying`
@@ -544,6 +553,7 @@ async function handleSpecRevise(
     phase: st.phase,
     uiState: st.uiState,
     ...(recovered ? { draftRecovered: true } : {}),
+    ...(outcome.planningChat !== undefined ? { planningChat: outcome.planningChat } : {}),
     spec: {
       specVersionId: outcome.specVersion.id,
       specHash: outcome.specVersion.contentHash,
@@ -558,6 +568,9 @@ async function handleSpecRevise(
     `spec revised for run ${cmd.runId} (T2): the coordinator drafted revision ${outcome.specVersion.revision} ` +
       `(${outcome.specVersion.id})${outcome.supersedes !== undefined ? `, superseding ${outcome.supersedes}` : ''} ` +
       `in ${outcome.rounds} round(s); phase ${st.phase}.`,
+    ...(outcome.planningChat !== undefined
+      ? [`planning chat: ${outcome.planningChat.viewerUrl} (${outcome.planningChat.roomCode}, closed after synthesis)`]
+      : []),
     ...(recovered
       ? [
           'note: the persisted draft was missing (W3-4 draft loss); the revision context was rebuilt ' +
@@ -1467,6 +1480,7 @@ async function reenterCoordinator(
     goal,
     coordinator: meta.coordinator,
     workspacePath: meta.workspacePath,
+    ...(meta.planningChatEnabled === true ? { enableChat: true } : {}),
     ...(revise !== undefined ? { revise } : {}),
   });
   // W3-4: BOTH branches complete through `completeCoordinationRound` (inside
@@ -1496,6 +1510,7 @@ async function reenterCoordinator(
     reentry: 'coordinator',
     phase: st.phase,
     uiState: st.uiState,
+    ...(outcome.planningChat !== undefined ? { planningChat: outcome.planningChat } : {}),
     spec: {
       specVersionId: outcome.specVersion.id,
       specHash: outcome.specVersion.contentHash,
@@ -1508,6 +1523,9 @@ async function reenterCoordinator(
   };
   const text = [
     `run ${runId} resumed: the coordinator round re-entered and completed (phase ${st.phase}).`,
+    ...(outcome.planningChat !== undefined
+      ? [`planning chat: ${outcome.planningChat.viewerUrl} (${outcome.planningChat.roomCode}, closed after synthesis)`]
+      : []),
     `spec hash: ${outcome.specVersion.contentHash}`,
     '',
     outcome.canonicalSpec,
@@ -1719,6 +1737,8 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
     ...(st.approvedSpecHash !== undefined ? { approvedSpecHash: st.approvedSpecHash } : {}),
     ...(st.goal !== undefined ? { goal: st.goal } : {}),
     ...(st.workspacePath !== undefined ? { workspacePath: st.workspacePath } : {}),
+    planningChatEnabled:
+      db.projections.get<RunMeta>(runId, RUN_META_PROJECTION)?.state.planningChatEnabled === true,
     vitals: {
       rssBytes, // null until process samples exist (§14 telemetry)
       cost: {
@@ -2043,6 +2063,7 @@ function renderStatusText(view: Record<string, unknown>, suspension: string): st
     }`,
     `  operation:  ${JSON.stringify(view['operation'])}`,
     `  child active: ${String(view['childActive'])}`,
+    `  planning chat: ${view['planningChatEnabled'] === true ? 'enabled' : 'disabled'}`,
     `  cost: ${costLabel} over ${String(vitals.cost['turns'])} turn(s); ` +
       `rss: ${vitals.rssBytes === null ? 'n/a' : `${vitals.rssBytes} bytes`}`,
     `  checkpoints: ${checkpoints.count}`,

@@ -26,7 +26,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "tsx src/cli/index.ts",
-    "smoke:live": "tsx scripts/live-smoke.ts"
+    "smoke:live": "tsx scripts/live-smoke.ts",
+    "smoke:live:chat": "tsx scripts/live-smoke.ts --chat"
   },
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.59.0",

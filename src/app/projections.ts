@@ -139,6 +139,9 @@ export interface RunMeta {
   readonly goal: string;
   readonly workspacePath: string;
   readonly coordinator: RoleModelSpec;
+  /** Opt-in Agent Room discussion remains bound to coordinator re-entry and
+   * later spec-revision rounds for this run. */
+  readonly planningChatEnabled?: boolean;
 }
 
 /**

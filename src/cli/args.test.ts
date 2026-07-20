@@ -27,6 +27,24 @@ describe('parseCliArgs — start', () => {
     });
   });
 
+  it('enables opt-in Agent Room planning chat', () => {
+    expect(
+      parseCliArgs([
+        'start',
+        '--workspace',
+        '/ws',
+        '--goal',
+        'g',
+        '--coordinator',
+        'claude:opus',
+        '--enable-chat',
+      ]),
+    ).toMatchObject({
+      kind: 'start',
+      enableChat: true,
+    });
+  });
+
   it('is a usage error when required flags are missing or the profile is bad', () => {
     expect(parseCliArgs(['start', '--workspace', '/ws', '--coordinator', 'claude', '--model', 'opus'])).toMatchObject({ kind: 'usage_error' });
     expect(parseCliArgs(['start', '--workspace', '/ws', '--goal', 'g', '--coordinator', 'bogus'])).toMatchObject({ kind: 'usage_error' });

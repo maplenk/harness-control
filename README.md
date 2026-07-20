@@ -34,6 +34,10 @@ run survives process restarts and is inspectable after the fact.
 - For live runs: the provider CLIs the adapters spawn — Claude Code and/or
   Codex — installed and authenticated (`doctor` reports the exact state).
   The offline test suite needs none of them.
+- Optional planning chat: install
+  [Agent Room](https://github.com/steviebuilds/agent-room) (or set
+  `AGENT_ROOM_CLI` to its `scripts/agent_room.mjs`) before using
+  `start --enable-chat`. Ordinary planning has no Agent Room dependency.
 
 ## Install / build
 
@@ -72,6 +76,15 @@ harness-orchestrator start --workspace /path/to/repo \
   --goal "Add a --verbose flag to the CLI" \
   --coordinator claude --model opus --effort low \
   --config harness.config.json
+
+# Add --enable-chat to make planning collaborative. The invitation is printed
+# immediately on stderr; open it as a human or paste it into another local
+# agent. The command stays in the room loop until the coordinator synthesizes
+# a host-validated spec (or the room is closed).
+harness-orchestrator start --workspace /path/to/repo \
+  --goal "Add a --verbose flag to the CLI" \
+  --coordinator claude:opus:low \
+  --enable-chat
 
 # 2b. Optional revision round before approving:
 harness-orchestrator spec revise RUN_ID --feedback "Tighten AC-2; no new deps"
@@ -113,6 +126,78 @@ terminal), `breaker reset` (after the restart circuit-breaker opens),
 `switch-model` (records a durable per-role DESIRED model, applied at the
 next spawn; `status` shows it pending, distinct from the effective/running
 model. Live in-place switching at a completed-turn boundary is deferred).
+
+## Opt-in planning chat
+
+`start --enable-chat` adapts the coordinator phase to an Agent Room discussion
+without changing the workflow or approval model:
+
+- Agent Room is started only for opted-in runs and is forced to
+  `127.0.0.1`; the normal planning path remains dependency-free.
+- The coordinator publishes an opening position, then long-polls the room's
+  server-managed unread queue. Humans can participate in the browser and other
+  local agents can join with the printed invitation.
+- The room's **Only when addressed** mode is honored: unaddressed messages are
+  observed but do not trigger a coordinator response.
+- A first draft is never accepted before at least one external contribution.
+  The final room synthesis still passes the same schema/testability validator,
+  becomes an immutable SpecVersion, and stops at explicit human approval.
+- The choice is persisted in run metadata, so coordinator resume and
+  `spec revise` keep chat enabled. `status --json` reports
+  `planningChatEnabled`.
+
+Room transcripts remain under Agent Room's local data directory. Planning
+fails with an install hint if chat is enabled but the Agent Room script cannot
+be found.
+
+## Real end-to-end acceptance test
+
+The committed live smoke is a repeatable, disposable test of the shipped CLI
+with real provider sessions:
+
+```sh
+# Coordinator → approval seam → Implementor → Verifier → merge_ready
+npm run smoke:live
+
+# The same flow, plus a real Agent Room planning discussion and human review
+npm run smoke:live:chat
+```
+
+`smoke:live:chat` creates a fresh temporary git repository containing a small
+`missionStatus` implementation task and deterministic failing Node tests. It
+waits for the real Coordinator's opening Agent Room message, posts an
+adversarial human review through the real room API, and requires a second
+Coordinator synthesis before proceeding. It then checks the immutable spec,
+uses the test-only explicit-approval seam, drives a real Implementor and an
+independent real Verifier, requires `merge_ready`, re-runs `npm test` itself,
+and proves that only the requested source file changed while the primary
+checkout remained untouched. The isolated room server and all temporary
+repositories, worktrees, run data, and transcripts are removed afterward.
+
+This is intentionally not part of `npm test`: it uses authenticated providers,
+takes longer, and may incur provider usage. Run `npm run dev -- doctor --json`
+first. Agent Room must be installed at its standard Codex skill path, or its
+single-file CLI can be supplied explicitly:
+
+```sh
+AGENT_ROOM_CLI=/path/to/agent_room.mjs npm run smoke:live:chat
+```
+
+Each role profile is independently configurable with a packed
+`harness:model[:effort]` token. For example, this runs all three roles through
+separate Codex sessions:
+
+```sh
+HARNESS_SMOKE_COORDINATOR=codex:gpt-5.6-terra:low \
+HARNESS_SMOKE_IMPLEMENTOR=codex:gpt-5.6-terra:medium \
+HARNESS_SMOKE_VERIFIER=codex:gpt-5.6-terra:high \
+npm run smoke:live:chat
+```
+
+Set `HARNESS_SMOKE_KEEP=1` to retain the disposable repository and run store
+for diagnosis after a failure. The smoke still does not bypass the production
+approval command: automation is possible only through `--test-approve` with
+`HARNESS_TEST_MODE=1`, binding the exact drafted spec version and hash.
 
 ## Safety posture
 

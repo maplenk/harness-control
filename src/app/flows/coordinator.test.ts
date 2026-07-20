@@ -27,6 +27,12 @@ import {
   type InProcessTurnScript,
 } from '../../adapters/index.js';
 import { OrchestrationService, type RoleAdapterFactory, type RoleAdapterOptions } from '../service.js';
+import type {
+  PlanningChatFactory,
+  PlanningChatMessage,
+  PlanningChatRoom,
+  PlanningChatUpdate,
+} from '../planning-chat.js';
 import type { Harness } from '../model-resolution.js';
 import {
   CoordinatorRunner,
@@ -215,6 +221,71 @@ function makeRunner(h: Harnessed, extra?: Partial<ConstructorParameters<typeof C
     explorationContext: 'src/cli/index.ts (base commit deadbeef): a hand-rolled arg parser.',
     ...extra,
   });
+}
+
+class FakePlanningRoom implements PlanningChatRoom {
+  readonly code = 'AM-TEST';
+  readonly invitation = 'Use the agent-room skill to join room: http://127.0.0.1:7331/rooms/AM-TEST';
+  readonly viewerUrl = 'http://127.0.0.1:7331/rooms/AM-TEST';
+  readonly coordinatorName = 'Coordinator';
+  readonly sent: string[] = [];
+  readonly summaries: string[] = [];
+  readonly #updates: PlanningChatUpdate[];
+
+  constructor(updates: readonly PlanningChatUpdate[]) {
+    this.#updates = [...updates];
+  }
+
+  async send(content: string): Promise<void> {
+    this.sent.push(content);
+  }
+
+  async listen(): Promise<PlanningChatUpdate> {
+    const update = this.#updates.shift();
+    if (update === undefined) throw new Error('FakePlanningRoom ran out of updates');
+    return update;
+  }
+
+  async close(summary: string): Promise<void> {
+    this.summaries.push(summary);
+  }
+}
+
+function chatMessage(
+  id: number,
+  sender: string,
+  content: string,
+  addressedToCoordinator = true,
+): PlanningChatMessage {
+  return {
+    id,
+    sender,
+    content,
+    kind: sender === 'Steve' ? 'human' : 'agent',
+    createdAt: '2026-07-18T00:00:00Z',
+    addressedToCoordinator,
+  };
+}
+
+function chatUpdate(
+  messages: readonly PlanningChatMessage[],
+  options: { readonly addressedOnly?: boolean; readonly shouldRespond?: boolean } = {},
+): PlanningChatUpdate {
+  return {
+    status: 'open',
+    activeAgents: 2,
+    addressedOnly: options.addressedOnly ?? false,
+    shouldRespond: options.shouldRespond ?? true,
+    participants: [
+      { name: 'Coordinator', role: 'agent' },
+      { name: messages[0]?.sender ?? 'Reviewer', role: messages[0]?.kind === 'human' ? 'human' : 'agent' },
+    ],
+    messages,
+  };
+}
+
+function chatFactory(room: PlanningChatRoom): PlanningChatFactory {
+  return { create: async () => room };
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +477,82 @@ describe('CoordinatorRunner via OrchestrationService.runCoordination (§7, §20 
     // The awaiting_approval advance is the service's, taken only after run()
     // returns — a thrown flow leaves the run in `specifying`.
     expect(h.service.status(runId).phase).toBe('specifying');
+  });
+
+  it('uses Agent Room when enabled and accepts the spec only after an external planning contribution', async () => {
+    // Even though turn 1 already contains a valid draft, chat mode deliberately
+    // waits for peer review and requires a second synthesis turn.
+    const h = await harness([[specTurn(validSpec()), specTurn(revisedSpec())]]);
+    const room = new FakePlanningRoom([
+      chatUpdate([
+        chatMessage(
+          2,
+          'Reviewer',
+          '@Coordinator add an acceptance criterion for the help output.',
+        ),
+      ]),
+    ]);
+    const { runId } = h.service.createRun({ goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
+
+    const outcome = await h.service.runCoordination(
+      runId,
+      makeRunner(h, { planningChat: chatFactory(room) }),
+    );
+
+    expect(outcome.rounds).toBe(2);
+    expect(outcome.specVersion.criteria.map((criterion) => String(criterion.id))).toEqual([
+      'AC-1',
+      'AC-2',
+      'AC-3',
+    ]);
+    expect(outcome.planningChat).toEqual({
+      roomCode: 'AM-TEST',
+      viewerUrl: room.viewerUrl,
+    });
+    expect(room.sent).toHaveLength(2);
+    expect(room.sent[0]).toContain('"AC-2"');
+    expect(room.sent[1]).toContain('"AC-3"');
+    expect(room.summaries[0]).toContain('host-validated specification');
+    expect(h.prompts[0]).toContain('Planning chat mode');
+    expect(h.prompts[1]).toContain('Reviewer');
+    expect(h.prompts[1]).toContain('help output');
+    expect(h.service.status(runId).phase).toBe('awaiting_approval');
+  });
+
+  it('honors Agent Room addressed-only mode and stays silent until Coordinator is addressed', async () => {
+    const h = await harness([
+      [
+        {
+          updates: [{ kind: 'agent_message_chunk', text: 'Opening planning position.' }],
+          result: { stopReason: 'end_turn' },
+        },
+        specTurn(validSpec()),
+      ],
+    ]);
+    const room = new FakePlanningRoom([
+      chatUpdate(
+        [chatMessage(2, 'Reviewer', 'I am thinking aloud; no response needed.', false)],
+        { addressedOnly: true, shouldRespond: false },
+      ),
+      chatUpdate(
+        [chatMessage(3, 'Steve', '@Coordinator finalize with the current scope.')],
+        { addressedOnly: true, shouldRespond: true },
+      ),
+    ]);
+    const { runId } = h.service.createRun({ goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
+
+    const outcome = await h.service.runCoordination(
+      runId,
+      makeRunner(h, { planningChat: chatFactory(room) }),
+    );
+
+    // Exactly two model turns: opening + the addressed response. The
+    // unaddressed message was marked read but never prompted a reply.
+    expect(outcome.rounds).toBe(2);
+    expect(h.prompts).toHaveLength(2);
+    expect(h.prompts[1]).toContain('@Coordinator finalize');
+    expect(h.prompts[1]).not.toContain('thinking aloud');
+    expect(room.sent).toHaveLength(2);
   });
 });
 
