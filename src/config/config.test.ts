@@ -250,16 +250,24 @@ describe('parseEngineConfig (deep partial overrides + validation)', () => {
     }
   });
 
-  it('P4b wave 2 (F4a): REJECTS an unadvertised effort at parse (`xhigh`)', () => {
+  it('P4b wave 2 (F4a): REJECTS an unadvertised effort at parse (`ultra`)', () => {
     const result = parseEngineConfig({
       failoverPolicy: 'switch_harness',
-      failoverLadder: [{ harness: 'codex', model: 'gpt-5.6-terra', effort: 'xhigh' }],
+      failoverLadder: [{ harness: 'codex', model: 'gpt-5.6-terra', effort: 'ultra' }],
     });
     expect(isErr(result)).toBe(true);
     if (isErr(result)) {
       expect(issuePaths(result.error).some((p) => /failoverLadder/.test(p))).toBe(true);
       expect(result.error.some((i) => /effort must be one of/.test(i.message))).toBe(true);
     }
+  });
+
+  it('accepts `xhigh` now that it is in the effort vocabulary', () => {
+    const result = parseEngineConfig({
+      failoverPolicy: 'switch_harness',
+      failoverLadder: [{ harness: 'codex', model: 'gpt-5.6-terra', effort: 'xhigh' }],
+    });
+    expect(isOk(result)).toBe(true);
   });
 
   it('P4b wave 2 (F4a): a valid harness+effort entry still parses', () => {

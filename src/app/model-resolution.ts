@@ -54,7 +54,7 @@ export type Harness = (typeof HARNESSES)[number];
  * values in `applyRoleModel`, so the same discrete ladder is used as the
  * canonical request and mapped by `resolveOptionId`.
  */
-export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'] as const;
+export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 /** A role's resolved harness/model/effort triple (the input to §11.2 pinning). */
