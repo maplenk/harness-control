@@ -81,6 +81,19 @@ export const RESTART_WINDOW_OFF = 'off' as const;
 export const RESTART_WINDOW_CHOICES = [3, 5, 8, RESTART_WINDOW_OFF] as const;
 export type RestartWindowMax = (typeof RESTART_WINDOW_CHOICES)[number];
 
+// ---------------------------------------------------------------------------
+// P4b-2 (§5cc): bounded same-harness AUTO-RESPAWN of a crashed child. `bounded`
+// (default, ON) has the lease-holding loop self-drive the successor spine after
+// a crash whose generation-matched T13 is `restart`-advised, bounded by the
+// breaker (each attempt grows the durable restart window; `breaker_open` → T14).
+// `off` reproduces P4a EXACTLY: a crash interrupts and waits for a manual resume.
+// The breaker's window/lifetime bounds still apply in BOTH modes — `off` only
+// removes the automatic re-drive, never the safety bound.
+// ---------------------------------------------------------------------------
+export const AUTO_RESPAWN_CHOICES = ['bounded', 'off'] as const;
+export type AutoRespawnMode = (typeof AUTO_RESPAWN_CHOICES)[number];
+export const DEFAULT_AUTO_RESPAWN: AutoRespawnMode = 'bounded';
+
 // Single source of truth for the two "5"s (this schema's literal default and
 // DEFAULT_BOUNDS.restartWindowMax) is DEFAULT_BOUNDS; the literal-union type
 // here is strictly narrower than EngineBounds.restartWindowMax's `number`, so
@@ -131,6 +144,14 @@ const restartsSchema = z
     lifetimeCap: z.number().int().positive().default(DEFAULT_BOUNDS.lifetimeRestartMax),
     /** Gate for `windowMax: 'off'`; retains the lifetime cap regardless. */
     unsafeDev: z.boolean().default(false),
+    /**
+     * P4b-2 (§5cc): `bounded` (default) = the lease-holding loop auto-respawns a
+     * crashed child through the successor spine, bounded by the window/lifetime
+     * breaker; `off` = P4a exactly (crash → interrupted → manual resume). The
+     * breaker bound above governs both modes — `off` removes only the automatic
+     * re-drive, never the safety bound.
+     */
+    autoRespawn: z.enum(AUTO_RESPAWN_CHOICES).default(DEFAULT_AUTO_RESPAWN),
   })
   .strict()
   .superRefine((v, ctx) => {

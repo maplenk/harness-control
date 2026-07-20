@@ -3,7 +3,7 @@
  * plus small shared domain vocabulary used by both entities and events.
  */
 import type { IsoTimestamp } from '../lib/clock.js';
-import type { ProcessGenerationId, SegmentId, TurnId } from './ids.js';
+import type { ArtifactHash, ProcessGenerationId, SegmentId, TurnId } from './ids.js';
 
 // ---------------------------------------------------------------------------
 // Axis 1: Run.phase (workflow position)
@@ -151,6 +151,52 @@ export interface ResumeReentryPending {
   readonly recordedAt: IsoTimestamp;
 }
 
+/**
+ * P4b-2 self-drive successor spine — the {harness, model, effort} a successor
+ * generation re-asserts on its first pin. Plain strings (not `RoleModelSpec`)
+ * so the domain layer never depends on the app's model-resolution module; the
+ * spine narrows it back through `resolveRoleModel` at spawn time. Wave 1 sets
+ * this to the crashed/paused generation's OWN target (same-harness/same-model);
+ * failover (a DIFFERENT target from the per-assignment ladder) is wave 2.
+ */
+export interface SuccessorTarget {
+  readonly harness: string;
+  /** Provider model slug, e.g. `opus` or `gpt-5.6-terra`. */
+  readonly model: string;
+  readonly effort?: string;
+}
+
+/**
+ * P4b-2 self-drive successor spine — the request carried on a resume trigger's
+ * `successor` payload field. `applyTransition`'s `initiate_resume` folds it
+ * into the durable `SuccessorIntent` marker (adding the derived returnPhase +
+ * recordedAt) in the SAME atomic write as the T9/T12 suspension-clear.
+ */
+export interface SuccessorIntentSeed {
+  readonly target: SuccessorTarget;
+  /** Why a successor was required (§6.3 T5 `require_successor`, or `recovery`). */
+  readonly reason: SuccessorReason;
+  /** T5: re-assert the model explicitly on the successor's first pin. */
+  readonly reassertModel: boolean;
+  /** §12.2 checkpoint the successor is seeded from (`resolveResumeCheckpointHash`;
+   * absent when no eligible checkpoint exists yet — the safe direction). */
+  readonly seedCheckpointHash?: ArtifactHash;
+}
+
+/**
+ * P4b-2 self-drive successor spine — the durable INTENT marker, a
+ * `resumeReentryPending` SIBLING in `EngineState`. Recorded ATOMICALLY (fused
+ * with the T9/T12 `initiate_resume` suspension-clear, ONE `#atomicEngineWrite`)
+ * BEFORE any OS spawn, and cleared by the SAME `child.spawned →
+ * resume_reentry.completed` ack that clears `resumeReentryPending`. An un-acked
+ * marker after a crash re-drives EXACTLY ONE successor on restart (reap kills a
+ * mid-spawn orphan; the un-acked marker re-drives) — windows A/B/C.
+ */
+export interface SuccessorIntent extends SuccessorIntentSeed {
+  readonly returnPhase: RunPhase;
+  readonly recordedAt: IsoTimestamp;
+}
+
 // ---------------------------------------------------------------------------
 // Counters & bounds consumed by the transition engine (§13, §14, §6.3)
 // ---------------------------------------------------------------------------
@@ -222,6 +268,19 @@ export const DEFAULT_PROBE_LADDER_MINUTES = [30, 60, 120, 240] as const;
 // Shared vocabulary (used by entities AND events; kept here to avoid cycles)
 // ---------------------------------------------------------------------------
 export type RoleName = 'coordinator' | 'implementor' | 'verifier';
+
+/**
+ * Why a checkpoint-successor generation is required (§11, §12.2): a limit
+ * during an unconfirmed model switch (T5), a mid-turn limit, a cross-harness
+ * switch, or crash/restart recovery. Shared vocabulary — consumed by both the
+ * `require_successor` effect (transitions) and the `segment.successor.required`
+ * event (events), and carried on the P4b-2 successor INTENT marker.
+ */
+export type SuccessorReason =
+  | 'model_switch_indeterminate'
+  | 'mid_turn_limit'
+  | 'cross_harness_switch'
+  | 'recovery';
 
 /** §9 classifyError result kinds (adapter/protocol envelopes ONLY). */
 export type ClassifiedErrorKind =

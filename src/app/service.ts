@@ -41,6 +41,7 @@ import type { IsoTimestamp } from '../lib/clock.js';
 import { type Clock } from '../lib/clock.js';
 import { RandomIdFactory, type IdFactory } from '../lib/id-factory.js';
 import {
+  alertId,
   artifactHash,
   eventSequence,
   gitSha,
@@ -108,6 +109,10 @@ import {
   type ResumeReentryPending,
   type RoleName,
   type RunPhase,
+  type SuccessorIntent,
+  type SuccessorIntentSeed,
+  type SuccessorReason,
+  type SuccessorTarget,
   type SuspensionKind,
 } from '../domain/state.js';
 import type {
@@ -117,7 +122,7 @@ import type {
   WorktreeState,
 } from '../domain/entities.js';
 import { DEFAULT_ENGINE_CONFIG, parseEngineConfig, toEngineBounds } from '../config/loader.js';
-import type { EngineConfig } from '../config/schema.js';
+import type { AutoRespawnMode, EngineConfig } from '../config/schema.js';
 import { isErr, unwrap } from '../lib/result.js';
 import {
   appendTriggerWithEffects,
@@ -420,6 +425,53 @@ export class ResumeEligibilityError extends Error {
   }
 }
 
+/**
+ * P4b-2 (§5cc) — a control-flow SIGNAL (not a failure): a crashed child's
+ * generation-matched T13 was `restart`-advised, `restarts.autoRespawn` is
+ * `bounded`, and the lease-holding loop opted in — so instead of unwinding to a
+ * manual interrupt, `#interruptOnChildDeath` returns this so the call site can
+ * hand control back to `runImplementVerifyLoop`, which waits `backoffMs` and
+ * re-drives the successor spine (same-harness/same-model in wave 1). The T13 is
+ * ALREADY durably applied (suspension=`interrupted`, generation stopped, the
+ * restart window grown) before this is raised — the breaker bounds the loop, and
+ * an exhausting crash opens the breaker (T14) instead of raising this signal.
+ * Caught ONLY by the loop; anywhere else it surfaces as an ordinary error.
+ */
+export class AutoRespawnSignal extends Error {
+  override readonly name: string = 'AutoRespawnSignal';
+  readonly runId: RunId;
+  /** The breaker's in-sequence attempt count for this crash (1-based). */
+  readonly attempt: number;
+  /** Real-time delay before the loop re-drives (exponential backoff, breaker). */
+  readonly backoffMs: number;
+  /** The crashed generation whose T13 licensed this respawn. */
+  readonly generationId: ProcessGenerationId;
+  constructor(input: {
+    runId: RunId;
+    attempt: number;
+    backoffMs: number;
+    generationId: ProcessGenerationId;
+  }) {
+    super(
+      `auto-respawn (bounded) requested for run ${input.runId} after a child crash ` +
+        `(attempt ${input.attempt}, backoff ${input.backoffMs}ms)`,
+    );
+    this.runId = input.runId;
+    this.attempt = input.attempt;
+    this.backoffMs = input.backoffMs;
+    this.generationId = input.generationId;
+  }
+}
+
+/**
+ * P4b-2: the disposition `#interruptOnChildDeath` hands its call sites — either
+ * unwind with a sink-safe error (the manual/P4a path) OR hand a control signal
+ * back to the loop for a bounded auto-respawn.
+ */
+type CrashDisposition =
+  | { readonly kind: 'throw'; readonly error: unknown }
+  | { readonly kind: 'respawn'; readonly signal: AutoRespawnSignal };
+
 /** §17.2 — a new turn was refused because measured + estimated spend + reservation
  * exceeds the estimated soft budget (W1-F5: estimated spend counts too — a run of
  * purely unpriced subscription turns must still trip the refusal). */
@@ -603,6 +655,15 @@ export interface RoleDispatch {
    * as `pending` (honest: nothing established mid-round; W2-5 refines). */
   readonly criterionIds?: readonly CriterionId[];
   readonly assignmentId?: AssignmentId;
+  /**
+   * P4b-2 (§5cc): the caller is the lease-holding implement→verify loop and is
+   * prepared to CATCH an `AutoRespawnSignal` and re-drive the successor spine.
+   * Set ONLY by `runImplementVerifyLoop`; a coordinator round or a bare
+   * `runRole` never opts in, so a crash there stays P4a (interrupted → manual).
+   * The auto-respawn decision additionally requires `restarts.autoRespawn ===
+   * 'bounded'`, a generation-matched T13, and in-process run ownership.
+   */
+  readonly autoRespawn?: boolean;
 }
 
 export type IngestResult =
@@ -690,6 +751,17 @@ export interface RunStatus {
   readonly activeChild?: ActiveChild;
   /** W2-1: unacknowledged T9/T12 re-entry awaiting `resume_reentry.completed`. */
   readonly resumeReentryPending?: ResumeReentryPending;
+  /** P4b-2: unacknowledged self-drive successor INTENT marker (a
+   * `resumeReentryPending` sibling), cleared by the same `child.spawned` ack. */
+  readonly successorIntent?: SuccessorIntent;
+  /**
+   * P4b-2: present iff the run is `interrupted` under `autoRespawn=bounded` (the
+   * breaker is not yet exhausted — an exhausted run is `breaker_open`, not
+   * `interrupted`). Signals the CLI to render "interrupted — auto-recovering
+   * (attempt N)" rather than a manual-resume prompt. `attempt` is the durable
+   * count of restarts folded into the current window so far.
+   */
+  readonly autoRecovering?: { readonly attempt: number };
   readonly counters: RestartCounters;
   readonly approvedSpecHash?: SpecHash;
   readonly cost: CostProjectionState;
@@ -1537,6 +1609,131 @@ export class OrchestrationService {
   }
 
   /**
+   * P4b-2 self-drive SUCCESSOR spine — STEP 1 (the durable INTENT marker,
+   * FIRST, BEFORE any OS spawn). Records the successor INTENT marker (a
+   * `resumeReentryPending` sibling on `EngineState`) in ONE `#atomicEngineWrite`
+   * fused with the T9/T12 `initiate_resume` suspension-clear: the marker carries
+   * the seed §12.2 checkpoint hash (`resolveResumeCheckpointHash`) and the
+   * target {harness, model, effort} the successor re-asserts. The predecessor
+   * T13 (crash → `interrupted`, restart-window folded + generation stopped) or
+   * T4/T5 (limit → `paused_limit`) already recorded the crash/limit bookkeeping
+   * — that IS the "prior durable state" observed at crash-window A — so this
+   * write only fuses the marker with the suspension-clear.
+   *
+   * The eligibility chain runs INSIDE the write-locked transaction exactly like
+   * `resume` (a superseded spec can never seed a successor). The reason and
+   * `reassertModel` come from any un-consumed `segment.successor.required` (T5's
+   * emitted-but-previously-zero-consumer event — the spine is now its consumer);
+   * absent, this is a plain `recovery` successor. Wave 1: the target defaults to
+   * the crashed/paused round's OWN role spec (same-harness/same-model);
+   * `opts.target` supplies an explicit target for wave-2 failover.
+   *
+   * STEP 2 (the OS spawn) is the POST-COMMIT side-effect, driven by the
+   * lease-holding owner through the EXISTING resume re-entry machinery
+   * (`reenterImplementVerify` → `runImplementVerifyLoop` resume → `adoptWorktree`
+   * + `runRole`); `child.spawned` ACKS the marker (the `resume_reentry.completed`
+   * path). Crash between STEP 1 and `child.spawned` (window B): reaping kills the
+   * mid-spawn orphan and the un-acked marker re-drives — EXACTLY ONE successor.
+   */
+  recordSuccessorIntent(
+    runId: RunId,
+    opts?: CommandOptions & { readonly target?: SuccessorTarget },
+  ): IngestResult {
+    // F1: `BEGIN IMMEDIATE` so the eligibility read + the trigger append (which
+    // folds the marker) are one write-locked unit and the inner `ingest`
+    // `transactionImmediate` nests as a shared no-op — IMMEDIATE stays outermost.
+    return this.#db.transactionImmediate(() => {
+      const state = this.#loadEngineRecord(runId).state;
+      const suspension = state.suspension.kind;
+      if (suspension !== 'paused_limit' && suspension !== 'interrupted') {
+        throw new WorkflowAdvanceError(
+          `successor spine: run ${runId} must be paused_limit or interrupted to seed a successor (suspension=${suspension})`,
+        );
+      }
+      const eligibility = this.checkResumeEligibility(runId);
+      if (!eligibility.eligible) {
+        throw new ResumeEligibilityError(runId, eligibility.reason, eligibility.detail);
+      }
+      const target = opts?.target ?? this.#defaultSuccessorTarget(runId);
+      if (target === undefined) {
+        throw new WorkflowAdvanceError(
+          `successor spine: run ${runId} has no resolvable target (no role round / loop binding recorded)`,
+        );
+      }
+      const requirement = this.#pendingSuccessorRequired(runId);
+      const seedCheckpointHash = this.resolveResumeCheckpointHash(runId);
+      const successor: SuccessorIntentSeed = {
+        target,
+        // The un-consumed T5 `segment.successor.required` (if any) is the reason;
+        // otherwise this is a crash/restart recovery successor.
+        reason: requirement?.reason ?? 'recovery',
+        reassertModel: requirement?.reassertModel ?? true,
+        ...(seedCheckpointHash !== undefined ? { seedCheckpointHash } : {}),
+      };
+      // The marker rides the SAME resume trigger the manual path uses (T12 from
+      // interrupted, T9 from paused_limit) — maximal reuse of the proven
+      // reclaim + `child.spawned` ack + startup-reclaim machinery.
+      if (suspension === 'interrupted') {
+        return this.ingest(
+          this.#trigger(runId, 'resume.user.requested', { successor }, opts) as DomainEvent,
+        );
+      }
+      return this.ingest(
+        this.#trigger(runId, 'resume.limit.requested', { mode: 'manual', successor }, opts) as DomainEvent,
+      );
+    });
+  }
+
+  /**
+   * P4b-2: an un-consumed `segment.successor.required` (T5's emitted-but-
+   * zero-consumer event, PLAN §6.3 gap) — the LATEST one whose sequence is
+   * beyond the latest resume trigger (a resume that recorded a marker consumes
+   * it). The spine is its consumer: `recordSuccessorIntent` reads the reason +
+   * `reassertModel` from here. Public so the CLI resume path can route a T5
+   * pause through the successor spine rather than a plain resume.
+   */
+  hasPendingSuccessorRequirement(runId: RunId): boolean {
+    return this.#pendingSuccessorRequired(runId) !== undefined;
+  }
+
+  #pendingSuccessorRequired(
+    runId: RunId,
+  ): { readonly reason: SuccessorReason; readonly reassertModel: boolean } | undefined {
+    let requirement: { reason: SuccessorReason; reassertModel: boolean; sequence: number } | undefined;
+    let latestResumeSeq = -1;
+    for (const event of this.#db.events.listByRun(runId)) {
+      if (event.type === 'segment.successor.required') {
+        const payload = event.payload;
+        requirement = {
+          reason: payload.reason,
+          reassertModel: payload.reassertModel,
+          sequence: Number(event.sequence),
+        };
+      } else if (event.type === 'resume.limit.requested' || event.type === 'resume.user.requested') {
+        latestResumeSeq = Number(event.sequence);
+      }
+    }
+    if (requirement === undefined || requirement.sequence <= latestResumeSeq) return undefined;
+    return { reason: requirement.reason, reassertModel: requirement.reassertModel };
+  }
+
+  /**
+   * P4b-2 wave-1 default target — the crashed/paused round's OWN role spec
+   * (same-harness/same-model): the coordinator spec for a coordinator round,
+   * else the loop binding's implementor/verifier spec. `undefined` when nothing
+   * durable resolves a target (no round or no loop binding) — the caller
+   * refuses honestly rather than seeding a target-less successor.
+   */
+  #defaultSuccessorTarget(runId: RunId): SuccessorTarget | undefined {
+    const round = this.getRoleRound(runId);
+    if (round === undefined) return undefined;
+    if (round.role === 'coordinator') return this.#requireMeta(runId).coordinator;
+    const loop = this.getImplementVerifyLoopState(runId);
+    if (loop === undefined) return undefined;
+    return round.role === 'verifier' ? loop.verifier : loop.implementor;
+  }
+
+  /**
    * W2-5 (pushback item 8) — the resume-eligibility check evaluated BEFORE
    * every T9/T12/interrupted re-entry (wired into `resume` and the scheduled
    * probe path): the CURRENT role round's assignment must be open and
@@ -1960,8 +2157,12 @@ export class OrchestrationService {
       // re-entry is recorded IS the re-entered round running — ack it with
       // `resume_reentry.completed` so startup/`resume` stop reclaiming it.
       // Folded idempotently; a normal (non-resume) dispatch has no pending
-      // re-entry and appends nothing.
-      if (this.#loadEngineRecord(runId).state.resumeReentryPending !== undefined) {
+      // re-entry and appends nothing. P4b-2: the SAME ack clears the successor
+      // INTENT marker — `child.spawned` acking the re-entered round IS the
+      // successor going active (the marker rides `resumeReentryPending`, but
+      // the gate fires on EITHER so a successor-only marker is acked too).
+      const ackState = this.#loadEngineRecord(runId).state;
+      if (ackState.resumeReentryPending !== undefined || ackState.successorIntent !== undefined) {
         this.ingest(
           this.#trigger(runId, 'resume_reentry.completed', {
             role: runner.role,
@@ -2126,6 +2327,18 @@ export class OrchestrationService {
       ...(state.resumeReentryPending !== undefined
         ? { resumeReentryPending: state.resumeReentryPending }
         : {}),
+      ...(state.successorIntent !== undefined ? { successorIntent: state.successorIntent } : {}),
+      // P4b-2: an `interrupted` run under `autoRespawn=bounded` whose interrupt
+      // folded at least one CHILD restart is auto-recovering (breaker not
+      // exhausted — exhaustion is `breaker_open`, a distinct suspension). The
+      // `restartsInWindow > 0` gate excludes a breaker-EXEMPT T17 orchestrator
+      // crash (which never folds a restart) — that stays a manual interrupt.
+      // `attempt` = restarts folded into the current window so far.
+      ...(state.suspension.kind === 'interrupted' &&
+      state.counters.restartsInWindow > 0 &&
+      this.#autoRespawnMode(runId) === 'bounded'
+        ? { autoRecovering: { attempt: state.counters.restartsInWindow } }
+        : {}),
       counters: state.counters,
       ...(state.approvedSpecHash !== undefined ? { approvedSpecHash: state.approvedSpecHash } : {}),
       cost,
@@ -2252,7 +2465,10 @@ export class OrchestrationService {
       case 'usage_limit':
         throw await this.#pauseForLimit(ctx, classification, 'initial_config_pin');
       case 'crash':
-        throw await this.#interruptOnChildDeath(ctx, raw);
+        // P4b-2: RETURN advice, not THROW — a bounded, generation-matched crash
+        // hands the loop an `AutoRespawnSignal` to catch and re-drive; every
+        // other case unwinds with the sink-safe error exactly as P4a did.
+        throw this.#unwrapCrashDisposition(await this.#interruptOnChildDeath(ctx, raw));
       case 'auth':
       case 'protocol':
         // Typed unwind reaches CLI output → the message must already be
@@ -2287,7 +2503,8 @@ export class OrchestrationService {
       case 'unknown_provider_error':
         throw await this.#pauseForLimit(ctx, classification, operation);
       case 'crash':
-        throw await this.#interruptOnChildDeath(ctx, raw);
+        // P4b-2: RETURN advice, not THROW (see `#routePinFailure`'s crash case).
+        throw this.#unwrapCrashDisposition(await this.#interruptOnChildDeath(ctx, raw));
       case 'auth':
       case 'protocol': {
         // Typed failure path: no pause, no retry. For a failed prompt turn
@@ -2315,14 +2532,25 @@ export class OrchestrationService {
   }
 
   /**
-   * W2-3: a provider-call failure classified `crash` = the child died →
-   * T13 (`child.exited.unexpectedly`, generation-stamped): counters fold,
-   * that generation is marked stopped, suspension=`interrupted` — manual
-   * resume required, ZERO auto-respawns in P4a. Returns the SINK-SAFE
-   * wrapping of the raw error (message redacted §17.1, shape preserved)
-   * for the caller to throw (typed unwind reaches CLI output).
+   * W2-3 / P4b-2: a provider-call failure classified `crash` = the child died →
+   * T13 (`child.exited.unexpectedly`, generation-stamped): counters fold, that
+   * generation is marked stopped, suspension=`interrupted`. The DISPOSITION the
+   * call site acts on:
+   *  - `throw` — unwind with the SINK-SAFE (redacted §17.1, shape-preserved) raw
+   *    error. This is the P4a path and covers `autoRespawn=off`, a stale/rejected
+   *    (non-generation-matched) T13, a non-loop caller (coordinator / bare
+   *    `runRole`), and a `breaker_open` (T14) exhaustion.
+   *  - `respawn` — the lease-holding loop must catch an `AutoRespawnSignal` and
+   *    re-drive the successor spine after `backoffMs`. Reached ONLY when the T13
+   *    was APPLIED (generation-matched — NOT `evaluateCrash`'s generation-blind
+   *    advice, S4), `restarts.autoRespawn==='bounded'`, the dispatch opted in,
+   *    and this process owns the run in-process (owner-alive). The crash is
+   *    recorded as an `alert.raised{respawn}` instead of `{crash}` — it
+   *    auto-recovered, so it is not an operator-actionable interrupt.
+   * T17 (orchestrator-restart) never reaches here, so orchestrator crashes never
+   * feed this window/lifetime bookkeeping NOR auto-respawn.
    */
-  async #interruptOnChildDeath(ctx: SpawnContext, raw: unknown): Promise<unknown> {
+  async #interruptOnChildDeath(ctx: SpawnContext, raw: unknown): Promise<CrashDisposition> {
     // W4-1: consult the breaker for THIS child crash. `evaluateCrash` folds the
     // crash into the time-decayed restart window and reads the authoritative
     // lifetime counter from the durable projection — on exhaustion it returns
@@ -2359,7 +2587,8 @@ export class OrchestrationService {
       // F4 (§5x): STAMP the generation so T14's `generation_matches_active`
       // guard keeps a stale/late breaker-open off a moved-on/paused/terminal
       // run (mirrors the T13 stamp below). P4b-1: T14's `breaker_open` notify
-      // rides an `alert.raised` in the SAME transaction.
+      // rides an `alert.raised` in the SAME transaction. Breaker exhaustion is
+      // ALWAYS a manual interrupt — never auto-respawned (the bound was hit).
       this.#ingestTransition(
         this.#trigger(ctx.runId, 'restart.exhausted', {
           reason: advice.reason,
@@ -2367,18 +2596,105 @@ export class OrchestrationService {
         }) as DomainEvent,
         alertCtx,
       );
-    } else {
-      // P4b-1: T13's `interrupted` notify rides an `alert.raised` atomically.
-      this.#ingestTransition(
-        this.#trigger(ctx.runId, 'child.exited.unexpectedly', {
-          segmentId: ctx.segmentId,
-          generationId: ctx.generationId,
-          classifiedAs: 'crash',
-        }) as DomainEvent,
-        alertCtx,
-      );
+      return { kind: 'throw', error: toSinkSafeTypedError(raw) };
     }
-    return toSinkSafeTypedError(raw);
+
+    // P4b-2: decide auto-respawn eligibility. `evaluateCrash`'s `restart` advice
+    // is generation-BLIND (S4) — so we gate on whether the T13 we build below is
+    // actually APPLIED (generation-matched); a stale/superseded crash's T13 is
+    // rejected and must NOT respawn. The other gates are known up front.
+    const wantRespawn =
+      advice.kind === 'restart' &&
+      this.#autoRespawnMode(ctx.runId) === 'bounded' &&
+      ctx.dispatch?.autoRespawn === true &&
+      this.#ownsRunInProcess(ctx.runId);
+
+    // P4b-1/P4b-2: T13's `interrupted` notify rides an `alert.raised{crash}`
+    // atomically ON THE MANUAL PATH. When auto-respawning we SUPPRESS the crash
+    // alert (it auto-recovered — not operator-actionable) and raise an
+    // `alert.raised{respawn}` instead, once the T13 is confirmed generation-matched.
+    const t13 = this.#ingestTransition(
+      this.#trigger(ctx.runId, 'child.exited.unexpectedly', {
+        segmentId: ctx.segmentId,
+        generationId: ctx.generationId,
+        classifiedAs: 'crash',
+      }) as DomainEvent,
+      wantRespawn ? undefined : alertCtx,
+    );
+
+    if (wantRespawn && t13.status === 'applied' && advice.kind === 'restart') {
+      // The crash interrupted the ACTIVE generation (generation-matched) AND
+      // auto-respawn is enabled/opted-in/owned → record the informational
+      // respawn alert and hand a control signal back to the loop.
+      this.#raiseRespawnAlert(ctx, alertCtx.detail);
+      return {
+        kind: 'respawn',
+        signal: new AutoRespawnSignal({
+          runId: ctx.runId,
+          attempt: advice.attempt,
+          backoffMs: advice.backoffMs,
+          generationId: ctx.generationId,
+        }),
+      };
+    }
+    // Manual interrupt: `autoRespawn=off`, a non-loop caller, no in-process
+    // ownership, OR a stale-generation crash whose T13 was rejected (a benign
+    // no-op — nothing to respawn). Unwind with the sink-safe error.
+    return { kind: 'throw', error: toSinkSafeTypedError(raw) };
+  }
+
+  /** P4b-2: the value a crash call site throws — the `AutoRespawnSignal` (a
+   * control signal the loop catches) or the sink-safe error (the manual unwind).
+   * Both branches THROW at the call site; only the loop treats the signal as
+   * non-fatal (re-drive), so a non-loop caller surfaces it as an ordinary error. */
+  #unwrapCrashDisposition(disposition: CrashDisposition): unknown {
+    return disposition.kind === 'respawn' ? disposition.signal : disposition.error;
+  }
+
+  /** P4b-2: the effective `autoRespawn` mode for a run — the pinned per-run
+   * config (W1-F5) if present, else this service's config. */
+  #autoRespawnMode(runId: RunId): AutoRespawnMode {
+    return (loadRunConfig(this.#db, runId) ?? this.#config).restarts.autoRespawn;
+  }
+
+  /** P4b-2 owner-alive gate: THIS process currently holds `runId`'s exclusive
+   * run-ownership lease (the implement→verify loop acquired it at entry). A
+   * bare `runRole` with no acquired lease is never auto-respawned — it has no
+   * in-process driver to re-drive the spine, so it stays P4a (manual). */
+  #ownsRunInProcess(runId: RunId): boolean {
+    const key = String(runId);
+    return this.#runOwnership.list().some(
+      (record) => record.runId === key && record.ownerPid === this.#selfPid,
+    );
+  }
+
+  /**
+   * P4b-2: raise the informational `alert.raised{respawn}` for a healthy
+   * auto-respawn. Emitted DIRECTLY by the spine (not derived from a
+   * `notify.requested` — there is no `respawn` notify), as a standalone
+   * supporting event AFTER the generation-matched T13 committed. `detail` is the
+   * already-redacted crash summary the T13's alertCtx carried. The idempotency
+   * key derives from the crashed generation so replay reproduces identical bytes
+   * and re-delivery dedups per `(alertId, sink)`.
+   */
+  #raiseRespawnAlert(ctx: SpawnContext, detail: string | undefined): void {
+    const key = idempotencyKey(`alert.raised:respawn:${String(ctx.generationId)}`);
+    this.ingest(
+      draftEvent({
+        type: 'alert.raised',
+        runId: ctx.runId,
+        idempotencyKey: key,
+        occurredAt: this.#clock.nowIso(),
+        payload: {
+          alertId: alertId(String(key)),
+          kind: 'respawn',
+          role: ctx.role,
+          generationId: ctx.generationId,
+          topic: 'respawn',
+          detail: redactText(detail ?? 'child crash — bounded auto-respawn'),
+        },
+      }) as DomainEvent,
+    );
   }
 
   /**

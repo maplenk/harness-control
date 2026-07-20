@@ -1088,6 +1088,43 @@ describe('W2-1: T9/T12 record a pending re-entry; child.spawned/resume_reentry.c
     expect(foldResumeReentryCompleted(acked)).toEqual(acked); // idempotent reclaim
   });
 
+  it('P4b-2: a resume trigger carrying a `successor` seed folds the successor INTENT marker in the SAME write as the T9 suspension-clear (marker rides one txn; the ack clears BOTH)', () => {
+    const applied = expectApplied(
+      applyTransition(
+        paused,
+        eventOf('resume.limit.requested', {
+          mode: 'manual',
+          successor: {
+            target: { harness: 'claude', model: 'opus', effort: 'low' },
+            reason: 'model_switch_indeterminate',
+            reassertModel: true,
+          },
+        }),
+      ),
+    );
+    // One write: suspension cleared, resume-reentry recorded, AND the successor
+    // marker folded — all in this single applied transition.
+    expect(applied.next.suspension.kind).toBe('none');
+    expect(applied.next.resumeReentryPending).toBeDefined();
+    expect(applied.next.successorIntent).toMatchObject({
+      target: { harness: 'claude', model: 'opus', effort: 'low' },
+      reason: 'model_switch_indeterminate',
+      reassertModel: true,
+      returnPhase: 'verifying',
+    });
+    // The resume-initiated effect signals the spine via `via: 'successor'`.
+    const init = applied.emitted.find((e) => e.type === 'segment.resume.initiated');
+    expect((init?.payload as { via?: string }).via).toBe('successor');
+    // A plain resume (no seed) records NO successor marker (`via: undetermined`).
+    const plain = expectApplied(applyTransition(paused, eventOf('resume.limit.requested', { mode: 'manual' })));
+    expect(plain.next.successorIntent).toBeUndefined();
+    // The SAME `resume_reentry.completed` ack clears BOTH markers (idempotent).
+    const acked = foldResumeReentryCompleted(applied.next);
+    expect(acked.resumeReentryPending).toBeUndefined();
+    expect(acked.successorIntent).toBeUndefined();
+    expect(foldResumeReentryCompleted(acked)).toEqual(acked);
+  });
+
   it('a LATE child.stopped from the pre-pause generation does not clear the freshly spawned one', () => {
     const resumed = expectApplied(
       applyTransition(paused, eventOf('resume.limit.requested', { mode: 'manual' })),

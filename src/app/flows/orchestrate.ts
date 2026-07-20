@@ -54,7 +54,8 @@ import type { RunPhase } from '../../domain/state.js';
 import * as git from '../../worktree/git.js';
 import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import type { RoleModelSpec } from '../model-resolution.js';
-import type { OrchestrationService } from '../service.js';
+import { AutoRespawnSignal, type OrchestrationService } from '../service.js';
+import { waitMs } from '../../supervisor/breaker.js';
 import { RunOwnershipConflictError } from '../run-ownership-store.js';
 import type { RoleRoundProjection } from '../projections.js';
 import {
@@ -95,6 +96,12 @@ export interface ImplementVerifyLoopDeps {
   readonly worktrees: GitWorktreeManager;
   readonly ids: IdFactory;
   readonly clock: Clock;
+  /**
+   * P4b-2: the real-time wait before a bounded auto-respawn re-drives (the
+   * breaker's exponential `backoffMs`). Defaults to `waitMs` (a real timer);
+   * tests inject a no-op to avoid waiting through backoff.
+   */
+  readonly delay?: (ms: number) => Promise<void>;
 }
 
 export interface ImplementVerifyLoopInput {
@@ -446,7 +453,12 @@ export async function runImplementVerifyLoop(
     // watchdog must taint through THIS manager on an emergency kill and respect
     // its git-op leases before a deadline termination.
     service.attachWorktreeSupervision(worktrees);
-    for (let round = entry.startRound; round <= maxRounds; round += 1) {
+    // P4b-2: manual increment — a round that completes advances `round`; a round
+    // that CRASHES under bounded auto-respawn is re-driven at the SAME `round`
+    // (the `catch` below), so the retry rebuilds a fresh dispatch from the live
+    // phase rather than re-running a stale one.
+    for (let round = entry.startRound; round <= maxRounds; ) {
+      try {
       const resumedRound = resume !== undefined && round === entry.startRound;
       const skipImplement = resumedRound && entry.first === 'verify';
       // The resumed VERIFIER round restarts on its SAME immutable binding
@@ -501,6 +513,9 @@ export async function runImplementVerifyLoop(
             baseCommit: handle.baseSha,
             criterionIds: input.criteria.map((c) => c.id),
             assignmentId: input.assignmentId,
+            // P4b-2: this loop OWNS the run lease and catches AutoRespawnSignal
+            // (the `catch` above), so it opts this dispatch into bounded respawn.
+            autoRespawn: true,
           },
         );
         worktrees.releaseLease(input.assignmentId);
@@ -607,6 +622,8 @@ export async function runImplementVerifyLoop(
           implementationCommit,
           criterionIds: input.criteria.map((c) => c.id),
           assignmentId: input.assignmentId,
+          // P4b-2: a verifier crash auto-respawns through this loop too.
+          autoRespawn: true,
         },
         ids: deps.ids,
         clock: deps.clock,
@@ -641,6 +658,25 @@ export async function runImplementVerifyLoop(
       const phaseAfterVerify = service.status(input.runId).phase;
       if (phaseAfterVerify === 'merge_ready' || phaseAfterVerify === 'failed') break;
       fixRequests = verification.fixRequests;
+      round += 1; // round completed → advance
+      } catch (crashOrSignal) {
+        // P4b-2 bounded AUTO-RESPAWN: a child crash under `autoRespawn=bounded`
+        // whose generation-matched T13 was `restart`-advised surfaces here as an
+        // `AutoRespawnSignal` (the service already durably recorded the T13 —
+        // suspension=`interrupted`, generation stopped, restart window grown —
+        // and raised the `respawn` alert). Anything else (a real error, a
+        // breaker_open unwind, an `autoRespawn=off` interrupt) propagates and
+        // unwinds the loop as before. Wait the breaker's backoff, then re-drive
+        // the SAME round through the successor spine: `recordSuccessorIntent`
+        // clears the `interrupted` suspension and writes the durable successor
+        // marker; the retry's `runRole` spawns the successor whose `child.spawned`
+        // acks it. `round` is NOT advanced — the crashed round is retried. The
+        // loop is bounded by the breaker: each crash grows the durable window and
+        // an exhausting crash is `breaker_open` (thrown, not signalled) → unwind.
+        if (!(crashOrSignal instanceof AutoRespawnSignal)) throw crashOrSignal;
+        await (deps.delay ?? waitMs)(crashOrSignal.backoffMs);
+        service.recordSuccessorIntent(input.runId);
+      }
     }
   } finally {
     // W4-4: release the RUN-ownership lease FIRST so a legitimate sequential

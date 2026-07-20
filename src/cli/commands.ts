@@ -1172,10 +1172,22 @@ async function handleResume(
     if (waited !== undefined) return withExtraJson(waited, reapExtra);
     return withExtraJson(await driveReentry(service, db, 'resume', cmd.runId, deps), reapExtra);
   }
+  // P4b-2 self-drive successor spine (T5 gap-close): a limit during an
+  // unconfirmed model switch (T5) paused the run AND emitted
+  // `segment.successor.required` — an event with zero consumers until now.
+  // "Resume is ALWAYS successor with explicit model re-assertion" (§6.3 T5):
+  // route this resume through the successor spine, which records the durable
+  // INTENT marker (seed checkpoint + target) atomically BEFORE the spawn, then
+  // re-enters via the SAME machinery. Wave 1 re-asserts the SAME target
+  // (same-harness/same-model); failover to a DIFFERENT target is wave 2.
+  const seedsSuccessor =
+    st.suspension === 'paused_limit' && service.hasPendingSuccessorRequirement(cmd.runId);
   // Eligibility-checked immediate re-entry (T9/T12). Typed refusals
   // (`ResumeEligibilityError`) and not-paused errors surface through
   // executeCommand's shared catch.
-  const result = service.resume(cmd.runId);
+  const result = seedsSuccessor
+    ? service.recordSuccessorIntent(cmd.runId)
+    : service.resume(cmd.runId);
   if (result.status !== 'applied') {
     return ingestOutput('resume', cmd.runId, result, {
       appliedText: `resume requested for run ${cmd.runId} (T9/T12).`,
@@ -1674,6 +1686,15 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
     runId,
     phase: st.phase,
     suspension: st.suspension,
+    // P4b-2: an `interrupted` run under `autoRespawn=bounded` is auto-recovering
+    // (breaker not yet exhausted) — surface it distinctly from a manual interrupt.
+    suspensionDetail:
+      st.autoRecovering !== undefined
+        ? `interrupted — auto-recovering (attempt ${st.autoRecovering.attempt})`
+        : st.suspension === 'interrupted'
+          ? 'interrupted — manual resume required'
+          : null,
+    ...(st.autoRecovering !== undefined ? { autoRecovering: st.autoRecovering } : {}),
     operation: st.operation,
     uiState: st.uiState,
     childActive: st.childActive,

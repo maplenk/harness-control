@@ -37,6 +37,7 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
         windowMinutes: 10,
         lifetimeCap: 10,
         unsafeDev: false,
+        autoRespawn: 'bounded',
       },
       maxLiveChildren: 3,
       failoverPolicy: 'wait',

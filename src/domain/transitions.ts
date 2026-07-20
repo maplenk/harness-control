@@ -36,6 +36,8 @@ import {
   type ResumeReentryPending,
   type RunPhase,
   type StopIntentCause,
+  type SuccessorIntent,
+  type SuccessorIntentSeed,
   type Suspension,
   type SuspensionKind,
 } from './state.js';
@@ -592,6 +594,13 @@ export interface EngineState {
   readonly activeChild?: ActiveChild;
   /** W2-1 T9/T12: recorded pending re-entry, cleared by `resume_reentry.completed`. */
   readonly resumeReentryPending?: ResumeReentryPending;
+  /**
+   * P4b-2 self-drive successor spine: the durable successor INTENT marker (a
+   * `resumeReentryPending` sibling). Recorded by `initiate_resume` when the
+   * resume trigger carries a `successor` seed — ONE atomic write with the
+   * suspension-clear — and cleared by the SAME `resume_reentry.completed` ack.
+   */
+  readonly successorIntent?: SuccessorIntent;
   /** Bound on T1. */
   readonly approvedSpecHash?: SpecHash;
   readonly counters: RestartCounters;
@@ -734,6 +743,7 @@ interface MutableDraft {
   operation: Operation;
   activeChild: ActiveChild | undefined;
   resumeReentryPending: ResumeReentryPending | undefined;
+  successorIntent: SuccessorIntent | undefined;
   approvedSpecHash: SpecHash | undefined;
   counters: RestartCounters;
 }
@@ -830,6 +840,7 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
     operation: state.operation,
     activeChild: state.activeChild,
     resumeReentryPending: state.resumeReentryPending,
+    successorIntent: state.successorIntent,
     approvedSpecHash: state.approvedSpecHash,
     counters: { ...state.counters },
   };
@@ -1106,7 +1117,28 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
             : 'manual';
         draft.resumeReentryPending = { returnPhase, mode, recordedAt: event.occurredAt };
         draft.counters = { ...draft.counters, probeCount: 0 };
-        emit('segment.resume.initiated', { via: 'undetermined', returnPhase });
+        // P4b-2 self-drive successor spine: a resume trigger MAY carry a
+        // `successor` seed — fold the durable INTENT marker (a
+        // resumeReentryPending sibling) in THIS same atomic write, BEFORE any
+        // OS spawn, cleared by the SAME `resume_reentry.completed` ack. The
+        // marker adds the derived returnPhase + recordedAt to the seed.
+        const successor = (event.payload as { successor?: SuccessorIntentSeed }).successor;
+        if (successor !== undefined) {
+          draft.successorIntent = {
+            target: successor.target,
+            reason: successor.reason,
+            reassertModel: successor.reassertModel,
+            ...(successor.seedCheckpointHash !== undefined
+              ? { seedCheckpointHash: successor.seedCheckpointHash }
+              : {}),
+            returnPhase,
+            recordedAt: event.occurredAt,
+          };
+        }
+        emit('segment.resume.initiated', {
+          via: successor !== undefined ? 'successor' : 'undetermined',
+          returnPhase,
+        });
         break;
       }
       case 'mark_interrupted_recovery': {
@@ -1129,6 +1161,9 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
           draft.activeChild = { ...rest, status: 'stopped' };
         }
         draft.resumeReentryPending = undefined;
+        // P4b-2: a terminal run drops any pending successor intent — no
+        // successor is ever driven for a cancelled/failed run.
+        draft.successorIntent = undefined;
         break;
       }
       case 'record_permission_pending': {
@@ -1218,6 +1253,7 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
     ...(draft.resumeReentryPending !== undefined
       ? { resumeReentryPending: draft.resumeReentryPending }
       : {}),
+    ...(draft.successorIntent !== undefined ? { successorIntent: draft.successorIntent } : {}),
     ...(draft.approvedSpecHash !== undefined ? { approvedSpecHash: draft.approvedSpecHash } : {}),
   };
 
@@ -1329,9 +1365,14 @@ export function foldChildStopped(
   return next;
 }
 
-/** Fold `resume_reentry.completed`: ack the pending re-entry (idempotent). */
+/**
+ * Fold `resume_reentry.completed`: ack the pending re-entry (idempotent). P4b-2:
+ * the SAME ack clears the successor INTENT marker — `child.spawned` acking the
+ * re-entered round IS the successor going active, so the marker is consumed
+ * exactly then (an un-acked marker after a crash re-drives one successor).
+ */
 export function foldResumeReentryCompleted(state: EngineState): EngineState {
-  if (state.resumeReentryPending === undefined) return state;
-  const { resumeReentryPending: _cleared, ...rest } = state;
+  if (state.resumeReentryPending === undefined && state.successorIntent === undefined) return state;
+  const { resumeReentryPending: _cleared, successorIntent: _successor, ...rest } = state;
   return rest;
 }

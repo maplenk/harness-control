@@ -46,9 +46,12 @@ import type {
   RoleName,
   RunPhase,
   StopIntentCause,
+  SuccessorIntentSeed,
+  SuccessorReason,
   SuspensionKind,
   WorktreeTaint,
 } from './state.js';
+export type { SuccessorReason } from './state.js';
 
 // ---------------------------------------------------------------------------
 // Classification payload (§9 classifyError — adapter/protocol envelopes ONLY;
@@ -74,7 +77,15 @@ export type NotifyTopic =
   | 'run_failed'
   | 'merge_ready'
   /** W2-1 T13: child exited unexpectedly → manual resume required (P4a has no auto-respawn). */
-  | 'interrupted';
+  | 'interrupted'
+  /**
+   * P4b-2 (§5cc): a same-harness bounded auto-respawn was driven for a crashed
+   * child (the crash's generation-matched T13 was `restart`-advised and
+   * `autoRespawn=bounded`). Not emitted as a `notify.requested` engine effect —
+   * the successor spine raises the `respawn` alert DIRECTLY (this topic is only
+   * the alert's audit back-reference), so it never fans out as an operator notify.
+   */
+  | 'respawn';
 
 /**
  * P4b-1 alert taxonomy (§5cc): the kinds of durable operator alert raised as a
@@ -110,12 +121,6 @@ export interface ChildPinRecord {
 
 /** How a generation's stop was confirmed (`child.stopped`, W2-1/W2-3). */
 export type ChildStopReason = 'graceful' | 'terminated' | 'exited' | 'startup_cleanup';
-
-export type SuccessorReason =
-  | 'model_switch_indeterminate'
-  | 'mid_turn_limit'
-  | 'cross_harness_switch'
-  | 'recovery';
 
 type Empty = Record<string, never>;
 
@@ -196,6 +201,14 @@ export interface EventPayloads {
   /** T9 — resume from paused_limit (scheduled probe OK or manual). */
   'resume.limit.requested': {
     readonly mode: 'scheduled_probe' | 'manual';
+    /**
+     * P4b-2 self-drive successor spine: when present, the `initiate_resume`
+     * fold ALSO records the durable `SuccessorIntent` marker in the SAME
+     * atomic write (a `resumeReentryPending` sibling) so a T5/limit resume can
+     * seed a checkpoint successor with an explicit target re-assertion. Absent
+     * on an ordinary limit resume.
+     */
+    readonly successor?: SuccessorIntentSeed;
   };
   /** T10 — probe found the provider still limited. */
   'limit.probe.still_limited': {
@@ -203,8 +216,13 @@ export interface EventPayloads {
   };
   /** T11 — user pause. */
   'pause.user.requested': Empty;
-  /** T12 — user resume from paused_user. */
-  'resume.user.requested': Empty;
+  /** T12 — user resume from paused_user OR interrupted (W2-1 manual re-entry).
+   * P4b-2: an optional `successor` seed makes this the crash-recovery entry of
+   * the self-drive successor spine — the marker rides the T12 `initiate_resume`
+   * write atomically (see `resume.limit.requested.successor`). */
+  'resume.user.requested': {
+    readonly successor?: SuccessorIntentSeed;
+  };
   /** T13 — child crash/exit (non-limit). W2-1: when the reporter stamps the
    * process generation, the row only applies to the ACTIVE generation — a
    * stale exit report from a superseded generation must not interrupt the
