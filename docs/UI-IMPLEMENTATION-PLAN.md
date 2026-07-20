@@ -65,10 +65,25 @@ Round-3 review: the architecture is **FULLY accepted** (application-neutral comm
 - **P1-1 idempotency** → `UNIQUE(actor, idempotencyKey)` (not `commandHash`+key), store the **versioned** command payload; matching-hash retry returns the op, mismatched payload → **CONFLICT** (§3A.2).
 - **P1-2 recovery** → per command × durable run stage: a crashed `run` in `approved` re-drives via **`handleRun`** (`commands.ts:712`, gate `:718` `phase==='approved'`), **not** `handleResume` (`:1105`, which refuses); plus the previously-missing `waiting_for_input→running`, pre-running cancel, and lease-expiry-reclaim transitions (§3A.2).
 - **P1-3 no-daemon proof** → direct CLI writes only after atomically acquiring the daemon's **exclusive writer lock**; a live-but-unreachable daemon → retry/fail, never a second writer (§3.7).
-- **P1-4 fleet protocol** → ONE locked protocol: a **durable `fleetRevision` sequence** with `afterFleetRevision` replay, incremented **atomically** with `RUN_META` membership changes (§3A.4).
+- **P1-4 fleet protocol** → ONE locked protocol: a **durable `fleetRevision` sequence** with `afterFleetRevision` replay, incremented **atomically** with every fleet-summary-affecting change — membership + phase + suspension + terminal + attention, not just `RUN_META` (§3A.4, tightened in Revision 5).
 - **P2** → propagate the locks into Phase A + Phase F (menus removed); quota = one daemon repo resolving immutable `RUN_CONFIG.perRunBytes` + a global `globalBytes` (§3.6); Slice 2 `approve` is a command that **resolves** an attention item, not "via the attention queue" (§6).
 
 Everything the reviewer marked well-addressed is kept verbatim.
+
+---
+
+## Revision 5 — final contract pass
+
+Round-4 review: **one final contract pass** — after these six the reviewer calls the plan **IMPLEMENTATION-READY**. Everything else is marked solid (application-neutral executor, operation/attention separation, permission fencing, approve→run, shared daemon kernel, single-writer, immutable config scopes, Electron lifecycle, server-owned projections). New claims verified by content (opencode churn keeps shifting lines):
+
+- **P1-1 atomic start binding** — `createRun` commits `registerRun`+`RUN_META` in its **own** transaction (`service.ts:1273`, `:1282-1286`); the operation→run binding is a separate write, so a crash between orphans the run and a replay would **duplicate** it. Require createRun **and** the binding in **one outer transaction** (§3A.2).
+- **P1-2 fleetRevision coverage** — `RUN_META` is **immutable** (`projections.ts:14`); phase/suspension live in `ENGINE_STATE` (`:4-5`), so a `RUN_META`-only revision goes stale. `fleetRevision` now advances **atomically for every fleet-summary-affecting change** (membership + phase + suspension + terminal + attention) (§3A.4).
+- **P1-3 concrete Phase B2** — human actions get a real phase (spec revision, exact-spec approval, permission response, the separate post-approval `run`) with screens/commands/lifecycle/acceptance (new **Phase B2**; §3A.5 repointed).
+- **P1-4 obsolete resume-only recovery removed** — §3.5, Phase A0, and the cross-cutting tests now use the §3A.2 per-command matrix, not a blanket `handleResume`.
+- **P1-5 writer-lock protocol completed** — grounded in the existing `run-ownership-store` **`BEGIN IMMEDIATE` compare-and-swap lease** (`:96-131`): primitive, ownership duration, §14 identity stale-reclaim + two-contender serialization/race test, CLI holds it for its complete write lifetime (§3.8).
+- **P2-6 terminal-session model** — Phase E gains a session registry (create/list/tabs/close/detach/reconnect/ownership/resize/scrollback/exit-state + the tmux boundary).
+
+Everything the reviewer marked solid is kept.
 
 ---
 
@@ -249,7 +264,7 @@ So `serve` **cannot** be a pass-through to the service. Within the boundary it s
 The daemon must model these distinctly (Phase A0 formalizes them):
 
 - **Command envelope** — validation, authorization (token), idempotency/retry. Synchronous accept/reject; returns fast.
-- **Operation (job)** — the long-running coordinator/implementor/verifier execution driven by `handleStart`/`handleRun`/`handleResume`/`handleRecheck`. Returns a durable `operationId`; the UI tracks progress through **events**, never a blocked HTTP call. Define daemon-restart behavior (an operation whose owner died is recovered through the existing `handleResume` path, gated on the durable run-ownership lease) and run-ownership (only the lease holder drives — `isRunClaimedByLiveProcess`).
+- **Operation (job)** — the long-running coordinator/implementor/verifier execution driven by `handleStart`/`handleRun`/`handleResume`/`handleRecheck`. Returns a durable `operationId`; the UI tracks progress through **events**, never a blocked HTTP call. Define daemon-restart behavior — recovery is **per command × durable run stage** (§3A.2: `start` / `run` / `resume` / `recheck`), **not** a blanket `handleResume` — gated on the durable run-ownership lease; and run-ownership (only the lease holder drives — `isRunClaimedByLiveProcess`).
 - **Attention request** — permission responses, spec approvals, human answers: the **durable interactive-action queue** (gap d), idempotent, surviving restart. Note there is **no respond-to-permission verb** today; it must be added here.
 
 ### 3.6 Multi-run execution model (blocking)
@@ -282,7 +297,12 @@ Either way, **read-only** enumeration/snapshot/event endpoints need **no** execu
 - **Explicit WebSocket auth** — token in the WS subprotocol or first message, **not** the query string (no token leakage into logs/history).
 - **One-time bootstrap-token delivery** without query-string leakage; tokens random + scoped + expiring.
 - **Restrictive permissions (0600)** on the daemon **connection-metadata** file (host/port/token).
-- **Single-daemon locking + stale recovery + port discovery** — a lockfile carrying `{pid, port, start-time}`; a dead/recycled owner is reclaimed; clients discover the port from the metadata file, not a hard-coded `7717`.
+- **Single-daemon locking + writer lock (concrete protocol) + port discovery:**
+    - **Primitive:** the exclusive lifetime writer lock is a durable **`BEGIN IMMEDIATE` compare-and-swap lease** — the *same proven shape* as `run-ownership-store.acquire()` (`:96-131`, returns a boolean): a record `{ownerPid, ownerStartedAt, port, tokenRef}` that `acquire` accepts iff **unclaimed, self, or held by a provably-dead/recycled owner**.
+    - **Ownership duration:** the **daemon** holds the lock for its whole lifetime (released on clean stop). The **CLI**, when it writes directly (no live daemon), holds the lock for its **complete write lifetime** — acquired before the first append, released in a `finally` after the last (never per-append).
+    - **Stale-reclaim (§14 identity):** a lock whose `ownerPid` is gone, or resolves to a **different start-time** (recycled pid), is reclaimable. Two contenders reclaiming one stale lock **serialize on the SQLite write lock** (`BEGIN IMMEDIATE`); the winner swaps in its identity, the loser's CAS returns **false** → it must **retry or fail**, never write. A **live** owner always wins; the loser retries/fails.
+    - **Race test (required):** (a) two processes contend for a *free* lock; (b) two contenders reclaim one *stale* lock — in both, **exactly one** wins and the other never becomes a second writer.
+    - **Port discovery:** clients read `{port, token}` from the `0600` connection-metadata file, never a hard-coded `7717`.
 
 ---
 
@@ -308,6 +328,7 @@ Today the command surface is presentation- and test-coupled: `CommandOutput` is 
 - **Columns:** `operationId`; **`UNIQUE(actor, idempotencyKey)`** as the dedup key — **not** `commandHash` + key (that would let the same key with a *different* command spawn a second operation); the canonical **versioned `ApplicationCommand` payload** + its `commandHash`; `kind`; **nullable `runId`** (a `start` has none until it binds one); `owner` (daemon pid + start-time); `lease`/`heartbeat`; `attemptCount`; durable `result`/`error`; timestamps.
 - **Idempotency semantics:** a retry on the same `(actor, idempotencyKey)` with a **matching** `commandHash` **returns the existing operation**; the same key with a **mismatched** payload **returns CONFLICT** — never a second run. The stored versioned payload is **required** to re-drive a `start` that crashed before binding a `runId` (no run exists yet — the payload is the only input).
 - **Atomic acceptance:** the operation row commits (state `accepted`) **before** the HTTP `202 { operationId }` returns, so a crash immediately after the response is still recoverable.
+- **Atomic `start` binding (no orphan / no duplicate):** `createRun` today commits `registerRun` + `RUN_META` in its **own** transaction (`service.ts:1273`, `:1282-1286`); if the operation→run binding were a *separate* write, a crash in between would leave an **orphan run** while the operation still holds the `start` payload — replay then creates a **duplicate**. Contract: **createRun and the `operation.runId` binding commit in ONE outer SQLite transaction** (the daemon composes createRun's writes + the binding inside a single `transactionImmediate`), so either the run exists **and** the operation is bound to it, or neither is.
 - **Recovery is per command × durable run stage (NOT one `handleResume` path):**
     - **`start`** — crashed before binding a `runId`: re-drive from the stored versioned payload (no run to resume). Crashed after `createRun`: the run sits in `created`/`specifying`; re-drive coordinator drafting.
     - **`run`** — crashed before its first effect leaves the run in **`approved`**: recovery re-invokes **`handleRun`** (`commands.ts:712`; it starts the implement→verify loop only when `phase==='approved'`, gate `:718`), **not** `handleResume` (`:1105`, which refuses a fresh approved run). Crashed mid-loop (a durable round/child exists): `handleResume` re-drives the stranded round.
@@ -332,7 +353,7 @@ ACP permission requests are bound to a **live JSON-RPC request** in the adapter'
 `GET /runs` then subscribing to `/events` can miss a change in the gap, and per-run sequences do not cursor **fleet membership** (a run created in the gap). Contract:
 
 - Every **run snapshot** returns **`asOfSequence`** (last event folded in); the client subscribes with `after=asOfSequence` → no gap, no dup (exclusive, §3.7).
-- **Fleet handoff — ONE locked protocol:** `fleetRevision` is a **durable monotonic sequence** persisted in the store, incremented **atomically within the same transaction** as any real `RUN_META` membership change (create / terminal / retention). A fleet snapshot returns the current `fleetRevision`; the fleet channel **replays** membership changes with **`afterFleetRevision=<n>`**, exactly like per-run cursors. A newly-created run is a `fleetRevision` bump, not a per-run sequence. (Replaces the earlier "deltas OR refetch".)
+- **Fleet handoff — ONE locked protocol:** `fleetRevision` is a **durable monotonic sequence** persisted in the store, incremented **atomically within the same transaction** as any **fleet-summary-affecting** change. `RUN_META` membership alone is **not** enough: `RUN_META` is immutable (`projections.ts:14`) while phase/suspension live in `ENGINE_STATE` (`:4-5`), so `fleetRevision` must bump on **run create/terminal + phase change + suspension change + attention-badge change** — every field the fleet rail renders — or the rail goes stale. A fleet snapshot returns the current `fleetRevision`; the fleet channel **replays** changes with **`afterFleetRevision=<n>`**, exactly like per-run cursors. (Replaces the earlier "deltas OR refetch".)
 - **No snapshot↔subscribe race (no separate buffering/handshake needed):** because both cursors are durable, the client snapshots at `(asOfSequence, fleetRevision)` and subscribes **`after`** those exact values; anything committed in the gap is replayed, so subscribe-vs-snapshot ordering is irrelevant.
 - **Projection-cursor consistency:** assemble a snapshot's multiple read models (engine_state, cost, role_round, …) at **one** cursor (read within a single transaction / one `asOfSequence`) — never a torn read across projections.
 - **Notify only after the ENCLOSING transaction commits (CRITICAL):** appends run inside `driver.transaction()` and can be **nested** (`appendBatch` inside a larger write — `event-repository.ts:106-116`; nested synchronous transactions documented `driver.ts:55-56`). Emitting subscriber notifications from inside `appendBatch` could surface events that later **roll back**. Notifications MUST fire only after the **outermost** commit (post-commit hook / outbox), never from within the append.
@@ -342,7 +363,7 @@ ACP permission requests are bound to a **live JSON-RPC request** in the adapter'
 
 Phase B is read-only; no phase yet implements the **human write actions**, and the engine's `approve` (`service.ts:1522`) only moves the run to **`approved`** — implementation starts via a **separate `run` command** (the brief's "Approve → Run implementation"). Contract:
 
-- **Schedule the human write actions** (Phase C2 / a dedicated actions slice): approve-exact-spec, request-revision, respond-to-permission, and invoke-run-after-approval — each a durable **operation** (§3A.2) through the executor (§3A.1); approval + permission also raise **attention** entries (§3.5).
+- **Schedule the human write actions** (new **Phase B2** — §5): approve-exact-spec, request-revision, respond-to-permission, and invoke-run-after-approval — each a durable **operation** (§3A.2) through the executor (§3A.1); approval + permission also raise **attention** entries (§3.5).
 - **Handoff (locked):** model "Approve and start" as **two durable commands** — `approve` (→ `approved`) then `run` (starts implementation) — where a **failed `run` leaves the run honestly `approved`**, not a fake "starting" state. A fused UI button is allowed only if it is still two durable operations underneath (crash-between-them is recoverable). The UI surfaces "Approved — start implementation" as an explicit, resumable step until the second command lands.
 
 ### 3A.6 Locked Phase-A decisions (resolved)
@@ -409,7 +430,7 @@ Each phase lists **delivers · seams (existing vs to-build) · screens · accept
 
 - **Delivers:** a CLI-independent command layer in `src/app/commands/` that BOTH the CLI and `serve` call — the **envelope** (validate/authorize/idempotency), the `handleStart`/`handleRun`/`handleRecheck`/`handleResume`/`handleApprove` composition (incl. `handleApprove`'s W1-F3/W3-4 draft+hash validation), and the **operation/attention** split (§3.5). No behavior change to the CLI contract.
 - **Seams — existing:** `executeCommand(service, db, RunCommand, env, deps)` already has a CLI-independent signature (`commands.ts:178`) with `deps.flows`/`adapterFactory` injection — this is a **lift-and-formalize**, not a from-scratch build.
-- **Seams — to build:** relocate `handleX` + validation out of `src/cli/`; define `Command envelope` vs `Operation` (returns a durable `operationId` for `start`/`run`/`resume`/`recheck`) vs `Attention request` (+ the missing respond-to-permission verb); define **daemon-restart + run-ownership** behavior for in-flight operations (recover through the existing `handleResume` path, gated on the run-ownership lease).
+- **Seams — to build:** relocate `handleX` + validation out of `src/cli/`; define `Command envelope` vs `Operation` (returns a durable `operationId` for `start`/`run`/`resume`/`recheck`) vs `Attention request` (+ the missing respond-to-permission verb); define **daemon-restart + run-ownership** behavior for in-flight operations (recover via the §3A.2 **per-command matrix** — `start`/`run`/`resume`/`recheck` by durable stage — gated on the run-ownership lease; **not** a blanket `handleResume`).
 - **Screens:** none (backend refactor).
 - **Acceptance:** the existing CLI suite passes unchanged (it now calls the shared layer); a non-CLI caller invoking `approve` gets the **same** W3-4 draft/hash validation a direct `service.approve()` would skip; a long-running `start` returns a durable `operationId`; a parity test proves CLI-vs-executor outcomes are identical.
 
@@ -435,6 +456,17 @@ Each phase lists **delivers · seams (existing vs to-build) · screens · accept
 - **Seams — to build:** client snapshot hydration + **delta-apply / invalidation-refetch (no client reducer, blocking 3)**; spec-version listing (prior revisions) for the diff; connection state machine (6 states, §12.1).
 - **Screens:** 1 Doctor, 2 Fleet, 4 Overview, 5 Spec (+6 revision diff read-only), 18 Reconnect.
 - **Acceptance:** fleet groups + attention badge reflect live `uiStateOf`; opening a run renders the composite status grammar (`[Phase] · [suspension/operation]`, brief §7.4); cost shows measured+estimated **separately**; authoritative run state comes only from server projections (the client holds **no** engine reducer; raw events feed only Activity/Events); reconnect keeps the last snapshot, disables commands, resumes from the **exclusive** cursor, and does **not** replay toasts.
+
+### Phase B2 — Human actions (the write path)
+
+- **Delivers:** the four human write actions the read-only screens can't perform — each a durable **operation** (§3A.2) through the executor (§3A.1): **spec revision**, **exact-spec approval**, **permission response**, and the **separate post-approval `run`**.
+- **Screens:** Spec review's approve / request-revision controls (screens 5–6); the inspector's permission-inbox allow/deny (§1.3 #9); the "Approved — start implementation" control (§3A.5).
+- **Commands & lifecycle:**
+    - **request-revision** → `reviseSpec` (service method); produces a **new immutable** spec version; the run stays pre-approval.
+    - **approve-exact-spec** → `approve` through the executor (runs `handleApprove`'s W1-F3/W3-4 hash binding, §3.4); **resolves** the approval **attention** item (§3A.3); moves the run to `approved` **only**.
+    - **respond-to-permission** → the durable permission response **fenced** by `(runId, processGeneration, acpSession, requestId, allowedOption)` (§3A.3); **default-deny** on timeout; rejects stale / dead-request answers.
+    - **run-after-approval** → the **separate** `run` command (§3A.5) — a distinct durable operation; a failed `run` leaves the run honestly **`approved`** (resumable), never a fake "starting".
+- **Acceptance:** approve binds the exact drafted hash (a mismatch is CONFLICT, §3A.1); request-revision never mutates an approved version (immutable, §1.3 #4); a permission answer for a dead/superseded request is rejected and a resumed run raises a **NEW** request (§3A.3); "Approve" and "Start implementation" are two durable operations with a recoverable gap; every action is idempotent under retry (`UNIQUE(actor, idempotencyKey)`, §3A.2).
 
 ### Phase C — Failure & recovery screens (the product differentiator)
 
@@ -464,8 +496,13 @@ Each phase lists **delivers · seams (existing vs to-build) · screens · accept
 ### Phase E — Terminal drawer + PTY broker
 
 - **Delivers:** the operator-shell drawer: Worktree shell (input-locked + explicit takeover), Workspace shell (PTY), Orchestrator log (output-only, redacted); terminal-focus keyboard capture.
+- **Terminal-session registry (P2 — the 3 fixed views are not enough):** a real session model the UI drives:
+    - **Create / list:** open a shell bound to `{runId?, cwd-role: worktree|workspace, shell}`; list all live sessions with owner + state.
+    - **Multiple tabs:** many concurrent sessions — the 3 canonical views are *defaults*, not the limit.
+    - **Lifecycle:** create / close / **detach** (keep the PTY alive when the UI disconnects) / **reconnect** (re-attach with scrollback); **ownership** (which client/tab holds input); **resize** (cols×rows propagated to the PTY); **scrollback limit** (bounded — Settings "10,000 lines"); **exit state** (exit code + reason surfaced, not silently gone).
+    - **tmux boundary:** tmux is **merely discovered** (enumerate windows/panes read-only, brief §11.3), **not** actively controlled in the MVP; a tmux-backed shell is labeled as such (brief §11.5). The registry is the source of truth; tmux never owns run state.
 - **Seams — existing:** worktree lease/validation; redaction (`src/redaction/*`); supervisor stop/checkpoint path for safe takeover.
-- **Seams — to build:** (e) node-pty broker; scoped, expiring terminal session token; takeover flow (pause → checkpoint → identity-verified stop → validate → enable input); optional tmux control-mode enumeration (brief §11.3, deferrable).
+- **Seams — to build:** (e) node-pty broker + the **session registry** above (create/list/detach/reconnect/resize/scrollback/exit); scoped, expiring **per-session** terminal token; takeover flow (pause → checkpoint → identity-verified stop → validate → enable input); read-only tmux enumeration (brief §11.3; active control deferred).
 - **Screens:** 17 Terminal drawer.
 - **Acceptance:** ACP children are **never** exposed as terminals (brief §11.1); worktree input stays locked while the run owns it; "Take over" pauses+checkpoints+stops safely before enabling input; terminal keystrokes win focus and `⌘K` does not steal input; loopback-only with an expiring token; redaction applies to the orchestrator log.
 
@@ -484,7 +521,7 @@ Each phase lists **delivers · seams (existing vs to-build) · screens · accept
 
 Foundations port (tokens, type scale, density, motion, **+ new light theme** and the empty/loading/error matrix §2.2); accessibility (roles/labels/keyboard order per brief §19); responsive collapse order (§18.2) validated at 1440/1280/1024/768/390; redlines/engineering notes per screen (§26.7): fields consumed, commands invoked, safety-confirmation rules.
 
-**Testing & acceptance (failure-first).** Beyond happy-path, the `serve` layer must have explicit tests for: cross-process writers (a CLI in another process advancing a run the daemon serves); daemon restart **mid-operation** (recover via resume + run-ownership lease); slow / backpressured WS subscribers (bounded **drop + replay**, PLAN §182); `SQLITE_BUSY` / DB contention; stale connection-metadata (dead pid/port reclaim); multiple browser clients on one run seeing identical ordered streams; command **idempotency** under retry; **command-accepted-then-daemon-crash** leaving a recoverable operation; and **exclusive-cursor no-duplicate** on reconnect. Drive all of these through the A0 executor with injected fake deps (§6) — no live provider.
+**Testing & acceptance (failure-first).** Beyond happy-path, the `serve` layer must have explicit tests for: cross-process writers (a CLI in another process advancing a run the daemon serves); daemon restart **mid-operation** (recover via the §3A.2 per-command matrix — `start`/`run`/`resume`/`recheck` by stage, each with its own test — + run-ownership lease); slow / backpressured WS subscribers (bounded **drop + replay**, PLAN §182); `SQLITE_BUSY` / DB contention; stale connection-metadata (dead pid/port reclaim); multiple browser clients on one run seeing identical ordered streams; command **idempotency** under retry; **command-accepted-then-daemon-crash** leaving a recoverable operation; and **exclusive-cursor no-duplicate** on reconnect. Drive all of these through the A0 executor with injected fake deps (§6) — no live provider.
 
 ---
 
