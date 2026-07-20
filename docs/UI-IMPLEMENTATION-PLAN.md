@@ -13,13 +13,38 @@ Companion inputs (read these alongside this plan):
 
 ---
 
+## Revision 2 — architectural review response
+
+An architectural review returned **"approve after architectural revision."** The visual/product work was endorsed; the weakness was the backend boundary — the plan treated `src/serve/` as a thin transport adapter when it must be a real **application/execution layer**. This revision folds in all six blocking changes and the corrections. Every cited code claim was re-verified against the current tree before folding in:
+
+| Cited claim | Verified? | Where folded |
+|---|---|---|
+| Command composition/validation lives in CLI; `handleApprove` (`src/cli/commands.ts:593`) does spec-draft + hash validation a direct `service.approve()` bypasses; `start/run/recheck/resume` composed via `handleX` from `executeCommand` (`commands.ts:178`) | ✅ | §3.4, §3.5, Phase A0 |
+| No engine event bus (only `BoundedQueue`, scoped to `src/adapters/acp/transport.ts`); events written to SQLite by whatever process runs the command → cross-process writes | ✅ | §3.3(c), §3.7 |
+| Browser must not re-reduce: plan asked the client to fold raw WS events into its snapshot (old §4.1/§6) | ✅ (self) | §4.1, Phase B, §6 |
+| `OrchestrationService` constructor-binds `#config`/`#bounds`/`#breaker` (`service.ts:1107-1117`); `#worktreeSupervision` is a single "CURRENT" manager; CLI builds a fresh service per run from persisted config (`cli/index.ts:104`) | ✅ | §3.6, Phase A |
+| Local HTTP security: `PLAN.md:182` already mandates loopback + scoped tokens + **Origin validation** + bounded drop+replay subscriber queues + cursor=(run_id,sequence) + read-only isolation from the writer | ✅ | §3.8, Phase A gate |
+| Desktop: `package.json:22` build is `tsc` only (no Vite/Electron); Phase F sidecar contradicts "quit UI, keep service running" | ✅ | Phase F |
+| `model-resolution.ts` `HARNESSES` is a **closed** production allowlist (claude/codex/opencode at time of writing — actively growing) + `asHarness` throws on unknowns → no shipped "fake harness" | ✅ | §6 |
+| `event-repository.ts:34` `fromSequence` is **inclusive** (`sequence >= ?`) → reconnect returns a duplicate | ✅ | §3.7, Phase A, §6 |
+| Activity overpromise: only usage is folded centrally (`role-runner.ts:15,57-61`, `cost.ts:foldUsageUpdate`); agent message chunks consumed privately | ✅ | Phase D |
+| Design now committed at `46ac79a` (Agent Room extension) | ✅ | Appendix |
+
+**Two precision notes (refinements, not rebuttals — neither changes a recommendation):**
+1. `executeCommand` (`commands.ts:178`) already takes a structured `(service, db, RunCommand, env, deps)` signature, not `argv` — so Phase A0 is a **lift-and-formalize** of the `handleX` composition out of `src/cli/`, not a from-scratch build. The review's core point stands: the validation and orchestration live in the CLI module and a direct `service.*` call bypasses them.
+2. The review calls the bounded queue "future"; it is in fact **implemented and in use**, but only inside the ACP transport (`src/adapters/acp/transport.ts`), not as an engine-wide event bus. The conclusion is unchanged: there is no bus for `serve` to subscribe to.
+
+**Endorsed and kept unchanged:** React + Vite, browser-first sequencing, the two-surface terminal model, durable-first UX, the failure/recovery screens as the differentiator, and Electron-last.
+
+---
+
 ## 0. TL;DR
 
 - **What the design is:** one self-contained, *interactive* React-runtime prototype (not a static canvas) that already covers **all 20** of the brief's §26.3 required screens plus extras (attention inbox, workspaces, command palette, context inspector, events inspector). It is dark-only, information-dense, and faithfully encodes the engine's three-axis state model.
 - **Biggest match:** the prototype's data model *is* the engine's `phase × suspension × operation` model, event vocabulary, and resume-by-cursor semantics. Design and engine are unusually well-aligned.
 - **Biggest gap (all on the backend):** the engine has a rich CLI + SQLite read-model core but **no network layer**. Nothing binds a browser to the engine yet. Confirmed absent: `harness serve` daemon, multi-run listing, live event relay, durable interactive-action queue, PTY broker.
-- **Recommended stack:** React + TypeScript + Vite in a new `web/` workspace; a new `src/serve/` daemon inside the existing Node/TS engine (HTTP + WS on `127.0.0.1`); xterm.js + node-pty for terminals; Electron desktop wrapper last (per brief §13.6).
-- **Build first:** the `harness serve` seam, proven by a **read-only vertical slice** — fleet list + one run's durable snapshot + live event tail with cursor-resume — against a real run created by the existing CLI. Then add the first *command* (approve) to prove the write path.
+- **Recommended stack:** React + TypeScript + Vite in a new `web/` workspace; a new `src/serve/` **application/execution layer** inside the existing Node/TS engine (loopback HTTP + multiplexed WS) — **not** a thin transport: it reuses a shared command executor, runs per-run execution contexts, relays events cross-process-safely, and ships behind a security gate (§3.4–§3.8); xterm.js + node-pty for terminals; Electron desktop wrapper last (per brief §13.6).
+- **Build first:** **Phase A0** — extract the CLI-independent command executor (today command validation/composition lives in `src/cli/commands.ts`, e.g. `handleApprove`'s spec-draft/hash checks that a direct `service.approve()` would bypass) — *then* **Phase A** (`serve`), proven by a **read-only vertical slice**: fleet list + one run's durable snapshot + live event tail with **exclusive** cursor-resume, behind the security gate, against a run created through the shared executor with injected fake deps. Then add the first *command* (approve, through the executor) to prove the *validated* write path.
 
 ---
 
@@ -34,7 +59,7 @@ Companion inputs (read these alongside this plan):
 
 ### 1.2 Visual system (as actually authored — Foundations, brief §26.1)
 
-Dark theme only (see gap in §3.4). CSS custom properties in the `<style>` block:
+Dark theme only (see gap in §2.2). CSS custom properties in the `<style>` block:
 
 | Token group | Values |
 |---|---|
@@ -171,14 +196,55 @@ Verified by reading `src/domain/*`, `src/app/*`, `src/cli/*`, `src/persistence/*
 |---|---|---|
 | (a) `harness serve` daemon (HTTP/WS) | **ABSENT** | No `createServer` / `WebSocketServer` / `.listen(` in `src/`; every `serve`/`ws` grep hit is `preserve`/`reserve`/`observe`. PLAN §4.2 lists `harness serve (WS)` as deferred, seams preserved |
 | (b) Multi-run listing API | **ABSENT** | No `listRuns`/`getRuns`/`enumerateRuns` anywhere; the engine is single-`runId`-addressed. Fleet needs a new enumeration read model over the runs/projection scopes |
-| (c) Live event relay (WS/SSE) | **PARTIAL → mostly ABSENT** | Underlying ordered query `readEvents(runId, sinceSeq)` exists; there is **no bus→socket fan-out** to push new events to clients. In-process event bus exists (PLAN §4.1) but is not network-exposed |
+| (c) Live event relay (WS/SSE) | **ABSENT — and no bus to tap** | The ordered replay *query* exists (`event-repository.ts` `listByRun(runId, {fromSequence})`), but there is **no engine event bus** to subscribe to. PLAN §4.1's "internal event bus (in-process)" is design intent not present in code — the only `BoundedQueue` is scoped to `src/adapters/acp/transport.ts`, not engine-wide. New-event delivery needs either a single-writer daemon (in-process post-append notify) or a SQLite watermark tail (§3.7). Also `fromSequence` is **inclusive** (`:34`) so the public cursor must be exclusive (§3.7, §6) |
 | (d) Durable interactive-action queue | **PARTIAL → ABSENT for UI** | `approve`/`reviseSpec` commands exist and are idempotent, but there is **no respond-to-permission verb** and no durable queue for UI-submitted actions that survives restart + dedups by idempotency key |
 | (e) PTY broker / terminal streaming | **ABSENT** | No `node-pty`/`pty`; terminals are purely a design concept today. ACP children are stdio and must never be surfaced as terminals (brief §11.1) |
 | (f) Native notification sink | **ABSENT** | `AlertSink` is `stderr｜status_json` only; native/in-product delivery is new (desktop phase) |
 
-### 3.4 The one architectural rule to hold
+### 3.4 `serve` is an application/execution layer, not a thin transport
 
-`serve` is **in-process with `OrchestrationService`**: it reads the same SQLite read models and submits commands through the same service methods — it does **not** re-implement state, and it does **not** touch ACP child stdio. WS/SSE carry *observations* (snapshots, events, telemetry) and *command acknowledgements* only. This honors PLAN §1.4 and keeps the existing deterministic replay-by-sequence core authoritative.
+The read models are directly bindable, but **commands are not**. The composition + validation that make a command *safe* live in the CLI layer today, not in `OrchestrationService`:
+
+- `handleApprove` (`src/cli/commands.ts:593`) runs the W1-F3/W3-4 spec-draft + hash binding/validation (`getSpecDraft` → `detectDraftLoss` → bind/verify the approved hash) **before** `service.approve()`. A `serve` route that calls `service.approve()` directly **bypasses** that and can approve a stale/missing draft.
+- `handleStart` / `handleRun` / `handleRecheck` / `handleResume` (dispatched from `executeCommand`, `commands.ts:178`) compose service calls with injected `deps.flows` and map engine errors to clean results.
+
+So `serve` **cannot** be a pass-through to the service. Within the boundary it still (a) never touches ACP child stdio, (b) keeps the event-sourced store authoritative, and (c) carries only observations + command submissions over WS (PLAN §1.4) — but it is a real app-layer that reuses the shared command executor and adds operation management, an attention queue, per-run execution contexts, and a security gate. §3.5–§3.8 make that concrete.
+
+### 3.5 Separate three conflated concepts: envelope · operation · attention
+
+The daemon must model these distinctly (Phase A0 formalizes them):
+
+- **Command envelope** — validation, authorization (token), idempotency/retry. Synchronous accept/reject; returns fast.
+- **Operation (job)** — the long-running coordinator/implementor/verifier execution driven by `handleStart`/`handleRun`/`handleResume`/`handleRecheck`. Returns a durable `operationId`; the UI tracks progress through **events**, never a blocked HTTP call. Define daemon-restart behavior (an operation whose owner died is recovered through the existing `handleResume` path, gated on the durable run-ownership lease) and run-ownership (only the lease holder drives — `isRunClaimedByLiveProcess`).
+- **Attention request** — permission responses, spec approvals, human answers: the **durable interactive-action queue** (gap d), idempotent, surviving restart. Note there is **no respond-to-permission verb** today; it must be added here.
+
+### 3.6 Multi-run execution model (blocking)
+
+**Fact:** `OrchestrationService` constructor-binds `#config`/`#bounds`/`#breaker` (`service.ts:1107-1117`), `#worktreeSupervision` is a single "CURRENT" manager (one-at-a-time, `:1096-1098`), and the CLI builds a **fresh service per run** from that run's persisted config (`cli/index.ts:104`). A single long-lived multi-run service would apply the **wrong** budget/bounds/supervision.
+
+**Decision (recommended):** the daemon holds a small set of per-run **execution contexts** — one service instance (or config-scoped facade) per *actively-driven* run, each resolving that run's pinned config + its own worktree supervision — while **sharing the global durable admission** (`spawn-reservation-store`), **run-ownership leases** (`run-ownership-store`), and **process registry** so the max-live-children cap and §14 identity checks stay global. *Alternative:* refactor `OrchestrationService` to resolve config + supervision per run (a larger change to a load-bearing, review-hardened class). Either way, **read-only** enumeration/snapshot/event endpoints need **no** execution context (they hit the store) — so the fleet + inspection UI works before this lands.
+
+### 3.7 Cross-process event & write model (blocking)
+
+**Fact:** there is no engine bus; events are appended to SQLite by whichever process runs the command, and a CLI in a *separate* process is a real writer. A bus living inside `serve` would not see those writes. Pick one explicit model:
+
+- **A (recommended) — daemon is the single command writer.** When a daemon is running, the CLI **forwards** commands to it over loopback instead of writing directly; the daemon appends in-process and notifies subscribers synchronously. Needs a CLI→daemon forward path + a "no daemon ⇒ write directly" fallback. Cleanest ordering + backpressure; matches PLAN §182's "read-only isolation from the writer."
+- **B — daemon tails SQLite by per-run sequence watermark.** Supports arbitrary external CLI writers, but needs a change signal (better-sqlite3 `update_hook` / WAL poll) and careful watermark advance. More robust to unknown writers, more moving parts.
+
+**Cursor is EXCLUSIVE at the public boundary.** `event-repository` `listByRun`'s `fromSequence` is *inclusive* (`:34`, `sequence >= ?`), so a client reconnecting with its last-seen sequence would get that event **again**. Define the wire cursor as `after=<lastSeen>` and translate to `fromSequence = lastSeen + 1` (or require documented client-side dedup). The Phase A "no dupes" acceptance depends on this.
+
+**WS must be MULTIPLEXED.** A single `/events` socket carries a **fleet channel** + **per-run cursor subscriptions**. A per-run-only socket cannot discover a newly-active run and cannot drive the Attention view; the fleet channel announces new/became-active runs and the client opens per-run subscriptions on demand.
+
+### 3.8 Local HTTP security — a Phase A acceptance GATE (blocking)
+
+`PLAN.md:182` already requires, *when `serve` is built:* "loopback-only, random scoped tokens, **Origin validation**, bounded drop+replay subscriber queues, cursor = (run_id, sequence), read-only isolation from the writer." This is a privileged command (and later PTY) server, so security is **not deferrable**. Phase A ships only when all of these hold:
+
+- **Host + Origin allowlist** — reject any non-loopback `Host`/`Origin` (defeats **DNS-rebinding**; loopback bind alone does not).
+- **CSRF protection for REST writes** — require a custom header / the session token, never rely on ambient cookie auth.
+- **Explicit WebSocket auth** — token in the WS subprotocol or first message, **not** the query string (no token leakage into logs/history).
+- **One-time bootstrap-token delivery** without query-string leakage; tokens random + scoped + expiring.
+- **Restrictive permissions (0600)** on the daemon **connection-metadata** file (host/port/token).
+- **Single-daemon locking + stale recovery + port discovery** — a lockfile carrying `{pid, port, start-time}`; a dead/recycled owner is reclaimed; clients discover the port from the metadata file, not a hard-coded `7717`.
 
 ---
 
@@ -190,8 +256,10 @@ Verified by reading `src/domain/*`, `src/app/*`, `src/cli/*`, `src/persistence/*
 |---|---|---|
 | UI framework | **React + TypeScript** | `support.js`/`dc-runtime` proves the design is authored against React (`window.React`/`ReactDOM`). Porting the `<x-dc>` template + token system to React is near-mechanical; components map 1:1 to the `sc-for`/`sc-if` structure |
 | Bundler/dev | **Vite** | Fast local dev, first-class TS, trivial static build to serve from the daemon; no CDN dependency (self-host fonts; tokens are already inline CSS vars) |
-| Server data | **REST for snapshots + WS for the event tail**; a small typed client | Snapshot = durable truth on connect (brief §4.5/§12.1); WS streams ordered `(run_id, sequence)` deltas. Prefer **server-projected `UiState`** (reuse `uiStateOf`) so the client stays a thin renderer and never re-derives state |
-| Client cache | TanStack Query (snapshots) + a reducer that folds WS events by sequence into the cached snapshot | Mirrors the engine's fold; gives cursor-resume + optimistic-free correctness |
+| Command path | **Shared command executor** extracted to `src/app/commands/` (Phase A0), called by BOTH the CLI and `serve` | Every write runs the same validation (e.g. `handleApprove`'s W3-4 draft/hash checks); `serve` never calls `service.*` directly (§3.4) |
+| Server data | **REST snapshots + a MULTIPLEXED WS** (`/events`: fleet channel + per-run cursor subscriptions); server projects `UiState` and emits **typed read-model deltas** or plain invalidations | Snapshot = durable truth on connect (brief §4.5/§12.1). The server owns projection (`uiStateOf`); the wire carries applied deltas/invalidations, not raw engine events |
+| Client cache | TanStack Query for snapshots; WS messages are **(i) invalidation → refetch** or **(ii) typed deltas applied verbatim** — **no client-side reducer**. Raw events feed **only** the Activity/Events views | The browser must never re-run engine reduction (blocking 3); authoritative run state always comes from a server projection |
+| Security | Host/Origin allowlist + scoped token + CSRF + WS-subprotocol auth + daemon lockfile/port-discovery | Phase A acceptance gate (§3.8), not deferred |
 | Terminal | **xterm.js** (client) + **node-pty** (server PTY broker) | Standard, loopback-only, token-scoped per brief §11.5 |
 | Desktop | **Electron** (last) | Brief §13.6: lower-integration-risk wrapper for a Node/TS engine using **native Node modules** (better-sqlite3). Tauri only if footprint later justifies a Rust host + Node sidecar. No Electron-specific chrome in the UI |
 | Transport lib | Node `http` + `ws` (or Fastify + `@fastify/websocket`) | Minimal; in-process with the engine. Avoid heavy frameworks |
@@ -203,19 +271,28 @@ Self-contained: no external CDN assumptions. The prototype references Google Fon
 ```
 harness-orchestration/
   src/
-    serve/            ← NEW: the daemon (HTTP+WS), in-process with OrchestrationService
-      http.ts         ← routes: /runs, /runs/:id/snapshot, /doctor, command POSTs
-      ws.ts           ← event relay: subscribe(runId, sinceSeq) → ordered push
-      auth.ts         ← loopback bind + session-token issuance/verification
-      projections/    ← run-enumeration + snapshot assembly read models (NEW)
-      actions.ts      ← durable interactive-action queue (approvals/permissions)
-      pty.ts          ← PTY broker (later phase)
+    app/
+      commands/       ← NEW (Phase A0): CLI-independent command executor + handleX
+                         composition + validation, lifted from src/cli/commands.ts.
+                         Models envelope · operation · attention (§3.5). Used by CLI + serve.
+    serve/            ← NEW: the daemon — an application/execution layer (NOT a thin transport)
+      http.ts         ← REST: /runs, /runs/:id/snapshot, /doctor, POST /commands (envelope)
+      ws.ts           ← MULTIPLEXED relay: /events (fleet channel + per-run cursor subs)
+      execution/      ← per-run execution contexts (config/supervision-scoped, §3.6);
+                         global admission + run-ownership + registry shared
+      actions.ts      ← durable interactive-action / attention queue (§3.5), idempotent
+      security.ts     ← Host/Origin allowlist, token, CSRF, WS auth, lockfile + port discovery (§3.8)
+      writer.ts       ← the single-writer path OR the SQLite watermark tail (§3.7)
+      projections/    ← run-enumeration + snapshot assembly read models
+      pty.ts          ← PTY broker (Phase E)
+  cli/
+    commands.ts       ← becomes a THIN client over src/app/commands (CLI contract unchanged)
   web/                ← NEW workspace: Vite React app (the UI)
     src/{app,shell,screens,components,tokens,client}/
-  desktop/            ← NEW (last): Electron wrapper + serve sidecar
+  desktop/            ← NEW (Phase F): Electron wrapper — see lifecycle decision in Phase F
 ```
 
-Rationale: the engine stays the single source of truth; `src/serve/` is a thin, testable adapter over it; `web/` builds to static assets the daemon serves on loopback; `desktop/` wraps the same web build. This matches "browser UI first, then desktop" (brief §1, §13.6).
+Rationale: the engine's event-sourced SQLite store stays the single source of truth. `src/serve/` is a real **application/execution layer** that (a) reuses the shared command executor so it never bypasses command validation, (b) runs per-run execution contexts for driven runs, and (c) enforces the security gate — while read-only endpoints hit the store directly. `web/` builds to static assets the daemon serves on loopback; `desktop/` wraps the same web build. This matches "browser UI first, then desktop" (brief §1, §13.6).
 
 ---
 
@@ -223,26 +300,36 @@ Rationale: the engine stays the single source of truth; `src/serve/` is a thin, 
 
 Each phase lists **delivers · seams (existing vs to-build) · screens · acceptance criteria**.
 
-### Phase A — `harness serve` daemon (THE seam; build first)
+### Phase A0 — Extract the shared command executor (build FIRST, before any HTTP route)
 
-- **Delivers:** a loopback HTTP+WS daemon, in-process with `OrchestrationService`, that exposes: run enumeration; per-run durable snapshot; ordered event relay with resume-by-cursor; and a command/action submit endpoint. Plus session-token auth and the connection state machine the client needs.
-- **Seams — existing:** `OrchestrationService` methods; `projections.ts` (+ `uiStateOf`); `event-repository` replay `readEvents(runId, sinceSeq)`; `status/doctor --json`.
-- **Seams — to build:** (b) multi-run enumeration read model; (a) HTTP+WS server on `127.0.0.1` (design port `7717`); (c) bus→socket fan-out that pushes new `(run_id, sequence)` events; (d) durable interactive-action queue with idempotency keys; session-token issuance + loopback guard.
-- **Screens:** none yet (pure backend), but it is the precondition for every screen.
+- **Delivers:** a CLI-independent command layer in `src/app/commands/` that BOTH the CLI and `serve` call — the **envelope** (validate/authorize/idempotency), the `handleStart`/`handleRun`/`handleRecheck`/`handleResume`/`handleApprove` composition (incl. `handleApprove`'s W1-F3/W3-4 draft+hash validation), and the **operation/attention** split (§3.5). No behavior change to the CLI contract.
+- **Seams — existing:** `executeCommand(service, db, RunCommand, env, deps)` already has a CLI-independent signature (`commands.ts:178`) with `deps.flows`/`adapterFactory` injection — this is a **lift-and-formalize**, not a from-scratch build.
+- **Seams — to build:** relocate `handleX` + validation out of `src/cli/`; define `Command envelope` vs `Operation` (returns a durable `operationId` for `start`/`run`/`resume`/`recheck`) vs `Attention request` (+ the missing respond-to-permission verb); define **daemon-restart + run-ownership** behavior for in-flight operations (recover through the existing `handleResume` path, gated on the run-ownership lease).
+- **Screens:** none (backend refactor).
+- **Acceptance:** the existing CLI suite passes unchanged (it now calls the shared layer); a non-CLI caller invoking `approve` gets the **same** W3-4 draft/hash validation a direct `service.approve()` would skip; a long-running `start` returns a durable `operationId`; a parity test proves CLI-vs-executor outcomes are identical.
+
+### Phase A — `serve` daemon (the seam every screen binds to)
+
+- **Delivers:** a loopback **HTTP + multiplexed WS** daemon exposing run enumeration, per-run durable snapshots, an ordered event relay with **exclusive** cursor resume, and a command/attention submit endpoint over the Phase-A0 executor — behind the §3.8 security gate, with the §3.7 write model chosen and §3.6 per-run execution contexts for driven runs.
+- **Seams — existing:** the A0 executor; `projections.ts` (+ `uiStateOf`); `event-repository` `listByRun(runId, {fromSequence})`; `status`/`doctor --json`; global admission (`spawn-reservation-store`), `run-ownership-store`, process registry.
+- **Seams — to build:** (b) multi-run **enumeration** read model (no `listRuns` today); (a) HTTP + multiplexed WS on loopback with **port discovery** (not a hard-coded `7717`); (c) the chosen event-delivery mechanism — **single-writer notify** (recommended) or **SQLite watermark tail** (§3.7); (d) the durable **attention** queue; per-run **execution contexts** (§3.6); the **security gate** (§3.8); daemon **lockfile** + stale reclaim.
+- **Screens:** none yet, but the precondition for every screen.
 - **Acceptance:**
-  - `GET /runs` returns each run's `uiStateOf` projection + meta; `GET /runs/:id/snapshot` returns a durable snapshot assembled purely from read models (no live process needed).
-  - `WS /runs/:id/events?since=<seq>` replays from the cursor then streams new events **in `(run_id, sequence)` order**, no gaps, no dupes, resumable after a disconnect.
-  - A command POST (start with `approve`) submits through `OrchestrationService`, is idempotent under retry, and emits the resulting events on the WS.
-  - Binds loopback-only; rejects without a valid session token; a second client sees the same ordered stream.
-  - Deterministic tests use the existing `fake` adapter + in-memory/temp SQLite; no live provider needed.
+  - `GET /runs` returns each run's `uiStateOf` projection + meta; `GET /runs/:id/snapshot` is assembled purely from read models (no live process needed).
+  - **Exclusive cursor:** `/events` replays from `after=<lastSeen>` (→ `fromSequence = lastSeen+1`, because the repo query is inclusive, `:34`) then streams new events in `(run_id, sequence)` order — reconnect returns **no duplicate** and no gap.
+  - **Multiplexed WS:** a newly-created/became-active run appears on the fleet channel **without a page reload**; the client opens a per-run subscription on demand; the Attention view is driven from the fleet channel.
+  - **Cross-process:** a run advanced by a **separate CLI process** still streams to connected clients (proves the §3.7 model); `command-accepted → daemon-crash` leaves a **recoverable** durable operation.
+  - **Multi-run:** two active runs with **different pinned configs** each execute under the correct budget/bounds/supervision (proves §3.6); the global max-live-children cap still holds across them.
+  - **Security gate (BLOCKS SHIP):** rejects non-loopback `Host`/`Origin` (DNS-rebind); requires a scoped token; CSRF on REST writes; WS auth off the query string; `0600` connection-metadata; single-daemon lock with stale reclaim.
+  - Deterministic tests drive the flows through the A0 executor with **injected fake deps** (see §6) + temp SQLite; no live provider.
 
 ### Phase B — App shell + core read screens
 
 - **Delivers:** the React shell (top bar, 5-nav, footer, `⌘K` palette, connection banner) + the three read screens that prove the model end-to-end: **Fleet rail/Attention, Run Overview (control room), Spec review**.
 - **Seams — existing:** Phase A endpoints; `SPEC_DRAFT`, `ROLE_ROUND`, `RUN_CONFIG`, `COST_ACCOUNTING`.
-- **Seams — to build:** client snapshot+WS fold; spec-version listing (prior revisions) for the diff; connection state machine (6 states, §12.1).
+- **Seams — to build:** client snapshot hydration + **delta-apply / invalidation-refetch (no client reducer, blocking 3)**; spec-version listing (prior revisions) for the diff; connection state machine (6 states, §12.1).
 - **Screens:** 1 Doctor, 2 Fleet, 4 Overview, 5 Spec (+6 revision diff read-only), 18 Reconnect.
-- **Acceptance:** fleet groups + attention badge reflect live `uiStateOf`; opening a run renders the composite status grammar (`[Phase] · [suspension/operation]`, brief §7.4); cost shows measured+estimated **separately**; reconnect keeps the last snapshot, disables commands, resumes from cursor, and does **not** replay toasts.
+- **Acceptance:** fleet groups + attention badge reflect live `uiStateOf`; opening a run renders the composite status grammar (`[Phase] · [suspension/operation]`, brief §7.4); cost shows measured+estimated **separately**; authoritative run state comes only from server projections (the client holds **no** engine reducer; raw events feed only Activity/Events); reconnect keeps the last snapshot, disables commands, resumes from the **exclusive** cursor, and does **not** replay toasts.
 
 ### Phase C — Failure & recovery screens (the product differentiator)
 
@@ -252,13 +339,21 @@ Each phase lists **delivers · seams (existing vs to-build) · screens · accept
 - **Screens:** 10, 11, 12, 13, 14 (+ the Attention items that route into them).
 - **Acceptance:** each failure state answers brief §4.4's five questions (what happened / what's safe / what's the orchestrator doing / must I act / safe next action); **"reset time unavailable"** is shown literally (never an invented ETA); merge-ready shows manual git commands and asserts nothing was merged/pushed; breaker reset is gated behind explicit inspection and preserves incident history.
 
+### Phase C2 — Core management screens (+ write APIs)
+
+- **Delivers:** the four management surfaces the earlier phases don't schedule, **with their write paths**: New Run (start), Workspaces (repo registry + add), Models & harnesses (effective/desired model, failover ladder), Settings (runtime/limits/budget/verification/terminal/notifications/storage).
+- **Seams — existing:** capability records; `desired-model-store`; `failover-store`; `run-config`/global config; `doctor --json`.
+- **Seams — to build:** `start` via the A0 executor + a workspace/folder picker (native in desktop, path entry in browser); config **write** endpoints; a desired-model / failover-ladder write path. Validation must reject unsupported values at the boundary, mirroring `model-resolution.ts` (the closed `HARNESSES` allowlist; `asHarness` throws on unknowns) and the failover-ladder parse gate (harness ∈ the runtime vocabulary, effort in the reasoning ladder).
+- **Screens:** 3 New run, 12 Workspaces, 13 Models & harnesses, 14 Settings.
+- **Acceptance:** writes are validated + idempotent; an invalid harness/effort is rejected with a clear message (never accepted then failed deep in dispatch); **no empty controls** for unsupported/deferred features (brief §25); "desired model" is shown distinctly from "running" and only applies on next spawn (brief §4.3).
+
 ### Phase D — Activity, Changes, Verify, Events
 
 - **Delivers:** the inspection surfaces: filtered activity timeline (Follow-live), read-only diff viewer, verification/evidence table with criterion inspector, technical event log.
-- **Seams — existing:** event replay; `WorktreeFactsState` + git diff; `IMPLEMENT_VERIFY_LOOP` + verification events; artifact repository (content-addressed evidence).
-- **Seams — to build:** diff read endpoint (git), evidence-fetch endpoint (artifact CAS), activity filter projections, Follow-live backpressure.
+- **Seams — existing:** event replay; `WorktreeFactsState` + git diff; `IMPLEMENT_VERIFY_LOOP` + verification events; artifact repository (content-addressed evidence). **Note:** only **usage** is folded centrally today (`role-runner.ts:15,57-61` wraps `onUpdate`; `cost.ts:foldUsageUpdate`); coordinator/verifier **message chunks** are consumed *privately* by the flows (`implementor.ts` `child.stdout.on('data')`) and are not on the durable event stream.
+- **Seams — to build:** diff read endpoint (git), evidence-fetch endpoint (artifact CAS), activity filter projections, Follow-live backpressure — and, for a full agent-activity feed, a **bounded, redacted observation sink** (decide durable vs ephemeral; redact at the sink via `src/redaction/*`). Until that exists, Activity shows the **milestone/event-log-derived** timeline (phase changes, verifications, permissions, checkpoints, commits), not raw agent narration.
 - **Screens:** 7 Activity, 8 Changes, 9 Verify (+ criterion evidence inspector), Events tab.
-- **Acceptance:** criteria show four distinct verdicts (verified/failed/**unproven**/running) — never collapsed; evidence artifacts open from the inspector; diff is strictly read-only (no merge/push affordance); Events shows the true `(seq,type,refs)` log; Follow-live inserts rows without losing scroll position and respects reduced-motion.
+- **Acceptance:** criteria show four distinct verdicts (verified/failed/**unproven**/running) — never collapsed; evidence artifacts open from the inspector; diff is strictly read-only (no merge/push affordance); Events shows the true `(seq,type,refs)` log; Activity clearly distinguishes durable milestones from any (redacted, bounded) live narration; Follow-live inserts rows without losing scroll position and respects reduced-motion.
 
 ### Phase E — Terminal drawer + PTY broker
 
@@ -270,50 +365,60 @@ Each phase lists **delivers · seams (existing vs to-build) · screens · accept
 
 ### Phase F — Desktop wrapper + native integration
 
-- **Delivers:** Electron app wrapping the web build, spawning `serve` as a sidecar; native folder picker, notifications (new AlertSink), dock/tray attention badge, deep-link to run, secure token storage, close/quit semantics.
-- **Seams — existing:** everything above; `alerts.ts` `NotifierRegistry` (add a native sink).
-- **Seams — to build:** (f) native notification sink + delivery-state feedback; tray/menu-bar; window lifecycle ("keep service running"); `better-sqlite3` packaging in Electron.
+- **Delivers:** Electron app wrapping the web build; native folder picker, notifications (new AlertSink), dock/tray attention badge, deep-link to run, secure token storage, close/quit semantics.
+- **Daemon lifecycle (resolve the contradiction):** a normal child sidecar dies with the app, which breaks "quit UI, keep service running." Pick one:
+  - **(i) separately-installed background daemon / LaunchAgent** — Electron only connects; never owns lifecycle.
+  - **(ii) detached, independently-managed daemon** — spawned detached with `{pid, port, token}` in the connection-metadata file (§3.8), reaped only on explicit "Stop service…". *Recommended* — matches the tray's "Quit UI · keep service running" + "Stop service…" most literally.
+  - **(iii) Electron stays alive as a tray process** — "quit UI" only closes windows; the app (and its child `serve`) keep running in the tray.
+- **Seams — existing:** everything above; `alerts.ts` `NotifierRegistry` (add a native sink); the daemon lockfile/port-discovery from §3.8.
+- **Seams — to build:** (f) native notification sink + delivery-state feedback; tray/menu-bar; the chosen lifecycle + reaping; `better-sqlite3` **native-module rebuild** for Electron's ABI. **Packaging is greenfield:** `package.json:22` `build` is `tsc` only — there is **no** Vite asset build and **no** desktop packaging yet; both are new work.
 - **Screens:** 19 Tray, 20 Mobile (responsive web, validated here), plus native chrome.
-- **Acceptance:** closing the window does not stop runs (teaches the choice, brief §13.4); notifications are actionable + privacy-conscious (no raw prompts/paths/secrets, brief §13.5) and deep-link to the exact attention item; the same web UI runs unchanged in browser and desktop (no Electron-only chrome).
+- **Acceptance:** closing the window does not stop runs (teaches the choice, brief §13.4); notifications are actionable + privacy-conscious (no raw prompts/paths/secrets, brief §13.5) and deep-link to the exact attention item; the same web UI runs unchanged in browser and desktop (no Electron-only chrome). **Packaging/CI tests:** code signing + notarization, `better-sqlite3` rebuild for the Electron ABI, clean install, and upgrade/migration.
 
 ### Cross-cutting (every phase)
 
 Foundations port (tokens, type scale, density, motion, **+ new light theme** and the empty/loading/error matrix §2.2); accessibility (roles/labels/keyboard order per brief §19); responsive collapse order (§18.2) validated at 1440/1280/1024/768/390; redlines/engineering notes per screen (§26.7): fields consumed, commands invoked, safety-confirmation rules.
 
+**Testing & acceptance (failure-first).** Beyond happy-path, the `serve` layer must have explicit tests for: cross-process writers (a CLI in another process advancing a run the daemon serves); daemon restart **mid-operation** (recover via resume + run-ownership lease); slow / backpressured WS subscribers (bounded **drop + replay**, PLAN §182); `SQLITE_BUSY` / DB contention; stale connection-metadata (dead pid/port reclaim); multiple browser clients on one run seeing identical ordered streams; command **idempotency** under retry; **command-accepted-then-daemon-crash** leaving a recoverable operation; and **exclusive-cursor no-duplicate** on reconnect. Drive all of these through the A0 executor with injected fake deps (§6) — no live provider.
+
 ---
 
 ## 6. Build FIRST + smallest vertical slice
 
-**Build first: Phase A's seam, proven by a read-only slice.**
+**Build first: Phase A0 (shared command executor) → Phase A's seam, proven by a read-only slice.**
 
 **Smallest end-to-end vertical slice (proves the architecture):**
 
-1. Create a real run with the existing CLI (`harness start …` → `approve` → `run`) using the `fake` adapter so it runs offline and lands durable events + projections in SQLite.
-2. Stand up `src/serve/` exposing exactly three read routes: `GET /runs` (new enumeration → `uiStateOf` per run), `GET /runs/:id/snapshot` (assembled from existing projections), and `WS /runs/:id/events?since=<seq>` (replay-from-cursor + live tail off the in-process bus), all loopback + session-token.
-3. Build a minimal `web/` React shell that renders the **fleet rail + one Run Overview**, hydrating from the snapshot and folding WS events by sequence — **read-only, no command buttons**.
-4. Prove **cursor-resume**: kill the socket, reconnect with the last `(run_id, sequence)`, and confirm the client catches up with no gaps/dupes and no toast replay.
+1. Create a real run **without a production harness**: call the A0 executor (or the current `executeCommand`) with **injected fake flow + adapter deps** — `src/adapters/fake/*` via `deps.flows` + `OrchestrationServiceOptions.adapterFactory` — so it runs offline and lands durable events + projections in SQLite. A shipped "fake harness" *value* is impossible: `model-resolution.ts` defines a **closed** production `HARNESSES` allowlist (claude/codex/opencode at time of writing — actively growing) and `asHarness` throws on anything outside it, so the fake path is a **test/fixture injection** (`src/adapters/fake/*` via `deps`), never a production harness id.
+2. Stand up `src/serve/` with three read routes behind the **§3.8 security gate** (loopback + Host/Origin + token — even the read-only slice is gated): `GET /runs` (new enumeration → `uiStateOf`), `GET /runs/:id/snapshot` (from existing projections), and the **multiplexed** `WS /events` with a per-run subscription at `after=<lastSeen>` (**exclusive** cursor → `fromSequence = lastSeen+1`, because the repo query is inclusive, `event-repository.ts:34`).
+3. Build a minimal `web/` React shell that renders the **fleet rail + one Run Overview**, hydrating from the snapshot and **applying server deltas / refetching on invalidation — no client-side reducer**, read-only.
+4. Prove **cursor-resume with no duplicate**: reconnect with `after=<lastSeen>` and assert the first replayed event is `lastSeen+1` (not `lastSeen`), no gaps, no toast replay; and prove the **fleet channel** surfaces a second run created meanwhile without a reload.
 
-This single slice exercises the whole spine: enumeration (gap b), snapshot assembly (existing projections), event relay + cursor-resume (gap c over existing replay), auth/loopback, and the client fold — everything else is additive. **Slice 2** adds the first write (`approve` through the durable action queue, gap d) to prove the command path and idempotency.
+This exercises the whole spine: the shared executor (A0), enumeration (gap b), snapshot assembly (existing projections), multiplexed relay + exclusive cursor (gap c), the security gate (§3.8), and server-projected client state — everything else is additive. **Slice 2** adds the first write: `approve` **through the A0 executor** (so the W3-4 draft/hash validation runs) via the durable attention queue (gap d), proving the validated, idempotent command path.
 
-Why this and not a failure screen first: the failure screens are the differentiator, but they are worthless without the seam; and a read-only slice de-risks the *observation boundary* (the part PLAN §1.4 is strict about) before any command/write surface is introduced.
+Why this and not a failure screen first: the failure screens are the differentiator, but they are worthless without the seam; a read-only slice de-risks the *observation boundary* (the part PLAN §1.4 is strict about) before any write surface — but note security and the shared executor are in from slice 1, not bolted on later.
 
 ---
 
 ## 7. Risks & open questions (for the user to decide)
 
-1. **Serve auth model.** Recommend: bind `127.0.0.1` only + a per-session token minted at daemon start (the design already shows "Loopback only · session token active"). Confirm whether multiple local clients/tabs share one token and how tokens rotate/expire. Terminal sessions need their own scoped, expiring token (brief §11.5).
-2. **WS vs SSE for the event relay.** Recommend WS (bidirectional: also carries command acks and terminal I/O later). SSE is simpler but one-way and awkward for terminals. Decide once, since it shapes the client.
-3. **Client-side vs server-side state projection.** Recommend the server project `UiState` (reuse `uiStateOf`) so the browser never re-implements the reducer and can't drift from the engine. Confirm acceptable.
-4. **Multi-run enumeration source.** There is no `listRuns` today. Decide whether to add a dedicated `runs` index/projection or enumerate projection scopes — and how retention/§15 pruning interacts with "recently completed" in the rail.
-5. **Interaction with the concurrent "Agent Room" work.** PLAN §4.1/§7 describe an optional localhost Agent Room chat during coordinator *planning* (`start --enable-chat`, forced to `127.0.0.1`, off the default path). It is **orthogonal** to `serve` (planning-time chat vs run-observation), but: (a) it sets a precedent for a second localhost server — decide whether `serve` should host/proxy it or stay separate; (b) the New-run/Spec-drafting flow *could* surface Agent Room in-UI later. **This plan does not depend on or modify that work** (coordinator.ts, planning-chat.ts, agent-room.ts, cli/*, service.ts are untouched). Confirm the boundary.
-6. **`paused_user` and the full §12.1 connection-state machine** are under-modeled in the prototype — confirm they're in-scope for Phase B/C (recommended).
-7. **Light theme + empty/loading/error matrix** are design gaps (§2.2); schedule the foundations work before or alongside Phase B.
-8. **Terminal takeover safety** is the highest-risk write path (it stops a live child). Its checkpoint→identity-verified-stop→validate sequence must reuse the supervisor's existing identity checks (§14) exactly; do not build a parallel stop path.
-9. **Desktop packaging:** Electron + `better-sqlite3` native module bundling is the main desktop risk; validate early in Phase F (or spike during Phase A) so the native-module choice isn't discovered late.
+**Resolved by this revision (were open; now decided):** WS (multiplexed), not SSE — §3.7/§4.1. Server-projected `UiState` + deltas/invalidation, **no** client reducer — §3.4/§4.1. Security is a Phase A **gate**, not a deferral — §3.8.
+
+**New decisions for the user (each shapes the daemon):**
+
+1. **Event-delivery + write model (§3.7).** Single-writer daemon with **CLI-forwarding** (recommended, model A) vs SQLite **watermark tail** (model B). Model A implies the CLI's default changes: *when a daemon is running, the CLI forwards commands to it instead of writing directly* — confirm that behavior change is acceptable (it is what gives clean ordering + backpressure + PLAN §182 writer-isolation).
+2. **Multi-run execution (§3.6).** Per-run **execution contexts** sharing global admission/registries (recommended) vs refactoring `OrchestrationService` for per-run config/supervision (larger change to a review-hardened class).
+3. **Desktop daemon lifecycle (Phase F).** Detached independently-managed daemon (recommended, matches the tray copy) vs tray-process vs separately-installed LaunchAgent.
+4. **Multi-run enumeration source.** Add a dedicated `runs` index/projection vs enumerate projection scopes — and how §15 retention/pruning interacts with "recently completed" in the rail.
+5. **Agent Room boundary.** PLAN §4.1/§7's optional localhost planning chat (`start --enable-chat`, forced `127.0.0.1`, off the default path) is **orthogonal** to `serve` (planning-time chat vs run-observation), but shares the localhost-server precedent. Decide whether `serve` hosts/proxies it or stays separate, and whether the New-run/Spec flow surfaces it in-UI. (Now committed in the design at `46ac79a`.)
+
+**Still-standing design/build risks (not new):** `paused_user` + the full §12.1 six-state connection machine are under-modeled in the prototype (in-scope Phase A/B); light theme + the empty/loading/error matrix are foundations gaps (§2.2); **terminal takeover** is the highest-risk write path — its checkpoint→identity-verified-stop→validate sequence must reuse the supervisor's existing §14 identity checks, never a parallel stop path; terminal sessions need their own scoped, expiring token (brief §11.5).
 
 ---
 
-## Appendix — provenance
+## Appendix — provenance & source-of-truth lock
 
-- Design imported to `docs/design/` at the session level (DesignSync was not reachable inside the planning subagent; the orchestrator fetched the current single-file `Harness Control.dc.html` + `support.js`).
+- **Design source-of-truth (lock before implementation):** `docs/design/Harness Control.dc.html` at commit **`46ac79a`** ("Add the Agent Room planning-chat feature to the design"); the canonical claude.ai/design copy was updated to match. Implementation should pin this hash and re-verify screen/field bindings if the design changes.
+- Design imported to `docs/design/` at the session level (DesignSync was not reachable inside the planning subagent; the orchestrator fetched the current single-file `Harness Control.dc.html` + `support.js`, then committed the Agent Room extension at `46ac79a`).
 - A stale predecessor snapshot ("Intent Next — design package," multi-file, dated earlier) exists only in the session scratchpad and was **not** used; this plan is built solely against the imported current files and the engine source.
+- **Revision 2 (this doc):** every code claim from the architectural review was re-verified against the current tree (line refs in the "Revision 2" section) before folding in; the two precision notes there are refinements, not rebuttals.
