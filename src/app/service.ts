@@ -162,6 +162,7 @@ import { CadenceTracker } from '../checkpoint/cadence.js';
 import { redactFlattenedJson, redactText } from '../redaction/index.js';
 import { sha256Hex } from '../artifacts/hash.js';
 import * as git from '../worktree/git.js';
+import { isWorktreeError } from '../worktree/errors.js';
 import {
   HeartbeatEmitter,
   DEFAULT_BREAKER_BOUNDS,
@@ -985,6 +986,30 @@ function toSinkSafeTypedError(raw: unknown): unknown {
     return safe;
   }
   return typeof raw === 'string' ? redactText(raw) : raw;
+}
+
+/**
+ * F3 (§5ff/§5hh review-7): is an error thrown by the ACTIVE role flow a
+ * RECOVERABLE typed failure — one that leaves the run genuinely reclaimable, so
+ * `#interruptActiveRoundOnFlowError` records a durable INTERRUPTED outcome
+ * instead of stranding it? Positive identification by error TYPE (the diagnosis
+ * mandates the recoverable/terminal split be type-based): the typed
+ * provider/flow errors are recoverable —
+ *  - any `AdapterError` the profile `classifyError` recognizes (auth/protocol
+ *    reach here sink-safe from `#routeProviderFailure`);
+ *  - a `BudgetExceededError` (§17.2 estimated-budget refusal — operational, not
+ *    a bug);
+ *  - a `WorktreeError` (every local git subprocess failure throws one, §16).
+ * Everything else — a `LoopCompositionError`/`RunOwnershipConflictError`/other
+ * composition/ownership/invariant breach, or any untyped `Error` (e.g. a plain
+ * artifact-IO `Error`, which has no discriminable type and could equally be an
+ * invariant breach) — is DELIBERATELY treated as terminal. Defaulting an
+ * unrecognized error to terminal is the safe direction: a falsely-resumable
+ * terminal error would make `resume` re-enter and re-throw forever, whereas a
+ * conservatively-terminal recoverable error is no worse than today's strand.
+ */
+function isRecoverableRoundFlowError(error: unknown): boolean {
+  return isAdapterError(error) || error instanceof BudgetExceededError || isWorktreeError(error);
 }
 
 /**
@@ -2440,7 +2465,25 @@ export class OrchestrationService {
         },
         ctx,
       );
-      const result = await runner.run(roleSession);
+      let result: T;
+      try {
+        result = await runner.run(roleSession);
+      } catch (flowError) {
+        // F3 (§5ff/§5hh review-7): an error thrown by the ACTIVE role flow
+        // itself — a non-limit/non-crash TYPED failure (auth/protocol after the
+        // prompt closure's `#routeProviderFailure`, a budget refusal, or a local
+        // git/worktree flow error) while the child is still alive and this round
+        // is durably ACTIVE — would otherwise skip the `completed` write below
+        // and STRAND the run: the round stays `active`, suspension `none`, so
+        // BOTH `resume` (paused/interrupted-only) and `run` (approved-only)
+        // refuse, with no operator path forward. Route it through the SAME
+        // interrupt discipline the crash/orchestrator-restart paths use so a
+        // RECOVERABLE typed failure records a durable INTERRUPTED outcome (T17)
+        // and the run stays reclaimable; a genuinely-terminal error is left
+        // untouched (terminal). The error still unwinds (the CLI renders it).
+        this.#interruptActiveRoundOnFlowError(ctx, flowError);
+        throw flowError;
+      }
       if (baseRound !== undefined) {
         // Preserve a checkpoint ref a mid-round pause recorded on THIS round
         // (a resumed round completing keeps its §12.2 lineage visible).
@@ -2784,6 +2827,60 @@ export class OrchestrationService {
         throw new Error(`Unhandled classification kind: ${String(exhaustive)}`);
       }
     }
+  }
+
+  /**
+   * F3 (§5ff/§5hh review-7): route an error thrown by `runner.run()` — the
+   * ACTIVE role flow, AFTER `child.spawned` advanced the phase and marked the
+   * round `active` — so a strand becomes a resumable interrupt. This is the
+   * SAME class of bug the restart-safety work fixed for a different trigger
+   * (F1: a reaped `active` generation whose owner died), now for a CAUGHT
+   * non-limit/non-crash typed error where the child was still alive.
+   *
+   * The recoverable/terminal split is by error TYPE (the diagnosis's crux):
+   *  - `LimitPausedError` / `AutoRespawnSignal`: the limit (T4/T16) and crash
+   *    (T13) spines already recorded their durable outcome from inside the
+   *    prompt closure and the loop consumes these as control signals — nothing
+   *    to add (the caller re-throws them byte-for-byte).
+   *  - a round the crash/pause spine ALREADY suspended (e.g. `autoRespawn=off`
+   *    landed T13 → `interrupted` before its sink-safe error reached here):
+   *    nothing to add — the guard below keeps that path byte-for-byte.
+   *  - a RECOVERABLE typed flow error (`isRecoverableRoundFlowError`: any
+   *    provider `AdapterError` the classifier handles — auth/protocol arrive
+   *    sink-safe from `#routeProviderFailure`; a `BudgetExceededError`; a local
+   *    `WorktreeError`/git flow failure): emit T17
+   *    `recovery.running_segment_found` — the PURPOSE-BUILT interrupt for a
+   *    still-running segment (suspension=`interrupted`, generation stopped,
+   *    round left reclaimable, breaker-EXEMPT — NOT T13, so a flow error never
+   *    pollutes the child-crash / respawn counters, exactly like the reap
+   *    producer). `resume` then reclaims the SAME round via T12 →
+   *    `resolveResumeEntry` — the identical path a T13 crash-interrupt uses.
+   *  - anything else (a composition/ownership/invariant breach, or any untyped
+   *    `Error`): left TERMINAL with NO interrupt. Relabeling it resumable would
+   *    make `resume` re-enter and re-throw forever.
+   *
+   * Scoped to a dispatched implementor/verifier round: a coordinator strand is
+   * already reclaimed by the W3-4 unsuspended re-drive (`handleResume`), and a
+   * bare `runRole` (no dispatch) has no round to interrupt. Emitting via the
+   * public `ingest` (not `#ingestTransition`) so a T17 rejected by its own
+   * preconditions is a benign no-op that never throws — mirroring the reap
+   * producer's contract.
+   */
+  #interruptActiveRoundOnFlowError(ctx: SpawnContext, error: unknown): void {
+    if (error instanceof LimitPausedError || error instanceof AutoRespawnSignal) return;
+    if (ctx.dispatch === undefined) return;
+    if (ctx.role !== 'implementor' && ctx.role !== 'verifier') return;
+    // The crash/pause spine may already hold this round suspended (an
+    // `autoRespawn=off` T13 interrupt, or a prompt-window T16) — re-recording
+    // would append a spurious rejected transition. Keep those paths untouched.
+    if (this.#loadEngineRecord(ctx.runId).state.suspension.kind !== 'none') return;
+    if (!isRecoverableRoundFlowError(error)) return;
+    this.ingest(
+      this.#trigger(ctx.runId, 'recovery.running_segment_found', {
+        generationId: ctx.generationId,
+        segmentId: ctx.segmentId,
+      }) as DomainEvent,
+    );
   }
 
   /**

@@ -101,6 +101,10 @@ harness-orchestrator run RUN_ID
 harness-orchestrator status RUN_ID --json
 
 # 6. Resume a paused/interrupted run (crash recovery AND limit/user resume).
+#    "interrupted" also covers a mid-round non-limit/non-crash failure — an
+#    auth/protocol error, a budget refusal, or a local git error thrown by the
+#    live role flow records a durable interrupt so the run stays resumable
+#    (never stranded); a terminal composition breach stays terminal.
 harness-orchestrator resume RUN_ID
 ```
 
