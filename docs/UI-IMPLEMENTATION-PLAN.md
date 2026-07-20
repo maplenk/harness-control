@@ -100,7 +100,7 @@ Round-5 review: **very close** (commit `26432ea` cleared all six prior findings)
 
 ## Revision 7 — dogfooding run plan (user)
 
-The UI is built by running the **harness on its own plan** — one `harness` run per phase (coordinator → human approval → implementor → independent verifier → `merge_ready`), **serial**, with a **merge/rebuild gate** between runs. Fixed three-vendor profiles (Anthropic / xAI / OpenAI): coordinator **Claude · opus · `xhigh`†**, implementor **`opencode:xai/grok-4.5:high`** (OpenCode drives Grok — no new adapter), verifier **Codex · gpt-5.6-sol · `xhigh`†**. † `xhigh` is a **bootstrap engine change** (not in the effort vocabulary yet — `high` is the fallback). Corrected run order (**Bootstrap → A0 → Phase A → proof slice → …**), the merge gate, per-run manifest, and `--goal` template are in **§6A**. Dogfooding **complements** the deterministic tests — it does not replace them.
+The UI is built by running the **harness on its own plan** — one `harness` run per bounded implementation slice (coordinator → human approval → implementor → independent verifier → `merge_ready`), **serial**, with a **merge/rebuild gate** between runs. Fixed three-vendor profiles (Anthropic / xAI / OpenAI): coordinator **Claude · opus · `xhigh`†**, implementor **`opencode:xai/grok-4.5:high`** (OpenCode drives Grok — no new adapter), verifier **Codex · gpt-5.6-sol · `xhigh`†**. † `xhigh` is a **bootstrap engine change** (not in the effort vocabulary yet — `high` is the fallback). Corrected run order (**Bootstrap → A0 → Phase A → proof slice → …**), the merge gate, per-run manifest, and `--goal` template are in **§6A**. Dogfooding **complements** the deterministic tests — it does not replace them.
 
 ## 0. TL;DR
 
@@ -560,7 +560,7 @@ Why this and not a failure screen first: the failure screens are the differentia
 
 ## 6A. Dogfooding — implement this plan via the harness itself
 
-**Decision (user): the UI is built by running the harness on its own plan.** Each phase is one `harness` run — the coordinator drafts a testable spec from the plan, the human approves the exact spec hash, one implementor works in an isolated worktree, an independent verifier gathers evidence against the acceptance criteria, and `merge_ready` hands off to the human to merge. This doubles as strong **system-level** validation: if the harness can drive its own control-room UI to `merge_ready`, that is a better whole-loop proof than any smoke test. It **complements** the deterministic suite (concurrency, crash-injection, rollback, security — §5 cross-cutting); it does **not** replace it — those tests prove the invariants, the dogfood runs prove the end-to-end loop.
+**Decision (user): the UI is built by running the harness on its own plan.** Each **bounded implementation slice** is one `harness` run — the coordinator drafts a testable spec from the plan, the human approves the exact spec hash, one implementor works in an isolated worktree, an independent verifier gathers evidence against the acceptance criteria, and `merge_ready` hands off to the human to merge. This doubles as strong **system-level** validation: if the harness can drive its own control-room UI to `merge_ready`, that is a better whole-loop proof than any smoke test. It **complements** the deterministic suite (concurrency, crash-injection, rollback, security — §5 cross-cutting); it does **not** replace it — those tests prove the invariants, the dogfood runs prove the end-to-end loop.
 
 **Fixed role profiles (user-set) — a genuine three-vendor split (Anthropic / xAI / OpenAI):**
 
@@ -578,17 +578,18 @@ Why this and not a failure screen first: the failure screens are the differentia
 - **OpenCode isolation — trusted (user decision).** OpenCode is the **least-isolated** harness: spawn args are literally `['acp']` (`opencode/command.ts:115`) — no `--safe-mode`/empty-MCP analog like Claude (factory `mcpServers:[]` + `CLAUDE_CONFIG_DIR`) and no `CODEX_HOME`-style per-run home like Codex (`codex/home-isolation.ts`). It inherits the real `HOME` and loads host `~/.config/opencode` (custom agents, permission settings, MCP servers) **unrestricted**; `mcpConfig` is `reportOnly` (`opencode/capabilities.ts:87`); the factory's **H-1 note is silent on opencode** (`factory.ts` covers only codex + claude); and whether a local auto-approve `permission`/agent config can **pre-empt ACP permission mediation** is **unverified**. The comprehensive review surfaced this asymmetry (the README states it plainly), and **the user accepted it as a trusted risk for the dogfood** — opencode is **NOT gated on a probe**. Blast radius is highest for the **implementor** (OpenCode's **`build` mode = edit + bash**, `opencode/capabilities.ts:26-28`); coordinator/verifier run **`plan` mode** (edit-contained, lower risk). **Recommended hardening follow-up (NOT a blocker):** an H-1-style probe mirroring `codex/home-isolation.test.ts` — set up a host `~/.config/opencode` with an auto-allow `permission` + an MCP server, verify the ACP child still routes `session/request_permission` and does not silently load the host MCP; if ever run and it fails, add an opencode isolation analog (per-run config-dir / empty-MCP).
 - **Clean tree + full approval.** Plan at full approval and the working tree **clean** so the implementor branches from a stable base. **This currently FAILS** — the opencode + provider work is uncommitted; commit it first.
 
-**Run order (corrected to §6 dependency order):** the live cross-process, cursor-resumable relay proof **depends on** Phase A's writer-lease + CLI-forwarding seams (§3.7/§3.8), and §6 requires **A0 → Phase A → proof slice** — so the real proof slice **cannot** precede A0/Phase A. Order: **Bootstrap readiness → A0 → Phase A → proof slice → B → B2 → C/C2 → D → E → F.**
+**Run order (corrected to §6 dependency order):** the live cross-process, cursor-resumable relay proof **depends on** Phase A's writer-lease + CLI-forwarding seams (§3.7/§3.8), and §6 requires **A0 → Phase A → proof slice** — so the real proof slice **cannot** precede A0/Phase A. Order: **Bootstrap readiness → A0 → Phase A → proof slice → B → B2 → C/C2 → D → E → F.** Within A0, the **durable operation repository + state machine (1b) lands before CLI forwarding (2a)** — a forwarded long-running command needs durable acceptance + recovery first.
 
 **Run decomposition (each row = one serial `harness` run; oversized phases split for a BOUNDED verifier contract):**
 
 | # | Run | Plan basis | Bounded verifier contract |
 |---|---|---|---|
 | B0 | *(optional)* **fixture-backed React shell** — no daemon, no `serve` | §1/§5 | renders fleet rail + one overview from **fixtures**; **no** serve / cursor-resume claim (look-and-feel only) |
-| 1 | **Phase A0** — application command executor | §3A.1-2 | envelope/operation/attention types; CLI parity; `--test-approve` impossible over HTTP |
-| 2a | **Phase A** — writer-lease + single-writer + CLI-forward | §3.7/3.8 | lease CAS + two-contender (free/stale) race; security gate |
-| 2b | **Phase A** — enumeration + snapshot + multiplexed WS | §3A.4 | `/runs` excludes reserved scopes; snapshot `asOfSequence`; exclusive-cursor no-dup |
-| 2c | **Phase A** — operation state machine + attention queue + `/meta` | §3A.2-3 | states/idempotency; permission fencing; version negotiation |
+| 1a | **Phase A0** — application-neutral executor + CLI parity | §3A.1 | envelope types (no presentation/test fields); CLI parity; `--test-approve` impossible over HTTP |
+| 1b | **Phase A0** — durable operation repository + state machine + idempotency + recovery | §3A.2 | `operations` table `accepted→…→terminal`; `UNIQUE(actor, idempotencyKey)`; atomic `start` binding; per-command recovery — **lands before CLI forwarding** (a forwarded long-running command needs durable acceptance + recovery first) |
+| 2a | **Phase A** — writer lease + daemon command endpoint + CLI forwarding | §3.7/3.8 | lease CAS + two-contender (free/stale) race; security gate; CLI-forward path |
+| 2b | **Phase A** — enumeration + snapshots + fleet + WS | §3A.4 | `/runs` excludes reserved scopes; snapshot `asOfSequence`; `fleetRevision`; exclusive-cursor no-dup |
+| 2c | **Phase A** — attention + permissions + `/meta` | §3A.3 | durable attention queue; permission fencing; `/meta` version negotiation |
 | 3 | **Proof slice** — read-only fleet rail + one overview wired to real `serve` | §6 | **live cursor-resume across a socket kill**; cross-process forward |
 | 4 | **Phase B** — app shell + core read screens | §5 B | 6-state connection machine; server-projected `UiState`, no client reducer |
 | 5 | **Phase B2** — human actions (approve / revise / permission / run) | §3A.5 / B2 | approve binds exact hash; permission fencing; failed `run` stays `approved` |
@@ -607,17 +608,34 @@ Why this and not a failure screen first: the failure screens are the differentia
 4. the **working tree is clean**;
 5. the next run's manifest records the **new base SHA + plan SHA**.
 
-Without this gate a later run would execute a **stale harness binary** or branch from an **unmerged** phase. (Note: A0 refactors the very command layer the harness runs on — the rebuild step is what makes each subsequent run use the refactored binary.)
+Without this gate a later run would execute a **stale harness binary** or branch from an **unmerged** slice. (Note: A0 refactors the very command layer the harness runs on — the rebuild step is what makes each subsequent run use the refactored binary.)
 
 **Per-run manifest (recorded for every run):** base SHA · plan SHA · plan section · goal text · role profiles · run ID · approved spec hash · implementation commit · verification evidence · merge commit.
 
 **The `--goal` template (there is NO `--spec-seed`; `start` takes `--goal TEXT` — `args.ts:38`/`:269`):** each run's goal instructs the coordinator to read a **pinned plan section at a pinned plan SHA** and turn *its* acceptance criteria into the spec, e.g.:
 
-> `harness start --workspace . --coordinator profiles/coordinator.md --effort <xhigh|high> --goal "Read docs/UI-IMPLEMENTATION-PLAN.md §<sec> at plan SHA <sha>. Produce a testable spec whose acceptance criteria are exactly that section's acceptance bullets. Scope: only <phase>; touch no files outside <paths>."`
+> `harness start --workspace . --coordinator profiles/coordinator.md --effort <xhigh|high> --goal "Read docs/UI-IMPLEMENTATION-PLAN.md §<sec> at plan SHA <sha>. Produce a testable spec whose acceptance criteria are exactly that section's acceptance bullets. Scope: only <slice>; touch no files outside <paths>."`
 
 The plan's own (now-testable) acceptance criteria become the verifier's evidence targets; a failed `run` after approval leaves the run honestly `approved` (§3A.5).
 
+**The rest of each slice's command sequence (every flag verified against `src/cli/args.ts` — use the executable `high` profiles; `xhigh` is the not-yet-done bootstrap):**
+
+```sh
+# after the coordinator drafts the spec and you review it — approve the EXACT hash:
+./dist/cli/index.js approve "$RUN_ID" --spec-version "$SPEC_VERSION" --spec-hash "$SPEC_HASH" --json
+# drive implement → verify → (bounded remediation) → merge-readiness. --implementor /
+# --verifier are OPTIONAL packed harness:model:effort tokens; omitted, they default to
+# the approved spec's proposed profiles:
+./dist/cli/index.js run "$RUN_ID" --implementor opencode:xai/grok-4.5:high --verifier codex:gpt-5.6-sol:high --json
+# inspect phase / suspension / vitals / cost at any point:
+./dist/cli/index.js status "$RUN_ID" --json
+```
+
+(Confirmed in `args.ts`: `approve` requires `--spec-version ID`, `--spec-hash` optional; `run` accepts `--implementor`/`--verifier`/`--no-wait`/`--json`; `status` accepts `--json`. A profile carrying `xhigh` is rejected today — see the bootstrap precondition.)
+
 **Revision 8 — §6A fixes (verified by content; the reviewer-approved core web/desktop plan is untouched):** (1) `xhigh` is now a **bootstrap engine change**, not an executable profile — the vocabulary `['minimal','low','medium','high']` (`model-resolution.ts:57`) rejects it and `config.test.ts:253` asserts the rejection; `high` is the fallback. (2) Implementor is the **executable `opencode:xai/grok-4.5:high`** — OpenCode drives Grok/xAI (`src/adapters/opencode/classify.ts`); the "add a Grok adapter" precondition is **removed** (native `grok` harness deferred, not pursued — no dual path left open). (3) Run order **corrected to §6** (Bootstrap → A0 → Phase A → proof slice → …); any up-front Run 0 is **fixture-only**. (4) Added the **serial merge/rebuild gate**, the **per-run manifest**, and the **`--goal` template** (there is no `--spec-seed`), and split oversized phases into bounded subphases. Dogfooding is framed as **complementing** the deterministic tests, not replacing them. (5) **OpenCode trusted (user decision)** — opencode is the least-isolated harness (spawn args `['acp']` `command.ts:115`; inherits host `~/.config/opencode`; `mcpConfig` reportOnly `capabilities.ts:87`; factory H-1 note silent on it) and the implementor runs `build` mode (edit + bash), but the user **accepted this as a trusted risk for the dogfood**; opencode is not gated on a probe — the H-1-style isolation probe is a **recommended hardening follow-up, NOT a blocker** (coordinator/verifier are `plan`-mode, lower risk).
+
+**Revision 9 — §6A re-check fixes:** (P1) reordered the run-decomposition table so the **durable operation repository + state machine (1b, §3A.2)** lands **before** writer-lease + **CLI forwarding (2a)** — a forwarded long-running command needs durable acceptance/recovery first; A0 is split into **1a** (executor + CLI parity) / **1b** (operations), Phase A into **2a** (lease + endpoint + forwarding) / **2b** (enumeration + snapshots + fleet + WS) / **2c** (attention + permissions + `/meta`). (P2) added the full **command runbook** (approve / run / status), every flag verified against `src/cli/args.ts` — `run`'s `--implementor`/`--verifier` are optional (default to the approved spec's proposals), runbook uses the executable `high` profiles. (P3) reworded the run unit "phase" → **"bounded implementation slice"** (the plan's structural phase names — Phase A0/A/B/… — are unchanged).
 
 ---
 
