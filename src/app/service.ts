@@ -194,12 +194,17 @@ import {
 } from './run-ownership-store.js';
 import {
   applyRoleModel,
+  asHarness,
   resolveRoleModel,
   type AppliedConfigOption,
   type ConfigOptionPurpose,
+  type Harness,
+  type ReasoningEffort,
   type ResolvedRoleModel,
   type RoleModelSpec,
 } from './model-resolution.js';
+import { DurableDesiredModelStore } from './desired-model-store.js';
+import { DurableFailoverStore } from './failover-store.js';
 import {
   emptyCostProjection,
   foldTurnUsage,
@@ -356,6 +361,25 @@ export class LimitPausedError extends Error {
     }
   }
 }
+
+/**
+ * P4b wave 2 FAILOVER (§5cc/§5ee) — the decision the lease-holding owner makes
+ * AFTER `#pauseForLimit` has atomically landed `paused_limit` + checkpoint +
+ * incident. `driveFailoverOnLimit` returns it so the loop knows whether to
+ * re-drive the (already-seeded) successor or leave the run paused.
+ *
+ *  - `failover`: the spine was self-driven to `target` (the next ladder rung);
+ *    the loop re-dispatches the SAME round + assignmentId on the new target.
+ *  - `exhausted`: the ladder ran out (or `maxFailoversPerIncident` was hit, or
+ *    no rung narrows to a live harness) — T25 `failover.no_live_target` kept the
+ *    run `paused_limit` and raised the `failover` alert (DEGRADE TO WAIT, never a
+ *    silent drop). The loop unwinds; the run waits for a probe / manual resume.
+ *  - `wait`: the policy is `wait`/`ask` (unchanged pause+wait behaviour).
+ */
+export type FailoverDecision =
+  | { readonly kind: 'failover'; readonly target: SuccessorTarget; readonly from: SuccessorTarget }
+  | { readonly kind: 'exhausted'; readonly position: number }
+  | { readonly kind: 'wait' };
 
 /**
  * W2-3 — `pauseForLimit` composed a T4/T16 trigger the engine REJECTED for a
@@ -1637,7 +1661,7 @@ export class OrchestrationService {
    */
   recordSuccessorIntent(
     runId: RunId,
-    opts?: CommandOptions & { readonly target?: SuccessorTarget },
+    opts?: CommandOptions & { readonly target?: SuccessorTarget; readonly reason?: SuccessorReason },
   ): IngestResult {
     // F1: `BEGIN IMMEDIATE` so the eligibility read + the trigger append (which
     // folds the marker) are one write-locked unit and the inner `ingest`
@@ -1664,9 +1688,11 @@ export class OrchestrationService {
       const seedCheckpointHash = this.resolveResumeCheckpointHash(runId);
       const successor: SuccessorIntentSeed = {
         target,
-        // The un-consumed T5 `segment.successor.required` (if any) is the reason;
-        // otherwise this is a crash/restart recovery successor.
-        reason: requirement?.reason ?? 'recovery',
+        // An explicit `opts.reason` wins (P4b wave-2 FAILOVER stamps
+        // `cross_harness_switch`/`model_switch_indeterminate` for lineage); else
+        // the un-consumed T5 `segment.successor.required` reason; else a plain
+        // crash/restart recovery successor.
+        reason: opts?.reason ?? requirement?.reason ?? 'recovery',
         reassertModel: requirement?.reassertModel ?? true,
         ...(seedCheckpointHash !== undefined ? { seedCheckpointHash } : {}),
       };
@@ -1731,6 +1757,235 @@ export class OrchestrationService {
     const loop = this.getImplementVerifyLoopState(runId);
     if (loop === undefined) return undefined;
     return round.role === 'verifier' ? loop.verifier : loop.implementor;
+  }
+
+  /**
+   * P4b wave 2 FAILOVER — the EFFECTIVE spec a role dispatch should spawn on:
+   * the durable desired-model record (set by `driveFailoverOnLimit` to the next
+   * ladder rung, applied by the existing `initial_config_pin` / model-pin
+   * machinery) if one exists, else the caller's `fallback` (the run default).
+   * The loop reads this at EVERY dispatch so a same-process re-drive AND a
+   * cross-process `resume` both spawn the failover successor on the ladder
+   * target. Pure read — never fabricates a segment.
+   */
+  effectiveRoleSpec(runId: RunId, role: RoleName, fallback: RoleModelSpec): RoleModelSpec {
+    const desired = new DurableDesiredModelStore(this.#db).get(runId, role);
+    if (desired === undefined) return fallback;
+    const harness = this.#narrowHarness(desired.harness);
+    if (harness === undefined) return fallback;
+    return desired.effort !== undefined
+      ? { harness, model: desired.model, effort: desired.effort as ReasoningEffort }
+      : { harness, model: desired.model };
+  }
+
+  /**
+   * P4b wave 2 FAILOVER — clear the per-incident ladder position once the run
+   * has made real progress PAST a limit (a role dispatch returned normally). A
+   * fresh limit later then restarts the ladder from the top rather than
+   * inheriting a stale position. Idempotent; safe to call on every healthy
+   * dispatch. The desired-model record is deliberately LEFT in place: the
+   * successor is legitimately running on the escalated target and `status`
+   * should keep showing it as effective until a human changes it.
+   */
+  resetFailoverIncident(runId: RunId, assignmentId: AssignmentId): void {
+    new DurableFailoverStore(this.#db).clear(runId, assignmentId);
+  }
+
+  /**
+   * P4b wave 2 FAILOVER routing on the PROVEN spine (§5cc/§5ee). Called by the
+   * lease-holding owner AFTER `#pauseForLimit` has ALREADY landed `paused_limit`
+   * + checkpoint + incident atomically (that half is UNCHANGED). This does NOT
+   * wait for the probe ladder: when the assignment's `failoverPolicy` is
+   * `switch_model`/`switch_harness` it self-drives `recordSuccessorIntent` with
+   * the NEXT `failoverLadder` rung — the adapter factory creates the other
+   * harness for `switch_harness`; the successor seeds from the mechanical
+   * checkpoint (`resolveResumeCheckpointHash`) and re-asserts the target pin.
+   *
+   * RULES (§5cc): the caller keeps the SAME `assignmentId` across the failover
+   * (the breaker buckets by assignmentId — a new one would be breaker-evasion),
+   * and this NEVER routes through `evaluateCrash` (a limit is not a crash) — but
+   * a failover successor that LATER crashes DOES feed the breaker, intentionally,
+   * under that same assignmentId. The per-incident ladder counter is its OWN
+   * durable bound (`maxFailoversPerIncident`), distinct from the crash breaker.
+   * On exhaustion the run DEGRADES TO WAIT (T25, stays paused_limit + alert),
+   * never a silent drop.
+   */
+  driveFailoverOnLimit(cause: LimitPausedError, assignmentId: AssignmentId): FailoverDecision {
+    const runId = cause.runId;
+    const config = loadRunConfig(this.#db, runId) ?? this.#config;
+    const policy = config.failoverPolicy;
+    if (policy !== 'switch_model' && policy !== 'switch_harness') return { kind: 'wait' };
+
+    const ladder = config.failoverLadder;
+    // The per-incident walk stops at the SHORTER of the ladder length and the
+    // own counter bound — either way it never oscillates forever.
+    const bound = Math.min(ladder.length, config.maxFailoversPerIncident);
+    const store = new DurableFailoverStore(this.#db);
+
+    // §review-7 F2: the whole failover ADVANCE — desired-target pin + ladder
+    // position advance + `failover` alert + successor intent — commits as ONE
+    // atomic unit (`#atomicEngineWrite` discipline). `BEGIN IMMEDIATE` takes the
+    // write lock up front and every inner `store.set` / `DesiredModelStore.set` /
+    // `ingest` / `recordSuccessorIntent` transparently JOINS this transaction, so
+    // there is NO window where the counter is advanced without the intent
+    // recorded: a crash mid-advance rolls back the position too, and a retry
+    // re-reads the SAME rung it selected rather than skipping one. The position
+    // read is INSIDE the lock so the select→advance is a single serialized atom.
+    // The SPAWN is the post-commit side-effect (the loop's re-dispatch).
+    return this.#db.transactionImmediate((): FailoverDecision => {
+      const position = store.position(runId, assignmentId);
+      const from =
+        this.#defaultSuccessorTarget(runId) ?? { harness: 'claude' as Harness, model: cause.classification.provider };
+
+      // The next rung must both exist (within the bound) AND narrow to a live
+      // harness; otherwise there is NO live target → DEGRADE TO WAIT via T25.
+      const entry = position < bound ? ladder[position] : undefined;
+      const targetHarness = entry !== undefined ? this.#narrowHarness(entry.harness) : undefined;
+      // §review-7 F4(b): a `switch_model` failover is model-ONLY — it must keep
+      // the role's EFFECTIVE (currently-running) harness. The parse-time
+      // cross-field check only proves the ladder entries agree with EACH OTHER;
+      // it cannot know which harness the role is actually running on. If a
+      // `switch_model` rung names a harness other than `from.harness`, REFUSE it
+      // at dispatch (degrade to wait via the same T25 no-live-target path) rather
+      // than silently applying it as a cross-harness switch. `switch_harness` is
+      // free to cross harnesses, so it is exempt from this guard.
+      const crossesHarnessUnderSwitchModel =
+        policy === 'switch_model' &&
+        targetHarness !== undefined &&
+        targetHarness !== from.harness;
+      if (entry === undefined || targetHarness === undefined || crossesHarnessUnderSwitchModel) {
+        // T25 `failover.no_live_target`: precondition suspension_in [paused_limit]
+        // (already true), invariants phase/suspension unchanged → the run STAYS
+        // paused_limit. NEVER drops the failover intent silently. The operator
+        // `failover` alert (topic `failover_exhausted`) is emitted DIRECTLY here
+        // (T25 is not driven at an alert-context fold site).
+        const limitedProviders = [...new Set([from.harness, ...ladder.map((e) => e.harness)])];
+        this.ingest(
+          this.#trigger(runId, 'failover.no_live_target', { limitedProviders }) as DomainEvent,
+        );
+        this.#raiseFailoverExhaustedAlert(runId, cause.role, position, limitedProviders);
+        return { kind: 'exhausted', position };
+      }
+
+      const target: SuccessorTarget = {
+        harness: targetHarness,
+        model: entry.model,
+        ...(entry.effort !== undefined ? { effort: entry.effort } : {}),
+      };
+      // Reuse the desired-model store as the escalation target's durable home so
+      // the successor spawn (this loop's re-dispatch OR a cross-process resume)
+      // pins it through the existing model-pin machinery (§5cc: reuse the store).
+      new DurableDesiredModelStore(this.#db).set({
+        runId: String(runId),
+        role: cause.role,
+        harness: target.harness,
+        model: target.model,
+        ...(target.effort !== undefined ? { effort: target.effort } : {}),
+        requestedAt: this.#clock.nowIso(),
+      });
+      // Advance the durable per-incident counter WITH the intent in this one
+      // atomic unit — the crash-safety comes from the enclosing transaction, not
+      // from ordering (the pre-fix ordering skipped a rung on a crash between the
+      // advance and the intent).
+      store.set(runId, assignmentId, position + 1);
+      const reason: SuccessorReason =
+        target.harness !== from.harness ? 'cross_harness_switch' : 'model_switch_indeterminate';
+      // Cross-harness successor is checkpoint-only (no NL digest, §12.2 deferred)
+      // — the seed is `resolveResumeCheckpointHash`, which recordSuccessorIntent
+      // reads. Record the from→to lineage on the durable `failover` alert.
+      this.#raiseFailoverAlert(runId, cause.role, from, target, position + 1, bound);
+      this.recordSuccessorIntent(runId, { target, reason });
+      return { kind: 'failover', target, from };
+    });
+  }
+
+  /** P4b wave 2 — narrow a stored/config harness id to a live `Harness`, or
+   * `undefined` when it is not one of the MVP harnesses (a misconfigured rung is
+   * treated as no-live-target rather than throwing inside the loop's catch). */
+  #narrowHarness(value: string): Harness | undefined {
+    try {
+      return asHarness(value);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * P4b wave 2 — raise the durable operator `alert.raised{failover}` for a
+   * ladder step. Like the `respawn` alert it is emitted DIRECTLY by the spine
+   * (there is no `failover` notify effect), carrying the from→to lineage
+   * (predecessor harness/model → successor harness/model), the ladder step, and
+   * the estimated new-session note (the cross-harness successor continues from
+   * the mechanical checkpoint, NOT the dead session's raw history). Detail is
+   * §17.1-redacted; the idempotency key derives from (run, role, step) so replay
+   * reproduces identical bytes and re-delivery dedups per `(alertId, sink)`.
+   */
+  #raiseFailoverAlert(
+    runId: RunId,
+    role: RoleName,
+    from: SuccessorTarget,
+    to: SuccessorTarget,
+    step: number,
+    bound: number,
+  ): void {
+    const key = idempotencyKey(`alert.raised:failover:${String(runId)}:${role}:${step}`);
+    const note =
+      to.harness !== from.harness
+        ? 'cross-harness successor continues from the mechanical checkpoint (new session, no raw history)'
+        : 'same-harness successor continues from the mechanical checkpoint';
+    const detail =
+      `failover ${role} ${from.harness}/${from.model} → ${to.harness}/${to.model}` +
+      `${to.effort !== undefined ? ` (${to.effort})` : ''} — ladder step ${step}/${bound}; ${note}`;
+    this.ingest(
+      draftEvent({
+        type: 'alert.raised',
+        runId,
+        idempotencyKey: key,
+        occurredAt: this.#clock.nowIso(),
+        payload: {
+          alertId: alertId(String(key)),
+          kind: 'failover',
+          role,
+          topic: 'failover',
+          detail: redactText(detail),
+        },
+      }) as DomainEvent,
+    );
+  }
+
+  /**
+   * P4b wave 2 — raise the durable operator `alert.raised{failover}` for the
+   * DEGRADE-TO-WAIT case (T25 `failover.no_live_target`): the ladder ran out (or
+   * `maxFailoversPerIncident` was hit, or no rung narrows to a live harness), so
+   * the run stays `paused_limit`. Topic `failover_exhausted` distinguishes it
+   * from a per-step `failover` alert. Idempotency keyed on (run, role, position).
+   */
+  #raiseFailoverExhaustedAlert(
+    runId: RunId,
+    role: RoleName,
+    position: number,
+    limitedProviders: readonly string[],
+  ): void {
+    const key = idempotencyKey(`alert.raised:failover_exhausted:${String(runId)}:${role}:${position}`);
+    const detail =
+      `failover ladder exhausted for ${role} after ${position} step${position === 1 ? '' : 's'} ` +
+      `(providers tried: ${limitedProviders.join(', ')}) — DEGRADING TO WAIT: the run stays paused_limit ` +
+      `for a probe or a manual resume`;
+    this.ingest(
+      draftEvent({
+        type: 'alert.raised',
+        runId,
+        idempotencyKey: key,
+        occurredAt: this.#clock.nowIso(),
+        payload: {
+          alertId: alertId(String(key)),
+          kind: 'failover',
+          role,
+          topic: 'failover_exhausted',
+          detail: redactText(detail),
+        },
+      }) as DomainEvent,
+    );
   }
 
   /**

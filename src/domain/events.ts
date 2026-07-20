@@ -85,7 +85,15 @@ export type NotifyTopic =
    * the successor spine raises the `respawn` alert DIRECTLY (this topic is only
    * the alert's audit back-reference), so it never fans out as an operator notify.
    */
-  | 'respawn';
+  | 'respawn'
+  /**
+   * P4b wave 2 FAILOVER (§5cc/§5ee): a usage limit under a `switch_model` /
+   * `switch_harness` policy self-drove the successor spine to the NEXT ladder
+   * target. Like `respawn`, this is NOT a `notify.requested` engine effect — the
+   * spine raises the `failover` alert DIRECTLY (this topic is only the alert's
+   * audit back-reference), so it never fans out as an operator notify.
+   */
+  | 'failover';
 
 /**
  * P4b-1 alert taxonomy (§5cc): the kinds of durable operator alert raised as a
@@ -95,7 +103,7 @@ export type NotifyTopic =
  * P4b-2 auto-respawn wave (the successor spine emits it) — declared now so the
  * projection/sink vocabulary is stable and wave 2 is a small delta.
  */
-export type AlertKind = 'limit_paused' | 'crash' | 'respawn' | 'breaker_open';
+export type AlertKind = 'limit_paused' | 'crash' | 'respawn' | 'breaker_open' | 'failover';
 
 /**
  * A named delivery sink for a raised alert. Built-ins are process `stderr`

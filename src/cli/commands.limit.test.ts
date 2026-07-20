@@ -29,6 +29,7 @@ import { artifactHash, specHash as toSpecHash, specVersionId as toSpecVersionId,
 import { openTestDatabase, type TestDatabaseHandle } from '../persistence/test-support.js';
 import { ArtifactStore } from '../artifacts/store.js';
 import { loadProfileFile, type Profile } from '../config/profile.js';
+import { engineConfigSchema } from '../config/schema.js';
 import {
   AdapterError,
   InProcessFakeAdapter,
@@ -221,18 +222,28 @@ function clockWaiter(clock: ManualClock, sleeps: number[]): WaitScheduler {
   };
 }
 
-async function setup(scripts: {
-  readonly coordinator?: readonly AdapterScript[];
-  readonly implementor?: readonly AdapterScript[];
-  readonly verifier?: readonly AdapterScript[];
-}): Promise<Wired> {
+async function setup(
+  scripts: {
+    readonly coordinator?: readonly AdapterScript[];
+    readonly implementor?: readonly AdapterScript[];
+    readonly verifier?: readonly AdapterScript[];
+  },
+  // §review-7 F8: an optional pinned engine config (e.g. a `switch_model`
+  // failover policy) so `status` can be exercised against a non-default policy.
+  configOverride?: Record<string, unknown>,
+): Promise<Wired> {
   repo = await makeTempGitRepo('harness-cli-limit-');
   const clock = new ManualClock(T0);
   dbHandle = await openTestDatabase({ kind: 'better-sqlite3', file: true, clock });
   worktrees = await GitWorktreeManager.open({ primaryRepoRoot: repo.dir, clock });
   const ids = new DeterministicIdFactory();
   const flowIds = new DeterministicIdFactory();
-  const service = new OrchestrationService({ db: dbHandle.db, ids, adapterFactory: makeFactory(scripts) });
+  const service = new OrchestrationService({
+    db: dbHandle.db,
+    ids,
+    adapterFactory: makeFactory(scripts),
+    ...(configOverride !== undefined ? { config: engineConfigSchema.parse(configOverride) } : {}),
+  });
   const store = new ArtifactStore({ rootDir: dbHandle.casRoot, clock, ids: flowIds });
   const profileResult = loadProfileFile(PROFILE_PATH);
   if (!profileResult.ok) throw new Error('coordinator profile failed to load');
@@ -643,6 +654,66 @@ describe('resume eligibility and status while paused', () => {
     const fresh = w2.service.createRun({ goal: 'g', workspacePath: repo!.dir, coordinator: COORDINATOR });
     const freshStatus = await executeCommand(w2.service, w2.db, { kind: 'status', json: true, runId: fresh.runId }, {});
     expect(freshStatus.json['limit']).toBeUndefined();
+  });
+
+  // §review-7 F8: status must not contradict durable state. It (a) reports the
+  // ACTUAL configured failover policy (not a hard-coded `wait`), and (b) surfaces
+  // an incident's structured `resumesAt` in BOTH the top-level `eta` and the
+  // human-readable line — keeping `unknown` only when genuinely unknown.
+  it('status reports the run\'s ACTUAL switch_model failover policy (not a hard-coded `wait`)', async () => {
+    // A `switch_model` ladder whose only rung crosses to `claude` while the
+    // implementor runs on `codex` DEGRADES to wait at dispatch (§review-7 F4b) —
+    // so the run STAYS paused_limit, but the pinned policy is still `switch_model`.
+    const w = await setup(
+      {
+        coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+        implementor: [{ turns: [{ errorEnvelope: rateLimitErrorEnvelope() }] }],
+      },
+      { failoverPolicy: 'switch_model', failoverLadder: [{ harness: 'claude', model: 'opus', effort: 'low' }] },
+    );
+    const runId = await startAndApprove(w);
+    await executeCommand(w.service, w.db, RUN_CMD(runId, true), {}, w.deps);
+
+    const status = await executeCommand(w.service, w.db, { kind: 'status', json: true, runId }, {});
+    expect(status.json['suspension']).toBe('paused_limit');
+    const limit = status.json['limit'] as Record<string, unknown>;
+    expect(limit['policy']).toBe('switch_model'); // the durable pinned policy
+    expect(limit['policy']).not.toBe('wait'); // never the hard-coded default
+  });
+
+  it('status surfaces a structured resumesAt as the exact ETA (top-level + human line), not unknown', async () => {
+    const RESUMES_AT = '2026-07-18T03:30:00.000Z';
+    const w = await setup({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [{ turns: [{ errorEnvelope: rateLimitErrorEnvelope({ resumesAt: RESUMES_AT }) }] }],
+    });
+    const runId = await startAndApprove(w);
+    await executeCommand(w.service, w.db, RUN_CMD(runId, true), {}, w.deps);
+
+    const status = await executeCommand(w.service, w.db, { kind: 'status', json: true, runId }, {});
+    expect(status.json['suspension']).toBe('paused_limit');
+    // Top-level ETA is the EXACT reset time — not the word `unknown`.
+    expect(status.json['eta']).toBe(RESUMES_AT);
+    const limit = status.json['limit'] as Record<string, unknown>;
+    expect(limit['resumesAt']).toBe(RESUMES_AT);
+    // Human-readable line surfaces it too (never the `ETA unknown` phrasing).
+    expect(status.text).toContain(`ETA ${RESUMES_AT}`);
+    expect(status.text).not.toContain('ETA unknown');
+  });
+
+  it('status keeps a GENUINELY-unknown ETA as `unknown` (no structured reset crossed the ACP)', async () => {
+    const w = await setup({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [{ turns: [{ errorEnvelope: rateLimitErrorEnvelope() }] }], // no resumesAt
+    });
+    const runId = await startAndApprove(w);
+    await executeCommand(w.service, w.db, RUN_CMD(runId, true), {}, w.deps);
+
+    const status = await executeCommand(w.service, w.db, { kind: 'status', json: true, runId }, {});
+    expect(status.json['suspension']).toBe('paused_limit');
+    expect(status.json['eta']).toBe('unknown'); // honest: no invented countdown (§13)
+    expect((status.json['limit'] as Record<string, unknown>)['resumesAt']).toBe('unknown');
+    expect(status.text).toContain('ETA unknown');
   });
 
   it('startup reclaim: an unacknowledged pending re-entry (T9 landed, process died) is driven idempotently by the next resume', async () => {

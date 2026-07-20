@@ -1647,9 +1647,11 @@ function buildLimitStatus(
           }
         : {}),
     },
-    // §13 per-assignment failover policy: `wait` is the MVP default and the
-    // only implemented policy until P4b lands switch_model/switch_harness.
-    policy: 'wait',
+    // §13/§review-7 F8 per-assignment failover policy: report the ACTUAL
+    // configured/effective policy for the run (`wait` | `switch_model` |
+    // `switch_harness`), never a hard-coded `wait` — status must not contradict
+    // the durable pinned config now that P4b implements the switch_* policies.
+    policy: pinned.failoverPolicy,
   };
 }
 
@@ -1682,6 +1684,13 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
   const st = service.status(runId);
   const checkpoints = collectCheckpoints(db, runId);
   const rssBytes = latestRssBytes(db, runId);
+  // §review-7 F8: build the limit block ONCE so both the top-level ETA and the
+  // block agree. A structured `resumesAt` (an ISO string, not the WORD
+  // `unknown`) is the exact reset time that crossed the ACP.
+  const limit = st.suspension === 'paused_limit' ? buildLimitStatus(service, db, runId) : undefined;
+  const resumesAt = limit?.['resumesAt'];
+  const limitResumesAt =
+    typeof resumesAt === 'string' && resumesAt !== 'unknown' ? resumesAt : undefined;
   const view: Record<string, unknown> = {
     runId,
     phase: st.phase,
@@ -1698,16 +1707,13 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
     operation: st.operation,
     uiState: st.uiState,
     childActive: st.childActive,
-    // §13: honest ETA — 'unknown' while limit-paused (no reset crosses ACP), else n/a.
-    eta: st.suspension === 'paused_limit' ? 'unknown' : null,
+    // §13/§review-7 F8: honest ETA — while limit-paused, surface the incident's
+    // EXACT structured `resumesAt` when one crossed the ACP; otherwise the WORD
+    // `unknown` (never an invented countdown). `null` (n/a) when not limit-paused.
+    eta: st.suspension === 'paused_limit' ? (limitResumesAt ?? 'unknown') : null,
     // W2-5: the honest limit block — incident/resumesAt/probes/policy — is
     // present exactly while the run is limit-paused with a recorded incident.
-    ...(st.suspension === 'paused_limit'
-      ? (() => {
-          const limit = buildLimitStatus(service, db, runId);
-          return limit !== undefined ? { limit } : {};
-        })()
-      : {}),
+    ...(limit !== undefined ? { limit } : {}),
     ...(st.resumeReentryPending !== undefined ? { resumeReentryPending: st.resumeReentryPending } : {}),
     counters: st.counters,
     ...(st.approvedSpecHash !== undefined ? { approvedSpecHash: st.approvedSpecHash } : {}),
@@ -2026,7 +2032,15 @@ function renderStatusText(view: Record<string, unknown>, suspension: string): st
       : `$${String(vitals.cost['totalCostUsd'])}`;
   const lines = [
     `run ${String(view['runId'])} — phase ${String(view['phase'])}, ui ${String(view['uiState'])}`,
-    `  suspension: ${suspension}${suspension === 'paused_limit' ? ' (ETA unknown — no reset time crosses ACP, §13)' : ''}`,
+    // §review-7 F8: when the incident carries a structured reset time, surface it
+    // as the exact ETA; keep `unknown` only when no reset crossed the ACP (§13).
+    `  suspension: ${suspension}${
+      suspension === 'paused_limit'
+        ? typeof view['eta'] === 'string' && view['eta'] !== 'unknown'
+          ? ` (ETA ${String(view['eta'])} — structured reset from the incident, §13)`
+          : ' (ETA unknown — no reset time crosses ACP, §13)'
+        : ''
+    }`,
     `  operation:  ${JSON.stringify(view['operation'])}`,
     `  child active: ${String(view['childActive'])}`,
     `  cost: ${costLabel} over ${String(vitals.cost['turns'])} turn(s); ` +

@@ -24,6 +24,7 @@
  */
 import { z } from 'zod';
 import type { FailoverPolicy } from '../domain/entities.js';
+import { HARNESSES, REASONING_EFFORTS } from '../app/model-resolution.js';
 import { DEFAULT_BOUNDS, DEFAULT_PROBE_LADDER_MINUTES } from '../domain/state.js';
 import { RSS_GRACEFUL_STOP_DEADLINE_MS } from '../domain/transitions.js';
 import { isSecretKeyName } from '../redaction/patterns.js';
@@ -71,6 +72,50 @@ export const FAILOVER_POLICIES = [
 ] as const satisfies readonly FailoverPolicy[];
 
 export const DEFAULT_FAILOVER_POLICY: FailoverPolicy = 'wait';
+
+// ---------------------------------------------------------------------------
+// P4b wave 2 FAILOVER (§5cc/§5ee): on a usage LIMIT, `switch_model`/
+// `switch_harness` self-drive the PROVEN successor spine (recordSuccessorIntent
+// with a ladder target) — NOT a new mechanism. The escalation target is drawn
+// IN ORDER from a per-assignment `failoverLadder` of concrete
+// {harness, model, effort?} targets. There is NO implicit default target: an
+// empty ladder means there is nothing to escalate TO, so the schema REFUSES
+// `switch_model`/`switch_harness` without a non-empty ladder (the honest policy
+// stays `wait`) and always refuses `ask` (unimplemented). `switch_model` is a
+// model-only ladder — every entry must keep ONE harness; only `switch_harness`
+// may cross harnesses. `maxFailoversPerIncident` bounds the per-incident ladder
+// walk with its OWN counter (distinct from — and never fed into — the §14 crash
+// breaker; a failover successor's LATER crash still feeds the breaker).
+// ---------------------------------------------------------------------------
+export const DEFAULT_MAX_FAILOVERS_PER_INCIDENT = 2;
+
+// §review-7 F4(a): a ladder entry's `harness`/`effort` must name a value the
+// RUNTIME can actually honor — an arbitrary string (`claude-code`, `xhigh`) that
+// parses today would only fail deep in dispatch (`#narrowHarness` → no-live-target
+// degrade) or silently drop the effort. Validate both at PARSE against the single
+// existing runtime vocabulary (`HARNESSES` = claude|codex, `REASONING_EFFORTS`)
+// reused from model-resolution.ts — no parallel list — so a misconfiguration is a
+// loud config error, not a runtime surprise.
+const failoverLadderEntrySchema = z
+  .object({
+    /** Harness id the successor runs on — a live MVP harness (`claude`|`codex`). */
+    harness: z.enum(HARNESSES, {
+      message: `failoverLadder harness must be one of ${HARNESSES.join(', ')}`,
+    }),
+    /** Provider model slug (e.g. `opus`, `gpt-5.6-terra`). */
+    model: z.string().min(1),
+    /** Optional per-target effort/thinking level — the runtime reasoning vocab. */
+    effort: z
+      .enum(REASONING_EFFORTS, {
+        message: `failoverLadder effort must be one of ${REASONING_EFFORTS.join(', ')}`,
+      })
+      .optional(),
+  })
+  .strict()
+  .readonly();
+
+/** One ordered escalation target in a per-assignment `failoverLadder`. */
+export type FailoverLadderEntry = z.infer<typeof failoverLadderEntrySchema>;
 
 // ---------------------------------------------------------------------------
 // §14: window-bound restart count is configurable among exactly 3|5|8, or
@@ -282,19 +327,27 @@ export const engineConfigSchema = z
     /** §14 concurrency: simple max-live-children guard (default 3). */
     maxLiveChildren: z.number().int().positive().default(3),
     /**
-     * §13: per-assignment default. The vocabulary (`wait|switch_model|
-     * switch_harness|ask`) is defined for the domain, but only `wait` is
-     * implemented — the runtime and status output hardcode `wait`. Non-`wait`
-     * failover (switch_model/switch_harness/ask) is P4b and unimplemented, so
-     * W4-1 rejects it at parse rather than silently accepting a no-op policy.
+     * §13: per-assignment default. `wait` (default) pauses + alerts. P4b wave 2
+     * accepts `switch_model`/`switch_harness` — but ONLY paired with a non-empty
+     * `failoverLadder` (enforced cross-field below; no implicit target). `ask`
+     * stays unimplemented, so it is refused here at parse rather than silently
+     * accepting a no-op policy (W4-1: accepted config must act or be refused).
      */
     failoverPolicy: z
       .literal(FAILOVER_POLICIES)
-      .refine((p) => p === DEFAULT_FAILOVER_POLICY, {
-        message:
-          "only 'wait' failoverPolicy is supported; 'switch_model', 'switch_harness', and 'ask' are not yet supported (P4b)",
+      .refine((p) => p !== 'ask', {
+        message: "'ask' failoverPolicy is not yet supported (P4b unimplemented)",
       })
       .default(DEFAULT_FAILOVER_POLICY),
+    /**
+     * P4b wave 2: per-assignment ORDERED escalation targets for
+     * `switch_model`/`switch_harness`. Empty by default — NO implicit target.
+     * Required (non-empty) whenever the policy is `switch_*` (cross-field).
+     */
+    failoverLadder: z.array(failoverLadderEntrySchema).readonly().default([]),
+    /** P4b wave 2: bound on the per-incident ladder walk (own counter, not the
+     * §14 crash breaker). */
+    maxFailoversPerIncident: z.number().int().positive().default(DEFAULT_MAX_FAILOVERS_PER_INCIDENT),
     limitProbe: limitProbeSchema.default(LIMIT_PROBE_DEFAULT),
     quotas: quotasSchema.default(QUOTAS_DEFAULT),
     remediation: remediationSchema.default(REMEDIATION_DEFAULT),
@@ -304,6 +357,37 @@ export const engineConfigSchema = z
     verification: verificationSchema.default(VERIFICATION_DEFAULT),
   })
   .strict()
+  // P4b wave 2: `switch_model`/`switch_harness` are only meaningful with a
+  // concrete ladder — refuse them without one (no implicit target), and keep
+  // `switch_model` model-only (single harness across all entries).
+  .superRefine((cfg, ctx) => {
+    const policy = cfg.failoverPolicy;
+    if (policy !== 'switch_model' && policy !== 'switch_harness') return;
+    if (cfg.failoverLadder.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['failoverPolicy'],
+        message:
+          `failoverPolicy '${policy}' requires a non-empty failoverLadder ` +
+          `(no implicit default target: configure an ordered list of ` +
+          `{harness, model, effort?} targets, or leave the policy at 'wait')`,
+      });
+      return;
+    }
+    if (policy === 'switch_model') {
+      const harnesses = [...new Set(cfg.failoverLadder.map((e) => e.harness))];
+      if (harnesses.length > 1) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['failoverLadder'],
+          message:
+            `failoverPolicy 'switch_model' is a model-only ladder: every ` +
+            `failoverLadder entry must keep the same harness (found ` +
+            `${harnesses.join(', ')}); use 'switch_harness' to cross harnesses`,
+        });
+      }
+    }
+  })
   .readonly();
 
 export type EngineConfig = z.infer<typeof engineConfigSchema>;
@@ -315,6 +399,8 @@ export type RemediationConfig = EngineConfig['remediation'];
 export type CheckpointConfig = EngineConfig['checkpoint'];
 export type BudgetConfig = EngineConfig['budget'];
 export type VerificationConfig = EngineConfig['verification'];
+/** P4b wave 2: the resolved per-assignment ordered escalation ladder. */
+export type FailoverLadderConfig = EngineConfig['failoverLadder'];
 
 /** Fully-resolved defaults — safe to import directly with no I/O or overrides. */
 export const DEFAULT_ENGINE_CONFIG: EngineConfig = deepFreeze(engineConfigSchema.parse({}));

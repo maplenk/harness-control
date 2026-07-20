@@ -219,6 +219,23 @@ model. Live in-place switching at a completed-turn boundary is deferred).
   unless the provider supplied one — never an invented countdown. Cost totals
   separate measured spend from conservative estimates, and `--max-budget` is
   an estimated soft budget (refusal gate), never claimed as a hard ceiling.
+- **Opt-in failover on a usage limit.** With a per-assignment
+  `failoverPolicy` of `switch_model`/`switch_harness` and an ORDERED
+  `failoverLadder` of `{harness, model, effort?}` targets (each `harness`/`effort`
+  validated at parse against the runtime vocabulary — an unadvertised value is
+  rejected, not accepted only to fail later), a usage limit first
+  pauses+checkpoints as usual, then self-drives the proven successor spine to
+  the next ladder rung (a same-harness model swap, or a checkpoint-seeded
+  successor on the other harness) instead of waiting — bounded per incident by
+  `maxFailoversPerIncident`. The failover keeps the same assignment (so the
+  crash breaker cannot be evaded) and raises a durable `failover` alert with
+  the from→to lineage; when the ladder is exhausted the run honestly degrades
+  to wait (stays paused for a probe or manual resume), never silently dropped.
+  Failover works for BOTH the implementor and the verifier half: the re-drive
+  re-enters at the role that paused (a verifier re-enters at verification), and
+  the whole ladder advance commits atomically so a crash mid-failover retries
+  the SAME rung rather than skipping one. Default `wait` is unchanged: pause and
+  wait.
 
 ## Layout
 

@@ -41,6 +41,10 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
       },
       maxLiveChildren: 3,
       failoverPolicy: 'wait',
+      // P4b wave 2: empty ladder by default (NO implicit target); per-incident
+      // failover walk bounded at 2.
+      failoverLadder: [],
+      maxFailoversPerIncident: 2,
       // W2-4 (Rev 2 correction): the cap is PER INCIDENT (`maxProbesPerIncident`,
       // permanent exhaustion) — the Wave-1 sliding-window fields
       // (`maxProbesPerWindow`/`windowHours`) are gone, deliberately.
@@ -177,22 +181,161 @@ describe('parseEngineConfig (deep partial overrides + validation)', () => {
     expect(isErr(result)).toBe(true);
   });
 
-  it('W4-1: rejects non-`wait` failover policies until P4b implements them (accepted config must act, not no-op)', () => {
-    // The vocabulary is defined for the domain, but only `wait` is
-    // implemented — the runtime + status output hardcode `wait`. Accepting a
-    // switch_model/switch_harness/ask override would silently no-op, so the
-    // schema refuses it at parse with a clear "not yet supported (P4b)" error.
-    for (const policy of ['switch_model', 'switch_harness', 'ask'] as const) {
-      const result = parseEngineConfig({ failoverPolicy: policy });
-      expect(isErr(result)).toBe(true);
-      if (isErr(result)) {
-        expect(issuePaths(result.error)).toContain('failoverPolicy');
-        expect(result.error.some((issue) => /P4b/.test(issue.message))).toBe(true);
-      }
-    }
-    // `wait` (and the default) still parse.
+  it('P4b wave 2: `wait` (and the default) still parse', () => {
     expect(isOk(parseEngineConfig({ failoverPolicy: 'wait' }))).toBe(true);
     expect(isOk(parseEngineConfig({}))).toBe(true);
+  });
+
+  it('P4b wave 2: still refuses `ask` (unimplemented) with a clear P4b message', () => {
+    const result = parseEngineConfig({ failoverPolicy: 'ask' });
+    expect(isErr(result)).toBe(true);
+    if (isErr(result)) {
+      expect(issuePaths(result.error)).toContain('failoverPolicy');
+      expect(result.error.some((issue) => /P4b/.test(issue.message))).toBe(true);
+    }
+    // Even paired with a ladder, `ask` is refused — it is unimplemented.
+    expect(
+      isErr(
+        parseEngineConfig({
+          failoverPolicy: 'ask',
+          failoverLadder: [{ harness: 'codex', model: 'gpt-5.6-terra' }],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it('P4b wave 2: accepts `switch_model` with a non-empty single-harness ladder', () => {
+    const result = parseEngineConfig({
+      failoverPolicy: 'switch_model',
+      failoverLadder: [
+        { harness: 'claude', model: 'opus' },
+        { harness: 'claude', model: 'sonnet', effort: 'high' },
+      ],
+    });
+    expect(isOk(result)).toBe(true);
+    if (isOk(result)) {
+      expect(unwrap(result).failoverLadder).toEqual([
+        { harness: 'claude', model: 'opus' },
+        { harness: 'claude', model: 'sonnet', effort: 'high' },
+      ]);
+    }
+  });
+
+  it('P4b wave 2: accepts `switch_harness` with a cross-harness ladder', () => {
+    const result = parseEngineConfig({
+      failoverPolicy: 'switch_harness',
+      failoverLadder: [
+        { harness: 'claude', model: 'opus' },
+        { harness: 'codex', model: 'gpt-5.6-terra', effort: 'high' },
+      ],
+      maxFailoversPerIncident: 3,
+    });
+    expect(isOk(result)).toBe(true);
+    if (isOk(result)) expect(unwrap(result).maxFailoversPerIncident).toBe(3);
+  });
+
+  // §review-7 F4(a): harness/effort in a ladder entry must name a value the
+  // RUNTIME can honor (the `HARNESSES` / `REASONING_EFFORTS` vocab reused from
+  // model-resolution.ts) — an arbitrary string that would only fail deep in
+  // dispatch is now a loud PARSE error.
+  it('P4b wave 2 (F4a): REJECTS an unadvertised harness at parse (`claude-code`)', () => {
+    const result = parseEngineConfig({
+      failoverPolicy: 'switch_harness',
+      failoverLadder: [{ harness: 'claude-code', model: 'opus' }],
+    });
+    expect(isErr(result)).toBe(true);
+    if (isErr(result)) {
+      expect(issuePaths(result.error).some((p) => /failoverLadder/.test(p))).toBe(true);
+      expect(result.error.some((i) => /harness must be one of/.test(i.message))).toBe(true);
+    }
+  });
+
+  it('P4b wave 2 (F4a): REJECTS an unadvertised effort at parse (`xhigh`)', () => {
+    const result = parseEngineConfig({
+      failoverPolicy: 'switch_harness',
+      failoverLadder: [{ harness: 'codex', model: 'gpt-5.6-terra', effort: 'xhigh' }],
+    });
+    expect(isErr(result)).toBe(true);
+    if (isErr(result)) {
+      expect(issuePaths(result.error).some((p) => /failoverLadder/.test(p))).toBe(true);
+      expect(result.error.some((i) => /effort must be one of/.test(i.message))).toBe(true);
+    }
+  });
+
+  it('P4b wave 2 (F4a): a valid harness+effort entry still parses', () => {
+    const result = parseEngineConfig({
+      failoverPolicy: 'switch_harness',
+      failoverLadder: [{ harness: 'codex', model: 'gpt-5.6-terra', effort: 'high' }],
+    });
+    expect(isOk(result)).toBe(true);
+  });
+
+  it('P4b wave 2: REJECTS `switch_model` without a ladder (no implicit target)', () => {
+    const result = parseEngineConfig({ failoverPolicy: 'switch_model' });
+    expect(isErr(result)).toBe(true);
+    if (isErr(result)) {
+      expect(issuePaths(result.error)).toContain('failoverPolicy');
+      expect(result.error.some((i) => /non-empty failoverLadder/.test(i.message))).toBe(true);
+    }
+    // An explicitly-empty ladder is refused the same way.
+    expect(isErr(parseEngineConfig({ failoverPolicy: 'switch_model', failoverLadder: [] }))).toBe(
+      true,
+    );
+  });
+
+  it('P4b wave 2: REJECTS `switch_harness` without a ladder (no implicit target)', () => {
+    const result = parseEngineConfig({ failoverPolicy: 'switch_harness' });
+    expect(isErr(result)).toBe(true);
+    if (isErr(result)) {
+      expect(issuePaths(result.error)).toContain('failoverPolicy');
+      expect(result.error.some((i) => /non-empty failoverLadder/.test(i.message))).toBe(true);
+    }
+  });
+
+  it('P4b wave 2: REJECTS a `switch_model` ladder that changes harness (model-only)', () => {
+    const result = parseEngineConfig({
+      failoverPolicy: 'switch_model',
+      failoverLadder: [
+        { harness: 'claude', model: 'opus' },
+        { harness: 'codex', model: 'gpt-5.6-terra' },
+      ],
+    });
+    expect(isErr(result)).toBe(true);
+    if (isErr(result)) {
+      expect(issuePaths(result.error)).toContain('failoverLadder');
+      expect(result.error.some((i) => /same harness/.test(i.message))).toBe(true);
+    }
+  });
+
+  it('P4b wave 2: validates ladder entries (rejects empty/missing fields and unknown keys)', () => {
+    // Missing model.
+    expect(
+      isErr(parseEngineConfig({ failoverPolicy: 'switch_harness', failoverLadder: [{ harness: 'codex' }] })),
+    ).toBe(true);
+    // Empty harness string.
+    expect(
+      isErr(
+        parseEngineConfig({
+          failoverPolicy: 'switch_harness',
+          failoverLadder: [{ harness: '', model: 'opus' }],
+        }),
+      ),
+    ).toBe(true);
+    // Unknown key (strict entry schema).
+    expect(
+      isErr(
+        parseEngineConfig({
+          failoverPolicy: 'switch_harness',
+          failoverLadder: [{ harness: 'codex', model: 'opus', temperature: 0.7 }],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it('P4b wave 2: rejects a non-positive / non-integer maxFailoversPerIncident', () => {
+    expect(isErr(parseEngineConfig({ maxFailoversPerIncident: 0 }))).toBe(true);
+    expect(isErr(parseEngineConfig({ maxFailoversPerIncident: -1 }))).toBe(true);
+    expect(isErr(parseEngineConfig({ maxFailoversPerIncident: 1.5 }))).toBe(true);
   });
 
   it('W3-1: accepts explicit, non-credential verification env-allowlist additions', () => {

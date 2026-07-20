@@ -54,7 +54,7 @@ import type { RunPhase } from '../../domain/state.js';
 import * as git from '../../worktree/git.js';
 import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import type { RoleModelSpec } from '../model-resolution.js';
-import { AutoRespawnSignal, type OrchestrationService } from '../service.js';
+import { AutoRespawnSignal, LimitPausedError, type OrchestrationService } from '../service.js';
 import { waitMs } from '../../supervisor/breaker.js';
 import { RunOwnershipConflictError } from '../run-ownership-store.js';
 import type { RoleRoundProjection } from '../projections.js';
@@ -232,6 +232,37 @@ function resolveResumeEntry(round: RoleRoundProjection, entryPhase: RunPhase): R
   throw new LoopCompositionError(
     `Cannot resume the implement→verify loop from a '${round.role}' round (coordinator rounds re-enter via runCoordination)`,
   );
+}
+
+/** A same-process re-drive re-entry override (§review-7 F1). */
+interface RedriveReentry {
+  readonly plan: ResumeEntryPlan;
+  readonly round: RoleRoundProjection;
+}
+
+/**
+ * §review-7 F1 — after a SAME-PROCESS re-drive (a `switch_model`/`switch_harness`
+ * failover on a limit, OR a bounded `AutoRespawnSignal` on a crash) records the
+ * successor intent, resolve WHERE the retried round re-enters from the durable
+ * `RoleRoundProjection` — exactly as the cross-process `resume` path does. A
+ * VERIFIER round re-enters at VERIFICATION on its immutable binding (returns the
+ * override); an IMPLEMENTOR round re-enters at the loop's default implementor
+ * branch (returns `undefined` — the branch is unchanged, so the proven
+ * implementor-side failover/respawn path is byte-for-byte preserved).
+ *
+ * Without this, the re-drive returns to the loop top with `resume` undefined →
+ * `skipImplement` false → it unconditionally enters the implementor branch, and
+ * when the paused/crashed role was the VERIFIER the phase guard rejects it with
+ * `LoopCompositionError`. This carries the failed role through the re-drive so
+ * BOTH drivers (failover AND auto-respawn) re-enter the correct half.
+ */
+function resolveRedriveReentry(service: OrchestrationService, runId: RunId): RedriveReentry | undefined {
+  const round = service.getRoleRound(runId);
+  if (round === undefined) return undefined;
+  const plan = resolveResumeEntry(round, service.status(runId).phase);
+  // Only the verifier half needs a re-entry override; an implementor re-entry
+  // (`first: 'implement'`) is the loop's default and must not be perturbed.
+  return plan.first === 'verify' ? { plan, round } : undefined;
 }
 
 /** The resumed implementor round's PERSISTED task scope (serialized round
@@ -453,19 +484,31 @@ export async function runImplementVerifyLoop(
     // watchdog must taint through THIS manager on an emergency kill and respect
     // its git-op leases before a deadline termination.
     service.attachWorktreeSupervision(worktrees);
+    // §review-7 F1: a same-process re-drive (failover / bounded auto-respawn) may
+    // record a VERIFIER re-entry override that the NEXT iteration consumes so the
+    // verifier half re-enters at verification instead of the implementor branch.
+    let redrive: RedriveReentry | undefined;
     // P4b-2: manual increment — a round that completes advances `round`; a round
     // that CRASHES under bounded auto-respawn is re-driven at the SAME `round`
     // (the `catch` below), so the retry rebuilds a fresh dispatch from the live
     // phase rather than re-running a stale one.
     for (let round = entry.startRound; round <= maxRounds; ) {
       try {
-      const resumedRound = resume !== undefined && round === entry.startRound;
-      const skipImplement = resumedRound && entry.first === 'verify';
+      // Re-entry for THIS iteration: a same-process re-drive override (§review-7
+      // F1) wins; else the cross-process `resume` entry on its start round; else
+      // a fresh round. Both non-fresh sources drive skip/forced-verifier the same
+      // way, so a verifier re-drive re-enters at verification exactly like resume.
+      const reentry: RedriveReentry | undefined =
+        redrive ??
+        (resume !== undefined && round === entry.startRound ? { plan: entry, round: resume.round } : undefined);
+      redrive = undefined; // consumed for this iteration
+      const resumedRound = reentry !== undefined;
+      const skipImplement = reentry?.plan.first === 'verify';
       // The resumed VERIFIER round restarts on its SAME immutable binding
       // (the forced commit); an implementor-completed re-entry verifies the
       // adopted worktree's own HEAD (host-read below).
       const forcedVerifierRound =
-        skipImplement && resume !== undefined && resume.round.role === 'verifier' ? resume.round : undefined;
+        skipImplement && reentry !== undefined && reentry.round.role === 'verifier' ? reentry.round : undefined;
 
       let implementation: ImplementorResult | undefined;
       if (!skipImplement) {
@@ -490,16 +533,21 @@ export async function runImplementVerifyLoop(
         // A resumed implementor round re-runs its PERSISTED serialized task
         // scope verbatim (the remediation payload travels inside it, W2-5);
         // fresh rounds build it from this loop's own fix-requests.
-        const persistedScope = resumedRound ? persistedTaskScope(resume!.round) : undefined;
+        const persistedScope = reentry !== undefined ? persistedTaskScope(reentry.round) : undefined;
         const context =
           persistedScope !== undefined
             ? { ...buildRoundContext(input, round, []), taskScope: persistedScope }
             : buildRoundContext(input, round, fixRequests);
         const flow = new ImplementorFlow(handle, context, buildImplementorOptions(input));
+        // P4b wave 2 FAILOVER: spawn on the EFFECTIVE spec — the ladder rung a
+        // prior limit escalated to (durable desired-model record), else the run
+        // default. A same-process failover re-drive AND a cross-process resume
+        // both land on the escalated target this way.
+        const implementorSpec = service.effectiveRoleSpec(input.runId, 'implementor', input.implementor);
         implementation = await service.runRole(
           input.runId,
           flow,
-          input.implementor,
+          implementorSpec,
           handle.worktreePath,
           {
             round,
@@ -519,6 +567,10 @@ export async function runImplementVerifyLoop(
           },
         );
         worktrees.releaseLease(input.assignmentId);
+        // P4b wave 2: the implementor ran a turn PAST any limit — the failover
+        // incident is resolved, so reset the per-incident ladder position (a
+        // fresh limit later restarts the ladder from the top).
+        service.resetFailoverIncident(input.runId, input.assignmentId);
 
         // W3-1: the confinement guard's primary-checkout drift is a durable
         // INCIDENT — append it NOW (before the verifier round renders any
@@ -592,7 +644,9 @@ export async function runImplementVerifyLoop(
       const verification = await runVerification({
         engine: service,
         runId: input.runId,
-        verifierSpec: input.verifier,
+        // P4b wave 2 FAILOVER: verify on the EFFECTIVE spec (ladder rung or run
+        // default), same as the implementor half.
+        verifierSpec: service.effectiveRoleSpec(input.runId, 'verifier', input.verifier),
         cwd: handle.worktreePath,
         binding,
         criteria: input.criteria,
@@ -628,6 +682,9 @@ export async function runImplementVerifyLoop(
         ids: deps.ids,
         clock: deps.clock,
       });
+      // P4b wave 2: the verifier ran a turn PAST any limit — resolve the
+      // failover incident (reset the ladder position for a future fresh limit).
+      service.resetFailoverIncident(input.runId, input.assignmentId);
 
       rounds.push({
         round,
@@ -673,9 +730,34 @@ export async function runImplementVerifyLoop(
         // acks it. `round` is NOT advanced — the crashed round is retried. The
         // loop is bounded by the breaker: each crash grows the durable window and
         // an exhausting crash is `breaker_open` (thrown, not signalled) → unwind.
+        if (crashOrSignal instanceof LimitPausedError) {
+          // P4b wave 2 FAILOVER: `#pauseForLimit` ALREADY landed `paused_limit`
+          // + checkpoint + incident atomically (unchanged). Do NOT wait for the
+          // probe ladder — ask the spine to self-drive the NEXT ladder rung
+          // (same assignmentId). On `failover` the run is un-paused and re-driven
+          // at the SAME round on the escalated target (the retry's `runRole`
+          // spawns the successor whose `child.spawned` acks the marker). On
+          // `wait` (policy=wait/ask) or `exhausted` (ladder ran out → T25 kept
+          // the run paused_limit + alerted), unwind and leave the run paused —
+          // a probe or a manual resume takes it from here.
+          //
+          // §review-7 F1: the re-drive re-enters at the ROLE that paused — derived
+          // from the durable RoleRoundProjection via `resolveRedriveReentry` — so a
+          // VERIFIER-side limit re-enters at VERIFICATION (its immutable binding),
+          // never the implementor branch (which the phase guard would reject with
+          // `LoopCompositionError`). This is now the proven path for BOTH halves.
+          const decision = service.driveFailoverOnLimit(crashOrSignal, input.assignmentId);
+          if (decision.kind !== 'failover') throw crashOrSignal;
+          redrive = resolveRedriveReentry(service, input.runId);
+          continue; // `round` NOT advanced — retry the paused round on the new target
+        }
+        // P4b-2 bounded AUTO-RESPAWN (crash): re-drive after the breaker backoff.
         if (!(crashOrSignal instanceof AutoRespawnSignal)) throw crashOrSignal;
         await (deps.delay ?? waitMs)(crashOrSignal.backoffMs);
         service.recordSuccessorIntent(input.runId);
+        // §review-7 F1: a VERIFIER-side crash re-enters at verification too — the
+        // same role-aware re-entry the failover path uses.
+        redrive = resolveRedriveReentry(service, input.runId);
       }
     }
   } finally {

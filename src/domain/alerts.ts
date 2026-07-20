@@ -36,9 +36,11 @@ import type { RoleName } from './state.js';
 /**
  * The three wave-1 alertable notify topics and the alert kind each maps to.
  * `paused_user`, `rss_soft`, `merge_ready`, `run_failed`, `failover_exhausted`,
- * `unknown_provider_error` deliberately do NOT raise an alert (they are not
- * operator-actionable incidents in the §5cc sense). `respawn` has no notify
- * topic yet — it is emitted directly by the wave-2 successor spine.
+ * `unknown_provider_error` deliberately do NOT derive an alert from a
+ * `notify.requested` here (they are not folded at an alert-context site). The
+ * P4b wave-2 `failover` alerts — both the per-step ladder escalation AND the
+ * degrade-to-wait exhaustion — are emitted DIRECTLY by the successor spine
+ * (`driveFailoverOnLimit`), like `respawn`, so they have no notify-derived path.
  */
 export const NOTIFY_TOPIC_TO_ALERT_KIND: Partial<Record<NotifyTopic, AlertKind>> = {
   paused_limit: 'limit_paused',
