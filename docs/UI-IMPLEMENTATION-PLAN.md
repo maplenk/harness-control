@@ -38,6 +38,26 @@ An architectural review returned **"approve after architectural revision."** The
 
 ---
 
+## Revision 3 — conditional-approval contracts
+
+Round-2 review **upgraded the verdict to CONDITIONAL APPROVAL** — implementation-ready once five remaining P1 *contracts* are written down as concrete specs (not gestures), five P2 corrections land, and three Phase-A decisions are locked. This revision does all three. Every cited claim was re-verified against the **current opencode-churned tree by content** (line numbers shifted; identifiers held):
+
+| Claim | Verified (current tree) | Where |
+|---|---|---|
+| Command surface is presentation/test-coupled: `CommandOutput={json,text,exitCode}` (commands.ts:82-90, `finish` :2056), `executeCommand(env: NodeJS.ProcessEnv)` (:182), `RunCommand` carries `testApprove` (:633), `noWait` (:1230), `wait` (:167) | ✅ | §3A.1 |
+| `handleResume` needs a `runId`; a `start` crashing before it binds a run can't be resumed | ✅ (by design) | §3A.2 |
+| ACP permissions live in in-memory `#pendingPermissions = new Map<string,PendingPermission>()` (session.ts:380, set :981, cleared on child death :1021-1022) | ✅ | §3A.3 |
+| `appendBatch` runs inside `driver.transaction()` (event-repository.ts:106-116); nested synchronous transactions (driver.ts:55-56) → notifying from inside an append can surface events that roll back | ✅ | §3A.4 |
+| `approve` (service.ts:1522) only moves the run to `approved`; implementation starts via a separate `run` command | ✅ | §3A.5 |
+| `RUN_CONFIG` pinned at creation, single save site (service.ts:1270) — never re-saved | ✅ | §3A.5 P2 / Phase C2 |
+| `recheck`/`switch_model` are CLI/application compositions (no service method); `driveFailoverOnLimit` is an internal response to a typed `LimitPausedError` (service.ts:1844) | ✅ | Phase C |
+| Reserved RunId-shaped scopes share the runs registry: `run__process_registry`, `run__desired_model`, `run__run_ownership`, `run__spawn_reservations`, `run__failover_incident` | ✅ | Phase A enumeration |
+| Agent-message handling is `agent_message_chunk` via private `onUpdate` (coordinator.ts:578, verifier.ts:412, implementor.ts:842-844) — **not** `child.stdout` | ✅ (citation corrected) | Phase D |
+
+**The five P1 contracts + the three locked decisions are in new §3A.** P2 corrections are folded into §3.6, Phase A, Phase C, Phase C2, Phase D, and §7.
+
+---
+
 ## 0. TL;DR
 
 - **What the design is:** one self-contained, *interactive* React-runtime prototype (not a static canvas) that already covers **all 20** of the brief's §26.3 required screens plus extras (attention inbox, workspaces, command palette, context inspector, events inspector). It is dark-only, information-dense, and faithfully encodes the engine's three-axis state model.
@@ -222,7 +242,9 @@ The daemon must model these distinctly (Phase A0 formalizes them):
 
 **Fact:** `OrchestrationService` constructor-binds `#config`/`#bounds`/`#breaker` (`service.ts:1107-1117`), `#worktreeSupervision` is a single "CURRENT" manager (one-at-a-time, `:1096-1098`), and the CLI builds a **fresh service per run** from that run's persisted config (`cli/index.ts:104`). A single long-lived multi-run service would apply the **wrong** budget/bounds/supervision.
 
-**Decision (recommended):** the daemon holds a small set of per-run **execution contexts** — one service instance (or config-scoped facade) per *actively-driven* run, each resolving that run's pinned config + its own worktree supervision — while **sharing the global durable admission** (`spawn-reservation-store`), **run-ownership leases** (`run-ownership-store`), and **process registry** so the max-live-children cap and §14 identity checks stay global. *Alternative:* refactor `OrchestrationService` to resolve config + supervision per run (a larger change to a load-bearing, review-hardened class). Either way, **read-only** enumeration/snapshot/event endpoints need **no** execution context (they hit the store) — so the fleet + inspection UI works before this lands.
+**Decision (recommended):** the daemon holds a small set of per-run **execution contexts** — one service instance (or config-scoped facade) per *actively-driven* run, each resolving that run's pinned config + its own worktree supervision — while **sharing the global durable admission** (`spawn-reservation-store`), **run-ownership leases** (`run-ownership-store`), and **process registry** so the max-live-children cap and §14 identity checks stay global. *Alternative:* refactor `OrchestrationService` to resolve config + supervision per run (a larger change to a load-bearing, review-hardened class). **Global (daemon kernel) vs run-scoped — be explicit (P2):** per-run service instances do **not** auto-share in-memory supervision, so the kernel must inject the shared singletons. GLOBAL = process registry (`run__process_registry`), spawn-reservation/admission (`run__spawn_reservations`), run-ownership leases (`run__run_ownership`), the **max-live-children cap**, watchdog/heartbeat, and the single SQLite store. RUN-SCOPED = engine config/bounds/breaker, worktree supervision, cost/role state. **Artifact quotas bind when the DB is opened**, so differently-pinned per-run quotas require an explicit choice: one store with per-run quota accounting, or per-run DB handles sharing the CAS root. The **global child cap is owned by ONE config — the daemon's** — not any single run's pinned config.
+
+Either way, **read-only** enumeration/snapshot/event endpoints need **no** execution context (they hit the store) — so the fleet + inspection UI works before this lands.
 
 ### 3.7 Cross-process event & write model (blocking)
 
@@ -245,6 +267,67 @@ The daemon must model these distinctly (Phase A0 formalizes them):
 - **One-time bootstrap-token delivery** without query-string leakage; tokens random + scoped + expiring.
 - **Restrictive permissions (0600)** on the daemon **connection-metadata** file (host/port/token).
 - **Single-daemon locking + stale recovery + port discovery** — a lockfile carrying `{pid, port, start-time}`; a dead/recycled owner is reclaimed; clients discover the port from the metadata file, not a hard-coded `7717`.
+
+---
+
+## 3A. Implementation contracts (Revision 3 — required before the daemon ships)
+
+These five contracts are the "implementation-ready" bar. Each is written as a concrete spec and verified against the current tree.
+
+### 3A.1 Application command API — not a CLI extraction (P1-1)
+
+Today the command surface is presentation- and test-coupled: `CommandOutput` is `{ json, text, exitCode }` (`commands.ts:82-90`, produced by `finish()` `:2056`), `executeCommand` takes `NodeJS.ProcessEnv` (`:182`), and `RunCommand` carries `testApprove` (`:633`), `noWait` (`:1230`), `wait` (`:167`), and `json`. HTTP must inherit **none** of that. Contract:
+
+- **`ApplicationCommand`** — the domain intents (`start`, `reviseSpec`, `approve`, `run`, `recheck`, `resume`, `pause`, `cancel`, `breakerReset`, `switchModel`, `respondToPermission`) with **no** presentation/test fields (no `json`/`text`/`exitCode`/`testApprove`/`noWait`).
+- **`CommandContext { actor, origin: 'cli' | 'http' | 'system', idempotencyKey }`** — carried alongside the command, not inside it.
+- **`ApplicationResult<T>` / `ApplicationError`** — typed discriminated outcomes (`accepted` / `rejected` / `conflict` / `not_found` / …), never a process exit code. The daemon maps them to HTTP status; the CLI maps them to exit code + text.
+- **CLI becomes an adapter over the executor:** `cli/commands.ts` parses argv → `ApplicationCommand` + `CommandContext{origin:'cli'}`, calls the shared executor, renders `ApplicationResult` → `{text, exitCode}`. The HTTP handler is the same shape with `origin:'http'`.
+- **`--test-approve` is structurally impossible over HTTP:** the synthetic-hash approve path stays CLI/test-only — it is not part of `ApplicationCommand`, so the HTTP adapter cannot express it. Approval over HTTP always binds the real drafted hash (the §3.4 `handleApprove` validation).
+
+### 3A.2 Operation state machine (P1-2)
+
+"Durable `operationId`" (§3.5) is a real record, not a token. Contract — an `operations` table/projection:
+
+- **States:** `accepted → claimed → running → waiting_for_input → (succeeded | failed | cancelled)`.
+- **Columns:** `operationId`; `commandHash` + `idempotencyKey` **UNIQUE together** (a retried submit returns the SAME operation — never a second run); `kind`; **nullable `runId`** (a `start` has none until it binds one); `owner` (daemon pid + start-time); `lease`/`heartbeat`; `attemptCount`; durable `result`/`error`; timestamps.
+- **Atomic acceptance:** the operation row commits (state `accepted`) **before** the HTTP `202 { operationId }` returns, so a crash immediately after the response is still recoverable.
+- **Per-command recovery on restart:** reconcile every non-terminal operation. A `run`/`resume`/`recheck` with a bound `runId` re-drives through the existing `handleResume` path (gated on the run-ownership lease). **A `start` that crashed before it created/bound a run CANNOT be recovered by `handleResume`** — there is no `runId`; the operation record is the only thing that lets the daemon detect the orphan and either re-drive from the durable command or fail it honestly.
+- **Reconciliation:** if the run advanced but the operation result never persisted (crash between the run-effect commit and the operation-result write), the reconciler reads the run's durable state and settles the operation to match — it never double-drives.
+- The UI tracks operation state (stream/poll), never a blocked HTTP call.
+
+### 3A.3 Permission lifecycle — durable ≠ resolvable after restart (P1-3)
+
+ACP permission requests are bound to a **live JSON-RPC request** in the adapter's in-memory `#pendingPermissions = new Map<string, PendingPermission>()` (`session.ts:380`, populated `:981`, cleared when the child/session dies `:1021-1022`). After the daemon or child dies, the original request **cannot** be answered. Contract:
+
+- **Persist** each request for **audit + UI attention**, separate from the in-memory ACP request it mirrors.
+- **Fence** every response by the tuple **`(runId, processGenerationId, acpSessionId, requestId, allowedOptionId)`**; apply only if all match a still-live pending request. **Reject** stale / duplicate / superseded responses (the map already deletes superseded at `:985`/`:989`).
+- **Expire/cancel** the durable request on child death or daemon restart (the in-memory entry is gone; the durable one is marked no-longer-answerable and shown as such).
+- **Default-deny** on timeout/disconnect — never auto-allow (brief §10).
+- On resumed execution, if the action is still required the successor raises a **NEW** permission request (new `requestId`/generation); the UI must not "answer" the dead one.
+
+### 3A.4 Snapshot ↔ WS consistency barrier (P1-4)
+
+`GET /runs` then subscribing to `/events` can miss a change in the gap, and per-run sequences do not cursor **fleet membership** (a run created in the gap). Contract:
+
+- Every **run snapshot** returns **`asOfSequence`** (last event folded in); the client subscribes with `after=asOfSequence` → no gap, no dup (exclusive, §3.7).
+- Every **fleet snapshot** returns a **`fleetRevision`**; the fleet channel carries membership deltas keyed by it, or reconnect forces a fleet refetch. A newly-created run is a fleet-revision change, not a per-run sequence.
+- **Subscribe-first buffering** OR a **snapshot/subscription handshake**: open (buffering) the subscription before/at snapshot assembly so nothing is lost between read and subscribe.
+- **Projection-cursor consistency:** assemble a snapshot's multiple read models (engine_state, cost, role_round, …) at **one** cursor (read within a single transaction / one `asOfSequence`) — never a torn read across projections.
+- **Notify only after the ENCLOSING transaction commits (CRITICAL):** appends run inside `driver.transaction()` and can be **nested** (`appendBatch` inside a larger write — `event-repository.ts:106-116`; nested synchronous transactions documented `driver.ts:55-56`). Emitting subscriber notifications from inside `appendBatch` could surface events that later **roll back**. Notifications MUST fire only after the **outermost** commit (post-commit hook / outbox), never from within the append.
+- **Overflow:** a subscriber that outruns its bounded queue (PLAN §182) receives **`resync_required`** → refetch snapshot + resubscribe, rather than a gapped stream.
+
+### 3A.5 Human-action flow + approve→run handoff (P1-5)
+
+Phase B is read-only; no phase yet implements the **human write actions**, and the engine's `approve` (`service.ts:1522`) only moves the run to **`approved`** — implementation starts via a **separate `run` command** (the brief's "Approve → Run implementation"). Contract:
+
+- **Schedule the human write actions** (Phase C2 / a dedicated actions slice): approve-exact-spec, request-revision, respond-to-permission, and invoke-run-after-approval — each a durable **operation** (§3A.2) through the executor (§3A.1); approval + permission also raise **attention** entries (§3.5).
+- **Handoff (locked):** model "Approve and start" as **two durable commands** — `approve` (→ `approved`) then `run` (starts implementation) — where a **failed `run` leaves the run honestly `approved`**, not a fake "starting" state. A fused UI button is allowed only if it is still two durable operations underneath (crash-between-them is recoverable). The UI surfaces "Approved — start implementation" as an explicit, resumable step until the second command lands.
+
+### 3A.6 Locked Phase-A decisions (resolved)
+
+1. **Event/write model — single-writer daemon with CLI forwarding.** When a daemon is running the CLI forwards commands to it; no-daemon ⇒ the CLI writes directly. (Was §3.7 model A.)
+2. **Multi-run kernel — per-run execution contexts backed by an EXPLICITLY shared daemon kernel.** The kernel owns the global singletons (process registry, spawn-reservation/admission, run-ownership leases, the max-live-children cap, watchdog/heartbeat, the one SQLite store); each run context resolves its own pinned config + worktree supervision and is *wired* to the shared kernel — per-run service instances do **not** auto-share in-memory supervision (§3.6). (Was §3.6 recommended.)
+3. **Desktop lifecycle — tray process for the MVP**, then a **managed background helper / LaunchAgent** for production durability. (Was Phase F options iii → i.)
 
 ---
 
@@ -312,7 +395,7 @@ Each phase lists **delivers · seams (existing vs to-build) · screens · accept
 
 - **Delivers:** a loopback **HTTP + multiplexed WS** daemon exposing run enumeration, per-run durable snapshots, an ordered event relay with **exclusive** cursor resume, and a command/attention submit endpoint over the Phase-A0 executor — behind the §3.8 security gate, with the §3.7 write model chosen and §3.6 per-run execution contexts for driven runs.
 - **Seams — existing:** the A0 executor; `projections.ts` (+ `uiStateOf`); `event-repository` `listByRun(runId, {fromSequence})`; `status`/`doctor --json`; global admission (`spawn-reservation-store`), `run-ownership-store`, process registry.
-- **Seams — to build:** (b) multi-run **enumeration** read model (no `listRuns` today); (a) HTTP + multiplexed WS on loopback with **port discovery** (not a hard-coded `7717`); (c) the chosen event-delivery mechanism — **single-writer notify** (recommended) or **SQLite watermark tail** (§3.7); (d) the durable **attention** queue; per-run **execution contexts** (§3.6); the **security gate** (§3.8); daemon **lockfile** + stale reclaim.
+- **Seams — to build:** (b) multi-run **enumeration** read model (no `listRuns` today) — **filter to rows with a real `RUN_META` projection** and EXCLUDE the RunId-shaped system scopes that share the runs registry (`run__process_registry`, `run__desired_model`, `run__run_ownership`, `run__spawn_reservations`, `run__failover_incident`), or add an explicit real/system `kind` discriminator; never enumerate every projection-scope as a user run; (a) HTTP + multiplexed WS on loopback with **port discovery** (not a hard-coded `7717`); (c) the chosen event-delivery mechanism — **single-writer notify** (recommended) or **SQLite watermark tail** (§3.7); (d) the durable **attention** queue; per-run **execution contexts** (§3.6); the **security gate** (§3.8); daemon **lockfile** + stale reclaim.
 - **Screens:** none yet, but the precondition for every screen.
 - **Acceptance:**
   - `GET /runs` returns each run's `uiStateOf` projection + meta; `GET /runs/:id/snapshot` is assembled purely from read models (no live process needed).
@@ -334,8 +417,8 @@ Each phase lists **delivers · seams (existing vs to-build) · screens · accept
 ### Phase C — Failure & recovery screens (the product differentiator)
 
 - **Delivers:** the composed suspension states that make this product distinct: **Paused—limit, Auto-recovering, Breaker open, Integration blocked, Merge-ready** — plus the write actions each needs.
-- **Seams — existing:** `status --json` limit block (`buildLimitStatus`), `MERGE_READINESS_BLOCKED`, breaker/crash/respawn/failover events, checkpoints; service `resume`/`breakerReset`/`recheck`/`switch_model`/`driveFailoverOnLimit`.
-- **Seams — to build:** command-submit wiring for these verbs via Phase A's action queue; `paused_user` state (deviation §2.2); "recheck readiness" git endpoint; integration-command copy (read-only, never executes merge).
+- **Seams — existing / terminology (P2):** `status --json` limit block (`buildLimitStatus`), `MERGE_READINESS_BLOCKED`, breaker/crash/respawn/failover events, checkpoints. **Service methods:** `resume`, `breakerReset` (+ `pause`, `approve`, `reviseSpec`, `cancel`). **NOT service methods:** `recheck` and `switch_model` are CLI/application **compositions**; `driveFailoverOnLimit` (`service.ts:1844`) is an **internal** response to a typed `LimitPausedError`, never a UI verb.
+- **Seams — to build:** command-submit wiring for these verbs through the **A0 executor / operation path** (§3A.1-2) — **NOT** the attention queue (that is reserved for human *requests*: approval, permission — §3.5); `paused_user` state (deviation §2.2); "recheck readiness" git endpoint; integration-command copy (read-only, never executes merge).
 - **Screens:** 10, 11, 12, 13, 14 (+ the Attention items that route into them).
 - **Acceptance:** each failure state answers brief §4.4's five questions (what happened / what's safe / what's the orchestrator doing / must I act / safe next action); **"reset time unavailable"** is shown literally (never an invented ETA); merge-ready shows manual git commands and asserts nothing was merged/pushed; breaker reset is gated behind explicit inspection and preserves incident history.
 
@@ -343,14 +426,15 @@ Each phase lists **delivers · seams (existing vs to-build) · screens · accept
 
 - **Delivers:** the four management surfaces the earlier phases don't schedule, **with their write paths**: New Run (start), Workspaces (repo registry + add), Models & harnesses (effective/desired model, failover ladder), Settings (runtime/limits/budget/verification/terminal/notifications/storage).
 - **Seams — existing:** capability records; `desired-model-store`; `failover-store`; `run-config`/global config; `doctor --json`.
-- **Seams — to build:** `start` via the A0 executor + a workspace/folder picker (native in desktop, path entry in browser); config **write** endpoints; a desired-model / failover-ladder write path. Validation must reject unsupported values at the boundary, mirroring `model-resolution.ts` (the closed `HARNESSES` allowlist; `asHarness` throws on unknowns) and the failover-ladder parse gate (harness ∈ the runtime vocabulary, effort in the reasoning ladder).
+- **Seams — to build:** `start` via the A0 executor + a workspace/folder picker (native in desktop, path entry in browser); the desired-model write path (via `desired-model-store`). Validation must reject unsupported values at the boundary, mirroring `model-resolution.ts` (the closed `HARNESSES` allowlist; `asHarness` throws on unknowns) and the failover-ladder parse gate (harness ∈ the runtime vocabulary, effort in the reasoning ladder).
+- **Config scope — three distinct tiers, not one "config endpoint" (P2):** (1) **global defaults** that apply to *future* runs (a real settings store — new); (2) **immutable current-run config** — `RUN_CONFIG` is pinned at creation and **never re-saved** (`service.ts:1270` is the single save site), so per-run config is **read-only** in the UI; (3) **explicitly-mutable commands** — e.g. desired model (next-spawn) via `desired-model-store`. A **mutable failover ladder is a NEW evented engine command + safety policy**, not a generic config `PUT`.
 - **Screens:** 3 New run, 12 Workspaces, 13 Models & harnesses, 14 Settings.
 - **Acceptance:** writes are validated + idempotent; an invalid harness/effort is rejected with a clear message (never accepted then failed deep in dispatch); **no empty controls** for unsupported/deferred features (brief §25); "desired model" is shown distinctly from "running" and only applies on next spawn (brief §4.3).
 
 ### Phase D — Activity, Changes, Verify, Events
 
 - **Delivers:** the inspection surfaces: filtered activity timeline (Follow-live), read-only diff viewer, verification/evidence table with criterion inspector, technical event log.
-- **Seams — existing:** event replay; `WorktreeFactsState` + git diff; `IMPLEMENT_VERIFY_LOOP` + verification events; artifact repository (content-addressed evidence). **Note:** only **usage** is folded centrally today (`role-runner.ts:15,57-61` wraps `onUpdate`; `cost.ts:foldUsageUpdate`); coordinator/verifier **message chunks** are consumed *privately* by the flows (`implementor.ts` `child.stdout.on('data')`) and are not on the durable event stream.
+- **Seams — existing:** event replay; `WorktreeFactsState` + git diff; `IMPLEMENT_VERIFY_LOOP` + verification events; artifact repository (content-addressed evidence). **Note (citation corrected, P2):** agent narration is `agent_message_chunk`, consumed through each role's **private `onUpdate` callback** — coordinator (`coordinator.ts:578`), verifier (`verifier.ts:412`), implementor (`implementor.ts:842-844`) — **not** `child.stdout`. Only **usage** is folded centrally (`role-runner.ts` `onUpdate` → `cost.ts:foldUsageUpdate`); the agent-message text is buffered privately by the flows and is **not** on the durable event stream.
 - **Seams — to build:** diff read endpoint (git), evidence-fetch endpoint (artifact CAS), activity filter projections, Follow-live backpressure — and, for a full agent-activity feed, a **bounded, redacted observation sink** (decide durable vs ephemeral; redact at the sink via `src/redaction/*`). Until that exists, Activity shows the **milestone/event-log-derived** timeline (phase changes, verifications, permissions, checkpoints, commits), not raw agent narration.
 - **Screens:** 7 Activity, 8 Changes, 9 Verify (+ criterion evidence inspector), Events tab.
 - **Acceptance:** criteria show four distinct verdicts (verified/failed/**unproven**/running) — never collapsed; evidence artifacts open from the inspector; diff is strictly read-only (no merge/push affordance); Events shows the true `(seq,type,refs)` log; Activity clearly distinguishes durable milestones from any (redacted, bounded) live narration; Follow-live inserts rows without losing scroll position and respects reduced-motion.
@@ -404,13 +488,13 @@ Why this and not a failure screen first: the failure screens are the differentia
 
 **Resolved by this revision (were open; now decided):** WS (multiplexed), not SSE — §3.7/§4.1. Server-projected `UiState` + deltas/invalidation, **no** client reducer — §3.4/§4.1. Security is a Phase A **gate**, not a deferral — §3.8.
 
-**New decisions for the user (each shapes the daemon):**
+**Locked in Revision 3 (§3A.6 — were open, now decided):** (1) **single-writer daemon with CLI forwarding** (§3.7); (2) **per-run execution contexts backed by an explicitly shared daemon kernel** (§3.6); (3) **tray process for the MVP desktop build, then a managed background helper / LaunchAgent** for production durability. Run **enumeration** is likewise settled (filter to a real `RUN_META` projection, exclude reserved scopes — Phase A). Model A does change CLI default behavior (a running daemon means the CLI forwards commands to it) — that is the accepted consequence of single-writer ordering + PLAN §182 writer-isolation.
 
-1. **Event-delivery + write model (§3.7).** Single-writer daemon with **CLI-forwarding** (recommended, model A) vs SQLite **watermark tail** (model B). Model A implies the CLI's default changes: *when a daemon is running, the CLI forwards commands to it instead of writing directly* — confirm that behavior change is acceptable (it is what gives clean ordering + backpressure + PLAN §182 writer-isolation).
-2. **Multi-run execution (§3.6).** Per-run **execution contexts** sharing global admission/registries (recommended) vs refactoring `OrchestrationService` for per-run config/supervision (larger change to a review-hardened class).
-3. **Desktop daemon lifecycle (Phase F).** Detached independently-managed daemon (recommended, matches the tray copy) vs tray-process vs separately-installed LaunchAgent.
-4. **Multi-run enumeration source.** Add a dedicated `runs` index/projection vs enumerate projection scopes — and how §15 retention/pruning interacts with "recently completed" in the rail.
-5. **Agent Room boundary.** PLAN §4.1/§7's optional localhost planning chat (`start --enable-chat`, forced `127.0.0.1`, off the default path) is **orthogonal** to `serve` (planning-time chat vs run-observation), but shares the localhost-server precedent. Decide whether `serve` hosts/proxies it or stays separate, and whether the New-run/Spec flow surfaces it in-UI. (Now committed in the design at `46ac79a`.)
+**Remaining open decisions for the user:**
+
+1. **Approve→run handoff surface (§3A.5).** Two explicit steps ("Approve", then "Start implementation") vs one fused "Approve and start" button — either way it is two durable commands underneath, and a failed `run` leaves the run honestly `approved`. Product/UX call.
+2. **Multi-run enumeration retention.** How §15 retention/pruning interacts with "recently completed" in the rail (the *exclusion* of system scopes is settled; the *retention window* is the open part).
+3. **Agent Room boundary.** PLAN §4.1/§7's optional localhost planning chat (`start --enable-chat`, forced `127.0.0.1`, off the default path) is **orthogonal** to `serve` (planning-time chat vs run-observation), but shares the localhost-server precedent. Decide whether `serve` hosts/proxies it or stays separate, and whether the New-run/Spec flow surfaces it in-UI. (Committed in the design at `46ac79a`.)
 
 **Still-standing design/build risks (not new):** `paused_user` + the full §12.1 six-state connection machine are under-modeled in the prototype (in-scope Phase A/B); light theme + the empty/loading/error matrix are foundations gaps (§2.2); **terminal takeover** is the highest-risk write path — its checkpoint→identity-verified-stop→validate sequence must reuse the supervisor's existing §14 identity checks, never a parallel stop path; terminal sessions need their own scoped, expiring token (brief §11.5).
 
