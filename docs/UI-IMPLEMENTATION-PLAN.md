@@ -98,6 +98,10 @@ Round-5 review: **very close** (commit `26432ea` cleared all six prior findings)
 
 ---
 
+## Revision 7 — dogfooding run plan (user)
+
+The UI is built by running the **harness on its own plan** — one `harness` run per phase (coordinator → human approval → implementor → independent verifier → `merge_ready`). Fixed three-vendor profiles: coordinator **Claude · opus · xhigh**, implementor **grok-4.5 · high**, verifier **gpt-5.6-sol (Codex) · xhigh**. Full run decomposition, sequencing, and preconditions (incl. the Grok-adapter dependency) in **§6A**.
+
 ## 0. TL;DR
 
 - **What the design is:** one self-contained, *interactive* React-runtime prototype (not a static canvas) that already covers **all 20** of the brief's §26.3 required screens plus extras (attention inbox, workspaces, command palette, context inspector, events inspector). It is dark-only, information-dense, and faithfully encodes the engine's three-axis state model.
@@ -551,6 +555,42 @@ Foundations port (tokens, type scale, density, motion, **+ new light theme** and
 This exercises the whole spine: the shared executor (A0), enumeration (gap b), snapshot assembly (existing projections), multiplexed relay + exclusive cursor (gap c), the security gate (§3.8), and server-projected client state — everything else is additive. **Slice 2** adds the first write: `approve` as a **command through the operation executor** (§3A.1-2) — it runs the W3-4 draft/hash validation and **resolves** the existing approval **attention** item (§3A.3). The command *is* the operation; the attention item is the human request it settles — they are **not** the same queue (that is the envelope/operation/attention separation §3.5/Phase C insist on). Proves the validated, idempotent command path **and** the operation↔attention split.
 
 Why this and not a failure screen first: the failure screens are the differentiator, but they are worthless without the seam; a read-only slice de-risks the *observation boundary* (the part PLAN §1.4 is strict about) before any write surface — but note security and the shared executor are in from slice 1, not bolted on later.
+
+---
+
+## 6A. Dogfooding — implement this plan via the harness itself
+
+**Decision (user): the UI is built by running the harness on its own plan.** Each phase is one `harness` run — the coordinator drafts a testable spec from the plan, the human approves the exact spec hash, one implementor works in an isolated worktree, an independent verifier gathers evidence against the acceptance criteria, and `merge_ready` hands off to the human to merge. This doubles as the strongest validation available: if the harness can drive its own control-room UI to `merge_ready`, that is a better proof it works than any smoke test.
+
+**Fixed role profiles (user-set) — a genuine three-vendor split:**
+
+| Role | Harness · model · effort |
+|---|---|
+| Coordinator | **Claude · opus · xhigh** |
+| Implementor | **grok-4.5 · high** |
+| Verifier | **gpt-5.6-sol (Codex) · xhigh** |
+
+Implementor and verifier are **different vendors** (Grok builds, Codex verifies) with Claude coordinating — the exact cross-harness independence the harness exists to provide, now turned on itself. The verifier is read-only on the implementor's exact commit; the coordinator writes no files.
+
+**Preconditions (before Run 0):**
+- Plan at **full approval** and the tree **clean** (Codex's opencode + Claude-spawn work committed), so the implementor branches from a stable base.
+- A **Grok adapter**. The live roster is `claude` / `codex` / `opencode` (`model-resolution.ts` `HARNESSES`; zero grok refs in `src/adapters/`), so `grok-4.5` as the implementor requires adding a Grok adapter first — roadmap: native `grok agent stdio`, opt-in (brief §3.2). It is the one build-vs-dogfood bootstrap: either add the adapter as a preliminary run or with a live implementor, then dogfood the UI with the profiles above.
+
+**Run decomposition (each row = one `harness` run):**
+
+| # | Run | Plan basis | Nature |
+|---|---|---|---|
+| 0 | **Proof slice** — read-only `serve` (`GET /runs`, `/snapshot`, `WS …/events?after=`) + minimal React fleet-rail | §6 | **Purely additive** — proves the loop + cursor-resume without touching the engine |
+| 1 | **Phase A0** — shared application command executor | §3A.1/3A.2 | **Self-referential** — refactors the command layer the harness itself runs on |
+| 2 | **Phase A** — `serve` daemon (writer-lease, security gate, multiplexed fleet, operation state machine) | §3.7/3.8/3A | Engine-adjacent |
+| 3 | **Phase B** — app shell + core read screens | §5 | Additive |
+| 4 | **Phase B2** — human actions (approve / revise / permission / run) | §3A.5 | Command-path |
+| 5 | **Phase C / C2** — failure/recovery + core management screens | §5 | Additive |
+| 6 | **Phase D** — Activity / Changes / Verify / Events | §5 | Additive |
+| 7 | **Phase E** — terminal drawer + PTY broker | §5 | Native |
+| 8 | **Phase F** — desktop wrapper + native integration | §5 | Native |
+
+**Sequencing:** Run 0 (purely additive) **first**, to prove the harness can build its own UI before Phase A0 — the self-referential run where it refactors the command layer it is executing. A0 is safe under the harness's own model (isolated worktree, independent verifier, human approval before merge) but is the phase to watch. Each run's **spec-seed** is the plan's own acceptance criteria for that phase (the review rounds made them testable), so the verifier has concrete evidence to gather; a failed `run` after approval leaves the run honestly `approved` (§3A.5).
 
 ---
 
