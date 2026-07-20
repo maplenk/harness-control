@@ -18,6 +18,7 @@ import {
   SEQUENCE_UNASSIGNED,
   idempotencyKey,
   type ArtifactHash,
+  type AlertId,
   type AssignmentId,
   type CheckpointId,
   type CriterionId,
@@ -74,6 +75,24 @@ export type NotifyTopic =
   | 'merge_ready'
   /** W2-1 T13: child exited unexpectedly → manual resume required (P4a has no auto-respawn). */
   | 'interrupted';
+
+/**
+ * P4b-1 alert taxonomy (§5cc): the kinds of durable operator alert raised as a
+ * supporting event folded into its triggering transition. `limit_paused`,
+ * `crash`, and `breaker_open` ship in wave 1 (derived from the `paused_limit` /
+ * `interrupted` / `breaker_open` notify effects); `respawn` is RESERVED for the
+ * P4b-2 auto-respawn wave (the successor spine emits it) — declared now so the
+ * projection/sink vocabulary is stable and wave 2 is a small delta.
+ */
+export type AlertKind = 'limit_paused' | 'crash' | 'respawn' | 'breaker_open';
+
+/**
+ * A named delivery sink for a raised alert. Built-ins are process `stderr`
+ * (CLI) and the `status --json` alerts section; the `Notifier` seam
+ * (webhook/push/desktop, wave 2) registers further named sinks. A plain string
+ * so the event log never constrains which sinks a deployment wires.
+ */
+export type AlertSink = string;
 
 /**
  * One model/effort pin applied during a spawn's `initial_config_pin` window
@@ -408,6 +427,37 @@ export interface EventPayloads {
   'notify.requested': {
     readonly topic: NotifyTopic;
     readonly message: string;
+  };
+  /**
+   * P4b-1 (§5cc) — a durable operator alert RAISED as a supporting event folded
+   * into the SAME `#atomicEngineWrite` transaction as its triggering transition
+   * (the `paused_limit`/`interrupted`/`breaker_open` notify effect), so an alert
+   * can NEVER exist without its cause and vice-versa. `alertId`/`idempotencyKey`
+   * are DERIVED from the trigger's key (replay-stable, dedupe-safe). `detail` is
+   * redacted through the §17.1 path before it is stored. `runId`/`occurredAt`
+   * live on the envelope. Delivery is best-effort/at-least-once and DERIVED from
+   * the log (an `alert.raised` with no matching `alert.delivered`, the F3
+   * derive-from-log pattern) — never a separate delivered cursor as the source
+   * of truth.
+   */
+  'alert.raised': {
+    readonly alertId: AlertId;
+    readonly kind: AlertKind;
+    readonly role: RoleName;
+    readonly generationId?: ProcessGenerationId;
+    /** The notify topic this alert was derived from (audit back-reference). */
+    readonly topic: NotifyTopic;
+    /** REDACTED (§17.1) human-readable detail. */
+    readonly detail: string;
+  };
+  /**
+   * P4b-1 (§5cc) — an `alert.raised` was delivered to `sink`. Dedup key is
+   * `(alertId, sink)`; the presence of ANY `alert.delivered` for an alert marks
+   * it acked so a restart re-derives only the still-un-acked alerts.
+   */
+  'alert.delivered': {
+    readonly alertId: AlertId;
+    readonly sink: AlertSink;
   };
   /** LimitIncident fact (id assigned by the repository at persist time). */
   'limit.incident.recorded': {

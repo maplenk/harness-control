@@ -65,12 +65,20 @@ describe('RestartBreaker: time-decayed window bound', () => {
   it('opens with reason=window_bound once more than the engine window max crash in quick succession', () => {
     const breaker = new RestartBreaker(new DeterministicIdFactory());
     // DEFAULT_BOUNDS.restartWindowMax = 5: five crashes fit; the sixth (still well inside the 10-minute window) trips it.
+    // S5 (§5cc): the decision derives from the DURABLE `counters.restartWindow`,
+    // so this drives the production loop faithfully — each ACCEPTED restart's T13
+    // is folded into the durable window by the reducer before the next crash
+    // reads it back (modeled here by growing `durable`).
     const base = Date.parse('2026-07-18T09:00:00.000Z');
+    let durable: readonly IsoTimestamp[] = [];
     let last: BreakerAdvice | undefined;
     for (let i = 0; i < 6; i += 1) {
       const occurredAt = isoTimestamp(new Date(base + i * 1000).toISOString());
-      last = breaker.evaluateCrash(baseInput({ occurredAt }));
-      if (i < 5) expectRestart(last);
+      last = breaker.evaluateCrash(baseInput({ occurredAt, counters: { ...ZERO_COUNTERS, restartWindow: durable } }));
+      if (i < 5) {
+        expectRestart(last);
+        durable = [...durable, occurredAt]; // reducer folds the accepted T13
+      }
     }
     expectOpen(last!);
     if (last!.kind === 'breaker_open') {
@@ -101,13 +109,45 @@ describe('RestartBreaker: time-decayed window bound', () => {
 
   it('windowCountAsOf reports the live, decayed count without mutating state', () => {
     const breaker = new RestartBreaker(new DeterministicIdFactory());
+    // S5 (§5cc): the observability cache reflects the durable window + the crash
+    // just evaluated, so thread the first crash's accepted fold into the second.
     breaker.evaluateCrash(baseInput({ occurredAt: at('2026-07-18T09:00:00.000Z') }));
-    breaker.evaluateCrash(baseInput({ occurredAt: at('2026-07-18T09:01:00.000Z') }));
+    breaker.evaluateCrash(
+      baseInput({
+        occurredAt: at('2026-07-18T09:01:00.000Z'),
+        counters: { ...ZERO_COUNTERS, restartWindow: [at('2026-07-18T09:00:00.000Z')] },
+      }),
+    );
     expect(breaker.windowCountAsOf(ASG, at('2026-07-18T09:02:00.000Z'))).toBe(2);
     // Ask again far in the future: both should have decayed out. Repeated
     // calls must not themselves add entries (read-only).
     expect(breaker.windowCountAsOf(ASG, at('2026-07-18T09:30:00.000Z'))).toBe(0);
     expect(breaker.windowCountAsOf(ASG, at('2026-07-18T09:30:01.000Z'))).toBe(0);
+  });
+
+  // S5 (§5cc) REGRESSION — FAILS against the pre-S5 in-memory accumulator.
+  it('a stale-generation crash whose T13 is REJECTED does not pollute the respawn-gating decision (decides off the durable window, never a private deque)', () => {
+    const breaker = new RestartBreaker(new DeterministicIdFactory());
+    // The durable, reducer-owned window holds 3 real restarts — well under the
+    // max of 5. It is the SINGLE writer's copy: only ACCEPTED, generation-matched
+    // T13s ever grow it.
+    const durable: readonly IsoTimestamp[] = [
+      at('2026-07-18T09:00:00.000Z'),
+      at('2026-07-18T09:00:01.000Z'),
+      at('2026-07-18T09:00:02.000Z'),
+    ];
+    const counters = { ...ZERO_COUNTERS, restartWindow: durable };
+    // Two stale-generation crashes arrive. Their T13 is generation-mismatched, so
+    // the engine REJECTS it and the reducer NEVER folds them — the durable window
+    // stays at 3 across all three calls (the caller re-reads the same `counters`).
+    breaker.evaluateCrash(baseInput({ occurredAt: at('2026-07-18T09:00:03.000Z'), counters }));
+    breaker.evaluateCrash(baseInput({ occurredAt: at('2026-07-18T09:00:04.000Z'), counters }));
+    // A legitimate crash for the ACTIVE generation: durable(3) + this = 4 ≤ 5, so
+    // it MUST still be a restart. The pre-S5 code accumulated the two rejected
+    // crashes into its private deque (3 → 4 → 5 → 6) and spuriously tripped
+    // `window_bound` on this fourth call.
+    const advice = breaker.evaluateCrash(baseInput({ occurredAt: at('2026-07-18T09:00:05.000Z'), counters }));
+    expectRestart(advice);
   });
 });
 
@@ -271,11 +311,12 @@ describe('RestartBreaker.evaluateCrash outputs drive the REAL transition engine 
   it('window_bound advice opens the engine breaker via T14', () => {
     const breaker = new RestartBreaker(new DeterministicIdFactory());
     const base = Date.parse('2026-07-18T09:00:00.000Z');
+    let durable: readonly IsoTimestamp[] = [];
     let advice: BreakerAdvice | undefined;
     for (let i = 0; i < 6; i += 1) {
-      advice = breaker.evaluateCrash(
-        baseInput({ occurredAt: isoTimestamp(new Date(base + i * 1000).toISOString()) }),
-      );
+      const occurredAt = isoTimestamp(new Date(base + i * 1000).toISOString());
+      advice = breaker.evaluateCrash(baseInput({ occurredAt, counters: { ...ZERO_COUNTERS, restartWindow: durable } }));
+      if (advice.kind === 'restart') durable = [...durable, occurredAt]; // reducer folds the accepted T13
     }
     expectOpen(advice!);
     const state: EngineState = initialEngineState({ phase: 'implementing', activeChild: liveChild() });

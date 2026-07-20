@@ -44,12 +44,14 @@ import {
   artifactHash,
   eventSequence,
   gitSha,
+  idempotencyKey,
   newIdempotencyKey,
   newProcessGenerationId,
   newRunId,
   newSegmentId,
   specHash,
   type AcpSessionId,
+  type AlertId,
   type ArtifactHash,
   type AssignmentId,
   type CriterionId,
@@ -74,6 +76,15 @@ import {
   type LimitClassification,
   type SpecDraftRef,
 } from '../domain/events.js';
+import {
+  buildAlertStatusEntries,
+  deriveAlertRaisedEvents,
+  deriveUnackedAlertDeliveries,
+  alertDeliveredIdempotencyKey,
+  type AlertRaisedContext,
+  type AlertStatusEntry,
+} from '../domain/alerts.js';
+import { defaultNotifierRegistry, NotifierRegistry, type Notifier } from './alerts.js';
 import {
   applyTransition,
   initialEngineState,
@@ -726,6 +737,24 @@ export interface SupervisionOptions {
   readonly selfPid?: number;
 }
 
+/**
+ * P4b-1 alert delivery seams (§5cc). Omit for production defaults (a `stderr`
+ * push sink over `process.stderr` + the `status_json` pull view). Provide
+ * `notifiers` to REPLACE the sink set (e.g. a capturing stderr in tests, or a
+ * wave-2 webhook adapter), or `stderrWrite` to only redirect the default
+ * stderr sink's output.
+ */
+export interface AlertOptions {
+  readonly notifiers?: readonly Notifier[];
+  readonly stderrWrite?: (line: string) => void;
+}
+
+/** One `(alertId, sink)` delivery an alert-delivery pass freshly appended. */
+export interface AlertDeliveredRecord {
+  readonly alertId: AlertId;
+  readonly sink: string;
+}
+
 export interface OrchestrationServiceOptions {
   readonly db: Database;
   readonly clock?: Clock;
@@ -735,6 +764,8 @@ export interface OrchestrationServiceOptions {
   readonly adapterFactory?: RoleAdapterFactory;
   /** W2-6 §14 supervision seams; omit for production defaults. */
   readonly supervision?: SupervisionOptions;
+  /** P4b-1 alert delivery seams; omit for production defaults. */
+  readonly alerts?: AlertOptions;
 }
 
 const DEFAULT_HEADLESS_MEDIATION: PermissionMediation = { mode: 'headless' };
@@ -946,6 +977,10 @@ export class OrchestrationService {
    * are counted (observable) instead of crashing the sampling loop. */
   #supervisionIngestErrors = 0;
 
+  /** P4b-1: the alert delivery sinks (`stderr` push + `status_json` pull view
+   * by default). Delivery is best-effort/at-least-once, driven from the log. */
+  readonly #notifiers: NotifierRegistry;
+
   constructor(options: OrchestrationServiceOptions) {
     this.#db = options.db;
     this.#clock = options.clock ?? options.db.clock;
@@ -958,6 +993,12 @@ export class OrchestrationService {
     // decision is consistent with the durable counters.
     this.#breaker = new RestartBreaker(this.#ids, DEFAULT_BREAKER_BOUNDS, this.#bounds);
     this.#adapterFactory = options.adapterFactory ?? defaultRoleAdapterFactory();
+    // P4b-1: alert delivery sinks. `notifiers` REPLACES the set; otherwise the
+    // default `stderr` + `status_json` sinks (with an optional stderr redirect).
+    this.#notifiers =
+      options.alerts?.notifiers !== undefined
+        ? new NotifierRegistry(options.alerts.notifiers)
+        : defaultNotifierRegistry(options.alerts?.stderrWrite);
 
     // W2-6 §14 assembly. The registry store is DURABLE by default (SQLite
     // projection layer) so identity survives an orchestrator crash; every
@@ -1152,6 +1193,18 @@ export class OrchestrationService {
       return { status: 'recorded', event: outcome.event, deduped: outcome.deduped };
     }
 
+    return this.#ingestTransition(event);
+  }
+
+  /**
+   * The §6.3 transition write-path (extracted from `ingest`): read + validate +
+   * append atomically. When `alertCtx` is supplied (P4b-1, the pause/crash/
+   * breaker sites), the transition's engine-emitted alertable `notify.requested`
+   * effects fold one `alert.raised` EACH as an extra supporting event IN THE
+   * SAME transaction — so an alert can never exist without its cause and the
+   * rejected path (a stale-generation crash, a double-pause) appends NO alert.
+   */
+  #ingestTransition(event: DomainEvent, alertCtx?: AlertRaisedContext): IngestResult {
     // F1 (§5x, Approach A): read + validate + append atomically. The read is
     // INSIDE the write-locked transaction, so `applyTransition` sees any
     // transition a concurrent CLI committed since this caller decided to
@@ -1162,7 +1215,11 @@ export class OrchestrationService {
       if (outcome.status === 'rejected') {
         return { trigger: outcome.rejectionEvent as DomainEvent, meta: outcome };
       }
-      return { trigger: event, emitted: outcome.emitted, meta: outcome };
+      const extraEvents =
+        alertCtx !== undefined
+          ? this.#deriveAlertEvents(currentState, event, outcome.emitted, alertCtx)
+          : [];
+      return { trigger: event, emitted: outcome.emitted, extraEvents, meta: outcome };
     });
 
     if (outcome.status === 'rejected') {
@@ -1189,6 +1246,77 @@ export class OrchestrationService {
       next: { ...written.projection.state, bounds: this.#bounds },
       emitted: written.appended.slice(1).map((o) => o.event),
     };
+  }
+
+  // ---- P4b-1 alerts (§5cc) -------------------------------------------------
+  /**
+   * The SINGLE alert emit point: scan a transition's engine-emitted effects for
+   * an alertable `notify.requested` (paused_limit / interrupted / breaker_open)
+   * and derive one `alert.raised` per hit, redacting `detail` through the §17.1
+   * path. Returned as extra supporting events the caller folds into the SAME
+   * `#atomicEngineWrite` transaction as the trigger. `generationId` defaults to
+   * the crashing/paused live child on the pre-transition state.
+   */
+  #deriveAlertEvents(
+    currentState: EngineState,
+    trigger: DomainEvent,
+    emitted: readonly DomainEvent[],
+    ctx: AlertRaisedContext,
+  ): DomainEvent[] {
+    const context: AlertRaisedContext = {
+      role: ctx.role,
+      ...(ctx.generationId !== undefined
+        ? { generationId: ctx.generationId }
+        : currentState.activeChild !== undefined
+          ? { generationId: currentState.activeChild.generationId }
+          : {}),
+      ...(ctx.detail !== undefined ? { detail: ctx.detail } : {}),
+    };
+    return deriveAlertRaisedEvents({ trigger, emitted, context, redact: redactText }) as DomainEvent[];
+  }
+
+  /**
+   * P4b-1 best-effort, at-least-once alert delivery. DERIVES the un-acked
+   * `(alert, sink)` pairs from the log (an `alert.raised` with no matching
+   * `alert.delivered` for that sink — the F3 derive-from-log pattern), delivers
+   * each to its registered `Notifier`, then appends `alert.delivered` (dedup by
+   * `(alertId, sink)`). A `Notifier` THROW leaves the alert un-acked so a later
+   * pass retries. Idempotent: a second call with nothing un-acked is a no-op, so
+   * a restart re-delivers exactly the alerts that were never acked — once more.
+   * Safe on an unknown run (empty log → nothing to do).
+   */
+  deliverPendingAlerts(runId: RunId): { readonly delivered: readonly AlertDeliveredRecord[] } {
+    const events = this.#db.events.listByRun(runId);
+    const pending = deriveUnackedAlertDeliveries(events, this.#notifiers.sinks());
+    const delivered: AlertDeliveredRecord[] = [];
+    for (const { alert, sink } of pending) {
+      const notifier = this.#notifiers.get(sink);
+      if (notifier === undefined) continue;
+      try {
+        notifier.deliver(alert);
+      } catch {
+        // Best-effort: leave un-acked (no `alert.delivered`) — a later pass
+        // (or a restart's re-derive) retries. This is the at-least-once edge.
+        continue;
+      }
+      const ackEvent = this.#trigger(
+        runId,
+        'alert.delivered',
+        { alertId: alert.alertId, sink },
+        { idempotencyKey: idempotencyKey(alertDeliveredIdempotencyKey(alert.alertId, sink)) },
+      ) as DomainEvent;
+      const [outcome] = this.#db.events.appendBatch([ackEvent]);
+      if (outcome !== undefined && !outcome.deduped) {
+        delivered.push({ alertId: alert.alertId, sink });
+      }
+    }
+    return { delivered };
+  }
+
+  /** P4b-1 — the alert read-model (the `status --json` alerts section), folded
+   * from the run's log (`alert.raised` + per-sink `alert.delivered`). */
+  alertStatus(runId: RunId): readonly AlertStatusEntry[] {
+    return buildAlertStatusEntries(this.#db.events.listByRun(runId));
   }
 
   /**
@@ -2219,23 +2347,35 @@ export class OrchestrationService {
       ...(latestCheckpointHash !== undefined ? { latestCheckpointHash } : {}),
       counters: this.#loadEngineRecord(ctx.runId).state.counters,
     });
+    // P4b-1: the crash detail carried onto the alert is the SINK-SAFE (redacted
+    // §17.1) raw error message — never the raw text. `#deriveAlertEvents` re-runs
+    // the redaction path defensively when it composes the stored detail.
+    const alertCtx: AlertRaisedContext = {
+      role: ctx.role,
+      generationId: ctx.generationId,
+      detail: raw instanceof Error ? raw.message : String(raw),
+    };
     if (advice.kind === 'breaker_open') {
-      this.ingest(
-        // F4 (§5x): STAMP the generation so T14's `generation_matches_active`
-        // guard keeps a stale/late breaker-open off a moved-on/paused/terminal
-        // run (mirrors the T13 stamp below).
+      // F4 (§5x): STAMP the generation so T14's `generation_matches_active`
+      // guard keeps a stale/late breaker-open off a moved-on/paused/terminal
+      // run (mirrors the T13 stamp below). P4b-1: T14's `breaker_open` notify
+      // rides an `alert.raised` in the SAME transaction.
+      this.#ingestTransition(
         this.#trigger(ctx.runId, 'restart.exhausted', {
           reason: advice.reason,
           generationId: ctx.generationId,
         }) as DomainEvent,
+        alertCtx,
       );
     } else {
-      this.ingest(
+      // P4b-1: T13's `interrupted` notify rides an `alert.raised` atomically.
+      this.#ingestTransition(
         this.#trigger(ctx.runId, 'child.exited.unexpectedly', {
           segmentId: ctx.segmentId,
           generationId: ctx.generationId,
           classifiedAs: 'crash',
         }) as DomainEvent,
+        alertCtx,
       );
     }
     return toSinkSafeTypedError(raw);
@@ -2317,10 +2457,21 @@ export class OrchestrationService {
       if (outcome.status === 'rejected') {
         return { trigger: outcome.rejectionEvent as DomainEvent, meta: outcome };
       }
+      // P4b-1: the T4/T16 `paused_limit` notify effect rides an `alert.raised`
+      // (kind `limit_paused`) in the SAME transaction as the pause + its
+      // `checkpoint.recorded` — an alert can never exist without its cause.
+      const alerts = this.#deriveAlertEvents(state, trigger, outcome.emitted, {
+        role: ctx.role,
+        generationId: ctx.generationId,
+        detail: `provider=${limit.provider} tier=${limit.detectionTier} operation=${operation}`,
+      });
       return {
         trigger,
         emitted: outcome.emitted,
-        extraEvents: checkpoint.event !== undefined ? [checkpoint.event as DomainEvent] : [],
+        extraEvents: [
+          ...(checkpoint.event !== undefined ? [checkpoint.event as DomainEvent] : []),
+          ...alerts,
+        ],
         meta: outcome,
       };
     });

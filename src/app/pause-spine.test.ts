@@ -244,8 +244,9 @@ describe('pauseForLimit — limit envelope on a prompt turn (T4)', () => {
       inFlightOperation: 'prompt_turn',
     });
 
-    // The ONE atomic append: trigger + engine effects + checkpoint.recorded,
-    // then the generation-matched confirmation.
+    // The ONE atomic append: trigger + engine effects + checkpoint.recorded +
+    // the P4b-1 alert.raised (rides the SAME transaction as its `paused_limit`
+    // notify cause), then the generation-matched confirmation.
     const types = eventTypes(db, runId);
     const pauseSlice = types.slice(types.indexOf('limit.classified.prompt_turn'));
     expect(pauseSlice).toEqual([
@@ -256,6 +257,7 @@ describe('pauseForLimit — limit envelope on a prompt turn (T4)', () => {
       'limit.incident.recorded',
       'notify.requested',
       'checkpoint.recorded',
+      'alert.raised',
       'child.stopped',
     ]);
 

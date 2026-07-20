@@ -181,6 +181,17 @@ export async function executeCommand(
   deps: CommandDeps = {},
 ): Promise<CommandOutput> {
   try {
+    // P4b-1: every CLI invocation over the shared store is a "startup" for the
+    // best-effort/at-least-once alert delivery — flush any un-acked alerts to
+    // their sinks (stderr push + status_json view) before serving the command.
+    // Best-effort: never let a delivery hiccup fail the command.
+    if ('runId' in command) {
+      try {
+        service.deliverPendingAlerts(command.runId);
+      } catch {
+        /* best-effort — delivery retries on the next invocation */
+      }
+    }
     switch (command.kind) {
       case 'start':
         return await handleStart(service, command, deps.flows);
@@ -1630,6 +1641,28 @@ function buildLimitStatus(
   };
 }
 
+/**
+ * P4b-1 — the `status --json` alerts section: each raised alert with its kind,
+ * role, generation, redacted detail, occurredAt, and per-sink delivery state.
+ * Derived from the log via the service's alert projection.
+ */
+function buildAlertsStatus(
+  service: OrchestrationService,
+  runId: RunId,
+): readonly Record<string, unknown>[] {
+  return service.alertStatus(runId).map((alert) => ({
+    alertId: alert.alertId,
+    kind: alert.kind,
+    role: alert.role,
+    ...(alert.generationId !== undefined ? { generationId: alert.generationId } : {}),
+    topic: alert.topic,
+    detail: alert.detail,
+    occurredAt: alert.occurredAt,
+    delivered: alert.delivered,
+    sinks: alert.sinks,
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // status (phase, suspension, ETA|unknown, vitals rss/context/cost, checkpoints)
 // ---------------------------------------------------------------------------
@@ -1682,6 +1715,12 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
     // §5t (4): the effective (running) model per role AND, when set, a DISTINCT
     // pending desired model — never conflated.
     models: buildModelsView(db, runId),
+    // P4b-1: the alerts section — every raised alert with its per-sink delivery
+    // state (derived from the log). Omitted when there are none.
+    ...(() => {
+      const alerts = buildAlertsStatus(service, runId);
+      return alerts.length > 0 ? { alerts } : {};
+    })(),
   };
   return finish('status', view, renderStatusText(view, st.suspension), 0);
 }

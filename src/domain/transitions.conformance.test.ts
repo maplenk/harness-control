@@ -286,6 +286,8 @@ const SUPPORTING_EVENT_TYPES = [
   'limit.probe.claimed', // W2-4 vocabulary (defined in W2-1)
   'limit.probe.inconclusive', // W2-4 vocabulary (defined in W2-1)
   'orchestrator.heartbeat',
+  'alert.raised', // P4b-1: durable operator alert, folded into its trigger's txn
+  'alert.delivered', // P4b-1: at-least-once delivery ack (dedup by alertId/sink)
 ] as const satisfies readonly DomainEventType[];
 
 type SupportingEventType = (typeof SUPPORTING_EVENT_TYPES)[number];
@@ -597,10 +599,10 @@ function assertInvariant(
 // Meta: guards the generator's own inputs against drift.
 // ---------------------------------------------------------------------------
 describe('conformance-suite event vocabulary bookkeeping', () => {
-  it('has exactly 25 trigger rows and 39 supporting types partitioning the full vocabulary', () => {
+  it('has exactly 25 trigger rows and 41 supporting types partitioning the full vocabulary', () => {
     expect(TRANSITION_TABLE).toHaveLength(25);
     expect(TRIGGER_EVENT_TYPES).toHaveLength(25);
-    expect(SUPPORTING_EVENT_TYPES).toHaveLength(39); // +verification.runner.violation (W3-1)
+    expect(SUPPORTING_EVENT_TYPES).toHaveLength(41); // +alert.raised, +alert.delivered (P4b-1)
 
     const triggerSet = new Set<string>(TRIGGER_EVENT_TYPES);
     const supportingSet = new Set<string>(SUPPORTING_EVENT_TYPES);

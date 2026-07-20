@@ -20,21 +20,21 @@
  * restart back out of the count as real time passes (`EngineConfig`'s
  * `restarts.windowMinutes` field — `../config/schema.ts` — exists for
  * exactly this and, prior to this module, had no consumer anywhere in the
- * codebase). This module is that consumer: it tracks each assignment's
- * restart timestamps itself (from each input's own `occurredAt` — no live
- * `Clock` reference needed here, exactly like `applyTransition` itself) and
- * decides `window_bound` from a genuinely time-decayed count, independent of — and MORE PERMISSIVE
- * than — the engine's own non-decaying counter can ever be. Lifetime is
- * deliberately NOT re-tracked independently here: `evaluateCrash` takes the
- * CALLER-supplied authoritative `RestartCounters` (read from the durably
- * persisted `EngineState` projection) as the single source of truth for
- * `lifetimeRestarts`, so a restarted orchestrator can never "forget" restarts
- * that happened before it crashed — a fresh in-memory window tracker
- * starting empty after an orchestrator restart is a SAFE direction to err in
- * for the window bound specifically (it only ever makes the window check
- * MORE permissive, never less), whereas the same amnesia for the
- * non-disableable lifetime cap would not be safe, hence reading it from the
- * caller instead of tracking it here.
+ * codebase). This module is that consumer: it decides `window_bound` from a
+ * genuinely time-decayed count (each input's own `occurredAt` — no live `Clock`
+ * reference needed here, exactly like `applyTransition` itself), independent of
+ * — and MORE PERMISSIVE than — the engine's own non-decaying counter can ever
+ * be. S5 (§5cc): that decayed count is read off the CALLER-supplied durable
+ * `counters.restartWindow` on EVERY call (the generation-guarded T13 reducer is
+ * its single writer), pruned to the live span, plus the current crash — NOT an
+ * independently-accumulating in-memory deque. So a stale-generation crash whose
+ * T13 the engine REJECTS never grows the durable window and thus can never
+ * pollute a later respawn-gating decision; the `#windowTimestampsMs` map is now
+ * only a re-hydratable observability cache. Lifetime is likewise NOT re-tracked
+ * independently: `evaluateCrash` takes the CALLER-supplied authoritative
+ * `RestartCounters` (read from the durably persisted `EngineState` projection)
+ * as the single source of truth for `lifetimeRestarts`, so a restarted
+ * orchestrator can never "forget" restarts that happened before it crashed.
  *
  * `no_progress` and `max_elapsed_recovery` are information the engine has NO
  * way to know regardless of decay (checkpoint content hashes; wall-clock
@@ -121,10 +121,11 @@ export interface RestartAttemptInput {
   /**
    * Current AUTHORITATIVE counters — read by the caller from the durably
    * persisted `EngineState` projection. This module is never the source of
-   * truth for `lifetimeRestarts` (see module doc); it only reads it here. F4
-   * (§5x): `counters.restartWindow` (the durable, reducer-pruned restart
-   * timestamps) also seeds this module's in-memory window deque on first use
-   * per assignment, so the fast 5/10min window survives a fresh process.
+   * truth for `lifetimeRestarts` (see module doc); it only reads it here. S5
+   * (§5cc): `counters.restartWindow` (the durable, reducer-pruned restart
+   * timestamps) is ALSO the sole basis for the fast 5/10min `window_bound`
+   * decision — re-read and re-pruned every call, never cached across calls —
+   * so a rejected stale-generation crash can never inflate it.
    */
   readonly counters: RestartCounters;
 }
@@ -231,22 +232,25 @@ export class RestartBreaker {
   evaluateCrash(input: RestartAttemptInput): BreakerAdvice {
     const nowMs = Date.parse(input.occurredAt);
 
-    // F4 (§5x): seed the in-memory window deque from the DURABLE, reducer-pruned
-    // `counters.restartWindow` the FIRST time this process sees the assignment
-    // (or the first crash after a `reset`) — so the fast 5/10min window is not
-    // amnesiac across a fresh CLI invocation. Subsequent in-process crashes use
-    // the accumulated deque directly (the reducer keeps the durable copy in sync
-    // on each folded T13). Never re-seeds a still-tracked assignment.
-    this.#hydrateWindow(input.assignmentId, input.counters);
-
     if (input.counters.lifetimeRestarts >= this.#engineBounds.lifetimeRestartMax) {
       return this.#breakerOpen(input, 'lifetime_cap');
     }
 
-    const window = this.#prunedWindow(input.assignmentId, nowMs);
-    window.push(nowMs);
-    this.#windowTimestampsMs.set(input.assignmentId, window);
-    if (window.length > this.#engineBounds.restartWindowMax) {
+    // S5 (§5cc): DECIDE the window bound off the DURABLE, reducer-pruned
+    // `counters.restartWindow` on EVERY call — the generation-guarded T13 reducer
+    // is that window's SINGLE writer, so a stale-generation crash whose T13 the
+    // engine REJECTS never grows it and therefore cannot pollute a later
+    // respawn-gating decision. (The pre-S5 code seeded an in-memory deque from
+    // durable ONCE, then accumulated every subsequent `evaluateCrash` push into
+    // it — including rejected stale-gen crashes the reducer never folded — so the
+    // fast 5/10min decision could diverge upward from durable truth and trip
+    // `window_bound` spuriously.) The in-memory `#windowTimestampsMs` deque is now
+    // ONLY a re-hydratable observability cache (`windowCountAsOf`): rebuilt from
+    // durable truth + this crash every call rather than independently accumulated,
+    // so a rejected crash it transiently saw is discarded on the next re-read.
+    const decisionWindow = [...this.#prunedDurableWindow(input.counters, nowMs), nowMs];
+    this.#windowTimestampsMs.set(input.assignmentId, decisionWindow);
+    if (decisionWindow.length > this.#engineBounds.restartWindowMax) {
       return this.#breakerOpen(input, 'window_bound');
     }
 
@@ -280,17 +284,16 @@ export class RestartBreaker {
     };
   }
 
-  /** F4 (§5x): lazily seed the in-memory window deque from the durable
-   * `counters.restartWindow` on first use per assignment (a fresh process, or
-   * the first crash after `reset` cleared the key). A still-tracked assignment
-   * is never re-seeded — the in-memory deque is authoritative once populated
-   * (the reducer keeps the durable copy in lockstep). */
-  #hydrateWindow(assignmentId: AssignmentId, counters: RestartCounters): void {
-    if (this.#windowTimestampsMs.has(assignmentId)) return;
-    const seeded = (counters.restartWindow ?? [])
+  /** S5 (§5cc): prune the DURABLE, reducer-owned `counters.restartWindow` to the
+   * live span as of `nowMs`. This — plus the current crash — is the SOLE basis
+   * for the window-bound decision; the in-memory deque is never the authority.
+   * (`#bounds.windowMinutes` matches the reducer's `foldRestartWindow` span, so
+   * the breaker's fast decision and the durable copy agree entry-for-entry.) */
+  #prunedDurableWindow(counters: RestartCounters, nowMs: number): number[] {
+    const spanMs = this.#bounds.windowMinutes * 60_000;
+    return (counters.restartWindow ?? [])
       .map((iso) => Date.parse(iso))
-      .filter((ms) => Number.isFinite(ms));
-    this.#windowTimestampsMs.set(assignmentId, seeded);
+      .filter((ms) => Number.isFinite(ms) && nowMs - ms <= spanMs);
   }
 
   #prunedWindow(assignmentId: AssignmentId, nowMs: number): number[] {

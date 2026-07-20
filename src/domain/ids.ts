@@ -21,6 +21,8 @@ export type VerificationId = Brand<string, 'VerificationId'>;
 export type MergeReadinessId = Brand<string, 'MergeReadinessId'>;
 export type LimitIncidentId = Brand<string, 'LimitIncidentId'>;
 export type MemoryEntryId = Brand<string, 'MemoryEntryId'>;
+/** P4b-1 durable alert identity (an `alert.raised` supporting event, §5cc). */
+export type AlertId = Brand<string, 'AlertId'>;
 /** Stable acceptance-criterion id inside a SpecVersion (PLAN §7). */
 export type CriterionId = Brand<string, 'CriterionId'>;
 /** Reserved for post-MVP parallel waves (PLAN §4.2, §6.1). */
@@ -59,6 +61,7 @@ export const verificationId = (value: string): VerificationId => value as Verifi
 export const mergeReadinessId = (value: string): MergeReadinessId => value as MergeReadinessId;
 export const limitIncidentId = (value: string): LimitIncidentId => value as LimitIncidentId;
 export const memoryEntryId = (value: string): MemoryEntryId => value as MemoryEntryId;
+export const alertId = (value: string): AlertId => value as AlertId;
 export const criterionId = (value: string): CriterionId => value as CriterionId;
 export const waveId = (value: string): WaveId => value as WaveId;
 export const artifactHash = (value: string): ArtifactHash => value as ArtifactHash;

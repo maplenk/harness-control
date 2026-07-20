@@ -16,6 +16,7 @@
  *   projection layer) backing the supervisor's startup orphan reaping.
  */
 export * from './service.js';
+export * from './alerts.js';
 export * from './role-runner.js';
 export * from './model-resolution.js';
 export * from './cost.js';
