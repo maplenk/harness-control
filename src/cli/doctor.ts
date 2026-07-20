@@ -5,11 +5,10 @@
  * §17.1 H-2 evidence-honest 4-state vocabulary.
  *
  * Every check is READ-ONLY and offline-deterministic:
- *  - **Adapters** (§3, §17.1): the lockfile-pinned `claude-agent-acp` /
- *    `codex-acp` binaries are resolved through the profiles' own resolvers
- *    (installed package's `package.json` `bin` — never `npx -y`), and the
- *    §13 version pin is checked (drift → overall FAIL: the classifier
- *    conformance fixtures are version-specific). Provenance is reported,
+ *  - **Adapters** (§3, §17.1): Claude resolves the user's installed
+ *    first-party `claude` provider and enforces the characterized minimum
+ *    version; Codex ACP and OpenCode remain lockfile-pinned local packages.
+ *    No adapter uses `npx -y`. Provenance is reported,
  *    including codex-acp's platform binary arriving via lockfile-pinned
  *    `optionalDependencies` with no postinstall (§17.1).
  *  - **Auth** (§3/D2 + §17.1 live-gate H-2 — evidence-honest, never
@@ -19,9 +18,12 @@
  *    credential artifacts checked for presence only, never opened/parsed/
  *    mutated) reports at most `detected_but_unvalidated`; `supported`
  *    requires a recorded successful provider turn, which a static doctor run
- *    never has. Claude's on-disk OAuth state stays
- *    `detected_but_unsupported` (subscription OAuth is ToS-barred,
- *    2026-02-19 — categorically not the automation path); codex's
+ *    never has. OpenCode's `auth.json` is treated the same way: provider
+ *    credentials from `opencode auth login` are detected without reading the
+ *    file, and remain unvalidated until a turn succeeds. Claude's native
+ *    provider owns its subscription/keychain authentication; the harness
+ *    never forwards `ANTHROPIC_API_KEY`. On-disk Claude state is therefore
+ *    `detected_but_unvalidated` until a provider turn succeeds. Codex's
  *    `~/.codex/auth.json` (ChatGPT/Codex subscription login — the real path
  *    on this machine, H-1 isolation copies it into spawned children) →
  *    `detected_but_unvalidated`. Nothing found → honest `unknown`.
@@ -65,14 +67,12 @@ import { promisify } from 'node:util';
 import { SystemClock, type Clock, type IsoTimestamp } from '../lib/clock.js';
 import { isOk } from '../lib/result.js';
 import {
-  ANTHROPIC_API_KEY_ENV_VAR,
-  CLAUDE_BIN_NAME,
   CLAUDE_HARNESS_ID,
-  CLAUDE_PACKAGE_NAME,
-  EXPECTED_CLAUDE_ADAPTER_VERSION,
-  checkVersionPin as checkClaudeVersionPin,
-  probeClaudeAuthReadiness,
-  tryResolveClaudeCommand,
+  CLAUDE_PROVIDER_BIN_NAME,
+  CLAUDE_PROVIDER_PACKAGE_NAME,
+  MIN_CLAUDE_PROVIDER_VERSION,
+  checkClaudeProviderVersion,
+  tryResolveClaudeProviderCommand,
 } from '../adapters/claude/index.js';
 import {
   CODEX_API_KEY_ENV_VAR,
@@ -87,6 +87,16 @@ import {
   tryResolveCodexCommand,
 } from '../adapters/codex/index.js';
 import { checkVersionPin as checkCodexVersionPin } from '../adapters/codex/command.js';
+import {
+  EXPECTED_OPENCODE_VERSION,
+  OPENCODE_BIN_NAME,
+  OPENCODE_HARNESS_ID,
+  OPENCODE_PACKAGE_NAME,
+  openCodeAuthJsonPath,
+  probeOpenCodeAuthReadiness,
+  tryResolveOpenCodeCommand,
+} from '../adapters/opencode/index.js';
+import { checkVersionPin as checkOpenCodeVersionPin } from '../adapters/opencode/command.js';
 import type { AuthReadiness } from '../adapters/spi.js';
 import { AcpStdioAdapter } from '../adapters/acp/index.js';
 import { fakeAcpChildPath, writeScenarioFile } from '../adapters/fake/index.js';
@@ -115,6 +125,8 @@ export interface DoctorAdapterReport {
   readonly versionPinned?: boolean;
   readonly issues: readonly string[];
   readonly provenance: string;
+  /** Spawn-time boundary that prevents host config from widening access. */
+  readonly isolation: string;
 }
 
 export interface DoctorAuthReport {
@@ -209,6 +221,8 @@ export interface DoctorOptions {
   readonly configPath?: string;
   /** Start dir for lockfile-pinned adapter resolution (tests). */
   readonly resolveFromDir?: string;
+  /** Injectable native Claude resolution; keeps doctor tests offline. */
+  readonly claudeProviderResolver?: () => ReturnType<typeof tryResolveClaudeProviderCommand>;
   /** Handshake bound for the fake-adapter check (default 15s, §10.2). */
   readonly handshakeTimeoutMs?: number;
   /** Injectable for deterministic tests; defaults to `process.platform`. */
@@ -221,14 +235,62 @@ export interface DoctorOptions {
 const LOCKFILE_PROVENANCE =
   'resolved from the installed lockfile-pinned package via its own package.json bin ' +
   '(never npx -y; PLAN §3/§17.1)';
+const CLAUDE_PROVIDER_PROVENANCE =
+  'resolved from the installed first-party Claude Code CLI on PATH (or CLAUDE_PROVIDER_BIN); ' +
+  'never npx -y; the harness uses its native subscription/keychain provider directly and never routes Claude through an API-key ACP adapter';
+const CLAUDE_PROVIDER_ISOLATION =
+  'native stream-json spawn pins --safe-mode, empty strict MCP config, role-scoped tools, and dontAsk/acceptEdits permission mode; verify live with `npm run smoke:claude:provider`';
+const CODEX_ISOLATION =
+  'per-run CODEX_HOME carries auth.json plus orchestrator config; caller and spawn-override CODEX_HOME replacement is rejected';
+const OPENCODE_ISOLATION =
+  'per-run HOME/XDG carries auth only; `acp --pure`, project/external config disabled, empty MCP/plugins, and protected OPENCODE_PERMISSION keep ACP authoritative; verify live with `npm run smoke:opencode:isolation`';
+
+function claudeProviderAdapterReport(
+  resolve: () => ReturnType<typeof tryResolveClaudeProviderCommand>,
+): DoctorAdapterReport {
+  const result = resolve();
+  if (!isOk(result)) {
+    return {
+      harnessId: CLAUDE_HARNESS_ID,
+      packageName: CLAUDE_PROVIDER_PACKAGE_NAME,
+      binName: CLAUDE_PROVIDER_BIN_NAME,
+      expectedVersion: MIN_CLAUDE_PROVIDER_VERSION,
+      resolved: false,
+      issues: [result.error.message],
+      provenance: CLAUDE_PROVIDER_PROVENANCE,
+      isolation: CLAUDE_PROVIDER_ISOLATION,
+    };
+  }
+  const resolved = result.value;
+  const compatible = checkClaudeProviderVersion(resolved.version);
+  return {
+    harnessId: CLAUDE_HARNESS_ID,
+    packageName: CLAUDE_PROVIDER_PACKAGE_NAME,
+    binName: CLAUDE_PROVIDER_BIN_NAME,
+    expectedVersion: MIN_CLAUDE_PROVIDER_VERSION,
+    resolved: true,
+    installedVersion: resolved.version,
+    binPath: resolved.binPath,
+    packageDir: resolved.packageDir,
+    versionPinned: compatible.pinned,
+    issues: compatible.pinned
+      ? []
+      : [
+          `unsupported Claude provider version ${resolved.version}; minimum characterized version is ${MIN_CLAUDE_PROVIDER_VERSION}`,
+        ],
+    provenance: CLAUDE_PROVIDER_PROVENANCE,
+    isolation: CLAUDE_PROVIDER_ISOLATION,
+  };
+}
 
 function adapterReport(
   harnessId: string,
   packageName: string,
   binName: string,
   expectedVersion: string,
-  resolve: () => ReturnType<typeof tryResolveClaudeCommand>,
+  resolve: () => ReturnType<typeof tryResolveCodexCommand>,
   checkPin: (installed: string, expected: string) => { pinned: boolean },
+  isolation: string,
   extraProvenance?: string,
 ): DoctorAdapterReport {
   const provenance =
@@ -243,6 +305,7 @@ function adapterReport(
       resolved: false,
       issues: [result.error.message],
       provenance,
+      isolation,
     };
   }
   const resolved = result.value;
@@ -266,6 +329,7 @@ function adapterReport(
     versionPinned: pin.pinned,
     issues,
     provenance,
+    isolation,
   };
 }
 
@@ -444,13 +508,8 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     options.resolveFromDir !== undefined ? { fromDir: options.resolveFromDir } : {};
 
   const adapters: DoctorAdapterReport[] = [
-    adapterReport(
-      CLAUDE_HARNESS_ID,
-      CLAUDE_PACKAGE_NAME,
-      CLAUDE_BIN_NAME,
-      EXPECTED_CLAUDE_ADAPTER_VERSION,
-      () => tryResolveClaudeCommand(resolveOptions),
-      checkClaudeVersionPin,
+    claudeProviderAdapterReport(
+      options.claudeProviderResolver ?? (() => tryResolveClaudeProviderCommand()),
     ),
     adapterReport(
       CODEX_HARNESS_ID,
@@ -459,27 +518,36 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
       EXPECTED_CODEX_ADAPTER_VERSION,
       () => tryResolveCodexCommand(resolveOptions),
       checkCodexVersionPin,
+      CODEX_ISOLATION,
       'codex-acp platform binary arrives via lockfile-pinned optionalDependencies, no postinstall (PLAN §3, §17.1)',
+    ),
+    adapterReport(
+      OPENCODE_HARNESS_ID,
+      OPENCODE_PACKAGE_NAME,
+      OPENCODE_BIN_NAME,
+      EXPECTED_OPENCODE_VERSION,
+      () => tryResolveOpenCodeCommand(resolveOptions),
+      checkOpenCodeVersionPin,
+      OPENCODE_ISOLATION,
+      'native ACP server is invoked as the pinned local binary with `acp --pure`; provider/model discovery stays dynamic',
     ),
   ];
 
   const auth: DoctorAuthReport[] = [
     authReport(
       CLAUDE_HARNESS_ID,
-      probeClaudeAuthReadiness(env),
-      [ANTHROPIC_API_KEY_ENV_VAR],
+      'unknown',
+      [],
       env,
       [
         path.join(home, '.claude', '.credentials.json'),
         path.join(home, '.claude.json'),
-        path.join(home, '.claude'),
       ],
-      'detected_but_unsupported',
-      [],
-      'API key is the documented path (PLAN D2), but a present key is UNVALIDATED until a successful ' +
-        'provider turn is recorded (H-2) — reported detected_but_unvalidated, never supported. Third-party ' +
-        'subscription OAuth is ToS-barred (2026-02-19), so on-disk OAuth state alone is detected_but_unsupported. ' +
-        'Presence checks only — nothing is opened or mutated.',
+      'detected_but_unvalidated',
+      [path.join(home, '.claude')],
+      'Claude roles always use the installed first-party Claude Code provider and its subscription/keychain login. ' +
+        'ANTHROPIC_API_KEY is intentionally not inherited by the child. Credential presence is only ' +
+        'detected_but_unvalidated; supported requires a successful native provider turn.',
     ),
     authReport(
       CODEX_HARNESS_ID,
@@ -494,6 +562,20 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
         'rode the inherited ~/.codex ChatGPT login. ~/.codex/auth.json (ChatGPT/Codex subscription login — ' +
         'carried into spawned children by H-1 CODEX_HOME isolation) is likewise detected_but_unvalidated; ' +
         'contents are never inspected (read-only presence check). supported requires validated turn evidence.',
+    ),
+    authReport(
+      OPENCODE_HARNESS_ID,
+      probeOpenCodeAuthReadiness(),
+      [],
+      env,
+      [openCodeAuthJsonPath(home)],
+      'detected_but_unvalidated',
+      [path.join(home, '.local', 'share', 'opencode')],
+      'OpenCode reuses provider credentials created by `opencode auth login` through an H-1 isolated ' +
+        'per-run HOME/XDG tree. The store is byte-copied in at spawn, never parsed or logged, and never ' +
+        'written back; host/project config, plugins, MCP, and auto-allow rules are excluded. The orchestrator ' +
+        'never starts an interactive login. ' +
+        'Presence is detected_but_unvalidated; supported requires a successful provider turn.',
     ),
   ];
 
@@ -595,15 +677,16 @@ export function renderDoctorText(report: DoctorReport): string {
   const lines: string[] = [];
   lines.push(`harness doctor — overall: ${report.overall.toUpperCase()} (${report.generatedAt})`);
   lines.push('');
-  lines.push('adapters (lockfile-pinned):');
+  lines.push('adapters (resolved and version-characterized):');
   for (const adapter of report.adapters) {
     const state = adapter.resolved
       ? `${adapter.installedVersion}${adapter.versionPinned === true ? ' (pinned)' : ' (VERSION DRIFT)'} at ${adapter.binPath}`
       : 'NOT RESOLVED';
     lines.push(`  [${mark(adapter.resolved && adapter.versionPinned !== false)}] ${adapter.harnessId}: ${adapter.packageName} ${state}`);
+    lines.push(`         provenance: ${adapter.provenance}`);
+    lines.push(`         isolation: ${adapter.isolation}`);
     for (const issue of adapter.issues) lines.push(`         - ${issue}`);
   }
-  lines.push(`  provenance: ${report.adapters[0]?.provenance ?? LOCKFILE_PROVENANCE}`);
   lines.push('');
   lines.push('auth (evidence-honest, read-only; supported requires a validated turn — H-2):');
   for (const auth of report.auth) {

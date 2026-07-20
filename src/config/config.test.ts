@@ -270,6 +270,17 @@ describe('parseEngineConfig (deep partial overrides + validation)', () => {
     expect(isOk(result)).toBe(true);
   });
 
+  it('P4b wave 2 (F4a): accepts an OpenCode dynamic provider/model target', () => {
+    const result = parseEngineConfig({
+      failoverPolicy: 'switch_harness',
+      failoverLadder: [
+        { harness: 'codex', model: 'gpt-5.6-terra' },
+        { harness: 'opencode', model: 'xai/grok-4.5', effort: 'high' },
+      ],
+    });
+    expect(isOk(result)).toBe(true);
+  });
+
   it('P4b wave 2: REJECTS `switch_model` without a ladder (no implicit target)', () => {
     const result = parseEngineConfig({ failoverPolicy: 'switch_model' });
     expect(isErr(result)).toBe(true);

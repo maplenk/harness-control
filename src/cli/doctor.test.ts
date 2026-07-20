@@ -11,15 +11,35 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock } from '../lib/clock.js';
 import {
-  EXPECTED_CLAUDE_ADAPTER_VERSION,
+  MIN_CLAUDE_PROVIDER_VERSION,
+  type ResolvedClaudeProviderCommand,
 } from '../adapters/claude/index.js';
 import { EXPECTED_CODEX_ADAPTER_VERSION } from '../adapters/codex/index.js';
+import {
+  EXPECTED_OPENCODE_VERSION,
+  openCodeAuthJsonPath,
+} from '../adapters/opencode/index.js';
 import { BYTES_PER_GB } from '../config/schema.js';
-import { runDoctor, renderDoctorText } from './doctor.js';
+import { runDoctor, renderDoctorText, type DoctorOptions } from './doctor.js';
 import { CLI_USAGE, parseCliArgs } from './index.js';
 
 const GENEROUS_MS = 30_000;
 const CLOCK = new ManualClock('2026-07-18T12:00:00.000Z');
+const CLAUDE_PROVIDER: ResolvedClaudeProviderCommand = {
+  command: '/test/bin/claude',
+  args: [],
+  packageName: '@anthropic-ai/claude-code',
+  version: `${MIN_CLAUDE_PROVIDER_VERSION} (Claude Code)`,
+  binPath: '/test/bin/claude',
+  packageDir: '/test/bin',
+};
+
+function runTestDoctor(options: DoctorOptions) {
+  return runDoctor({
+    ...options,
+    claudeProviderResolver: () => ({ ok: true, value: CLAUDE_PROVIDER }),
+  });
+}
 
 const tempDirs: string[] = [];
 async function makeTempDir(prefix: string): Promise<string> {
@@ -36,26 +56,42 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
     'reports every §18 section and warns (not fails) when no auth evidence exists',
     async () => {
       const home = await makeTempDir('doctor-home-empty-');
-      const report = await runDoctor({ env: {}, homeDir: home, clock: CLOCK });
+      const report = await runTestDoctor({ env: {}, homeDir: home, clock: CLOCK });
 
       expect(report.generatedAt).toBe(CLOCK.nowIso());
 
       // Adapters: resolved from THIS repo's lockfile-pinned node_modules.
-      expect(report.adapters.map((a) => a.harnessId)).toEqual(['claude', 'codex']);
+      expect(report.adapters.map((a) => a.harnessId)).toEqual([
+        'claude',
+        'codex',
+        'opencode',
+      ]);
       for (const adapter of report.adapters) {
         expect(adapter.resolved).toBe(true);
         expect(adapter.versionPinned).toBe(true);
-        expect(adapter.binPath).toContain('node_modules');
         expect(adapter.provenance).toContain('never npx -y');
       }
-      expect(report.adapters[0]?.installedVersion).toBe(EXPECTED_CLAUDE_ADAPTER_VERSION);
+      expect(report.adapters[0]?.installedVersion).toContain(MIN_CLAUDE_PROVIDER_VERSION);
+      expect(report.adapters[0]?.packageName).toBe('@anthropic-ai/claude-code');
+      expect(report.adapters[0]?.provenance).toContain('subscription/keychain');
+      expect(report.adapters[1]?.binPath).toContain('node_modules');
+      expect(report.adapters[2]?.binPath).toContain('node_modules');
       expect(report.adapters[1]?.installedVersion).toBe(EXPECTED_CODEX_ADAPTER_VERSION);
+      expect(report.adapters[2]?.installedVersion).toBe(EXPECTED_OPENCODE_VERSION);
       expect(report.adapters[1]?.provenance).toContain('optionalDependencies');
+      expect(report.adapters[2]?.provenance).toContain('native ACP');
+      expect(report.adapters[0]?.isolation).toContain('--safe-mode');
+      expect(report.adapters[0]?.isolation).toContain('smoke:claude:provider');
+      expect(report.adapters[1]?.isolation).toContain('CODEX_HOME');
+      expect(report.adapters[2]?.isolation).toContain('HOME/XDG');
+      expect(report.adapters[2]?.isolation).toContain('acp --pure');
+      expect(report.adapters[2]?.isolation).toContain('smoke:opencode:isolation');
 
       // Auth: empty env + empty home → honest unknown for both providers.
       expect(report.auth.map((a) => [a.provider, a.readiness])).toEqual([
         ['claude', 'unknown'],
         ['codex', 'unknown'],
+        ['opencode', 'unknown'],
       ]);
 
       // Host config (H-1): no ~/.codex/config.toml → safe (core default user).
@@ -95,6 +131,9 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
       expect(text).toContain('overall: WARN');
       expect(text).toContain('claude');
       expect(text).toContain('codex');
+      expect(text).toContain('opencode');
+      expect(text).toContain('isolation: per-run HOME/XDG');
+      expect(text).toContain('npm run smoke:opencode:isolation');
     },
     GENEROUS_MS,
   );
@@ -107,28 +146,32 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
       await writeFile(path.join(home, '.claude', '.credentials.json'), '{}', 'utf8');
       await mkdir(path.join(home, '.codex'), { recursive: true });
       await writeFile(path.join(home, '.codex', 'auth.json'), '{}', 'utf8');
+      await mkdir(path.dirname(openCodeAuthJsonPath(home)), { recursive: true });
+      await writeFile(openCodeAuthJsonPath(home), '{}', 'utf8');
 
-      // Disk artifacts only: claude OAuth state stays detected_but_unsupported
-      // (ToS-barred path); codex auth.json is the REAL (ChatGPT subscription)
-      // path — material present but unvalidated until a turn succeeds.
-      const detected = await runDoctor({ env: {}, homeDir: home, clock: CLOCK });
+      // Disk artifacts are material only; each native provider still needs a
+      // successful turn before readiness can become supported.
+      const detected = await runTestDoctor({ env: {}, homeDir: home, clock: CLOCK });
       expect(detected.auth.map((a) => a.readiness)).toEqual([
-        'detected_but_unsupported',
+        'detected_but_unvalidated',
+        'detected_but_unvalidated',
         'detected_but_unvalidated',
       ]);
       expect(detected.auth[0]?.evidence.join(' ')).toContain('.credentials.json');
       expect(detected.auth[1]?.evidence.join(' ')).toContain('auth.json');
+      expect(detected.auth[2]?.evidence.join(' ')).toContain('opencode/auth.json');
       expect(detected.overall).toBe('warn');
 
       // Env keys are MATERIAL, not validation (the live gate proved a
       // present OPENAI_API_KEY 401-invalid): detected_but_unvalidated, and
       // overall stays warn — never ok from presence alone.
-      const withKeys = await runDoctor({
+      const withKeys = await runTestDoctor({
         env: { ANTHROPIC_API_KEY: 'sk-ant-x', OPENAI_API_KEY: 'sk-oai-x' },
         homeDir: home,
         clock: CLOCK,
       });
       expect(withKeys.auth.map((a) => a.readiness)).toEqual([
+        'detected_but_unvalidated',
         'detected_but_unvalidated',
         'detected_but_unvalidated',
       ]);
@@ -147,7 +190,7 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
       const content = 'approvals_reviewer = "auto_review"\n';
       await writeFile(configPath, content, 'utf8');
 
-      const report = await runDoctor({ env: {}, homeDir: home, clock: CLOCK });
+      const report = await runTestDoctor({ env: {}, homeDir: home, clock: CLOCK });
       expect(report.hostConfig.codex).toMatchObject({
         exists: true,
         approvalsReviewers: ['auto_review'],
@@ -165,7 +208,7 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
 
       // Safe value → no flag.
       await writeFile(configPath, 'approvals_reviewer = "user"\n', 'utf8');
-      const safeReport = await runDoctor({ env: {}, homeDir: home, clock: CLOCK });
+      const safeReport = await runTestDoctor({ env: {}, homeDir: home, clock: CLOCK });
       expect(safeReport.hostConfig.codex).toMatchObject({ safe: true, approvalsReviewers: ['user'] });
       expect(safeReport.notes.join(' ')).not.toContain('host codex config flagged');
     },
@@ -182,7 +225,7 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
         JSON.stringify({ quotas: { perRunBytes: 1024, globalBytes: 4096 } }),
         'utf8',
       );
-      const withFile = await runDoctor({ env: {}, homeDir: dir, clock: CLOCK, configPath: good });
+      const withFile = await runTestDoctor({ env: {}, homeDir: dir, clock: CLOCK, configPath: good });
       expect(withFile.quotas).toMatchObject({
         source: 'file',
         configPath: good,
@@ -192,7 +235,7 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
 
       const bad = path.join(dir, 'bad.json');
       await writeFile(bad, JSON.stringify({ quotas: { perRunBytes: -1 } }), 'utf8');
-      const failed = await runDoctor({ env: {}, homeDir: dir, clock: CLOCK, configPath: bad });
+      const failed = await runTestDoctor({ env: {}, homeDir: dir, clock: CLOCK, configPath: bad });
       expect(failed.quotas.issues.length).toBeGreaterThan(0);
       expect(failed.overall).toBe('fail');
       expect(failed.notes.join(' ')).toContain('engine config invalid');
@@ -205,12 +248,12 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
     async () => {
       const home = await makeTempDir('doctor-platform-');
 
-      const onLinux = await runDoctor({ env: {}, homeDir: home, clock: CLOCK, platform: 'linux' });
+      const onLinux = await runTestDoctor({ env: {}, homeDir: home, clock: CLOCK, platform: 'linux' });
       expect(onLinux.overall).toBe('warn'); // never fail — supervision is the only degraded axis here
       expect(onLinux.notes.join(' ')).toContain('supervision is macOS-only in MVP');
       expect(renderDoctorText(onLinux)).toContain('supervision is macOS-only in MVP');
 
-      const onDarwin = await runDoctor({ env: {}, homeDir: home, clock: CLOCK, platform: 'darwin' });
+      const onDarwin = await runTestDoctor({ env: {}, homeDir: home, clock: CLOCK, platform: 'darwin' });
       expect(onDarwin.notes.join(' ')).not.toContain('supervision is macOS-only');
     },
     GENEROUS_MS,

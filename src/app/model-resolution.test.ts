@@ -15,6 +15,7 @@ import {
   asHarness,
   CLAUDE_REASONING_OPTION_ID,
   CODEX_REASONING_OPTION_ID,
+  OPENCODE_REASONING_OPTION_ID,
   UnadvertisedModelTargetError,
 } from './model-resolution.js';
 
@@ -43,6 +44,22 @@ const CLAUDE_OPTIONS: readonly ConfigOptionDescriptor[] = [
 const CODEX_OPTIONS: readonly ConfigOptionDescriptor[] = [
   { id: 'model', kind: 'model', values: ['gpt-5.6-terra', 'gpt-5.6-sol'], current: 'gpt-5.6-sol' },
   { id: CODEX_REASONING_OPTION_ID, kind: 'reasoning', values: ['minimal', 'low', 'medium', 'high'], current: 'medium' },
+];
+
+const OPENCODE_OPTIONS: readonly ConfigOptionDescriptor[] = [
+  {
+    id: 'model',
+    kind: 'model',
+    values: ['xai/grok-4.5'],
+    current: 'xai/grok-4.5',
+  },
+  {
+    id: OPENCODE_REASONING_OPTION_ID,
+    kind: 'reasoning',
+    values: ['low', 'medium', 'high'],
+    current: 'low',
+  },
+  { id: 'mode', kind: 'mode', values: ['build', 'plan'], current: 'plan' },
 ];
 
 describe('resolveRoleModel (pure §11.2 mapping)', () => {
@@ -78,6 +95,24 @@ describe('resolveRoleModel (pure §11.2 mapping)', () => {
     ]);
     expect(resolved.codexConfigOverrides).toEqual({ model: 'gpt-5.6-terra' });
     expect(resolved.effort).toBeUndefined();
+  });
+
+  it('maps opencode/xai/grok-4.5/high → dynamic model id + effort option', () => {
+    const resolved = resolveRoleModel({
+      harness: 'opencode',
+      model: 'xai/grok-4.5',
+      effort: 'high',
+    });
+    expect(resolved.configOptions).toEqual([
+      { purpose: 'model', optionId: 'model', value: 'xai/grok-4.5', kind: 'model' },
+      {
+        purpose: 'reasoning',
+        optionId: OPENCODE_REASONING_OPTION_ID,
+        value: 'high',
+        kind: 'reasoning',
+      },
+    ]);
+    expect(resolved.codexConfigOverrides).toBeUndefined();
   });
 });
 
@@ -152,6 +187,22 @@ describe('applyRoleModel (against the in-process fake)', () => {
     ]);
   });
 
+  it('opencode/xai/grok-4.5/high pins the exact advertised model and effort', async () => {
+    const { adapter, sessionId, advertised } = await fakeWith('opencode', OPENCODE_OPTIONS);
+    const resolved = resolveRoleModel({
+      harness: 'opencode',
+      model: 'xai/grok-4.5',
+      effort: 'high',
+    });
+
+    await applyRoleModel(adapter, sessionId, resolved, advertised);
+
+    expect(setCalls(adapter)).toEqual([
+      { optionId: 'model', value: 'xai/grok-4.5' },
+      { optionId: 'effort', value: 'high' },
+    ]);
+  });
+
   it('captures a per-intent failure (value outside advertised set) without throwing', async () => {
     const narrowed: readonly ConfigOptionDescriptor[] = [
       { id: 'model', kind: 'model', values: ['opus'], current: 'opus' },
@@ -183,6 +234,10 @@ describe('applyRoleModel (against the in-process fake)', () => {
 });
 
 describe('asHarness / roleModelSpec validation', () => {
+  it('accepts OpenCode as a live harness', () => {
+    expect(asHarness('opencode')).toBe('opencode');
+  });
+
   it('rejects unknown harness and effort', () => {
     expect(() => asHarness('gemini')).toThrow(/Unknown harness/);
     expect(() => roleModelSpec('claude', 'opus', 'turbo')).toThrow(/Unknown reasoning effort/);

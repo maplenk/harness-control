@@ -366,10 +366,14 @@ const NO_EVIDENCE_NOTE = 'Reported passed without evidence; downgraded to unprov
  */
 export class VerifierRunner implements RoleRunner<VerifierGathering> {
   readonly role = 'verifier' as const;
+  readonly allowedShellCommands: readonly string[];
   readonly #config: VerifierRunnerConfig;
 
   constructor(config: VerifierRunnerConfig) {
     this.#config = config;
+    this.allowedShellCommands = [
+      ...new Set(config.criteria.flatMap((criterion) => criterion.verificationCommands)),
+    ];
   }
 
   async run(session: RoleSession): Promise<VerifierGathering> {

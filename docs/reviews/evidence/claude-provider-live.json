@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-07-20T17:58:34.867Z",
+  "harness": "claude",
+  "providerVersion": "2.1.215 (Claude Code)",
+  "requestedModel": "sonnet",
+  "requestedEffort": "low",
+  "observedModel": "claude-sonnet-5",
+  "permissionPolicy": {
+    "role": "verifier",
+    "mode": "dontAsk",
+    "exactAllowedCommand": "touch claude-model-sonnet-anthropic.txt",
+    "allowedToolCalls": [
+      "Bash"
+    ],
+    "allowedIdentityFile": "claude-model-sonnet-anthropic.txt",
+    "nonAllowlistedCommand": "touch claude-denied-must-not-exist.txt",
+    "deniedToolCalls": [
+      "Bash"
+    ],
+    "deniedSentinelCreated": false,
+    "allowedStopReason": "end_turn",
+    "deniedStopReason": "end_turn"
+  },
+  "rateLimitEnvelope": {
+    "classifierMatched": true,
+    "observations": [
+      {
+        "infoKey": "rate_limit_info",
+        "fields": [
+          "isUsingOverage",
+          "rateLimitType",
+          "resetsAt",
+          "status",
+          "surpassedThreshold",
+          "utilization"
+        ],
+        "status": "allowed_warning",
+        "resetsAt": 1784934000,
+        "rateLimitType": "seven_day",
+        "classification": {
+          "kind": "unknown_provider_error",
+          "source": "parsed",
+          "confidence": "low",
+          "detectionTier": "unknown",
+          "provider": "claude"
+        }
+      }
+    ]
+  },
+  "toolInvocationObservations": [
+    {
+      "name": "Bash",
+      "inputKeys": [
+        "command",
+        "description"
+      ],
+      "command": "touch claude-model-sonnet-anthropic.txt"
+    },
+    {
+      "name": "Bash",
+      "inputKeys": [
+        "command",
+        "description"
+      ],
+      "command": "touch claude-denied-must-not-exist.txt"
+    }
+  ],
+  "providerMessages": {
+    "allowed": "CLAUDE_ALLOWED_OK",
+    "denied": "CLAUDE_DENIED_OK"
+  }
+}

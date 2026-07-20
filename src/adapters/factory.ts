@@ -1,8 +1,8 @@
 /**
  * Provider adapter factory (PLAN §5, §9, §10) — the composition seam that
  * assembles a ready-to-`initialize()` `AcpStdioAdapter` from a per-provider
- * ACP profile (PLAN §5: "generic ACP stdio transport ├─ Claude ACP profile
- * └─ Codex ACP profile"). The profiles (`./claude`, `./codex`) deliberately
+ * ACP profile (PLAN §5: generic ACP stdio transport + per-harness profiles).
+ * The profiles (`./claude`, `./codex`, `./opencode`) deliberately
  * never spawn anything and the generic transport/session (`./acp`)
  * deliberately knows nothing provider-specific; THIS module is where the two
  * meet:
@@ -17,7 +17,11 @@
  *    provider's own. For CODEX the factory additionally prepares the H-1
  *    per-run isolated `CODEX_HOME` (see `codex/home-isolation.ts`) so the
  *    spawned core cannot inherit host-global provider config that would
- *    re-route approvals away from the ACP client. (Claude watch-list, PLAN
+ *    re-route approvals away from the ACP client. OpenCode receives an
+ *    equivalent boundary through a fresh HOME/XDG tree, auth-only copy-in,
+ *    `--pure`, disabled project/external config, and an ACP-routing
+ *    permission overlay (see `opencode/home-isolation.ts`). (Claude
+ *    watch-list, PLAN
  *    §17.1: the SDK child inherits user-global MCP servers despite
  *    `mcpServers:[]` — `CLAUDE_CONFIG_DIR`-class isolation is promoted only
  *    if that becomes load-bearing; not implemented here.)
@@ -39,9 +43,10 @@
  *
  * The factory never spawns a process; `initialize()` is the caller's
  * explicit act. Its only filesystem I/O is command resolution (reading the
- * installed package's `package.json`) plus, for codex, the H-1 isolated-home
- * preparation (temp dir + orchestrator config + auth-material byte copy —
- * disposed via `adapter.close()`). Real-adapter spawning belongs to the P2
+ * installed package's `package.json`) plus the Codex/OpenCode H-1
+ * isolated-home preparation (temp dir + orchestrator config +
+ * auth-material byte copy — disposed via `adapter.close()`). Real-adapter
+ * spawning belongs to the P2
  * live gate — offline tests exercise this factory against the fake child via
  * `spawnOverride` (documented below).
  */
@@ -55,7 +60,7 @@ import {
   type PermissionMediationConfig,
   type SessionModePolicy,
 } from './acp/index.js';
-import type { CapabilityRecord, ErrorClassification } from './spi.js';
+import { AdapterError, type CapabilityRecord, type ErrorClassification } from './spi.js';
 import {
   ANTHROPIC_API_KEY_ENV_VAR,
   CLAUDE_SESSION_MODE_POLICY,
@@ -72,6 +77,7 @@ import {
 } from './claude/index.js';
 import {
   CODEX_API_KEY_ENV_VAR,
+  CODEX_HOME_ENV_VAR,
   CODEX_HARNESS_ID,
   CODEX_SESSION_MODE_POLICY,
   OPENAI_API_KEY_ENV_VAR,
@@ -82,6 +88,18 @@ import {
   probeCodexAuthReadiness,
   type PreparedCodexHome,
 } from './codex/index.js';
+import {
+  OPENCODE_HARNESS_ID,
+  OPENCODE_SESSION_MODE_POLICY,
+  assertOpenCodeVersionPinned,
+  buildOpenCodeCapabilityRecord,
+  classifyOpenCodeError,
+  detectOpenCodeAuthMaterial,
+  OPENCODE_ISOLATION_ENV_KEYS,
+  prepareOpenCodeHomeIsolation,
+  probeOpenCodeAuthReadiness,
+  type PreparedOpenCodeHome,
+} from './opencode/index.js';
 
 // ---------------------------------------------------------------------------
 // Options
@@ -102,7 +120,11 @@ export interface CreateProviderAdapterOptions {
    * seam — production callers keep the profile policy.
    */
   readonly sessionMode?: SessionModePolicy;
-  /** Extra child env, layered OVER the factory's credential forwarding. */
+  /**
+   * Extra child env, layered over credential forwarding. Isolation-owned
+   * keys (for example CODEX_HOME and OpenCode's HOME/XDG policy) cannot be
+   * supplied here.
+   */
   readonly env?: Readonly<Record<string, string>>;
   /**
    * Environment consulted for credential forwarding + auth-readiness
@@ -116,9 +138,9 @@ export interface CreateProviderAdapterOptions {
    * (e.g. the fake ACP child), while command resolution + the version-pin
    * assertion still run so provider identity stays honest. Offline suites
    * use it because real adapters are never spawned outside the live gate.
-   * The factory-assembled child env (credentials + §17.1 isolation env such
-   * as `CODEX_HOME`) is MERGED UNDER the override's own env, so isolation
-   * regressions stay testable against the fake child.
+   * The factory-assembled child env (credentials + §17.1 isolation env) is
+   * merged under the override's own env. Isolation-owned keys cannot be
+   * supplied by the override.
    */
   readonly spawnOverride?: AcpSpawnSpec;
   /**
@@ -137,6 +159,16 @@ export interface CreateProviderAdapterOptions {
   readonly codexHome?: {
     readonly mode?: 'isolated' | 'inherit_host';
     readonly realCodexHome?: string;
+    readonly tempRoot?: string;
+  };
+  /**
+   * OpenCode H-1 isolation controls. Production defaults to `isolated`.
+   * `inherit_host` exists only to reproduce/characterize the unsafe legacy
+   * behavior in tests and diagnostics.
+   */
+  readonly openCodeHome?: {
+    readonly mode?: 'isolated' | 'inherit_host';
+    readonly realHome?: string;
     readonly tempRoot?: string;
   };
 }
@@ -158,6 +190,8 @@ export interface CreatedProviderAdapter {
    * `dispose()` stays callable directly (idempotent) for abnormal paths.
    */
   readonly codexHome?: PreparedCodexHome;
+  /** Per-run isolated OpenCode HOME/XDG tree (OpenCode only). */
+  readonly openCodeHome?: PreparedOpenCodeHome;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,10 +241,11 @@ interface ProviderWiring {
   readonly classifyError: (raw: unknown, clock: Clock) => ErrorClassification;
   /** P-1: the provider's normative per-role session-mode pinning policy. */
   readonly sessionModePolicy: SessionModePolicy;
-  /** §17.1 H-1: isolation env layered OVER credentials, UNDER caller env
-   * (e.g. `{CODEX_HOME: <isolated dir>}`). Per-call, closed over by the
-   * provider factory function. */
+  /** §17.1 H-1: isolation env layered over credentials, under caller env for
+   * non-protected keys. Per-call, closed over by the provider factory. */
   readonly spawnEnv?: Readonly<Record<string, string>>;
+  /** Isolation-owned keys that caller/override env must never replace. */
+  readonly protectedSpawnEnvKeys?: readonly string[];
   /** §17.1 H-1: resource disposal wired into `adapter.close()` (idempotent). */
   readonly onClose?: () => void | Promise<void>;
 }
@@ -227,18 +262,30 @@ function createProviderAdapter(
 
   // 2. §17.1 credential forwarding: only this provider's own documented
   //    key variable(s), only when present and non-empty. Layering (last
-  //    wins): credentials → provider isolation env (H-1, e.g. CODEX_HOME) →
-  //    caller env.
+  //    wins): credentials → provider isolation env → caller env for
+  //    non-protected keys. Isolation-owned keys are rejected below.
   const credentialEnv: Record<string, string> = {};
   for (const name of wiring.credentialEnvVars) {
     const value = processEnv[name];
     if (typeof value === 'string' && value.length > 0) credentialEnv[name] = value;
   }
+  for (const key of wiring.protectedSpawnEnvKeys ?? []) {
+    if (
+      Object.prototype.hasOwnProperty.call(options.env ?? {}, key) ||
+      Object.prototype.hasOwnProperty.call(options.spawnOverride?.env ?? {}, key)
+    ) {
+      throw new AdapterError(
+        'invalid_argument',
+        `Child env '${key}' is owned by ${wiring.harnessId} spawn isolation and cannot be overridden`,
+        { harnessId: wiring.harnessId },
+      );
+    }
+  }
   const childEnv = { ...credentialEnv, ...(wiring.spawnEnv ?? {}), ...(options.env ?? {}) };
 
   // The factory-assembled env applies to the spawnOverride seam too (merged
-  // UNDER the override's own env) — H-1 isolation must remain testable
-  // against the fake child exactly as it ships for real spawns.
+  // UNDER the override's own non-protected env) — H-1 isolation must remain
+  // testable against the fake child exactly as it ships for real spawns.
   const spawn: AcpSpawnSpec =
     options.spawnOverride !== undefined
       ? {
@@ -349,7 +396,13 @@ export function createCodexAcpAdapter(
         resolve: (fromDir) =>
           assertCodexAdapterVersionPinned(fromDir !== undefined ? { fromDir } : {}),
         credentialEnvVars: [CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR],
-        ...(prepared !== undefined ? { spawnEnv: prepared.env, onClose: prepared.dispose } : {}),
+        ...(prepared !== undefined
+          ? {
+              spawnEnv: prepared.env,
+              protectedSpawnEnvKeys: [CODEX_HOME_ENV_VAR],
+              onClose: prepared.dispose,
+            }
+          : {}),
         buildStaticRecord: (executable, clock, processEnv) =>
           buildCodexCapabilityRecord({
             executable,
@@ -368,6 +421,63 @@ export function createCodexAcpAdapter(
     return { ...created, ...(prepared !== undefined ? { codexHome: prepared } : {}) };
   } catch (error) {
     // Never leak a temp dir holding copied auth material on a failed build.
+    prepared?.dispose();
+    throw error;
+  }
+}
+
+/**
+ * OpenCode's native ACP server × the generic stdio transport, isolated by
+ * default. A fresh HOME/XDG tree carries only a byte-copy of the OpenCode auth
+ * store and orchestrator-owned config. `--pure`, disabled project/external
+ * config, and the final permission overlay keep ACP as the approval authority.
+ */
+export function createOpenCodeAcpAdapter(
+  options: CreateProviderAdapterOptions = {},
+): CreatedProviderAdapter {
+  const processEnv = options.processEnv ?? process.env;
+  const isolationMode = options.openCodeHome?.mode ?? 'isolated';
+  const authHome = options.openCodeHome?.realHome ?? processEnv['HOME'];
+  const prepared: PreparedOpenCodeHome | undefined =
+    isolationMode === 'isolated'
+      ? prepareOpenCodeHomeIsolation({
+          ...(authHome !== undefined ? { realHome: authHome } : {}),
+          ...(options.openCodeHome?.tempRoot !== undefined
+            ? { tempRoot: options.openCodeHome.tempRoot }
+            : {}),
+          ...(options.permissions?.role !== undefined ? { role: options.permissions.role } : {}),
+        })
+      : undefined;
+  const authMaterialDetected =
+    prepared?.authMaterial === 'auth_json' ||
+    (prepared === undefined && authHome !== undefined && detectOpenCodeAuthMaterial(authHome));
+  try {
+    const created = createProviderAdapter(
+      {
+        harnessId: OPENCODE_HARNESS_ID,
+        resolve: (fromDir) =>
+          assertOpenCodeVersionPinned(fromDir !== undefined ? { fromDir } : {}),
+        credentialEnvVars: [],
+        ...(prepared !== undefined
+          ? {
+              spawnEnv: prepared.env,
+              protectedSpawnEnvKeys: OPENCODE_ISOLATION_ENV_KEYS,
+              onClose: prepared.dispose,
+            }
+          : {}),
+        buildStaticRecord: (executable, clock) =>
+          buildOpenCodeCapabilityRecord({
+            executable,
+            clock,
+            auth: probeOpenCodeAuthReadiness({ authMaterialDetected }),
+          }),
+        classifyError: classifyOpenCodeError,
+        sessionModePolicy: OPENCODE_SESSION_MODE_POLICY,
+      },
+      options,
+    );
+    return { ...created, ...(prepared !== undefined ? { openCodeHome: prepared } : {}) };
+  } catch (error) {
     prepared?.dispose();
     throw error;
   }

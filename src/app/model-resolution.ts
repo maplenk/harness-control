@@ -17,6 +17,10 @@
  *    overrides (`-c model=…`, `-c model_reasoning_effort=…`) — carried here as
  *    `codexConfigOverrides`, the documented fallback (codex/capabilities.ts)
  *    if `session/set_config_option` ever regresses.
+ *  - **OpenCode** (`opencode-ai@1.18.1`, native `opencode acp`): a fully
+ *    qualified provider/model id (for example `xai/grok-4.5`) maps to
+ *    `model`; its model-dependent reasoning variant maps
+ *    to the `effort` config option.
  *
  * `resolveRoleModel` is PURE (no I/O, no adapter): it yields config-option
  * INTENTS keyed by purpose. `applyRoleModel` is the one function that touches
@@ -39,8 +43,8 @@ import { redactText } from '../redaction/index.js';
 // ---------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------
-/** The two MVP harnesses (PLAN §3: ACP-uniform MVP over Claude + Codex). */
-export const HARNESSES = ['claude', 'codex'] as const;
+/** Live ACP harnesses supported by the runtime. */
+export const HARNESSES = ['claude', 'codex', 'opencode'] as const;
 export type Harness = (typeof HARNESSES)[number];
 
 /**
@@ -56,7 +60,7 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 /** A role's resolved harness/model/effort triple (the input to §11.2 pinning). */
 export interface RoleModelSpec {
   readonly harness: Harness;
-  /** Provider model slug, e.g. `opus` or `gpt-5.6-terra`. */
+  /** Provider model slug/id, e.g. `opus` or `xai/grok-4.5`. */
   readonly model: string;
   readonly effort?: ReasoningEffort;
 }
@@ -83,6 +87,8 @@ export const MODEL_OPTION_ID = 'model';
 export const CLAUDE_REASONING_OPTION_ID = 'thinking';
 /** Codex's config key for reasoning effort (also a `-c` override key). */
 export const CODEX_REASONING_OPTION_ID = 'model_reasoning_effort';
+/** OpenCode's provider/model-specific reasoning variant option. */
+export const OPENCODE_REASONING_OPTION_ID = 'effort';
 
 // ---------------------------------------------------------------------------
 // Resolved intents
@@ -139,23 +145,39 @@ export function resolveRoleModel(spec: RoleModelSpec): ResolvedRoleModel {
     };
   }
 
-  // codex
-  const overrides: Record<string, string> = { model: spec.model };
+  if (spec.harness === 'codex') {
+    const overrides: Record<string, string> = { model: spec.model };
+    if (spec.effort !== undefined) {
+      intents.push({
+        purpose: 'reasoning',
+        optionId: CODEX_REASONING_OPTION_ID,
+        value: spec.effort,
+        kind: 'reasoning',
+      });
+      overrides[CODEX_REASONING_OPTION_ID] = spec.effort;
+    }
+    return {
+      harness: 'codex',
+      model: spec.model,
+      ...(spec.effort !== undefined ? { effort: spec.effort } : {}),
+      configOptions: intents,
+      codexConfigOverrides: overrides,
+    };
+  }
+
   if (spec.effort !== undefined) {
     intents.push({
       purpose: 'reasoning',
-      optionId: CODEX_REASONING_OPTION_ID,
+      optionId: OPENCODE_REASONING_OPTION_ID,
       value: spec.effort,
       kind: 'reasoning',
     });
-    overrides[CODEX_REASONING_OPTION_ID] = spec.effort;
   }
   return {
-    harness: 'codex',
+    harness: 'opencode',
     model: spec.model,
     ...(spec.effort !== undefined ? { effort: spec.effort } : {}),
     configOptions: intents,
-    codexConfigOverrides: overrides,
   };
 }
 

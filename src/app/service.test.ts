@@ -68,6 +68,13 @@ function fakeConfigOptions(harness: Harness): ConfigOptionDescriptor[] {
       { id: 'thinking', kind: 'reasoning', values: ['minimal', 'low', 'medium', 'high'], current: 'medium' },
     ];
   }
+  if (harness === 'opencode') {
+    return [
+      { id: 'model', kind: 'model', values: ['xai/grok-4.5'], current: 'xai/grok-4.5' },
+      { id: 'effort', kind: 'reasoning', values: ['low', 'medium', 'high'], current: 'low' },
+      { id: 'mode', kind: 'mode', values: ['build', 'plan'], current: 'plan' },
+    ];
+  }
   return [
     { id: 'model', kind: 'model', values: ['gpt-5.6-terra', 'gpt-5.6-sol'], current: 'gpt-5.6-sol' },
     { id: 'model_reasoning_effort', kind: 'reasoning', values: ['minimal', 'low', 'medium', 'high'], current: 'medium' },
@@ -144,6 +151,11 @@ async function setup(opts?: FakeFactoryOptions, config?: EngineConfig): Promise<
 }
 
 const CLAUDE_LOW = { harness: 'claude', model: 'opus', effort: 'low' } as const;
+const OPENCODE_HIGH = {
+  harness: 'opencode',
+  model: 'xai/grok-4.5',
+  effort: 'high',
+} as const;
 
 /** W2-1: T24 is payload-validated — a READY §16 MergeReadiness fixture. */
 function readyMergeReadiness(forRunId: Parameters<OrchestrationService['status']>[0]): MergeReadiness {
@@ -170,6 +182,31 @@ function readyMergeReadiness(forRunId: Parameters<OrchestrationService['status']
 // Run lifecycle + role-flow seam
 // ---------------------------------------------------------------------------
 describe('OrchestrationService — run lifecycle', () => {
+  it('forwards a verifier flow exact evidence commands to the provider factory', async () => {
+    const { service, created } = await setup();
+    const { runId } = service.createRun({
+      goal: 'Verify exact commands',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const runner: RoleRunner = {
+      role: 'verifier',
+      allowedShellCommands: ['npm test', 'git diff --stat'],
+      run: async (session) => {
+        await session.prompt({ prompt: 'verify' });
+        return {};
+      },
+    };
+
+    await service.runRole(runId, runner, CLAUDE_LOW, '/ws');
+
+    expect(created).toHaveLength(1);
+    expect(created[0]?.options.allowedShellCommands).toEqual([
+      'npm test',
+      'git diff --stat',
+    ]);
+  });
+
   it('persists the opt-in planning-chat choice in immutable run metadata', async () => {
     const { service, db } = await setup();
     const { runId } = service.createRun({
@@ -212,6 +249,31 @@ describe('OrchestrationService — run lifecycle', () => {
     expect(setConfigCalls(coordinatorFake!)).toEqual([
       { optionId: 'model', value: 'opus' },
       { optionId: 'thinking', value: 'low' },
+    ]);
+  });
+
+  it('runs an OpenCode coordinator with its exact dynamic model and effort pins', async () => {
+    const { service, created } = await setup();
+    const { runId } = service.createRun({
+      goal: 'Draft with Grok',
+      workspacePath: '/ws',
+      coordinator: OPENCODE_HIGH,
+    });
+    const runner: RoleRunner = {
+      role: 'coordinator',
+      run: async (session) => {
+        await session.prompt({ prompt: 'Draft the spec.' });
+        return {};
+      },
+    };
+
+    await service.runCoordination(runId, runner);
+
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+    expect(created[0]?.options.resolved).toMatchObject(OPENCODE_HIGH);
+    expect(setConfigCalls(created[0]!.adapter)).toEqual([
+      { optionId: 'model', value: 'xai/grok-4.5' },
+      { optionId: 'effort', value: 'high' },
     ]);
   });
 

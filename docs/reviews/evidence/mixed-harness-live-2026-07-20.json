@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "runId": "run_52776a31-4adc-43b9-9575-06357236cbd9",
+  "recordedAt": "2026-07-20T16:12:31.032Z",
+  "outcome": "merge_ready",
+  "roles": {
+    "coordinator": {
+      "requestedProfile": "claude:opus:low",
+      "requestedHarness": "claude",
+      "requestedModel": "opus",
+      "requestedEffort": "low",
+      "effectiveModel": "opus",
+      "providerEchoed": true,
+      "pinOptionId": "model",
+      "source": "durable child.spawned model pin"
+    },
+    "implementor": {
+      "requestedProfile": "opencode:xai/grok-4.5:high",
+      "requestedHarness": "opencode",
+      "requestedModel": "xai/grok-4.5",
+      "requestedEffort": "high",
+      "effectiveModel": "xai/grok-4.5",
+      "providerEchoed": true,
+      "pinOptionId": "model",
+      "source": "durable child.spawned model pin"
+    },
+    "verifier": {
+      "requestedProfile": "codex:gpt-5.6-terra",
+      "requestedHarness": "codex",
+      "requestedModel": "gpt-5.6-terra",
+      "effectiveModel": "gpt-5.6-terra",
+      "providerEchoed": true,
+      "pinOptionId": "model",
+      "source": "durable child.spawned model pin"
+    }
+  }
+}

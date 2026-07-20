@@ -7,8 +7,8 @@
  *   start  →  approve (--test-approve, HARNESS_TEST_MODE=1)  →  run  →  status
  *
  * against a FRESH temp git repo, using the production `defaultRoleAdapterFactory`
- * (REAL Claude/Codex ACP spawns + existing logins — H-1 isolation holds, no user
- * `CODEX_HOME` is forwarded). This exercises the exact D-1 wiring the shipped CLI
+ * (REAL native Claude subscription/Codex ACP/OpenCode ACP spawns + existing logins — H-1 isolation
+ * holds, no user `CODEX_HOME` is forwarded). This exercises the exact D-1 wiring the shipped CLI
  * now carries: `start` drives the coordinator flow to `awaiting_approval`, and
  * `run` drives implement→verify→merge-readiness.
  *
@@ -40,6 +40,7 @@ import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseRoleProfile } from '../src/cli/profile.js';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const TSX_BIN = path.join(REPO_ROOT, 'node_modules', '.bin', 'tsx');
@@ -52,6 +53,12 @@ const IMPLEMENTOR = process.env.HARNESS_SMOKE_IMPLEMENTOR ?? 'codex:gpt-5.6-terr
 const VERIFIER = process.env.HARNESS_SMOKE_VERIFIER ?? 'claude:opus:low';
 const CHAT_ENABLED = process.argv.slice(2).includes('--chat');
 const KEEP_ARTIFACTS = process.env.HARNESS_SMOKE_KEEP === '1';
+const ROLE_PROFILES = {
+  coordinator: COORDINATOR,
+  implementor: IMPLEMENTOR,
+  verifier: VERIFIER,
+} as const;
+type SmokeRole = keyof typeof ROLE_PROFILES;
 
 /** Per-command wall-clock cap (real provider turns can take tens of seconds). */
 const CLI_TIMEOUT_MS = 8 * 60 * 1000;
@@ -127,6 +134,109 @@ function fail(step: string, detail: string): never {
 }
 
 class SmokeFailure extends Error {}
+
+interface SpawnEvidenceView {
+  readonly source?: unknown;
+  readonly optionId?: unknown;
+  readonly requested?: unknown;
+  readonly effective?: unknown;
+  readonly echoed?: unknown;
+}
+
+interface ModelStatusView {
+  readonly effective?: unknown;
+  readonly spawnEvidence?: SpawnEvidenceView;
+}
+
+interface ModelSpawnProofEntry {
+  readonly requestedProfile: string;
+  readonly requestedHarness: string;
+  readonly requestedModel: string;
+  readonly requestedEffort?: string;
+  readonly effectiveModel: string;
+  readonly providerEchoed: boolean;
+  readonly pinOptionId: string;
+  readonly source: 'durable child.spawned model pin';
+}
+
+/**
+ * Turn the shipped `status --json` read-model into a human-auditable artifact.
+ * A role is accepted only when it has durable `child.spawned` evidence whose
+ * requested model matches the exact profile passed to this smoke. The
+ * provider's effective echo (or honest absence of one) remains visible.
+ */
+async function writeModelSpawnProof(
+  status: Record<string, unknown>,
+  runId: string,
+  workRoot: string,
+): Promise<string> {
+  const rawModels = status['models'];
+  if (rawModels === null || typeof rawModels !== 'object' || Array.isArray(rawModels)) {
+    fail('model spawn proof', 'status --json did not return a models object');
+  }
+  const models = rawModels as Record<string, ModelStatusView>;
+  const roles = {} as Record<SmokeRole, ModelSpawnProofEntry>;
+
+  for (const role of Object.keys(ROLE_PROFILES) as SmokeRole[]) {
+    const requestedProfile = ROLE_PROFILES[role];
+    const parsed = parseRoleProfile({ profile: requestedProfile });
+    if (!parsed.ok) {
+      fail('model spawn proof', `cannot parse ${role} profile '${requestedProfile}': ${parsed.error}`);
+    }
+    const evidence = models[role]?.spawnEvidence;
+    if (
+      evidence?.source !== 'child.spawned' ||
+      typeof evidence.optionId !== 'string' ||
+      typeof evidence.requested !== 'string' ||
+      typeof evidence.effective !== 'string' ||
+      typeof evidence.echoed !== 'boolean'
+    ) {
+      fail('model spawn proof', `${role} has no complete durable child.spawned model-pin evidence`);
+    }
+    if (evidence.requested !== parsed.value.model) {
+      fail(
+        'model spawn proof',
+        `${role} requested '${parsed.value.model}' but child.spawned recorded '${evidence.requested}'`,
+      );
+    }
+    roles[role] = {
+      requestedProfile,
+      requestedHarness: parsed.value.harness,
+      requestedModel: parsed.value.model,
+      ...(parsed.value.effort !== undefined ? { requestedEffort: parsed.value.effort } : {}),
+      effectiveModel: evidence.effective,
+      providerEchoed: evidence.echoed,
+      pinOptionId: evidence.optionId,
+      source: 'durable child.spawned model pin',
+    };
+  }
+
+  const proofPath = path.join(workRoot, 'model-spawns.json');
+  await writeFile(
+    proofPath,
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        runId,
+        recordedAt: new Date().toISOString(),
+        roles,
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
+  process.stdout.write(`[smoke:live] model spawn proof written to ${proofPath}\n`);
+  for (const role of Object.keys(ROLE_PROFILES) as SmokeRole[]) {
+    const entry = roles[role];
+    process.stdout.write(
+      `[smoke:live] spawned ${role}: ${entry.requestedHarness}:${entry.effectiveModel}` +
+        `${entry.requestedEffort !== undefined ? `:${entry.requestedEffort}` : ''}` +
+        ` (child.spawned model pin; provider echoed=${String(entry.providerEchoed)})\n`,
+    );
+  }
+  return proofPath;
+}
 
 interface AgentRoomMessage {
   readonly id: number;
@@ -537,6 +647,7 @@ async function main(): Promise<void> {
     if (CHAT_ENABLED && status.json['planningChatEnabled'] !== true) {
       fail('status', 'planningChatEnabled was not persisted');
     }
+    await writeModelSpawnProof(status.json, runId, workRoot);
 
     process.stdout.write(
       `\n[smoke:live${CHAT_ENABLED ? ':chat' : ''}] PASSED — ` +

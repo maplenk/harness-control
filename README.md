@@ -1,8 +1,9 @@
 # harness-orchestration
 
 CLI-first orchestration across coding-agent harnesses. One headless TypeScript
-engine drives **Claude Code** and **Codex** as child agents over the Agent
-Client Protocol (ACP), through three host-enforced roles:
+engine drives **Claude Code**, **Codex**, and **OpenCode** as child agents over
+their native headless protocols (Claude stream JSON; Codex/OpenCode ACP),
+through three host-enforced roles:
 
 - **Coordinator** — explores the workspace read-only and drafts an immutable,
   content-addressed specification with objectively testable acceptance
@@ -31,9 +32,11 @@ run survives process restarts and is inspectable after the fact.
 - Node.js **>= 22.14** (ESM, TypeScript strict; `better-sqlite3` is bundled as
   a dependency).
 - `git` on PATH (worktree isolation and the §16 merge-readiness probes).
-- For live runs: the provider CLIs the adapters spawn — Claude Code and/or
-  Codex — installed and authenticated (`doctor` reports the exact state).
-  The offline test suite needs none of them.
+- For live runs: the selected provider is authenticated (`doctor` reports the
+  exact state). Claude always uses the installed first-party `claude` binary
+  and its Claude Code subscription/keychain login; Codex uses its installed credentials;
+  OpenCode is lockfile-pinned by this package and reuses credentials created
+  by `opencode auth login`. The offline test suite needs no live provider.
 - Optional planning chat: install
   [Agent Room](https://github.com/steviebuilds/agent-room) (or set
   `AGENT_ROOM_CLI` to its `scripts/agent_room.mjs`) before using
@@ -102,7 +105,7 @@ harness-orchestrator approve RUN_ID --spec-version SPEC_ID --spec-hash HASH
 #    a flag nor a resolvable proposal.
 harness-orchestrator run RUN_ID \
   --implementor codex:gpt-5.6-terra:medium \
-  --verifier claude:sonnet:medium
+  --verifier opencode:xai/grok-4.5:high
 
 # 4b. …or let the approved spec's proposals stand in — no profile flags needed:
 harness-orchestrator run RUN_ID
@@ -126,6 +129,97 @@ terminal), `breaker reset` (after the restart circuit-breaker opens),
 `switch-model` (records a durable per-role DESIRED model, applied at the
 next spawn; `status` shows it pending, distinct from the effective/running
 model. Live in-place switching at a completed-turn boundary is deferred).
+
+## Claude harness invariant
+
+`claude` has one production meaning in this repository: the installed
+first-party Claude Code provider using the user's Claude subscription. This is
+enforced for Coordinator, Implementor, Verifier, retries, probes, and model
+switches. Production routing never falls back to `claude-agent-acp`, never
+requires `ANTHROPIC_API_KEY`, and does not forward that environment variable to
+the Claude child.
+
+Role policy remains host-owned:
+
+- Coordinator runs in `dontAsk` mode with only Read/Glob/Grep.
+- Verifier runs in `dontAsk` mode with Read/Glob/Grep plus narrowly granted
+  `Bash(command)` permissions for the approved spec's exact verification
+  commands; it receives no blanket shell permission.
+- Implementor runs in `acceptEdits` mode inside the harness-created isolated
+  implementation worktree with only Read/Glob/Grep/Edit/Write.
+- Bash, subagents, nested worktrees, session persistence, hooks, plugins, and
+  MCP servers are unavailable to native Claude roles.
+
+Unlike Codex's isolated `CODEX_HOME`, native Claude intentionally retains the
+real `HOME` so Claude Code can reach its subscription/keychain login. Its
+confinement boundary is therefore policy-based rather than a filesystem
+sandbox: safe mode, empty strict MCP, the role-specific tool list, denied
+tools, `dontAsk`, and exact verifier `Bash(command)` grants. The complete spawn
+argv for every role is regression-tested as a security contract. A real
+subscription-backed probe additionally proves that an exact verifier Bash
+grant executes, a different Bash command is denied under `dontAsk`, and the
+installed CLI's `rate_limit_event` envelope agrees with the production
+classifier:
+
+```sh
+npm run smoke:claude:provider
+```
+
+Use `npm run smoke:claude:provider:record` when deliberately refreshing the
+credential-free evidence in
+`docs/reviews/evidence/claude-provider-live.json`.
+
+The harness prevents the earlier wrong-transport/API-key failure class. No
+local adapter can guarantee availability during a Claude outage, expired
+login, or subscription usage limit; those remain explicit provider failures
+and enter the existing pause/retry/failover machinery instead of silently
+changing credentials or models.
+
+## OpenCode providers and models
+
+The OpenCode harness uses the pinned local `opencode-ai` dependency and its
+native `opencode acp` server. Authenticate providers ahead of a run:
+
+```sh
+./node_modules/.bin/opencode auth login
+./node_modules/.bin/opencode auth list
+./node_modules/.bin/opencode models xai
+```
+
+The orchestrator never parses or logs
+`~/.local/share/opencode/auth.json`, never launches an interactive login, and
+never assumes OpenRouter. Each spawn gets a private HOME/XDG tree: the auth
+store is byte-copied in at `0600`, the real store is never written back, and
+the tree is deleted on close. OpenCode runs as `opencode acp --pure`; host and
+project config, external plugins/skills, custom agents, MCP servers, and
+auto-allow permission rules are excluded. The orchestrator pins the exact
+`provider_id/model_id` advertised by the new ACP session. For example:
+
+```sh
+harness-orchestrator start --workspace /path/to/repo \
+  --goal "Plan the requested change" \
+  --coordinator opencode:xai/grok-4.5:high
+```
+
+Provider/model catalogs are dynamic. Connect the provider first, run
+`opencode models PROVIDER_ID`, and use the exact returned identifier. OpenCode
+supports SuperGrok OAuth for xAI and the Z.AI Coding Plan credential path.
+Moonshot/Kimi currently uses a Moonshot API key rather than a Kimi consumer
+subscription login. A requested model that the live session does not
+advertise is rejected before a turn; it is never silently substituted.
+
+OpenCode build-mode safety is source- and live-characterized for the pinned
+`opencode-ai@1.18.1`. Workspace reads and structured implementor edits are
+allowed; Bash, network, external-directory access, and every unlisted tool
+must ask the ACP client and are default-denied in headless runs. Delegation
+through OpenCode's `task` tool is denied because the orchestrator owns roles.
+The offline suite pins the committed proof to the exact OpenCode version. A
+version bump cannot pass until the hostile-config + real Grok acceptance
+probe succeeds and refreshes that proof:
+
+```sh
+npm run smoke:opencode:isolation:record
+```
 
 ## Opt-in planning chat
 
@@ -163,6 +257,12 @@ npm run smoke:live
 npm run smoke:live:chat
 ```
 
+Every Claude role uses the installed first-party `claude` provider in
+persistent stream-JSON mode, backed by the authenticated Claude Code
+subscription rather than an Anthropic API key. The role policies in
+[Claude harness invariant](#claude-harness-invariant) apply unchanged during
+the smoke.
+
 `smoke:live:chat` creates a fresh temporary git repository containing a small
 `missionStatus` implementation task and deterministic failing Node tests. It
 waits for the real Coordinator's opening Agent Room message, posts an
@@ -171,8 +271,12 @@ Coordinator synthesis before proceeding. It then checks the immutable spec,
 uses the test-only explicit-approval seam, drives a real Implementor and an
 independent real Verifier, requires `merge_ready`, re-runs `npm test` itself,
 and proves that only the requested source file changed while the primary
-checkout remained untouched. The isolated room server and all temporary
-repositories, worktrees, run data, and transcripts are removed afterward.
+checkout remained untouched. Before cleanup it also reads each role's durable
+`child.spawned` model pin, fails if it does not match the requested role
+profile, prints the effective model and provider-echo status, and writes the
+three-role evidence to `model-spawns.json`. The isolated room server and all
+temporary repositories, worktrees, run data, transcripts, and model evidence
+are removed afterward.
 
 This is intentionally not part of `npm test`: it uses authenticated providers,
 takes longer, and may incur provider usage. Run `npm run dev -- doctor --json`
@@ -194,9 +298,10 @@ HARNESS_SMOKE_VERIFIER=codex:gpt-5.6-terra:high \
 npm run smoke:live:chat
 ```
 
-Set `HARNESS_SMOKE_KEEP=1` to retain the disposable repository and run store
-for diagnosis after a failure. The smoke still does not bypass the production
-approval command: automation is possible only through `--test-approve` with
+Set `HARNESS_SMOKE_KEEP=1` to retain the disposable repository, run store, and
+`model-spawns.json` proof artifact for diagnosis after a failure or successful
+audit run. The smoke still does not bypass the production approval command:
+automation is possible only through `--test-approve` with
 `HARNESS_TEST_MODE=1`, binding the exact drafted spec version and hash.
 
 ## Safety posture
@@ -215,6 +320,10 @@ approval command: automation is possible only through `--test-approve` with
   that routes approvals to the orchestrator — host-level provider config can
   never weaken permission mediation. Permission mediation is default-deny;
   the coordinator and verifier additionally carry a host-enforced write veto.
+  OpenCode children likewise run with private HOME/XDG state, `acp --pure`,
+  excluded host/project config and MCP, and a protected permission overlay;
+  native `plan` is pinned for coordinator/verifier and `build` only for the
+  implementor worktree.
 - **Verification-command confinement (W3-1, MVP-honest).** The spec's declared
   verification commands are full command lines the HOST shell executes in the
   implementor worktree — they are **not fully sandboxed** in the MVP: there is
@@ -330,7 +439,8 @@ approval command: automation is possible only through `--test-approve` with
 
 - `src/domain` — event vocabulary + the §6.3 transition table (pure).
 - `src/app` — the orchestration service, role flows, cost accounting.
-- `src/adapters` — ACP transport + Claude/Codex profiles + offline fakes.
+- `src/adapters` — native Claude provider, Codex/OpenCode ACP transports, and
+  offline fakes.
 - `src/persistence` — SQLite event log, projections, quota-aware artifact CAS.
 - `src/worktree`, `src/supervisor`, `src/checkpoint`, `src/memory` — worktree
   isolation, process supervision, mechanical checkpoints, provenance memory.

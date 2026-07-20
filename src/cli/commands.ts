@@ -1774,6 +1774,19 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
 
 interface RoleModelView {
   readonly effective?: string;
+  /**
+   * Durable proof that this role reached `child.spawned` after its model pin
+   * succeeded. `echoed:false` is intentionally visible: it proves the
+   * requested pin crossed the adapter boundary, but not that the provider
+   * echoed an effective value.
+   */
+  readonly spawnEvidence?: {
+    readonly source: 'child.spawned';
+    readonly optionId: string;
+    readonly requested: string;
+    readonly effective: string;
+    readonly echoed: boolean;
+  };
   readonly desired?: { readonly harness: string; readonly model: string; readonly effort?: string };
 }
 
@@ -1786,11 +1799,17 @@ function buildModelsView(db: Database, runId: RunId): Record<string, RoleModelVi
   const desired = new DurableDesiredModelStore(db).listForRun(runId);
   const out: Record<string, RoleModelView> = {};
   for (const role of ['coordinator', 'implementor', 'verifier'] as const) {
-    const effective = currentModelFor(db, runId, role);
+    const spawnEvidence = currentModelPinFor(db, runId, role);
+    const effective =
+      spawnEvidence?.effective ??
+      (role === 'coordinator'
+        ? db.projections.get<RunMeta>(runId, RUN_META_PROJECTION)?.state.coordinator.model
+        : undefined);
     const want = desired.find((record) => record.role === role);
     if (effective === undefined && want === undefined) continue;
     out[role] = {
       ...(effective !== undefined ? { effective } : {}),
+      ...(spawnEvidence !== undefined ? { spawnEvidence } : {}),
       ...(want !== undefined
         ? {
             desired: {
@@ -1901,27 +1920,43 @@ function handleSwitchModel(
 }
 
 /**
- * The EFFECTIVE (running) model per role, read from the durable `child.spawned`
- * pins (§5t #1 / S6 — a READ-MODEL over F8 truth, no parallel store): the latest
- * spawn's `model`-purpose pin, preferring the adapter-echoed effective value
- * over the requested value. Coordinator falls back to the RunMeta pin (its
- * durable source) when it has not spawned a child.
+ * The latest durable `child.spawned` model-pin evidence per role (§5t #1 / S6
+ * — a READ-MODEL over F8 truth, no parallel store). The public status view
+ * keeps both the requested value and the provider echo fact so live acceptance
+ * tests can prove which model crossed the actual spawn boundary.
  */
-function effectiveModelsFromPins(db: Database, runId: RunId): Partial<Record<RoleName, string>> {
-  const byRole: Partial<Record<RoleName, string>> = {};
+function modelPinsFromSpawnEvents(
+  db: Database,
+  runId: RunId,
+): Partial<Record<RoleName, NonNullable<RoleModelView['spawnEvidence']>>> {
+  const byRole: Partial<Record<RoleName, NonNullable<RoleModelView['spawnEvidence']>>> = {};
   for (const event of db.events.listByRun(runId)) {
     if (event.type !== 'child.spawned') continue;
     const modelPin = event.payload.pins.find((pin) => pin.purpose === 'model');
     if (modelPin === undefined) continue;
     // Later events win (the newest spawn's pin is the running model).
-    byRole[event.payload.role] = modelPin.effectiveValue ?? modelPin.value;
+    byRole[event.payload.role] = {
+      source: 'child.spawned',
+      optionId: modelPin.optionId,
+      requested: modelPin.value,
+      effective: modelPin.effectiveValue ?? modelPin.value,
+      echoed: modelPin.echoed,
+    };
   }
   return byRole;
 }
 
+function currentModelPinFor(
+  db: Database,
+  runId: RunId,
+  role: RoleName,
+): NonNullable<RoleModelView['spawnEvidence']> | undefined {
+  return modelPinsFromSpawnEvents(db, runId)[role];
+}
+
 function currentModelFor(db: Database, runId: RunId, role: RoleName): string | undefined {
-  const fromPins = effectiveModelsFromPins(db, runId)[role];
-  if (fromPins !== undefined) return fromPins;
+  const fromPins = currentModelPinFor(db, runId, role);
+  if (fromPins !== undefined) return fromPins.effective;
   if (role !== 'coordinator') return undefined;
   const meta = db.projections.get<RunMeta>(runId, RUN_META_PROJECTION);
   return meta?.state.coordinator.model;

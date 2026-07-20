@@ -94,5 +94,11 @@ export interface RoleSession {
  */
 export interface RoleRunner<TResult = unknown> {
   readonly role: RoleName;
+  /**
+   * Exact shell commands this flow must execute as evidence. Native Claude
+   * uses these to build narrow `Bash(command)` permissions; other transports
+   * may ignore the hint and keep their own permission mediation.
+   */
+  readonly allowedShellCommands?: readonly string[];
   run(session: RoleSession): Promise<TResult>;
 }

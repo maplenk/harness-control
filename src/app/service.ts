@@ -133,8 +133,9 @@ import {
 } from '../persistence/index.js';
 import {
   AdapterError,
-  createClaudeAcpAdapter,
+  createClaudeProviderAdapter,
   createCodexAcpAdapter,
+  createOpenCodeAcpAdapter,
   isAdapterError,
   type CreateProviderAdapterOptions,
   type ErrorClassification,
@@ -538,6 +539,8 @@ export interface RoleAdapterOptions {
   readonly clock: Clock;
   readonly permissions: PermissionMediationConfig;
   readonly resolved: ResolvedRoleModel;
+  /** Exact approved evidence commands needed by this role, if any. */
+  readonly allowedShellCommands?: readonly string[];
 }
 
 export interface RoleAdapterHandle {
@@ -557,8 +560,8 @@ export interface RoleAdapterHandle {
   dispose(): Promise<void>;
 }
 
-/** Seam over the provider adapter factories (`createClaudeAcpAdapter` /
- * `createCodexAcpAdapter`); tests inject an in-process fake to avoid spawns. */
+/** Seam over the provider adapter factories; tests inject an in-process fake
+ * to avoid real harness spawns. */
 export interface RoleAdapterFactory {
   create(options: RoleAdapterOptions): RoleAdapterHandle;
 }
@@ -596,24 +599,44 @@ export function captureAcpProcessIdentity(
 }
 
 /**
- * Production factory: real Claude/Codex ACP adapters. §17.1 H-1 — the Codex
- * path relies on `createCodexAcpAdapter`'s default isolated `CODEX_HOME`; this
- * call site NEVER forwards a user-controlled `CODEX_HOME` (no `codexHome`
- * override, no `env.CODEX_HOME`), so the isolation that routes approvals to
- * the ACP client cannot be bypassed.
+ * Production factory: the first-party Claude Code subscription provider for
+ * EVERY Claude role, plus real Codex-ACP/OpenCode-ACP adapters. There is no
+ * production Claude ACP/API-key fallback: selecting harness `claude` always
+ * means the installed native provider. §17.1 H-1 — the Codex path relies on
+ * `createCodexAcpAdapter`'s default isolated `CODEX_HOME`; this call site NEVER
+ * forwards a user-controlled `CODEX_HOME`.
  */
 export function defaultRoleAdapterFactory(): RoleAdapterFactory {
   return {
     create(options: RoleAdapterOptions): RoleAdapterHandle {
+      if (options.resolved.harness === 'claude') {
+        const created = createClaudeProviderAdapter({
+          role: options.role,
+          cwd: options.cwd,
+          clock: options.clock,
+          model: options.resolved.model,
+          ...(options.resolved.effort !== undefined ? { effort: options.resolved.effort } : {}),
+          ...(options.allowedShellCommands !== undefined
+            ? { allowedShellCommands: options.allowedShellCommands }
+            : {}),
+        });
+        const ps = createPsClient(options.clock);
+        return {
+          adapter: created.adapter,
+          captureProcessIdentity: (generationId: ProcessGenerationId) =>
+            captureAcpProcessIdentity(created.adapter, generationId, ps),
+          dispose: (): Promise<void> => created.adapter.close(),
+        };
+      }
       const base: CreateProviderAdapterOptions = {
         cwd: options.cwd,
         clock: options.clock,
         permissions: options.permissions,
       };
       const created =
-        options.resolved.harness === 'claude'
-          ? createClaudeAcpAdapter(base)
-          : createCodexAcpAdapter(base);
+        options.resolved.harness === 'codex'
+          ? createCodexAcpAdapter(base)
+          : createOpenCodeAcpAdapter(base);
       const ps = createPsClient(options.clock);
       return {
         adapter: created.adapter,
@@ -2342,6 +2365,9 @@ export class OrchestrationService {
         clock: this.#clock,
         permissions,
         resolved,
+        ...(runner.allowedShellCommands !== undefined
+          ? { allowedShellCommands: runner.allowedShellCommands }
+          : {}),
       });
     } catch (error) {
       // W4-8: resource setup failed AFTER admission was granted (e.g. the

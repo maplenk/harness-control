@@ -566,6 +566,28 @@ describe('executeCommand — switch-model (HONEST desired-model; §5t)', () => {
     expect(models['implementor']?.effective).toBeUndefined();
   });
 
+  it('surfaces durable child.spawned model-pin evidence instead of only a model label', async () => {
+    const { service, db } = await setup();
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    seedLiveChild(service, db, runId, 'coordinator', 'opus');
+
+    const status = await executeCommand(service, db, { kind: 'status', json: true, runId }, {});
+    expect(status.json).toMatchObject({
+      models: {
+        coordinator: {
+          effective: 'opus',
+          spawnEvidence: {
+            source: 'child.spawned',
+            optionId: 'model',
+            requested: 'opus',
+            effective: 'opus',
+            echoed: true,
+          },
+        },
+      },
+    });
+  });
+
   it('NEVER produces operation=model_switch via the CLI path even when a live idle child owns the run (deleted T19 false-success)', async () => {
     const { service, db } = await setup();
     const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });

@@ -27,9 +27,23 @@ import {
   CODEX_SESSION_MODE_POLICY,
   EXPECTED_CODEX_ADAPTER_VERSION,
 } from './codex/index.js';
+import {
+  EXPECTED_OPENCODE_VERSION,
+  OPENCODE_AUTH_JSON_RELATIVE_PATH,
+  OPENCODE_HARNESS_ID,
+  OPENCODE_PERMISSION_ENV_VAR,
+  OPENCODE_SESSION_MODE_POLICY,
+  openCodePermissionPolicyForRole,
+  openCodeAuthJsonPath,
+} from './opencode/index.js';
 import { fakeAcpChildPath, writeScenarioFile, type FakeAcpScenario } from './fake/index.js';
 import type { SessionUpdate } from './spi.js';
-import { createClaudeAcpAdapter, createCodexAcpAdapter, providerStaticOverrides } from './factory.js';
+import {
+  createClaudeAcpAdapter,
+  createCodexAcpAdapter,
+  createOpenCodeAcpAdapter,
+  providerStaticOverrides,
+} from './factory.js';
 
 const GENEROUS_MS = 20_000;
 const CLOCK = new ManualClock('2026-07-18T12:00:00.000Z');
@@ -42,6 +56,7 @@ afterEach(async () => {
 /** Isolation disabled — for tests where the codex home is irrelevant (no
  * fixture I/O, and the developer's real ~/.codex is never consulted). */
 const NO_ISOLATION = { mode: 'inherit_host' } as const;
+const NO_OPENCODE_ISOLATION = { mode: 'inherit_host' } as const;
 
 /** Fixture "real" codex home + tempRoot (H-1 tests never touch ~/.codex). */
 function fixtureCodexHome(options: { authJson?: boolean } = {}): {
@@ -60,6 +75,24 @@ function fixtureCodexHome(options: { authJson?: boolean } = {}): {
   const tempRoot = path.join(root, 'isolated');
   mkdirSync(tempRoot, { recursive: true });
   return { realCodexHome, tempRoot };
+}
+
+function fixtureOpenCodeHome(options: { authJson?: boolean } = {}): {
+  readonly realHome: string;
+  readonly tempRoot: string;
+} {
+  const root = mkdtempSync(path.join(tmpdir(), 'factory-opencode-home-'));
+  cleanups.push(async () => rm(root, { recursive: true, force: true }));
+  const realHome = path.join(root, 'real-home');
+  mkdirSync(realHome, { recursive: true });
+  if (options.authJson !== false) {
+    const authPath = openCodeAuthJsonPath(realHome);
+    mkdirSync(path.dirname(authPath), { recursive: true });
+    writeFileSync(authPath, 'opaque-opencode-auth-fixture', { mode: 0o600 });
+  }
+  const tempRoot = path.join(root, 'isolated');
+  mkdirSync(tempRoot, { recursive: true });
+  return { realHome, tempRoot };
 }
 
 const claudeLimitEnvelope = {
@@ -92,6 +125,18 @@ describe('provider adapter factory — command resolution + version pin (§3, §
     expect(adapter.harnessId).toBe(CODEX_HARNESS_ID);
     expect(resolved.version).toBe(EXPECTED_CODEX_ADAPTER_VERSION);
   });
+
+  it('opencode: resolves the lockfile-pinned native binary + acp subcommand', () => {
+    const { adapter, resolved, spawn } = createOpenCodeAcpAdapter({
+      clock: CLOCK,
+      processEnv: {},
+      openCodeHome: NO_OPENCODE_ISOLATION,
+    });
+    expect(adapter.harnessId).toBe(OPENCODE_HARNESS_ID);
+    expect(resolved.version).toBe(EXPECTED_OPENCODE_VERSION);
+    expect(spawn.command).toBe(resolved.binPath);
+    expect(spawn.args).toEqual(['acp', '--pure']);
+  });
 });
 
 describe('provider adapter factory — §17.1 credential forwarding + H-1 isolation env', () => {
@@ -117,6 +162,104 @@ describe('provider adapter factory — §17.1 credential forwarding + H-1 isolat
 
     const empty = createClaudeAcpAdapter({ clock: CLOCK, processEnv: {} });
     expect(empty.spawn.env).toBeUndefined();
+
+    const opencode = createOpenCodeAcpAdapter({
+      clock: CLOCK,
+      openCodeHome: NO_OPENCODE_ISOLATION,
+      processEnv: {
+        HOME: '/fixture/home-without-opencode-auth',
+        OPENROUTER_API_KEY: 'sk-or-test',
+        UNRELATED_SECRET: 'nope',
+      },
+    });
+    // OpenCode owns provider auth dynamically through its auth store. No
+    // provider-specific key is guessed or forwarded implicitly.
+    expect(opencode.spawn.env).toBeUndefined();
+
+    const explicitOpenCodeEnv = createOpenCodeAcpAdapter({
+      clock: CLOCK,
+      processEnv: {},
+      openCodeHome: NO_OPENCODE_ISOLATION,
+      env: { CUSTOM_PROVIDER_TOKEN: 'caller-opt-in' },
+    });
+    expect(explicitOpenCodeEnv.spawn.env).toEqual({
+      CUSTOM_PROVIDER_TOKEN: 'caller-opt-in',
+    });
+  });
+
+  it('opencode legacy inherit seam detects its auth store without opening it', () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'factory-opencode-home-'));
+    cleanups.push(async () => rm(home, { recursive: true, force: true }));
+    const authPath = openCodeAuthJsonPath(home);
+    mkdirSync(path.dirname(authPath), { recursive: true });
+    writeFileSync(authPath, 'opaque-credential-fixture');
+
+    const created = createOpenCodeAcpAdapter({
+      clock: CLOCK,
+      processEnv: { HOME: home },
+      openCodeHome: NO_OPENCODE_ISOLATION,
+    });
+
+    expect(created.staticCapabilities.auth).toBe('detected_but_unvalidated');
+    expect(created.spawn.env).toBeUndefined();
+  });
+
+  it('opencode default H-1 isolation copies auth only and pins ACP-routing policy', async () => {
+    const { realHome, tempRoot } = fixtureOpenCodeHome();
+    const created = createOpenCodeAcpAdapter({
+      clock: CLOCK,
+      processEnv: { HOME: realHome, OPENROUTER_API_KEY: 'must-not-cross' },
+      permissions: { mode: 'headless', role: 'implementor' },
+      openCodeHome: { realHome, tempRoot },
+    });
+    cleanups.push(async () => created.adapter.close());
+
+    expect(created.spawn.args).toEqual(['acp', '--pure']);
+    expect(created.openCodeHome?.authMaterial).toBe('auth_json');
+    expect(created.staticCapabilities.auth).toBe('detected_but_unvalidated');
+    expect(created.spawn.env?.['HOME']).toBe(created.openCodeHome?.dir);
+    expect(created.spawn.env?.['XDG_CONFIG_HOME']).toBe(
+      path.join(created.openCodeHome!.dir, '.config'),
+    );
+    expect(created.spawn.env?.['OPENCODE_DISABLE_PROJECT_CONFIG']).toBe('true');
+    expect(JSON.parse(created.spawn.env?.[OPENCODE_PERMISSION_ENV_VAR] ?? '{}')).toEqual(
+      openCodePermissionPolicyForRole('implementor'),
+    );
+    expect(created.spawn.env?.['OPENROUTER_API_KEY']).toBeUndefined();
+    expect(readFileSync(created.openCodeHome!.authPath, 'utf8')).toBe(
+      'opaque-opencode-auth-fixture',
+    );
+    expect(created.openCodeHome!.authPath).toBe(
+      path.join(created.openCodeHome!.dir, OPENCODE_AUTH_JSON_RELATIVE_PATH),
+    );
+
+    const isolatedDir = created.openCodeHome!.dir;
+    await created.adapter.close();
+    expect(existsSync(isolatedDir)).toBe(false);
+  });
+
+  it('opencode isolation env cannot be replaced by caller or spawnOverride env', () => {
+    const { realHome, tempRoot } = fixtureOpenCodeHome({ authJson: false });
+    expect(() =>
+      createOpenCodeAcpAdapter({
+        clock: CLOCK,
+        processEnv: { HOME: realHome },
+        openCodeHome: { realHome, tempRoot },
+        env: { HOME: '/hostile/caller-home' },
+      }),
+    ).toThrow(/owned by opencode spawn isolation/);
+    expect(() =>
+      createOpenCodeAcpAdapter({
+        clock: CLOCK,
+        processEnv: { HOME: realHome },
+        openCodeHome: { realHome, tempRoot },
+        spawnOverride: {
+          command: process.execPath,
+          args: [fakeAcpChildPath(), '/fixture/scenario.json'],
+          env: { OPENCODE_PERMISSION: '{"*":"allow"}' },
+        },
+      }),
+    ).toThrow(/owned by opencode spawn isolation/);
   });
 
   it('codex default (H-1): isolated CODEX_HOME injected — orchestrator config + copied auth, key vars still forwarded', () => {
@@ -150,16 +293,28 @@ describe('provider adapter factory — §17.1 credential forwarding + H-1 isolat
     expect(created.staticCapabilities.auth).toBe('detected_but_unvalidated');
   });
 
-  it('codex caller env wins over the isolation env (documented layering)', () => {
+  it('codex isolation CODEX_HOME cannot be replaced by caller or spawnOverride env', () => {
     const { realCodexHome, tempRoot } = fixtureCodexHome();
-    const created = createCodexAcpAdapter({
-      clock: CLOCK,
-      processEnv: {},
-      codexHome: { realCodexHome, tempRoot },
-      env: { [CODEX_HOME_ENV_VAR]: '/caller/pinned/home' },
-    });
-    cleanups.push(async () => created.codexHome?.dispose());
-    expect(created.spawn.env?.[CODEX_HOME_ENV_VAR]).toBe('/caller/pinned/home');
+    expect(() =>
+      createCodexAcpAdapter({
+        clock: CLOCK,
+        processEnv: {},
+        codexHome: { realCodexHome, tempRoot },
+        env: { [CODEX_HOME_ENV_VAR]: '/caller/pinned/home' },
+      }),
+    ).toThrow(/owned by codex spawn isolation/);
+    expect(() =>
+      createCodexAcpAdapter({
+        clock: CLOCK,
+        processEnv: {},
+        codexHome: { realCodexHome, tempRoot },
+        spawnOverride: {
+          command: process.execPath,
+          args: [fakeAcpChildPath(), '/fixture/scenario.json'],
+          env: { [CODEX_HOME_ENV_VAR]: '/override/pinned/home' },
+        },
+      }),
+    ).toThrow(/owned by codex spawn isolation/);
   });
 });
 
@@ -302,6 +457,11 @@ describe('provider adapter factory — P-1 session-mode pinning wired from the p
       value: 'agent',
     });
     expect(CODEX_SESSION_MODE_POLICY.defaultPin?.value).toBe('read-only');
+    // OpenCode: plan for read-only roles; build only in the implementor worktree.
+    expect(OPENCODE_SESSION_MODE_POLICY.byRole.coordinator?.value).toBe('plan');
+    expect(OPENCODE_SESSION_MODE_POLICY.byRole.verifier?.value).toBe('plan');
+    expect(OPENCODE_SESSION_MODE_POLICY.byRole.implementor?.value).toBe('build');
+    expect(OPENCODE_SESSION_MODE_POLICY.defaultPin?.value).toBe('plan');
   });
 
   it(

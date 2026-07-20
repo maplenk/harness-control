@@ -26,6 +26,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "tsx src/cli/index.ts",
+    "smoke:claude:provider": "tsx scripts/claude-provider-live-smoke.ts",
+    "smoke:claude:provider:record": "tsx scripts/claude-provider-live-smoke.ts --record-evidence",
+    "smoke:opencode:isolation": "tsx scripts/opencode-isolation-smoke.ts",
+    "smoke:opencode:isolation:record": "tsx scripts/opencode-isolation-smoke.ts --record-evidence",
     "smoke:live": "tsx scripts/live-smoke.ts",
     "smoke:live:chat": "tsx scripts/live-smoke.ts --chat"
   },
@@ -34,6 +38,7 @@
     "@agentclientprotocol/codex-acp": "1.1.4",
     "@agentclientprotocol/sdk": "1.2.1",
     "better-sqlite3": "12.11.1",
+    "opencode-ai": "1.18.1",
     "zod": "4.4.3"
   },
   "devDependencies": {

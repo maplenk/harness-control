@@ -61,7 +61,9 @@ commands:
   cancel RUN_ID              T18: idempotent, one terminal result
 
 profiles (§18): '--coordinator claude --model opus --effort low' or a packed
-  token '--implementor codex:gpt-5.6-terra' (harness[:model[:effort]]).
+  token '--implementor codex:gpt-5.6-terra'. OpenCode uses the exact dynamic
+  provider/model id, e.g. '--verifier opencode:xai/grok-4.5:high'
+  (harness[:model[:effort]]).
 
 global options:
   -h, --help                 show this help

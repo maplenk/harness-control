@@ -25,6 +25,18 @@ describe('parseRoleProfile', () => {
     if (isOk(result)) expect(result.value).toEqual({ harness: 'codex', model: 'gpt-5.6-terra', effort: 'high' });
   });
 
+  it('maps an OpenCode provider/model id without splitting its slash', () => {
+    const result = parseRoleProfile({ profile: 'opencode:xai/grok-4.5:high' });
+    expect(isOk(result)).toBe(true);
+    if (isOk(result)) {
+      expect(result.value).toEqual({
+        harness: 'opencode',
+        model: 'xai/grok-4.5',
+        effort: 'high',
+      });
+    }
+  });
+
   it('errors when no model can be resolved', () => {
     expect(isErr(parseRoleProfile({ profile: 'claude' }))).toBe(true);
   });

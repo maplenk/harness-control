@@ -9,7 +9,8 @@
  *   (coordinator/implementor/verifier) implement next phase, plus the
  *   `PermissionMediation` config.
  * - `model-resolution.ts`: `{harness, model, effort}` → §11.2 config-option
- *   pins (Claude reasoning/thinking; Codex model slug + model_reasoning_effort).
+ *   pins (Claude reasoning/thinking; Codex model_reasoning_effort; OpenCode
+ *   dynamic provider/model id + model-dependent effort).
  * - `cost.ts`: §17.2 honest per-role/per-phase token+cost accounting.
  * - `projections.ts`: EngineState reducer + UI vocabulary projection.
  * - `process-registry-store.ts`: W2-6 durable §14 identity store (SQLite

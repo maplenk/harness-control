@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 2,
+  "recordedAt": "2026-07-20T17:59:34.520Z",
+  "harness": "opencode",
+  "adapterVersion": "1.18.1",
+  "requestedModel": "xai/grok-4.5",
+  "requestedEffort": "high",
+  "appliedPins": [
+    {
+      "purpose": "model",
+      "requested": "xai/grok-4.5",
+      "effective": "xai/grok-4.5",
+      "echoed": true
+    },
+    {
+      "purpose": "reasoning",
+      "requested": "high",
+      "effective": "high",
+      "echoed": true
+    }
+  ],
+  "childArgs": [
+    "acp",
+    "--pure"
+  ],
+  "isolation": {
+    "pure": true,
+    "isolatedHome": true,
+    "hostileHostConfigLoaded": false,
+    "hostileProjectConfigLoaded": false,
+    "hostileMcpStarted": false
+  },
+  "permissionMediation": {
+    "requestsObserved": [
+      "printf BASH_PROBE > bash-probe-must-not-exist"
+    ],
+    "denied": [
+      {
+        "operation": "printf BASH_PROBE > bash-probe-must-not-exist",
+        "reason": "denied_default",
+        "optionId": "reject"
+      }
+    ],
+    "bashBypassFileCreated": false
+  },
+  "modelIdentityFile": "model=xai/grok-4.5\nprovider=xai\nharness=opencode\n",
+  "agentResponse": "I will run that single harmless workspace command now.I will update `model-spawn.txt` with the three required lines.GROK_ISOLATION_OK"
+}
