@@ -30,6 +30,8 @@
     "smoke:claude:provider:record": "tsx scripts/claude-provider-live-smoke.ts --record-evidence",
     "smoke:opencode:isolation": "tsx scripts/opencode-isolation-smoke.ts",
     "smoke:opencode:isolation:record": "tsx scripts/opencode-isolation-smoke.ts --record-evidence",
+    "smoke:grok:isolation": "tsx scripts/grok-build-isolation-smoke.ts",
+    "smoke:grok:isolation:record": "tsx scripts/grok-build-isolation-smoke.ts --record-evidence",
     "smoke:live": "tsx scripts/live-smoke.ts",
     "smoke:live:chat": "tsx scripts/live-smoke.ts --chat"
   },

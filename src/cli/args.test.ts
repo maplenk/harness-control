@@ -4,7 +4,7 @@
  * are additionally pinned in `doctor.test.ts`.)
  */
 import { describe, expect, it } from 'vitest';
-import { parseCliArgs } from './args.js';
+import { CLI_USAGE, parseCliArgs } from './args.js';
 
 describe('parseCliArgs — start', () => {
   it('parses the coordinator profile + flags onto a RoleModelSpec', () => {
@@ -24,6 +24,23 @@ describe('parseCliArgs — start', () => {
       kind: 'start',
       json: true,
       coordinator: { harness: 'codex', model: 'gpt-5.6-terra' },
+    });
+  });
+
+  it('accepts a packed Grok Build coordinator token', () => {
+    expect(
+      parseCliArgs([
+        'start',
+        '--workspace',
+        '/ws',
+        '--goal',
+        'g',
+        '--coordinator',
+        'grok:grok-build:high',
+      ]),
+    ).toMatchObject({
+      kind: 'start',
+      coordinator: { harness: 'grok', model: 'grok-build', effort: 'high' },
     });
   });
 
@@ -101,6 +118,23 @@ describe('parseCliArgs — spec revise / approve / run', () => {
       verifier: { harness: 'claude', model: 'opus' },
     });
   });
+
+  it('parses Grok Build implementor and verifier profiles', () => {
+    expect(
+      parseCliArgs([
+        'run',
+        'run_1',
+        '--implementor',
+        'grok:grok-build:high',
+        '--verifier',
+        'grok:grok-build:low',
+      ]),
+    ).toMatchObject({
+      kind: 'run',
+      implementor: { harness: 'grok', model: 'grok-build', effort: 'high' },
+      verifier: { harness: 'grok', model: 'grok-build', effort: 'low' },
+    });
+  });
 });
 
 describe('parseCliArgs — simple RUN_ID commands', () => {
@@ -147,6 +181,24 @@ describe('parseCliArgs — switch-model', () => {
     });
   });
 
+  it('accepts a Grok Build switch target', () => {
+    expect(
+      parseCliArgs([
+        'switch-model',
+        'run_1',
+        '--role',
+        'implementor',
+        '--model',
+        'grok:grok-build',
+        '--effort',
+        'high',
+      ]),
+    ).toMatchObject({
+      kind: 'switch_model',
+      target: { harness: 'grok', model: 'grok-build', effort: 'high' },
+    });
+  });
+
   it('rejects an unknown role or an undeterminable harness', () => {
     expect(parseCliArgs(['switch-model', 'run_1', '--role', 'boss', '--model', 'codex:x'])).toMatchObject({ kind: 'usage_error' });
     expect(parseCliArgs(['switch-model', 'run_1', '--role', 'implementor', '--model', 'opus'])).toMatchObject({ kind: 'usage_error' });
@@ -155,6 +207,10 @@ describe('parseCliArgs — switch-model', () => {
 });
 
 describe('parseCliArgs — general', () => {
+  it('documents the first-party Grok Build packed profile form', () => {
+    expect(CLI_USAGE).toContain('--implementor grok:grok-build:high');
+  });
+
   it('treats --help anywhere as help and unknown commands/options as usage errors', () => {
     expect(parseCliArgs(['status', 'run_1', '--help'])).toEqual({ kind: 'help' });
     expect(parseCliArgs(['frobnicate'])).toMatchObject({ kind: 'usage_error' });

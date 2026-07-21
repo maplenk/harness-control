@@ -8,7 +8,15 @@
  * either `codexHome` points at a fixture, or `mode:'inherit_host'` disables
  * isolation for tests where it is irrelevant.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -36,11 +44,19 @@ import {
   openCodePermissionPolicyForRole,
   openCodeAuthJsonPath,
 } from './opencode/index.js';
+import {
+  GROK_HARNESS_ID,
+  GROK_HOME_ENV_VAR,
+  GROK_PROVIDER_BIN_ENV_VAR,
+  MINIMUM_GROK_VERSION,
+  grokAuthJsonPath,
+} from './grok/index.js';
 import { fakeAcpChildPath, writeScenarioFile, type FakeAcpScenario } from './fake/index.js';
 import type { SessionUpdate } from './spi.js';
 import {
   createClaudeAcpAdapter,
   createCodexAcpAdapter,
+  createGrokBuildAcpAdapter,
   createOpenCodeAcpAdapter,
   providerStaticOverrides,
 } from './factory.js';
@@ -57,6 +73,28 @@ afterEach(async () => {
  * fixture I/O, and the developer's real ~/.codex is never consulted). */
 const NO_ISOLATION = { mode: 'inherit_host' } as const;
 const NO_OPENCODE_ISOLATION = { mode: 'inherit_host' } as const;
+
+function fixtureGrok(): {
+  readonly root: string;
+  readonly cwd: string;
+  readonly realHome: string;
+  readonly tempRoot: string;
+  readonly bin: string;
+} {
+  const root = mkdtempSync(path.join(tmpdir(), 'factory-grok-'));
+  cleanups.push(async () => rm(root, { recursive: true, force: true }));
+  const cwd = path.join(root, 'repo');
+  const realHome = path.join(root, 'real-home');
+  const tempRoot = path.join(root, 'isolated');
+  mkdirSync(cwd, { recursive: true });
+  mkdirSync(path.dirname(grokAuthJsonPath(realHome)), { recursive: true });
+  mkdirSync(tempRoot, { recursive: true });
+  writeFileSync(grokAuthJsonPath(realHome), 'opaque-supergrok-auth-fixture', { mode: 0o600 });
+  const bin = path.join(root, 'grok');
+  writeFileSync(bin, `#!/bin/sh\nprintf 'grok ${MINIMUM_GROK_VERSION} (test) [stable]\\n'\n`);
+  chmodSync(bin, 0o700);
+  return { root, cwd, realHome, tempRoot, bin };
+}
 
 /** Fixture "real" codex home + tempRoot (H-1 tests never touch ~/.codex). */
 function fixtureCodexHome(options: { authJson?: boolean } = {}): {
@@ -136,6 +174,40 @@ describe('provider adapter factory — command resolution + version pin (§3, §
     expect(resolved.version).toBe(EXPECTED_OPENCODE_VERSION);
     expect(spawn.command).toBe(resolved.binPath);
     expect(spawn.args).toEqual(['acp', '--pure']);
+  });
+
+  it('grok: resolves the installed first-party binary and pins its ACP argv', () => {
+    const fixture = fixtureGrok();
+    const { adapter, resolved, spawn } = createGrokBuildAcpAdapter({
+      cwd: fixture.cwd,
+      clock: CLOCK,
+      processEnv: {
+        HOME: fixture.realHome,
+        [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin,
+      },
+      grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
+      permissions: { mode: 'headless', role: 'implementor' },
+      role: 'implementor',
+      model: 'grok-build',
+      reasoningEffort: 'high',
+    });
+    cleanups.push(async () => adapter.close());
+
+    expect(adapter.harnessId).toBe(GROK_HARNESS_ID);
+    expect(resolved.binPath).toBe(fixture.bin);
+    expect(spawn.command).toBe(fixture.bin);
+    expect(spawn.args).toEqual(
+      expect.arrayContaining([
+        '--sandbox',
+        'workspace',
+        '--permission-mode',
+        'acceptEdits',
+        '--model',
+        'grok-build',
+        '--reasoning-effort',
+        'high',
+      ]),
+    );
   });
 });
 
@@ -260,6 +332,42 @@ describe('provider adapter factory — §17.1 credential forwarding + H-1 isolat
         },
       }),
     ).toThrow(/owned by opencode spawn isolation/);
+  });
+
+  it('grok default isolation copies SuperGrok auth only, pins both homes, and disposes', async () => {
+    const fixture = fixtureGrok();
+    const created = createGrokBuildAcpAdapter({
+      cwd: fixture.cwd,
+      clock: CLOCK,
+      processEnv: {
+        HOME: fixture.realHome,
+        [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin,
+        UNRELATED_SECRET: 'must-not-cross',
+      },
+      grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
+      permissions: { mode: 'headless', role: 'verifier' },
+      role: 'verifier',
+      model: 'grok-build',
+      reasoningEffort: 'high',
+    });
+
+    expect(created.grokHome?.authMaterial).toBe('auth_json');
+    expect(created.staticCapabilities.auth).toBe('detected_but_unvalidated');
+    expect(created.spawn.env?.HOME).toBe(created.grokHome?.dir);
+    expect(created.spawn.env?.[GROK_HOME_ENV_VAR]).toBe(created.grokHome?.dir);
+    expect(created.spawn.env?.UNRELATED_SECRET).toBeUndefined();
+    expect(readFileSync(created.grokHome!.authPath, 'utf8')).toBe(
+      'opaque-supergrok-auth-fixture',
+    );
+    expect(statSync(created.grokHome!.dir).mode & 0o777).toBe(0o700);
+    expect(statSync(created.grokHome!.authPath).mode & 0o777).toBe(0o600);
+    const config = readFileSync(created.grokHome!.configPath, 'utf8');
+    expect(config).toContain('auto_update = false');
+    expect(config).toContain('mcps = false');
+
+    const isolatedDir = created.grokHome!.dir;
+    await created.adapter.close();
+    expect(existsSync(isolatedDir)).toBe(false);
   });
 
   it('codex default (H-1): isolated CODEX_HOME injected — orchestrator config + copied auth, key vars still forwarded', () => {
@@ -432,6 +540,63 @@ describe('provider adapter factory — composed initialize() over the fake wire 
       // The spawned (override) path is what executable.resolvedPath reports.
       expect(record.executable.resolvedPath).toBe(fakeAcpChildPath());
       expect(record.executable.resolvedPath).not.toBe(resolved.binPath);
+    },
+    GENEROUS_MS,
+  );
+
+  it(
+    'grok exposes immutable spawn pins and permits only an in-worktree structured implementor write',
+    async () => {
+      const fixture = fixtureGrok();
+      const target = path.join(fixture.cwd, 'implemented.txt');
+      const scenarioPath = await writeScenarioFile(
+        {
+          turns: [
+            {
+              permission: { toolTitle: `Write \`${target}\`` },
+              response: { stopReason: 'end_turn' },
+            },
+          ],
+        },
+        fixture.root,
+      );
+      const created = createGrokBuildAcpAdapter({
+        cwd: fixture.cwd,
+        clock: CLOCK,
+        processEnv: {
+          HOME: fixture.realHome,
+          [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin,
+        },
+        grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
+        permissions: { mode: 'headless', role: 'implementor' },
+        role: 'implementor',
+        model: 'grok-build',
+        reasoningEffort: 'high',
+        spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
+      });
+      cleanups.push(async () => created.adapter.close());
+
+      await created.adapter.initialize();
+      const session = await created.adapter.createSession({ cwd: fixture.cwd });
+      const options = await created.adapter.listConfigOptions(session.acpSessionId);
+      expect(options).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: 'model', current: 'grok-build' }),
+          expect.objectContaining({ id: 'reasoning_effort', current: 'high' }),
+        ]),
+      );
+      expect(created.adapter.modePins).toEqual([]);
+
+      await expect(
+        created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'implement' }),
+      ).resolves.toMatchObject({ stopReason: 'end_turn' });
+      expect(created.adapter.permissionDecisions).toEqual([
+        expect.objectContaining({
+          operation: `Write \`${target}\``,
+          action: 'allow',
+          reason: 'allowlisted_workspace_write',
+        }),
+      ]);
     },
     GENEROUS_MS,
   );

@@ -55,6 +55,13 @@ export interface FakeHandshakeScript {
    * historical behavior).
    */
   readonly authMethods?: ReadonlyArray<{ readonly id: string; readonly name?: string }>;
+  /** Extra initialize `_meta` fields for provider-extension policy tests. */
+  readonly meta?: Readonly<Record<string, unknown>>;
+  /** Provider-extension notifications emitted immediately after initialize. */
+  readonly notifications?: ReadonlyArray<{
+    readonly method: string;
+    readonly params?: unknown;
+  }>;
 }
 
 /** H-2 substrate: scripted `authenticate` handling. Default (no script):

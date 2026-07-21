@@ -95,6 +95,13 @@ if (scenarioPath) {
     process.stderr.write(`fake-acp-child: cannot read scenario ${scenarioPath}: ${String(error)}\n`);
     process.exit(2);
   }
+} else if (process.env.FAKE_ACP_SCENARIO) {
+  try {
+    scenario = JSON.parse(process.env.FAKE_ACP_SCENARIO);
+  } catch (error) {
+    process.stderr.write(`fake-acp-child: cannot parse FAKE_ACP_SCENARIO: ${String(error)}\n`);
+    process.exit(2);
+  }
 }
 
 const handshake = scenario.handshake ?? {};
@@ -608,9 +615,19 @@ async function handleInitialize(message) {
         name: method.name ?? method.id,
         description: null,
       })),
-      _meta: { spawnId: process.env.HARNESS_SPAWN_ID ?? null },
+      _meta: {
+        ...(handshake.meta ?? {}),
+        spawnId: process.env.HARNESS_SPAWN_ID ?? null,
+      },
     },
   });
+  for (const notification of handshake.notifications ?? []) {
+    void send({
+      jsonrpc: '2.0',
+      method: notification.method,
+      ...(notification.params !== undefined ? { params: notification.params } : {}),
+    });
+  }
 }
 
 /** TX-1: `session/new` requires `cwd` AND `mcpServers` — like both adapters. */

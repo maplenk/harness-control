@@ -1,9 +1,9 @@
 # harness-orchestration
 
 CLI-first orchestration across coding-agent harnesses. One headless TypeScript
-engine drives **Claude Code**, **Codex**, and **OpenCode** as child agents over
-their native headless protocols (Claude stream JSON; Codex/OpenCode ACP),
-through three host-enforced roles:
+engine drives **Claude Code**, **Codex**, **Grok Build**, and **OpenCode** as
+child agents over their native headless protocols (Claude stream JSON;
+Codex/Grok/OpenCode ACP), through three host-enforced roles:
 
 - **Coordinator** — explores the workspace read-only and drafts an immutable,
   content-addressed specification with objectively testable acceptance
@@ -34,9 +34,12 @@ run survives process restarts and is inspectable after the fact.
 - `git` on PATH (worktree isolation and the §16 merge-readiness probes).
 - For live runs: the selected provider is authenticated (`doctor` reports the
   exact state). Claude always uses the installed first-party `claude` binary
-  and its Claude Code subscription/keychain login; Codex uses its installed credentials;
-  OpenCode is lockfile-pinned by this package and reuses credentials created
-  by `opencode auth login`. The offline test suite needs no live provider.
+  and its Claude Code subscription/keychain login; Codex uses its installed
+  credentials;
+  Grok Build uses the installed first-party `grok` binary (version 0.2.106 or
+  newer) and its SuperGrok login; OpenCode is lockfile-pinned by this package
+  and reuses credentials created by `opencode auth login`. The offline test
+  suite needs no live provider.
 - Optional planning chat: install
   [Agent Room](https://github.com/steviebuilds/agent-room) (or set
   `AGENT_ROOM_CLI` to its `scripts/agent_room.mjs`) before using
@@ -80,6 +83,11 @@ harness-orchestrator start --workspace /path/to/repo \
   --coordinator claude --model opus --effort low \
   --config harness.config.json
 
+# Grok Build is a first-class profile; model and effort are pinned at spawn.
+harness-orchestrator start --workspace /path/to/repo \
+  --goal "Plan the requested change" \
+  --coordinator grok:grok-build:high
+
 # Add --enable-chat to make planning collaborative. The invitation is printed
 # immediately on stderr; open it as a human or paste it into another local
 # agent. The command stays in the room loop until the coordinator synthesizes
@@ -105,7 +113,7 @@ harness-orchestrator approve RUN_ID --spec-version SPEC_ID --spec-hash HASH
 #    a flag nor a resolvable proposal.
 harness-orchestrator run RUN_ID \
   --implementor codex:gpt-5.6-terra:medium \
-  --verifier opencode:xai/grok-4.5:high
+  --verifier grok:grok-build:high
 
 # 4b. …or let the approved spec's proposals stand in — no profile flags needed:
 harness-orchestrator run RUN_ID
@@ -175,6 +183,55 @@ login, or subscription usage limit; those remain explicit provider failures
 and enter the existing pause/retry/failover machinery instead of silently
 changing credentials or models.
 
+## Grok Build harness
+
+`grok` means the installed first-party Grok Build CLI using its native
+`grok agent stdio` ACP server. Install Grok Build using the
+[official instructions](https://docs.x.ai/build/cli/reference), sign in with
+the SuperGrok account, and verify the characterized minimum version before a
+live run:
+
+```sh
+grok login
+grok --version             # 0.2.106 or newer
+grok models                # confirm grok-build is available
+harness-orchestrator doctor --json
+```
+
+The packed profile is `grok:MODEL[:EFFORT]`; for example,
+`grok:grok-build:high`. Model and reasoning effort are passed to the Grok
+process before ACP starts and are never silently substituted. Grok uses the
+SuperGrok browser-login token in `~/.grok/auth.json`; the orchestrator does
+not require an `XAI_API_KEY` for that subscription path and never parses or
+logs the auth file.
+
+Every spawned Grok role receives a disposable `GROK_HOME` containing only a
+byte-copy of `auth.json` plus orchestrator-owned configuration. Auto-update,
+leader sharing, memory, subagents, host hooks/plugins/MCP, and compatibility
+imports are disabled. A workspace containing project-scoped hooks, plugins,
+MCP, sandbox, or permission configuration is rejected before spawn rather
+than trusted. Coordinator and verifier are read-only; only the implementor
+may write, and only inside its assigned worktree. The isolated home is deleted
+when the adapter closes and is never written back to `~/.grok`.
+
+The live hostile-config probe is intentionally separate from the offline test
+suite. It requires an explicit opt-in because it consumes SuperGrok usage; all
+probe files and homes are disposable and credential contents are never parsed
+or exposed:
+
+```sh
+HARNESS_GROK_LIVE_SMOKE=1 npm run smoke:grok:isolation
+
+# Deliberately refresh the sanitized committed evidence:
+HARNESS_GROK_LIVE_SMOKE=1 npm run smoke:grok:isolation:record
+```
+
+Authentication and weekly subscription limits remain provider-owned. Doctor
+reports credential presence only as `detected_but_unvalidated`; a successful
+live turn is required before auth can be called supported. Auth failures and
+usage-limit envelopes enter the existing interrupt, retry, and failover state
+machine without changing credentials or models.
+
 ## OpenCode providers and models
 
 The OpenCode harness uses the pinned local `opencode-ai` dependency and its
@@ -183,7 +240,7 @@ native `opencode acp` server. Authenticate providers ahead of a run:
 ```sh
 ./node_modules/.bin/opencode auth login
 ./node_modules/.bin/opencode auth list
-./node_modules/.bin/opencode models xai
+./node_modules/.bin/opencode models PROVIDER_ID
 ```
 
 The orchestrator never parses or logs
@@ -198,12 +255,14 @@ auto-allow permission rules are excluded. The orchestrator pins the exact
 ```sh
 harness-orchestrator start --workspace /path/to/repo \
   --goal "Plan the requested change" \
-  --coordinator opencode:xai/grok-4.5:high
+  --coordinator opencode:PROVIDER_ID/MODEL_ID:high
 ```
 
 Provider/model catalogs are dynamic. Connect the provider first, run
 `opencode models PROVIDER_ID`, and use the exact returned identifier. OpenCode
 supports SuperGrok OAuth for xAI and the Z.AI Coding Plan credential path.
+Use the first-party `grok:grok-build:EFFORT` harness for new SuperGrok runs;
+the OpenCode xAI path remains supported only as an OpenCode-provider option.
 Moonshot/Kimi currently uses a Moonshot API key rather than a Kimi consumer
 subscription login. A requested model that the live session does not
 advertise is rejected before a turn; it is never silently substituted.
@@ -323,7 +382,10 @@ automation is possible only through `--test-approve` with
   OpenCode children likewise run with private HOME/XDG state, `acp --pure`,
   excluded host/project config and MCP, and a protected permission overlay;
   native `plan` is pinned for coordinator/verifier and `build` only for the
-  implementor worktree.
+  implementor worktree. Grok Build children run with a disposable `GROK_HOME`
+  carrying only SuperGrok auth plus orchestrator policy; model/effort, sandbox,
+  tools, permissions, `--no-leader`, `--no-memory`, and `--no-subagents` are
+  pinned before `grok agent stdio` starts.
 - **Verification-command confinement (W3-1, MVP-honest).** The spec's declared
   verification commands are full command lines the HOST shell executes in the
   implementor worktree — they are **not fully sandboxed** in the MVP: there is
@@ -439,7 +501,7 @@ automation is possible only through `--test-approve` with
 
 - `src/domain` — event vocabulary + the §6.3 transition table (pure).
 - `src/app` — the orchestration service, role flows, cost accounting.
-- `src/adapters` — native Claude provider, Codex/OpenCode ACP transports, and
+- `src/adapters` — native Claude provider, Codex/Grok/OpenCode ACP transports, and
   offline fakes.
 - `src/persistence` — SQLite event log, projections, quota-aware artifact CAS.
 - `src/worktree`, `src/supervisor`, `src/checkpoint`, `src/memory` — worktree

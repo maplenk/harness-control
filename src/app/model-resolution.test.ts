@@ -15,6 +15,7 @@ import {
   asHarness,
   CLAUDE_REASONING_OPTION_ID,
   CODEX_REASONING_OPTION_ID,
+  GROK_REASONING_OPTION_ID,
   OPENCODE_REASONING_OPTION_ID,
   UnadvertisedModelTargetError,
 } from './model-resolution.js';
@@ -50,8 +51,8 @@ const OPENCODE_OPTIONS: readonly ConfigOptionDescriptor[] = [
   {
     id: 'model',
     kind: 'model',
-    values: ['xai/grok-4.5'],
-    current: 'xai/grok-4.5',
+    values: ['openai/gpt-4.1'],
+    current: 'openai/gpt-4.1',
   },
   {
     id: OPENCODE_REASONING_OPTION_ID,
@@ -60,6 +61,16 @@ const OPENCODE_OPTIONS: readonly ConfigOptionDescriptor[] = [
     current: 'low',
   },
   { id: 'mode', kind: 'mode', values: ['build', 'plan'], current: 'plan' },
+];
+
+const GROK_OPTIONS: readonly ConfigOptionDescriptor[] = [
+  { id: 'model', kind: 'model', values: ['grok-build'], current: 'grok-build' },
+  {
+    id: GROK_REASONING_OPTION_ID,
+    kind: 'reasoning',
+    values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+    current: 'medium',
+  },
 ];
 
 describe('resolveRoleModel (pure §11.2 mapping)', () => {
@@ -97,14 +108,14 @@ describe('resolveRoleModel (pure §11.2 mapping)', () => {
     expect(resolved.effort).toBeUndefined();
   });
 
-  it('maps opencode/xai/grok-4.5/high → dynamic model id + effort option', () => {
+  it('maps opencode/openai/gpt-4.1/high → dynamic model id + effort option', () => {
     const resolved = resolveRoleModel({
       harness: 'opencode',
-      model: 'xai/grok-4.5',
+      model: 'openai/gpt-4.1',
       effort: 'high',
     });
     expect(resolved.configOptions).toEqual([
-      { purpose: 'model', optionId: 'model', value: 'xai/grok-4.5', kind: 'model' },
+      { purpose: 'model', optionId: 'model', value: 'openai/gpt-4.1', kind: 'model' },
       {
         purpose: 'reasoning',
         optionId: OPENCODE_REASONING_OPTION_ID,
@@ -113,6 +124,34 @@ describe('resolveRoleModel (pure §11.2 mapping)', () => {
       },
     ]);
     expect(resolved.codexConfigOverrides).toBeUndefined();
+  });
+
+  it('maps grok/grok-build/high → spawn-time virtual model + reasoning_effort options', () => {
+    const resolved = resolveRoleModel({ harness: 'grok', model: 'grok-build', effort: 'high' });
+    expect(resolved).toEqual({
+      harness: 'grok',
+      model: 'grok-build',
+      effort: 'high',
+      configOptions: [
+        { purpose: 'model', optionId: 'model', value: 'grok-build', kind: 'model' },
+        {
+          purpose: 'reasoning',
+          optionId: GROK_REASONING_OPTION_ID,
+          value: 'high',
+          kind: 'reasoning',
+        },
+      ],
+    });
+  });
+
+  it('omits Grok Build reasoning pin when no effort is requested', () => {
+    expect(resolveRoleModel({ harness: 'grok', model: 'grok-build' })).toEqual({
+      harness: 'grok',
+      model: 'grok-build',
+      configOptions: [
+        { purpose: 'model', optionId: 'model', value: 'grok-build', kind: 'model' },
+      ],
+    });
   });
 });
 
@@ -187,19 +226,31 @@ describe('applyRoleModel (against the in-process fake)', () => {
     ]);
   });
 
-  it('opencode/xai/grok-4.5/high pins the exact advertised model and effort', async () => {
+  it('opencode/openai/gpt-4.1/high pins the exact advertised model and effort', async () => {
     const { adapter, sessionId, advertised } = await fakeWith('opencode', OPENCODE_OPTIONS);
     const resolved = resolveRoleModel({
       harness: 'opencode',
-      model: 'xai/grok-4.5',
+      model: 'openai/gpt-4.1',
       effort: 'high',
     });
 
     await applyRoleModel(adapter, sessionId, resolved, advertised);
 
     expect(setCalls(adapter)).toEqual([
-      { optionId: 'model', value: 'xai/grok-4.5' },
+      { optionId: 'model', value: 'openai/gpt-4.1' },
       { optionId: 'effort', value: 'high' },
+    ]);
+  });
+
+  it('grok/grok-build/high confirms its spawn-time virtual pins', async () => {
+    const { adapter, sessionId, advertised } = await fakeWith('grok', GROK_OPTIONS);
+    const resolved = resolveRoleModel({ harness: 'grok', model: 'grok-build', effort: 'high' });
+
+    await applyRoleModel(adapter, sessionId, resolved, advertised);
+
+    expect(setCalls(adapter)).toEqual([
+      { optionId: 'model', value: 'grok-build' },
+      { optionId: 'reasoning_effort', value: 'high' },
     ]);
   });
 
@@ -234,8 +285,9 @@ describe('applyRoleModel (against the in-process fake)', () => {
 });
 
 describe('asHarness / roleModelSpec validation', () => {
-  it('accepts OpenCode as a live harness', () => {
+  it('accepts OpenCode and Grok Build as live harnesses', () => {
     expect(asHarness('opencode')).toBe('opencode');
+    expect(asHarness('grok')).toBe('grok');
   });
 
   it('rejects unknown harness and effort', () => {

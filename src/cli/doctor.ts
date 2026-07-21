@@ -7,7 +7,9 @@
  * Every check is READ-ONLY and offline-deterministic:
  *  - **Adapters** (§3, §17.1): Claude resolves the user's installed
  *    first-party `claude` provider and enforces the characterized minimum
- *    version; Codex ACP and OpenCode remain lockfile-pinned local packages.
+ *    version; Grok resolves the user's installed first-party `grok` provider
+ *    and enforces its characterized minimum; Codex ACP and OpenCode remain
+ *    lockfile-pinned local packages.
  *    No adapter uses `npx -y`. Provenance is reported,
  *    including codex-acp's platform binary arriving via lockfile-pinned
  *    `optionalDependencies` with no postinstall (§17.1).
@@ -27,6 +29,8 @@
  *    `~/.codex/auth.json` (ChatGPT/Codex subscription login — the real path
  *    on this machine, H-1 isolation copies it into spawned children) →
  *    `detected_but_unvalidated`. Nothing found → honest `unknown`.
+ *    Grok's `~/.grok/auth.json` is handled identically for SuperGrok: doctor
+ *    checks presence only, while spawned children receive an isolated copy.
  *  - **Host config safety (H-1)**: `~/.codex/config.toml` is read
  *    READ-ONLY and FLAGGED (warn, never mutated) when `approvals_reviewer`
  *    is anything but the safe client-routing `"user"` — `auto_review` /
@@ -87,6 +91,17 @@ import {
   tryResolveCodexCommand,
 } from '../adapters/codex/index.js';
 import { checkVersionPin as checkCodexVersionPin } from '../adapters/codex/command.js';
+import {
+  GROK_BIN_NAME,
+  GROK_HARNESS_ID,
+  GROK_PACKAGE_NAME,
+  MINIMUM_GROK_VERSION,
+  XAI_API_KEY_ENV_VAR,
+  checkGrokMinimumVersion,
+  grokAuthJsonPath,
+  probeGrokAuthReadiness,
+  tryResolveGrokCommand,
+} from '../adapters/grok/index.js';
 import {
   EXPECTED_OPENCODE_VERSION,
   OPENCODE_BIN_NAME,
@@ -223,6 +238,8 @@ export interface DoctorOptions {
   readonly resolveFromDir?: string;
   /** Injectable native Claude resolution; keeps doctor tests offline. */
   readonly claudeProviderResolver?: () => ReturnType<typeof tryResolveClaudeProviderCommand>;
+  /** Injectable first-party Grok resolution; keeps doctor tests offline. */
+  readonly grokProviderResolver?: () => ReturnType<typeof tryResolveGrokCommand>;
   /** Handshake bound for the fake-adapter check (default 15s, §10.2). */
   readonly handshakeTimeoutMs?: number;
   /** Injectable for deterministic tests; defaults to `process.platform`. */
@@ -242,6 +259,11 @@ const CLAUDE_PROVIDER_ISOLATION =
   'native stream-json spawn pins --safe-mode, empty strict MCP config, role-scoped tools, and dontAsk/acceptEdits permission mode; verify live with `npm run smoke:claude:provider`';
 const CODEX_ISOLATION =
   'per-run CODEX_HOME carries auth.json plus orchestrator config; caller and spawn-override CODEX_HOME replacement is rejected';
+const GROK_PROVIDER_PROVENANCE =
+  'resolved from the installed first-party Grok Build CLI on PATH (or GROK_PROVIDER_BIN); ' +
+  'never npx -y; the harness uses its native ACP server and SuperGrok subscription login';
+const GROK_PROVIDER_ISOLATION =
+  'per-run GROK_HOME carries only auth.json plus orchestrator policy; model/effort and role sandbox are pinned, leader sharing/memory/subagents/host extensions are disabled, and permission-bearing project config is rejected before spawn; verify live with `npm run smoke:grok:isolation`';
 const OPENCODE_ISOLATION =
   'per-run HOME/XDG carries auth only; `acp --pure`, project/external config disabled, empty MCP/plugins, and protected OPENCODE_PERMISSION keep ACP authoritative; verify live with `npm run smoke:opencode:isolation`';
 
@@ -280,6 +302,44 @@ function claudeProviderAdapterReport(
         ],
     provenance: CLAUDE_PROVIDER_PROVENANCE,
     isolation: CLAUDE_PROVIDER_ISOLATION,
+  };
+}
+
+function grokProviderAdapterReport(
+  resolve: () => ReturnType<typeof tryResolveGrokCommand>,
+): DoctorAdapterReport {
+  const result = resolve();
+  if (!isOk(result)) {
+    return {
+      harnessId: GROK_HARNESS_ID,
+      packageName: GROK_PACKAGE_NAME,
+      binName: GROK_BIN_NAME,
+      expectedVersion: MINIMUM_GROK_VERSION,
+      resolved: false,
+      issues: [result.error.message],
+      provenance: GROK_PROVIDER_PROVENANCE,
+      isolation: GROK_PROVIDER_ISOLATION,
+    };
+  }
+  const resolved = result.value;
+  const compatible = checkGrokMinimumVersion(resolved.version);
+  return {
+    harnessId: GROK_HARNESS_ID,
+    packageName: resolved.packageName,
+    binName: GROK_BIN_NAME,
+    expectedVersion: MINIMUM_GROK_VERSION,
+    resolved: true,
+    installedVersion: resolved.version,
+    binPath: resolved.binPath,
+    packageDir: resolved.packageDir,
+    versionPinned: compatible.supported,
+    issues: compatible.supported
+      ? []
+      : [
+          `unsupported Grok Build version ${resolved.version}; minimum characterized version is ${MINIMUM_GROK_VERSION}`,
+        ],
+    provenance: GROK_PROVIDER_PROVENANCE,
+    isolation: GROK_PROVIDER_ISOLATION,
   };
 }
 
@@ -521,6 +581,9 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
       CODEX_ISOLATION,
       'codex-acp platform binary arrives via lockfile-pinned optionalDependencies, no postinstall (PLAN §3, §17.1)',
     ),
+    grokProviderAdapterReport(
+      options.grokProviderResolver ?? (() => tryResolveGrokCommand({ env })),
+    ),
     adapterReport(
       OPENCODE_HARNESS_ID,
       OPENCODE_PACKAGE_NAME,
@@ -562,6 +625,19 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
         'rode the inherited ~/.codex ChatGPT login. ~/.codex/auth.json (ChatGPT/Codex subscription login — ' +
         'carried into spawned children by H-1 CODEX_HOME isolation) is likewise detected_but_unvalidated; ' +
         'contents are never inspected (read-only presence check). supported requires validated turn evidence.',
+    ),
+    authReport(
+      GROK_HARNESS_ID,
+      probeGrokAuthReadiness(env),
+      [XAI_API_KEY_ENV_VAR],
+      env,
+      [grokAuthJsonPath(home)],
+      'detected_but_unvalidated',
+      [path.join(home, '.grok')],
+      'Grok Build reuses the SuperGrok browser login from ~/.grok/auth.json through an isolated per-run ' +
+        'GROK_HOME. The auth file is byte-copied, never parsed or logged, and never written back. ' +
+        'XAI_API_KEY is supported as a separate credential path but presence alone remains ' +
+        'detected_but_unvalidated; supported requires a successful provider turn.',
     ),
     authReport(
       OPENCODE_HARNESS_ID,

@@ -4,13 +4,14 @@
  * transport + session adapter, the per-provider ACP profiles, and the
  * factory that composes profile × transport into a ready adapter.
  *
- * `claude`/`codex`/`opencode` are NAMESPACE re-exports on purpose: the profile
+ * Provider profiles are NAMESPACE re-exports on purpose: the profile
  * packages intentionally mirror each other's module layout and therefore
  * declare same-named members (`checkVersionPin`, `ResolvedAdapterCommand`,
  * `ResolveCommandOptions`, `VersionPinCheck`, `EnvelopeRecord`) — star
  * re-exporting both would make those names silently ambiguous (ESM drops
  * ambiguous star exports rather than erroring). Deep imports
- * (`./claude/index.js`, `./codex/index.js`, `./opencode/index.js`) remain
+ * (`./claude/index.js`, `./codex/index.js`, `./opencode/index.js`,
+ * `./grok/index.js`) remain
  * first-class.
  */
 export * from './spi.js';
@@ -21,3 +22,4 @@ export { createClaudeProviderAdapter } from './claude/provider.js';
 export * as claude from './claude/index.js';
 export * as codex from './codex/index.js';
 export * as opencode from './opencode/index.js';
+export * as grok from './grok/index.js';

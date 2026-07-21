@@ -62,7 +62,8 @@ commands:
 
 profiles (§18): '--coordinator claude --model opus --effort low' or a packed
   token '--implementor codex:gpt-5.6-terra'. OpenCode uses the exact dynamic
-  provider/model id, e.g. '--verifier opencode:xai/grok-4.5:high'
+  provider/model id, e.g. '--verifier opencode:openai/gpt-4.1:high'
+  and first-party Grok Build uses e.g. '--implementor grok:grok-build:high'
   (harness[:model[:effort]]).
 
 global options:

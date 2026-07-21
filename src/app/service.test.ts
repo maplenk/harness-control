@@ -70,9 +70,20 @@ function fakeConfigOptions(harness: Harness): ConfigOptionDescriptor[] {
   }
   if (harness === 'opencode') {
     return [
-      { id: 'model', kind: 'model', values: ['xai/grok-4.5'], current: 'xai/grok-4.5' },
+      { id: 'model', kind: 'model', values: ['openai/gpt-4.1'], current: 'openai/gpt-4.1' },
       { id: 'effort', kind: 'reasoning', values: ['low', 'medium', 'high'], current: 'low' },
       { id: 'mode', kind: 'mode', values: ['build', 'plan'], current: 'plan' },
+    ];
+  }
+  if (harness === 'grok') {
+    return [
+      { id: 'model', kind: 'model', values: ['grok-build'], current: 'grok-build' },
+      {
+        id: 'reasoning_effort',
+        kind: 'reasoning',
+        values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+        current: 'medium',
+      },
     ];
   }
   return [
@@ -153,9 +164,10 @@ async function setup(opts?: FakeFactoryOptions, config?: EngineConfig): Promise<
 const CLAUDE_LOW = { harness: 'claude', model: 'opus', effort: 'low' } as const;
 const OPENCODE_HIGH = {
   harness: 'opencode',
-  model: 'xai/grok-4.5',
+  model: 'openai/gpt-4.1',
   effort: 'high',
 } as const;
+const GROK_HIGH = { harness: 'grok', model: 'grok-build', effort: 'high' } as const;
 
 /** W2-1: T24 is payload-validated — a READY §16 MergeReadiness fixture. */
 function readyMergeReadiness(forRunId: Parameters<OrchestrationService['status']>[0]): MergeReadiness {
@@ -255,7 +267,7 @@ describe('OrchestrationService — run lifecycle', () => {
   it('runs an OpenCode coordinator with its exact dynamic model and effort pins', async () => {
     const { service, created } = await setup();
     const { runId } = service.createRun({
-      goal: 'Draft with Grok',
+      goal: 'Draft with OpenCode',
       workspacePath: '/ws',
       coordinator: OPENCODE_HIGH,
     });
@@ -272,8 +284,33 @@ describe('OrchestrationService — run lifecycle', () => {
     expect(service.status(runId).phase).toBe('awaiting_approval');
     expect(created[0]?.options.resolved).toMatchObject(OPENCODE_HIGH);
     expect(setConfigCalls(created[0]!.adapter)).toEqual([
-      { optionId: 'model', value: 'xai/grok-4.5' },
+      { optionId: 'model', value: 'openai/gpt-4.1' },
       { optionId: 'effort', value: 'high' },
+    ]);
+  });
+
+  it('runs a Grok Build coordinator with its exact spawn-pin vocabulary', async () => {
+    const { service, created } = await setup();
+    const { runId } = service.createRun({
+      goal: 'Draft with first-party Grok Build',
+      workspacePath: '/ws',
+      coordinator: GROK_HIGH,
+    });
+    const runner: RoleRunner = {
+      role: 'coordinator',
+      run: async (session) => {
+        await session.prompt({ prompt: 'Draft the spec.' });
+        return {};
+      },
+    };
+
+    await service.runCoordination(runId, runner);
+
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+    expect(created[0]?.options.resolved).toMatchObject(GROK_HIGH);
+    expect(setConfigCalls(created[0]!.adapter)).toEqual([
+      { optionId: 'model', value: 'grok-build' },
+      { optionId: 'reasoning_effort', value: 'high' },
     ]);
   });
 

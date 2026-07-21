@@ -16,6 +16,11 @@ import {
 } from '../adapters/claude/index.js';
 import { EXPECTED_CODEX_ADAPTER_VERSION } from '../adapters/codex/index.js';
 import {
+  MINIMUM_GROK_VERSION,
+  grokAuthJsonPath,
+  type ResolvedGrokCommand,
+} from '../adapters/grok/index.js';
+import {
   EXPECTED_OPENCODE_VERSION,
   openCodeAuthJsonPath,
 } from '../adapters/opencode/index.js';
@@ -33,11 +38,20 @@ const CLAUDE_PROVIDER: ResolvedClaudeProviderCommand = {
   binPath: '/test/bin/claude',
   packageDir: '/test/bin',
 };
+const GROK_PROVIDER: ResolvedGrokCommand = {
+  command: '/test/bin/grok',
+  args: ['agent', 'stdio'],
+  packageName: 'grok-build',
+  version: MINIMUM_GROK_VERSION,
+  binPath: '/test/bin/grok',
+  packageDir: '/test/bin',
+};
 
 function runTestDoctor(options: DoctorOptions) {
   return runDoctor({
     ...options,
     claudeProviderResolver: () => ({ ok: true, value: CLAUDE_PROVIDER }),
+    grokProviderResolver: () => ({ ok: true, value: GROK_PROVIDER }),
   });
 }
 
@@ -64,6 +78,7 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
       expect(report.adapters.map((a) => a.harnessId)).toEqual([
         'claude',
         'codex',
+        'grok',
         'opencode',
       ]);
       for (const adapter of report.adapters) {
@@ -75,22 +90,28 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
       expect(report.adapters[0]?.packageName).toBe('@anthropic-ai/claude-code');
       expect(report.adapters[0]?.provenance).toContain('subscription/keychain');
       expect(report.adapters[1]?.binPath).toContain('node_modules');
-      expect(report.adapters[2]?.binPath).toContain('node_modules');
+      expect(report.adapters[2]?.binPath).toBe('/test/bin/grok');
+      expect(report.adapters[3]?.binPath).toContain('node_modules');
       expect(report.adapters[1]?.installedVersion).toBe(EXPECTED_CODEX_ADAPTER_VERSION);
-      expect(report.adapters[2]?.installedVersion).toBe(EXPECTED_OPENCODE_VERSION);
+      expect(report.adapters[2]?.installedVersion).toBe(MINIMUM_GROK_VERSION);
+      expect(report.adapters[3]?.installedVersion).toBe(EXPECTED_OPENCODE_VERSION);
       expect(report.adapters[1]?.provenance).toContain('optionalDependencies');
-      expect(report.adapters[2]?.provenance).toContain('native ACP');
+      expect(report.adapters[2]?.provenance).toContain('SuperGrok');
+      expect(report.adapters[3]?.provenance).toContain('native ACP');
       expect(report.adapters[0]?.isolation).toContain('--safe-mode');
       expect(report.adapters[0]?.isolation).toContain('smoke:claude:provider');
       expect(report.adapters[1]?.isolation).toContain('CODEX_HOME');
-      expect(report.adapters[2]?.isolation).toContain('HOME/XDG');
-      expect(report.adapters[2]?.isolation).toContain('acp --pure');
-      expect(report.adapters[2]?.isolation).toContain('smoke:opencode:isolation');
+      expect(report.adapters[2]?.isolation).toContain('GROK_HOME');
+      expect(report.adapters[2]?.isolation).toContain('smoke:grok:isolation');
+      expect(report.adapters[3]?.isolation).toContain('HOME/XDG');
+      expect(report.adapters[3]?.isolation).toContain('acp --pure');
+      expect(report.adapters[3]?.isolation).toContain('smoke:opencode:isolation');
 
-      // Auth: empty env + empty home → honest unknown for both providers.
+      // Auth: empty env + empty home → honest unknown for every provider.
       expect(report.auth.map((a) => [a.provider, a.readiness])).toEqual([
         ['claude', 'unknown'],
         ['codex', 'unknown'],
+        ['grok', 'unknown'],
         ['opencode', 'unknown'],
       ]);
 
@@ -131,7 +152,9 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
       expect(text).toContain('overall: WARN');
       expect(text).toContain('claude');
       expect(text).toContain('codex');
+      expect(text).toContain('grok');
       expect(text).toContain('opencode');
+      expect(text).toContain('npm run smoke:grok:isolation');
       expect(text).toContain('isolation: per-run HOME/XDG');
       expect(text).toContain('npm run smoke:opencode:isolation');
     },
@@ -146,6 +169,8 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
       await writeFile(path.join(home, '.claude', '.credentials.json'), '{}', 'utf8');
       await mkdir(path.join(home, '.codex'), { recursive: true });
       await writeFile(path.join(home, '.codex', 'auth.json'), '{}', 'utf8');
+      await mkdir(path.dirname(grokAuthJsonPath(home)), { recursive: true });
+      await writeFile(grokAuthJsonPath(home), '{}', 'utf8');
       await mkdir(path.dirname(openCodeAuthJsonPath(home)), { recursive: true });
       await writeFile(openCodeAuthJsonPath(home), '{}', 'utf8');
 
@@ -156,10 +181,12 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
         'detected_but_unvalidated',
         'detected_but_unvalidated',
         'detected_but_unvalidated',
+        'detected_but_unvalidated',
       ]);
       expect(detected.auth[0]?.evidence.join(' ')).toContain('.credentials.json');
       expect(detected.auth[1]?.evidence.join(' ')).toContain('auth.json');
-      expect(detected.auth[2]?.evidence.join(' ')).toContain('opencode/auth.json');
+      expect(detected.auth[2]?.evidence.join(' ')).toContain('.grok/auth.json');
+      expect(detected.auth[3]?.evidence.join(' ')).toContain('opencode/auth.json');
       expect(detected.overall).toBe('warn');
 
       // Env keys are MATERIAL, not validation (the live gate proved a
@@ -174,9 +201,21 @@ describe('doctor — full report (fake handshake, real pinned resolution, temp s
         'detected_but_unvalidated',
         'detected_but_unvalidated',
         'detected_but_unvalidated',
+        'detected_but_unvalidated',
       ]);
       expect(withKeys.overall).toBe('warn');
       expect(withKeys.notes.join(' ')).toContain('VALIDATED');
+
+      const apiOnlyHome = await makeTempDir('doctor-home-grok-key-');
+      const withXaiKey = await runTestDoctor({
+        env: { XAI_API_KEY: 'xai-test-only' },
+        homeDir: apiOnlyHome,
+        clock: CLOCK,
+      });
+      const grokAuth = withXaiKey.auth.find((entry) => entry.provider === 'grok');
+      expect(grokAuth?.readiness).toBe('detected_but_unvalidated');
+      expect(grokAuth?.evidence).toContain('env XAI_API_KEY present');
+      expect(withXaiKey.overall).toBe('warn');
     },
     GENEROUS_MS,
   );

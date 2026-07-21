@@ -26,14 +26,22 @@ describe('parseRoleProfile', () => {
   });
 
   it('maps an OpenCode provider/model id without splitting its slash', () => {
-    const result = parseRoleProfile({ profile: 'opencode:xai/grok-4.5:high' });
+    const result = parseRoleProfile({ profile: 'opencode:openai/gpt-4.1:high' });
     expect(isOk(result)).toBe(true);
     if (isOk(result)) {
       expect(result.value).toEqual({
         harness: 'opencode',
-        model: 'xai/grok-4.5',
+        model: 'openai/gpt-4.1',
         effort: 'high',
       });
+    }
+  });
+
+  it('maps a packed Grok Build model and effort token', () => {
+    const result = parseRoleProfile({ profile: 'grok:grok-build:high' });
+    expect(isOk(result)).toBe(true);
+    if (isOk(result)) {
+      expect(result.value).toEqual({ harness: 'grok', model: 'grok-build', effort: 'high' });
     }
   });
 
@@ -74,6 +82,14 @@ describe('parseSwitchTarget', () => {
     const result = parseSwitchTarget({ model: 'codex:gpt-5.6-sol' });
     expect(isOk(result)).toBe(true);
     if (isOk(result)) expect(result.value).toEqual({ harness: 'codex', model: 'gpt-5.6-sol' });
+  });
+
+  it('resolves a Grok Build switch target', () => {
+    const result = parseSwitchTarget({ model: 'grok:grok-build', effort: 'high' });
+    expect(isOk(result)).toBe(true);
+    if (isOk(result)) {
+      expect(result.value).toEqual({ harness: 'grok', model: 'grok-build', effort: 'high' });
+    }
   });
 
   it('carries --effort through', () => {

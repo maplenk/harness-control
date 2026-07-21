@@ -93,7 +93,7 @@ export const DEFAULT_MAX_FAILOVERS_PER_INCIDENT = 2;
 // RUNTIME can actually honor — an arbitrary string (`claude-code`, `xhigh`) that
 // parses today would only fail deep in dispatch (`#narrowHarness` → no-live-target
 // degrade) or silently drop the effort. Validate both at PARSE against the single
-// existing runtime vocabulary (`HARNESSES` = claude|codex|opencode,
+// existing runtime vocabulary (`HARNESSES` = claude|codex|opencode|grok,
 // `REASONING_EFFORTS`)
 // reused from model-resolution.ts — no parallel list — so a misconfiguration is a
 // loud config error, not a runtime surprise.

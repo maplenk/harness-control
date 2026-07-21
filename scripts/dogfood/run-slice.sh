@@ -10,7 +10,7 @@
 #   scripts/dogfood/run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH
 #
 # Parameters (env-overridable):
-#   IMPLEMENTOR  default opencode:xai/grok-4.5:high   (xAI via OpenCode)
+#   IMPLEMENTOR  default grok:grok-build:high          (xAI/Grok Build)
 #   VERIFIER     default codex:gpt-5.6-sol:high        (OpenAI/Codex, read-only)
 set -euo pipefail
 
@@ -23,7 +23,7 @@ CLI=(node "$ROOT/dist/cli/index.js")
 RUN_ID="${1:?usage: run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH}"
 SPEC_VERSION="${2:?spec version id required}"
 SPEC_HASH="${3:?spec hash required (binds the exact drafted spec)}"
-IMPLEMENTOR="${IMPLEMENTOR:-opencode:xai/grok-4.5:high}"
+IMPLEMENTOR="${IMPLEMENTOR:-grok:grok-build:high}"
 VERIFIER="${VERIFIER:-codex:gpt-5.6-sol:high}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"

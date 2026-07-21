@@ -6,3 +6,4 @@
  */
 export * from './transport.js';
 export * from './session.js';
+export * from './spawn-pinned.js';

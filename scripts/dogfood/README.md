@@ -8,7 +8,7 @@ hands off to the human to merge. Runs are **serial** with a **merge/rebuild
 gate** between them.
 
 Three-vendor role split (fixed): coordinator **claude:opus:xhigh** (Anthropic),
-implementor **opencode:xai/grok-4.5:high** (xAI via OpenCode), verifier
+implementor **grok:grok-build:high** (xAI/Grok Build), verifier
 **codex:gpt-5.6-sol:high** (OpenAI, read-only).
 
 ## Run order (§6A)

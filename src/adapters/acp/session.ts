@@ -46,7 +46,7 @@
  *   `config_option_update`, `current_mode_update` normalize into typed
  *   events; unknown kinds still pass through un-dropped.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import * as path from 'node:path';
 import type { AcpStopReason, TurnUsage } from '../../domain/entities.js';
 import { acpSessionId, nativeSessionId, type AcpSessionId } from '../../domain/ids.js';
@@ -101,6 +101,12 @@ import {
  */
 export interface HeadlessPermissionPolicy {
   readonly allow: readonly string[];
+  /**
+   * Optional canonical workspace boundary for structured path-qualified
+   * `Write` / `Edit` operations. Shell-shaped or unparseable operations never
+   * match. The provider factory enables this only for the Grok implementor.
+   */
+  readonly workspaceWriteRoot?: string;
 }
 
 export type PermissionMediationConfig =
@@ -124,6 +130,7 @@ export type PermissionMediationConfig =
 export type PermissionDecisionReason =
   | 'allowlisted'
   | 'interactive'
+  | 'allowlisted_workspace_write'
   | 'denied_default'
   | 'denied_unknown_operation'
   | 'denied_role_write';
@@ -147,8 +154,53 @@ export function isWriteOperation(operation: string | undefined): boolean {
   return !READ_ONLY_OPERATION_RE.test(operation);
 }
 
+function isPathInside(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === '' ||
+    (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  );
+}
+
+function nearestExistingAncestor(candidate: string): string | undefined {
+  let current = candidate;
+  for (;;) {
+    if (existsSync(current)) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
 /**
- * Pure decision core (unit-testable): §10.2 — interactive → surface;
+ * Grok's ACP permission title for a structured edit is path-qualified rather
+ * than a stable tool id. Accept only the two observed structured verbs, one
+ * absolute backtick-delimited path, and a target whose nearest existing
+ * ancestor resolves inside the canonical assigned worktree. This rejects
+ * traversal and symlink escapes before Grok's process sandbox independently
+ * enforces the same workspace boundary.
+ */
+export function isWorkspaceWriteOperation(
+  operation: string | undefined,
+  workspaceRoot: string,
+): boolean {
+  if (operation === undefined) return false;
+  const match = /^(?:Write|Edit) `([^`\r\n]+)`$/.exec(operation.trim());
+  if (match === null) return false;
+  const requested = match[1];
+  if (requested === undefined || !path.isAbsolute(requested)) return false;
+  try {
+    const realRoot = realpathSync(workspaceRoot);
+    const ancestor = nearestExistingAncestor(requested);
+    if (ancestor === undefined) return false;
+    return isPathInside(realRoot, realpathSync(ancestor));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decision core (unit-testable): §10.2 — interactive → surface;
  * headless → allowlist EXACT match else deny; unknown → deny;
  * coordinator/verifier write requests ALWAYS denied (every mode).
  */
@@ -168,6 +220,13 @@ export function decidePermission(
   }
   if ((config.policy?.allow ?? []).includes(operation)) {
     return { action: 'allow', reason: 'allowlisted' };
+  }
+  if (
+    role === 'implementor' &&
+    config.policy?.workspaceWriteRoot !== undefined &&
+    isWorkspaceWriteOperation(operation, config.policy.workspaceWriteRoot)
+  ) {
+    return { action: 'allow', reason: 'allowlisted_workspace_write' };
   }
   return { action: 'deny', reason: 'denied_default' };
 }
@@ -301,6 +360,20 @@ export interface AcpAdapterOptions {
    * (the composition seam) passes ONLY provider-static fields here.
    */
   readonly capabilityOverrides?: Partial<CapabilityRecord>;
+  /**
+   * Provider-specific fail-closed validation over the initialize result.
+   * Used when an ACP extension can expose executable host configuration that
+   * the base protocol does not model (for example Grok's `_meta.mcpServers`).
+   * The callback must never include raw credential-bearing payloads in a
+   * thrown message.
+   */
+  readonly initializeGuard?: (result: unknown) => void;
+  /**
+   * Provider-specific fail-closed validation over non-core notifications.
+   * A rejection terminates the transport instead of letting an extension
+   * silently widen the orchestrator's tool boundary.
+   */
+  readonly notificationGuard?: (method: string, params: unknown) => void;
   /**
    * Provider-specific §13 classifier (Claude/Codex profiles supply
    * `classifyClaudeError`/`classifyCodexError`). Defaults to the reference
@@ -496,6 +569,18 @@ export class AcpStdioAdapter implements HarnessAdapter {
     );
 
     const result = asRecord(raw) ?? {};
+    try {
+      this.#options.initializeGuard?.(result);
+    } catch (cause) {
+      const error = isAdapterError(cause)
+        ? cause
+        : new AdapterError('invalid_argument', 'Provider initialize metadata violated adapter policy', {
+            harnessId: this.harnessId,
+            cause,
+          });
+      transport.fail(error);
+      throw error;
+    }
     const advertisedVersion = result['protocolVersion'];
     if (advertisedVersion !== expectedVersion) {
       const error = new AdapterError(
@@ -891,6 +976,18 @@ export class AcpStdioAdapter implements HarnessAdapter {
 
   // ---- Internals: incoming traffic ----------------------------------------
   #onNotification(method: string, params: unknown): void {
+    try {
+      this.#options.notificationGuard?.(method, params);
+    } catch (cause) {
+      const error = isAdapterError(cause)
+        ? cause
+        : new AdapterError('invalid_argument', 'Provider notification violated adapter policy', {
+            harnessId: this.harnessId,
+            cause,
+          });
+      this.#transport?.fail(error);
+      return;
+    }
     if (method !== 'session/update') return; // unknown notifications ignored
     const record = asRecord(params) ?? {};
     const sessionKey = typeof record['sessionId'] === 'string' ? record['sessionId'] : undefined;

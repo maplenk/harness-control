@@ -18,9 +18,14 @@
  *    `codexConfigOverrides`, the documented fallback (codex/capabilities.ts)
  *    if `session/set_config_option` ever regresses.
  *  - **OpenCode** (`opencode-ai@1.18.1`, native `opencode acp`): a fully
- *    qualified provider/model id (for example `xai/grok-4.5`) maps to
+ *    qualified provider/model id (for example `openai/gpt-4.1`) maps to
  *    `model`; its model-dependent reasoning variant maps
  *    to the `effort` config option.
+ *  - **Grok Build** (`grok agent stdio`): model and reasoning effort are
+ *    process-spawn pins exposed to the orchestration layer as virtual ACP
+ *    config options (`model` and `reasoning_effort`). This preserves the same
+ *    confirm-by-echo contract as session-mutable providers without silently
+ *    pretending the underlying process can switch either value in place.
  *
  * `resolveRoleModel` is PURE (no I/O, no adapter): it yields config-option
  * INTENTS keyed by purpose. `applyRoleModel` is the one function that touches
@@ -44,7 +49,7 @@ import { redactText } from '../redaction/index.js';
 // Inputs
 // ---------------------------------------------------------------------------
 /** Live ACP harnesses supported by the runtime. */
-export const HARNESSES = ['claude', 'codex', 'opencode'] as const;
+export const HARNESSES = ['claude', 'codex', 'opencode', 'grok'] as const;
 export type Harness = (typeof HARNESSES)[number];
 
 /**
@@ -60,7 +65,7 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 /** A role's resolved harness/model/effort triple (the input to §11.2 pinning). */
 export interface RoleModelSpec {
   readonly harness: Harness;
-  /** Provider model slug/id, e.g. `opus` or `xai/grok-4.5`. */
+  /** Provider model slug/id, e.g. `opus` or `openai/gpt-4.1`. */
   readonly model: string;
   readonly effort?: ReasoningEffort;
 }
@@ -89,6 +94,8 @@ export const CLAUDE_REASONING_OPTION_ID = 'thinking';
 export const CODEX_REASONING_OPTION_ID = 'model_reasoning_effort';
 /** OpenCode's provider/model-specific reasoning variant option. */
 export const OPENCODE_REASONING_OPTION_ID = 'effort';
+/** Grok Build's spawn-time reasoning-effort virtual config option. */
+export const GROK_REASONING_OPTION_ID = 'reasoning_effort';
 
 // ---------------------------------------------------------------------------
 // Resolved intents
@@ -162,6 +169,23 @@ export function resolveRoleModel(spec: RoleModelSpec): ResolvedRoleModel {
       ...(spec.effort !== undefined ? { effort: spec.effort } : {}),
       configOptions: intents,
       codexConfigOverrides: overrides,
+    };
+  }
+
+  if (spec.harness === 'grok') {
+    if (spec.effort !== undefined) {
+      intents.push({
+        purpose: 'reasoning',
+        optionId: GROK_REASONING_OPTION_ID,
+        value: spec.effort,
+        kind: 'reasoning',
+      });
+    }
+    return {
+      harness: 'grok',
+      model: spec.model,
+      ...(spec.effort !== undefined ? { effort: spec.effort } : {}),
+      configOptions: intents,
     };
   }
 

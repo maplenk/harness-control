@@ -135,6 +135,7 @@ import {
   AdapterError,
   createClaudeProviderAdapter,
   createCodexAcpAdapter,
+  createGrokBuildAcpAdapter,
   createOpenCodeAcpAdapter,
   isAdapterError,
   type CreateProviderAdapterOptions,
@@ -600,11 +601,11 @@ export function captureAcpProcessIdentity(
 
 /**
  * Production factory: the first-party Claude Code subscription provider for
- * EVERY Claude role, plus real Codex-ACP/OpenCode-ACP adapters. There is no
- * production Claude ACP/API-key fallback: selecting harness `claude` always
- * means the installed native provider. §17.1 H-1 — the Codex path relies on
- * `createCodexAcpAdapter`'s default isolated `CODEX_HOME`; this call site NEVER
- * forwards a user-controlled `CODEX_HOME`.
+ * EVERY Claude role, plus real Codex-ACP/OpenCode-ACP/Grok Build adapters.
+ * There is no production Claude ACP/API-key fallback: selecting harness
+ * `claude` always means the installed native provider. §17.1 H-1 — the Codex
+ * path relies on `createCodexAcpAdapter`'s default isolated `CODEX_HOME`; this
+ * call site NEVER forwards a user-controlled `CODEX_HOME`.
  */
 export function defaultRoleAdapterFactory(): RoleAdapterFactory {
   return {
@@ -636,7 +637,16 @@ export function defaultRoleAdapterFactory(): RoleAdapterFactory {
       const created =
         options.resolved.harness === 'codex'
           ? createCodexAcpAdapter(base)
-          : createOpenCodeAcpAdapter(base);
+          : options.resolved.harness === 'opencode'
+            ? createOpenCodeAcpAdapter(base)
+            : createGrokBuildAcpAdapter({
+                ...base,
+                role: options.role,
+                model: options.resolved.model,
+                ...(options.resolved.effort !== undefined
+                  ? { reasoningEffort: options.resolved.effort }
+                  : {}),
+              });
       const ps = createPsClient(options.clock);
       return {
         adapter: created.adapter,

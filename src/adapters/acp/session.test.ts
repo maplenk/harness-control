@@ -8,7 +8,7 @@
  *
  * Integration-style: real child processes, real timers, generous bounds.
  */
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -34,6 +34,7 @@ import type { AcpTransportLimits } from './transport.js';
 import {
   AcpStdioAdapter,
   decidePermission,
+  isWorkspaceWriteOperation,
   isWriteOperation,
   normalizeSessionUpdate,
   parseConfigOptionsWire,
@@ -215,6 +216,41 @@ describe('permission mediation decision core (§10.2, T20)', () => {
       ).action,
     ).toBe('allow');
     expect(decidePermission({ mode: 'interactive' }, 'write file').action).toBe('interactive');
+  });
+
+  it('allows only path-qualified structured writes inside an implementor worktree', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'acp-workspace-write-'));
+    const outside = await mkdtemp(path.join(tmpdir(), 'acp-workspace-outside-'));
+    cleanups.push(async () => {
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    });
+    await symlink(outside, path.join(root, 'escape'));
+
+    const insideTitle = `Write \`${path.join(root, 'new-file.txt')}\``;
+    const outsideTitle = `Write \`${path.join(outside, 'new-file.txt')}\``;
+    const symlinkTitle = `Edit \`${path.join(root, 'escape', 'new-file.txt')}\``;
+    const policy = {
+      mode: 'headless',
+      role: 'implementor',
+      policy: { allow: [], workspaceWriteRoot: root },
+    } as const;
+
+    expect(isWorkspaceWriteOperation(insideTitle, root)).toBe(true);
+    expect(decidePermission(policy, insideTitle)).toEqual({
+      action: 'allow',
+      reason: 'allowlisted_workspace_write',
+    });
+    expect(isWorkspaceWriteOperation(outsideTitle, root)).toBe(false);
+    expect(isWorkspaceWriteOperation(symlinkTitle, root)).toBe(false);
+    expect(decidePermission(policy, 'Bash `touch new-file.txt`').action).toBe('deny');
+    expect(decidePermission(policy, `Write ${path.join(root, 'unquoted.txt')}`).action).toBe('deny');
+    expect(
+      decidePermission(
+        { ...policy, role: 'verifier' },
+        insideTitle,
+      ),
+    ).toEqual({ action: 'deny', reason: 'denied_role_write' });
   });
 });
 

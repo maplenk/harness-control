@@ -2,7 +2,7 @@
  * Provider adapter factory (PLAN §5, §9, §10) — the composition seam that
  * assembles a ready-to-`initialize()` `AcpStdioAdapter` from a per-provider
  * ACP profile (PLAN §5: generic ACP stdio transport + per-harness profiles).
- * The profiles (`./claude`, `./codex`, `./opencode`) deliberately
+ * The profiles (`./claude`, `./codex`, `./opencode`, `./grok`) deliberately
  * never spawn anything and the generic transport/session (`./acp`)
  * deliberately knows nothing provider-specific; THIS module is where the two
  * meet:
@@ -43,7 +43,7 @@
  *
  * The factory never spawns a process; `initialize()` is the caller's
  * explicit act. Its only filesystem I/O is command resolution (reading the
- * installed package's `package.json`) plus the Codex/OpenCode H-1
+ * installed package's `package.json` or first-party executable) plus the Codex/OpenCode/Grok H-1
  * isolated-home preparation (temp dir + orchestrator config +
  * auth-material byte copy — disposed via `adapter.close()`). Real-adapter
  * spawning belongs to the P2
@@ -52,13 +52,16 @@
  */
 import type { Clock } from '../lib/clock.js';
 import { SystemClock } from '../lib/clock.js';
+import type { RoleName } from '../domain/state.js';
 import {
   AcpStdioAdapter,
+  SpawnPinnedAcpAdapter,
   type AcpAdapterOptions,
   type AcpSpawnSpec,
   type AcpTransportLimits,
   type PermissionMediationConfig,
   type SessionModePolicy,
+  type SpawnPinnedAcpAdapterOptions,
 } from './acp/index.js';
 import { AdapterError, type CapabilityRecord, type ErrorClassification } from './spi.js';
 import {
@@ -100,6 +103,20 @@ import {
   probeOpenCodeAuthReadiness,
   type PreparedOpenCodeHome,
 } from './opencode/index.js';
+import {
+  GROK_HARNESS_ID,
+  GROK_ISOLATION_ENV_KEYS,
+  XAI_API_KEY_ENV_VAR,
+  assertGrokMinimumVersion,
+  assertSafeGrokInitializeExtensions,
+  assertSafeGrokMcpServersUpdated,
+  assertSafeGrokProjectConfig,
+  buildGrokCapabilityRecord,
+  classifyGrokError,
+  prepareGrokHomeIsolation,
+  probeGrokAuthReadiness,
+  type PreparedGrokHome,
+} from './grok/index.js';
 
 // ---------------------------------------------------------------------------
 // Options
@@ -173,6 +190,22 @@ export interface CreateProviderAdapterOptions {
   };
 }
 
+/**
+ * Grok Build pins model, effort, and the role sandbox in process argv because
+ * its ACP v1 server does not expose mutable config or mode setters.
+ */
+export interface CreateGrokBuildAcpAdapterOptions extends CreateProviderAdapterOptions {
+  readonly model: string;
+  readonly reasoningEffort?: string;
+  readonly role?: RoleName;
+  /** Production defaults to an isolated HOME/GROK_HOME containing auth only. */
+  readonly grokHome?: {
+    readonly mode?: 'isolated' | 'inherit_host';
+    readonly realHome?: string;
+    readonly tempRoot?: string;
+  };
+}
+
 export interface CreatedProviderAdapter {
   readonly adapter: AcpStdioAdapter;
   /** The lockfile-pinned command that was resolved (and version-asserted). */
@@ -192,6 +225,8 @@ export interface CreatedProviderAdapter {
   readonly codexHome?: PreparedCodexHome;
   /** Per-run isolated OpenCode HOME/XDG tree (OpenCode only). */
   readonly openCodeHome?: PreparedOpenCodeHome;
+  /** Per-run isolated HOME/GROK_HOME tree (Grok Build only). */
+  readonly grokHome?: PreparedGrokHome;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,8 +274,15 @@ interface ProviderWiring {
     processEnv: NodeJS.ProcessEnv,
   ) => CapabilityRecord;
   readonly classifyError: (raw: unknown, clock: Clock) => ErrorClassification;
-  /** P-1: the provider's normative per-role session-mode pinning policy. */
-  readonly sessionModePolicy: SessionModePolicy;
+  /** Provider extension metadata that must fail closed before use. */
+  readonly initializeGuard?: AcpAdapterOptions['initializeGuard'];
+  readonly notificationGuard?: AcpAdapterOptions['notificationGuard'];
+  /** Immutable model/reasoning values already present in the child argv. */
+  readonly spawnPins?: Pick<SpawnPinnedAcpAdapterOptions, 'model' | 'reasoning'>;
+  /** P-1: the provider's normative per-role session-mode pinning policy.
+   * Omitted for providers such as Grok Build whose role/model policy is
+   * fixed in process argv and whose ACP server advertises no session mode. */
+  readonly sessionModePolicy?: SessionModePolicy;
   /** §17.1 H-1: isolation env layered over credentials, under caller env for
    * non-protected keys. Per-call, closed over by the provider factory. */
   readonly spawnEnv?: Readonly<Record<string, string>>;
@@ -310,6 +352,7 @@ function createProviderAdapter(
     processEnv,
   );
   const overrides = providerStaticOverrides(staticCapabilities, spawnedPath);
+  const sessionMode = options.sessionMode ?? wiring.sessionModePolicy;
 
   const adapterOptions: AcpAdapterOptions = {
     harnessId: wiring.harnessId,
@@ -320,15 +363,25 @@ function createProviderAdapter(
     ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
     // 5. P-1: NORMATIVE per-role session-mode pinning at session setup (the
     //    profile policy unless the caller's test/dev override says otherwise).
-    sessionMode: options.sessionMode ?? wiring.sessionModePolicy,
+    ...(sessionMode !== undefined ? { sessionMode } : {}),
     capabilityOverrides: overrides,
     // 4. §13 provider classifier on the SPI surface.
     classifyError: wiring.classifyError,
+    ...(wiring.initializeGuard !== undefined
+      ? { initializeGuard: wiring.initializeGuard }
+      : {}),
+    ...(wiring.notificationGuard !== undefined
+      ? { notificationGuard: wiring.notificationGuard }
+      : {}),
     // 6. §17.1 H-1: dispose factory-owned spawn resources on close.
     ...(wiring.onClose !== undefined ? { onClose: wiring.onClose } : {}),
   };
 
-  return { adapter: new AcpStdioAdapter(adapterOptions), resolved, spawn, staticCapabilities, overrides };
+  const adapter =
+    wiring.spawnPins !== undefined
+      ? new SpawnPinnedAcpAdapter({ ...adapterOptions, ...wiring.spawnPins })
+      : new AcpStdioAdapter(adapterOptions);
+  return { adapter, resolved, spawn, staticCapabilities, overrides };
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +530,120 @@ export function createOpenCodeAcpAdapter(
       options,
     );
     return { ...created, ...(prepared !== undefined ? { openCodeHome: prepared } : {}) };
+  } catch (error) {
+    prepared?.dispose();
+    throw error;
+  }
+}
+
+/**
+ * First-party Grok Build ACP server × generic stdio transport. The child gets
+ * an auth-only HOME/GROK_HOME, immutable model/effort argv pins, and a
+ * role-specific process sandbox. Project sources that can add executable
+ * integrations or widen permissions are refused before any process is
+ * spawned; provider extension metadata is separately guarded on the wire.
+ */
+export function createGrokBuildAcpAdapter(
+  options: CreateGrokBuildAcpAdapterOptions,
+): CreatedProviderAdapter {
+  if (options.model.length === 0) {
+    throw new AdapterError('invalid_argument', 'Grok Build model must not be empty', {
+      harnessId: GROK_HARNESS_ID,
+    });
+  }
+
+  const processEnv = options.processEnv ?? process.env;
+  const cwd = options.cwd ?? process.cwd();
+  const role = options.role ?? options.permissions?.role;
+  if (
+    options.role !== undefined &&
+    options.permissions?.role !== undefined &&
+    options.role !== options.permissions.role
+  ) {
+    throw new AdapterError('invalid_argument', 'Grok Build role and permission role must match', {
+      harnessId: GROK_HARNESS_ID,
+    });
+  }
+  assertSafeGrokProjectConfig(cwd);
+
+  const permissions: PermissionMediationConfig | undefined =
+    role === 'implementor' && options.permissions?.mode === 'headless'
+      ? {
+          ...options.permissions,
+          policy: {
+            allow: options.permissions.policy?.allow ?? [],
+            workspaceWriteRoot: cwd,
+          },
+        }
+      : options.permissions;
+  const providerOptions: CreateProviderAdapterOptions = {
+    ...options,
+    ...(permissions !== undefined ? { permissions } : {}),
+  };
+
+  const isolationMode = options.grokHome?.mode ?? 'isolated';
+  const authHome = options.grokHome?.realHome ?? processEnv['HOME'];
+  const prepared: PreparedGrokHome | undefined =
+    isolationMode === 'isolated'
+      ? prepareGrokHomeIsolation({
+          ...(authHome !== undefined ? { realHome: authHome } : {}),
+          ...(options.grokHome?.tempRoot !== undefined
+            ? { tempRoot: options.grokHome.tempRoot }
+            : {}),
+          ...(role !== undefined ? { role } : {}),
+        })
+      : undefined;
+
+  try {
+    const created = createProviderAdapter(
+      {
+        harnessId: GROK_HARNESS_ID,
+        resolve: () =>
+          assertGrokMinimumVersion({
+            env: processEnv,
+            cwd,
+            model: options.model,
+            ...(options.reasoningEffort !== undefined
+              ? { reasoningEffort: options.reasoningEffort }
+              : {}),
+            ...(role !== undefined ? { role } : {}),
+          }),
+        credentialEnvVars: [XAI_API_KEY_ENV_VAR],
+        ...(prepared !== undefined
+          ? {
+              spawnEnv: prepared.env,
+              protectedSpawnEnvKeys: GROK_ISOLATION_ENV_KEYS,
+              onClose: prepared.dispose,
+            }
+          : {}),
+        buildStaticRecord: (executable, clock, env) =>
+          buildGrokCapabilityRecord({
+            executable,
+            clock,
+            auth: probeGrokAuthReadiness(env, {
+              authMaterialDetected: prepared?.authMaterial === 'auth_json',
+            }),
+          }),
+        classifyError: classifyGrokError,
+        initializeGuard: assertSafeGrokInitializeExtensions,
+        notificationGuard: (method, params) => {
+          if (method === '_x.ai/mcp/servers_updated') assertSafeGrokMcpServersUpdated(params);
+        },
+        spawnPins: {
+          model: options.model,
+          ...(options.reasoningEffort !== undefined
+            ? {
+                reasoning: {
+                  optionId: 'reasoning_effort',
+                  value: options.reasoningEffort,
+                },
+              }
+            : {}),
+        },
+      },
+      providerOptions,
+    );
+    return { ...created, ...(prepared !== undefined ? { grokHome: prepared } : {}) };
   } catch (error) {
     prepared?.dispose();
     throw error;

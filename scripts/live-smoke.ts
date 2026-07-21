@@ -7,7 +7,7 @@
  *   start  →  approve (--test-approve, HARNESS_TEST_MODE=1)  →  run  →  status
  *
  * against a FRESH temp git repo, using the production `defaultRoleAdapterFactory`
- * (REAL native Claude subscription/Codex ACP/OpenCode ACP spawns + existing logins — H-1 isolation
+ * (REAL native Claude subscription/Codex ACP/Grok ACP/OpenCode ACP spawns + existing logins — H-1 isolation
  * holds, no user `CODEX_HOME` is forwarded). This exercises the exact D-1 wiring the shipped CLI
  * now carries: `start` drives the coordinator flow to `awaiting_approval`, and
  * `run` drives implement→verify→merge-readiness.
