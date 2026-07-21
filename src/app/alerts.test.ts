@@ -16,6 +16,7 @@
  * Real code paths only (`runCoordination` → `pauseForLimit` / `#interruptOnChildDeath`);
  * synthetic secrets/pids only; no real spawns.
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock } from '../lib/clock.js';
 import { specVersionId, specHash as toSpecHash, type RunId } from '../domain/ids.js';
@@ -40,7 +41,7 @@ import {
 } from '../persistence/test-support.js';
 import { parseEngineConfig } from '../config/loader.js';
 import { OrchestrationService, type RoleAdapterFactory, type AlertOptions } from './service.js';
-import type { RoleRunner } from './role-runner.js';
+import type { RoleRunner, RoleSession } from './role-runner.js';
 import type { Harness, RoleModelSpec } from './model-resolution.js';
 import type { RoleName } from '../domain/state.js';
 
@@ -109,6 +110,7 @@ async function setup(opts?: {
     db,
     ids: new DeterministicIdFactory(),
     adapterFactory: makeFactory(opts?.factory ?? {}),
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
     ...(parsed?.ok === true ? { config: parsed.value } : {}),
     ...(opts?.alerts !== undefined ? { alerts: opts.alerts } : {}),
   });
@@ -116,13 +118,13 @@ async function setup(opts?: {
 }
 
 function roleRunnerOnce(role: RoleName): RoleRunner {
-  return {
-    role,
-    run: async (session) => {
-      await session.prompt({ prompt: 'go' });
-      return {};
-    },
+  const run = async (session: RoleSession): Promise<{}> => {
+    await session.prompt({ prompt: 'go' });
+    return {};
   };
+  return role === 'implementor'
+    ? { role, run, adjudicateRoundOutcome: () => 'completed' }
+    : { role, run };
 }
 
 function eventTypes(db: TestDatabaseHandle['db'], runId: RunId): string[] {
@@ -148,12 +150,12 @@ function crashOnAppendOf(db: TestDatabaseHandle['db'], type: string): { restore:
   return { restore: () => void (events.appendBatch = original) };
 }
 
-function approvedImplementing(service: OrchestrationService): RunId {
-  const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+async function approvedImplementing(service: OrchestrationService): Promise<RunId> {
+  const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
   service.advanceWorkflowPhase(runId, 'created', 'specifying');
   service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
   expect(
-    service.approve(runId, { specVersionId: specVersionId('sv_alerts'), specHash: SPEC }).status,
+    (await service.approve(runId, { specVersionId: specVersionId('sv_alerts'), specHash: SPEC })).status,
   ).toBe('applied');
   service.advanceWorkflowPhase(runId, 'approved', 'implementing');
   return runId;
@@ -165,7 +167,7 @@ function approvedImplementing(service: OrchestrationService): RunId {
 describe('P4b-1: alert.raised rides its triggering transition atomically', () => {
   it('a LIMIT pause (T4) emits alert.raised{limit_paused} in the SAME atomic append as the trigger + checkpoint', async () => {
     const { service, db } = await setup({ factory: { turns: limitOnTurnN(1) } });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     await service.runCoordination(runId, roleRunnerOnce('coordinator')).catch(() => undefined);
     expect(service.status(runId).suspension).toBe('paused_limit');
@@ -195,7 +197,7 @@ describe('P4b-1: alert.raised rides its triggering transition atomically', () =>
       factory: { onSetConfigOption: crashOnPin },
       config: { restarts: { windowMax: 3 } },
     });
-    const runId = approvedImplementing(service);
+    const runId = await approvedImplementing(service);
 
     const outcomes: string[] = [];
     for (let i = 0; i < 4; i += 1) {
@@ -221,7 +223,7 @@ describe('P4b-1: alert.raised rides its triggering transition atomically', () =>
 
   it('NO cause → NO alert / NO alert → NO cause: crash-injecting the alert.raised append rolls the WHOLE pause transaction back', async () => {
     const { service, db } = await setup({ factory: { turns: limitOnTurnN(1) } });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const crash = crashOnAppendOf(db, 'alert.raised');
     const error: unknown = await service
@@ -251,7 +253,7 @@ describe('P4b-1: delivery derived from the log (at-least-once, dedup)', () => {
       factory: { turns: limitOnTurnN(1) },
       alerts: { stderrWrite: (line) => stderr.push(line) },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(runId, roleRunnerOnce('coordinator')).catch(() => undefined);
 
     // Raised but NOT yet delivered.
@@ -276,7 +278,7 @@ describe('P4b-1: delivery derived from the log (at-least-once, dedup)', () => {
       factory: { turns: limitOnTurnN(1) },
       alerts: { stderrWrite: () => expect.fail('process A must not deliver') },
     });
-    const { runId } = serviceA.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(serviceA, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await serviceA.runCoordination(runId, roleRunnerOnce('coordinator')).catch(() => undefined);
     expect(db.events.listByRun(runId).some((e) => e.type === 'alert.raised')).toBe(true);
     expect(db.events.listByRun(runId).some((e) => e.type === 'alert.delivered')).toBe(false);
@@ -340,7 +342,7 @@ describe('P4b-1: alert detail is redacted (§17.1)', () => {
       throw new AdapterError('unexpected_eof', `child died: leaked ${secret} here`);
     };
     const { service, db } = await setup({ factory: { onSetConfigOption: crashWithSecret } });
-    const runId = approvedImplementing(service);
+    const runId = await approvedImplementing(service);
     await service.runCoordination(runId, roleRunnerOnce('coordinator')).catch(() => undefined);
     expect(service.status(runId).suspension).toBe('interrupted');
 
@@ -363,7 +365,7 @@ describe('P4b-1: both sqlite drivers raise + deliver alerts', () => {
         factory: { turns: limitOnTurnN(1) },
         alerts: { stderrWrite: (line) => stderr.push(line) },
       });
-      const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+      const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
       await service.runCoordination(runId, roleRunnerOnce('coordinator')).catch(() => undefined);
       expect(raisedAlerts(db, runId)).toHaveLength(1);
       service.deliverPendingAlerts(runId);

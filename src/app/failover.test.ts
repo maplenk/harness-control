@@ -20,12 +20,14 @@
  *     SAME assignmentId (bounded → breaker_open);
  *  6. `wait` policy is unchanged (pause + wait, no failover).
  */
+import { createRunFixture } from './test-support.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   assignmentId as toAssignmentId,
   criterionId,
+  gitSha,
   specHash as toSpecHash,
   specVersionId,
   type RunId,
@@ -213,6 +215,7 @@ interface LoopRig {
   readonly runId: RunId;
   readonly assignmentId: ReturnType<typeof toAssignmentId>;
   readonly resolved: ResolvedByRole;
+  readonly baseCommit: ReturnType<typeof gitSha>;
 }
 
 async function openLoopRig(
@@ -248,13 +251,27 @@ async function openLoopRig(
     adapterFactory: factory,
     config: opts.config,
   });
-  const { runId } = service.createRun({ goal: 'g', workspacePath: repo.dir, coordinator: CLAUDE_LOW });
+  const baseCommit = gitSha(await repo.headSha());
+  const { runId } = createRunFixture(service, {
+    goal: 'g',
+    workspacePath: repo.dir,
+    coordinator: CLAUDE_LOW,
+    baseCommit,
+  });
   service.advanceWorkflowPhase(runId, 'created', 'specifying');
   service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
-  expect(service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH }).status).toBe(
+  expect((await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH })).status).toBe(
     'applied',
   );
-  return { service, db: handle.db, worktrees, runId, assignmentId: toAssignmentId(`asg_${runId}`), resolved };
+  return {
+    service,
+    db: handle.db,
+    worktrees,
+    runId,
+    assignmentId: toAssignmentId(`asg_${runId}`),
+    resolved,
+    baseCommit,
+  };
 }
 
 function loopInput(rig: LoopRig) {
@@ -270,7 +287,7 @@ function loopInput(rig: LoopRig) {
     criteria: CRITERIA,
     evidence: fakeEvidence(),
     runVerificationCommands: PASS_VERIFY,
-    baseRef: 'HEAD', // F5: pin the fresh test repo HEAD explicitly
+    baseCommit: rig.baseCommit,
   };
 }
 

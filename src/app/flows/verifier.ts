@@ -79,7 +79,7 @@ import type {
 import type { SessionUpdate } from '../../adapters/spi.js';
 import type { ArtifactSink } from '../../artifacts/store.js';
 import * as git from '../../worktree/git.js';
-import type { RoleRunner, RoleSession } from '../role-runner.js';
+import type { ReadOnlyRoleRunner, RoleRunner, RoleSession } from '../role-runner.js';
 import type { RoleModelSpec } from '../model-resolution.js';
 import type { IngestResult, RoleDispatch } from '../service.js';
 import type { MergeReadinessBlockedState } from '../projections.js';
@@ -364,7 +364,7 @@ const NO_EVIDENCE_NOTE = 'Reported passed without evidence; downgraded to unprov
  * with the verifier's OWN evidence refs, and returns the decision. It never
  * touches the engine, DB, or adapter directly (the seam owns those).
  */
-export class VerifierRunner implements RoleRunner<VerifierGathering> {
+export class VerifierRunner implements ReadOnlyRoleRunner<VerifierGathering> {
   readonly role = 'verifier' as const;
   readonly allowedShellCommands: readonly string[];
   readonly #config: VerifierRunnerConfig;

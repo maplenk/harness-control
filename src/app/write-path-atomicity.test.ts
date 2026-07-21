@@ -26,6 +26,7 @@
  *
  * FAILS without the fix on BOTH drivers.
  */
+import { createRunFixture } from './test-support.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   idempotencyKey,
@@ -142,7 +143,7 @@ describe.each(DRIVER_KINDS)('F1 write-path atomicity (%s)', (kind) => {
       adapterFactory: noopFactory(),
     });
 
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // Seed an ACTIVE child so BOTH a T18 cancel (phase non-terminal) and a T13
     // crash (suspension none + child active + generation matches) are legal

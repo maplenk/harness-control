@@ -11,6 +11,7 @@
  * pins the registry↔projection-name linkage the persistence layer cannot
  * import (its map holds literal strings; the constants live here in app).
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { assignmentId, specHash, specVersionId } from '../domain/ids.js';
 import { InProcessFakeAdapter, type ConfigOptionDescriptor } from '../adapters/index.js';
@@ -66,6 +67,7 @@ async function setup(): Promise<{ service: OrchestrationService; db: TestDatabas
     db: handle.db,
     ids: new DeterministicIdFactory(),
     adapterFactory: makeFakeFactory(),
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
   });
   return { service, db: handle.db };
 }
@@ -94,7 +96,7 @@ describe('W3-3 metadata-sink redaction — service readbacks', () => {
 
   it('start --goal with a planted secret: raw run_meta row + status() readback are redacted (the review probe)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({
+    const { runId } = createRunFixture(service, {
       goal: `Ship the toggle before Friday. ${PLANTED}`,
       workspacePath: '/ws/repo',
       coordinator: CLAUDE_LOW,
@@ -113,7 +115,7 @@ describe('W3-3 metadata-sink redaction — service readbacks', () => {
 
   it('the coordinator round inputs carry the REDACTED goal: getRoleRound + raw role_round row', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({
+    const { runId } = createRunFixture(service, {
       goal: `Ship it. ${PLANTED}`,
       workspacePath: '/ws',
       coordinator: CLAUDE_LOW,
@@ -144,11 +146,11 @@ describe('W3-3 metadata-sink redaction — service readbacks', () => {
 
   it('spec revise --feedback with a planted secret: raw event row + listByRun redacted; recover replays the live state', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     service.advanceWorkflowPhase(runId, 'created', 'specifying');
     service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
 
-    const result = service.reviseSpec(runId, `Scope this down. ${PLANTED}`);
+    const result = await service.reviseSpec(runId, `Scope this down. ${PLANTED}`);
     expect(result.status).toBe('applied');
 
     // Raw DB row: no secret survives.
@@ -181,7 +183,7 @@ describe('W3-3 metadata-sink redaction — service readbacks', () => {
 
   it('getSpecDraft: canonicalSpec + goal redacted; specHash/specVersionId/criteria byte-identical', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const hash = specHash('0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0');
     const versionId = specVersionId('spec_w33_1');
@@ -213,7 +215,7 @@ describe('W3-3 metadata-sink redaction — service readbacks', () => {
 
   it('implement→verify loop taskScope redacted; assignment/spec bindings byte-identical', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     service.saveImplementVerifyLoopState(runId, {
       assignmentId: assignmentId('asg_w33_1'),
@@ -238,7 +240,7 @@ describe('W3-3 metadata-sink redaction — service readbacks', () => {
 
   it('approval hash binding is untouched by redaction: approvedSpecHash byte-identical end to end', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({
+    const { runId } = createRunFixture(service, {
       goal: `g ${PLANTED}`,
       workspacePath: '/ws',
       coordinator: CLAUDE_LOW,
@@ -247,7 +249,7 @@ describe('W3-3 metadata-sink redaction — service readbacks', () => {
     service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
 
     const hash = specHash('c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00');
-    const approved = service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: hash });
+    const approved = await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: hash });
     expect(approved.status).toBe('applied');
     expect(String(service.status(runId).approvedSpecHash)).toBe(String(hash));
 

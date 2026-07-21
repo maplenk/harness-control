@@ -17,6 +17,7 @@
  *    plain interrupts (T13); `breaker reset` (T15) clears the in-memory window
  *    so the next crash interrupts again rather than re-opening immediately.
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   artifactHash,
@@ -47,7 +48,7 @@ import { DeterministicIdFactory, RandomIdFactory } from '../lib/id-factory.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../persistence/test-support.js';
 import { parseEngineConfig } from '../config/loader.js';
 import { LimitPausedError, OrchestrationService, type RoleAdapterFactory } from './service.js';
-import type { RoleRunner } from './role-runner.js';
+import type { RoleRunner, RoleSession } from './role-runner.js';
 import type { Harness, RoleModelSpec } from './model-resolution.js';
 import { ENGINE_STATE_PROJECTION } from './projections.js';
 import { DurableRunOwnershipStore } from './run-ownership-store.js';
@@ -126,6 +127,7 @@ async function setup(opts?: {
     db,
     ids: new DeterministicIdFactory(),
     adapterFactory: makeFactory(opts?.factory ?? {}),
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
     ...(parsed?.ok === true ? { config: parsed.value } : {}),
     ...(opts?.supervision !== undefined
       ? {
@@ -153,21 +155,21 @@ function eventTypes(db: TestDatabaseHandle['db'], runId: RunId): string[] {
 
 /** A role runner that drives exactly one prompt turn and completes cleanly. */
 function roleRunnerOnce(role: RoleName): RoleRunner {
-  return {
-    role,
-    run: async (session) => {
-      await session.prompt({ prompt: 'go' });
-      return {};
-    },
+  const run = async (session: RoleSession): Promise<{}> => {
+    await session.prompt({ prompt: 'go' });
+    return {};
   };
+  return role === 'implementor'
+    ? { role, run, adjudicateRoundOutcome: () => 'completed' }
+    : { role, run };
 }
 
 /** Drive a run to `approved` (T1) with `SPEC` bound. */
-function approvedRun(service: OrchestrationService): RunId {
-  const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+async function approvedRun(service: OrchestrationService): Promise<RunId> {
+  const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
   service.advanceWorkflowPhase(runId, 'created', 'specifying');
   service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
-  expect(service.approve(runId, { specVersionId: specVersionId('sv_stage2'), specHash: SPEC }).status).toBe('applied');
+  expect((await service.approve(runId, { specVersionId: specVersionId('sv_stage2'), specHash: SPEC })).status).toBe('applied');
   return runId;
 }
 
@@ -199,7 +201,7 @@ function sampleFor(pid: number): ProcessIdentitySample {
 describe('W4-4 consumer resume-routing gate', () => {
   it('variant 2: implementor completed, phase `implementing`, suspension none → resume RE-DRIVES (fails without the gate: resume errored "not paused")', async () => {
     const { service, db } = await setup({ factory: { turnsByRole: { implementor: [{}] } } });
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
 
     // Drive the implementor round to completion but STOP before dispatching the
     // verifier (the natural variant-2 boundary: the implement→verify loop
@@ -229,7 +231,7 @@ describe('W4-4 consumer resume-routing gate', () => {
 
   it('symmetric gap: verifier round completed, phase `verifying`, suspension none → resume RE-DRIVES', async () => {
     const { service, db } = await setup({ factory: { turnsByRole: { verifier: [{}] } } });
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
     service.advanceWorkflowPhase(runId, 'approved', 'implementing');
 
     await service.runRole(runId, roleRunnerOnce('verifier'), CLAUDE_LOW, '/ws', {
@@ -253,7 +255,7 @@ describe('W4-4 consumer resume-routing gate', () => {
 
   it('owner-liveness: a run claimed by a still-alive process is NOT re-driven — the gate WITHHOLDS (falls through to the "not paused" error)', async () => {
     const { service, db } = await setup({ factory: { turnsByRole: { implementor: [{}] } } });
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
     await service.runRole(runId, roleRunnerOnce('implementor'), CLAUDE_LOW, '/ws', {
       round: 1,
       advance: { from: 'approved', to: 'implementing' },
@@ -290,7 +292,7 @@ describe('W4-4 consumer resume-routing gate', () => {
     const SELF = 58_200;
     ps.identities.set(SELF, sampleFor(SELF));
     const { service, db } = await setup({ supervision: { ps: ps.client, selfPid: SELF } });
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
     service.advanceWorkflowPhase(runId, 'approved', 'implementing'); // non-terminal home
 
     // Seed an ACTIVE implementor generation whose owner (DEAD_OWNER) crashed
@@ -319,7 +321,7 @@ describe('W4-4 consumer resume-routing gate', () => {
       }) as DomainEvent,
     );
     const childPid = 58_300;
-    ps.identities.set(childPid, sampleFor(childPid)); // live child → reap kills it
+    ps.identities.set(childPid, sampleFor(childPid)); // live child → first reap only signals it
     service.supervision.registry.store.put({
       generationId: generation,
       pid: childPid,
@@ -334,7 +336,19 @@ describe('W4-4 consumer resume-routing gate', () => {
     });
     expect(engineState(db, runId).counters.lifetimeRestarts).toBe(0);
 
-    service.reapOrphanProcesses();
+    const signaled = service.reapOrphanProcesses();
+    expect(signaled.signalSentCount).toBe(1);
+    expect(signaled.confirmedGoneCount).toBe(0);
+    expect(eventTypes(db, runId)).not.toContain('recovery.running_segment_found');
+    expect(engineState(db, runId).suspension.kind).toBe('none');
+    expect(service.supervision.registry.store.get(generation)).toBeDefined();
+
+    // The signal path retains registry ownership. A subsequent independent
+    // observation of absence is the confirmation boundary that produces T17.
+    ps.identities.delete(childPid);
+    const confirmed = service.reapOrphanProcesses();
+    expect(confirmed.signalSentCount).toBe(0);
+    expect(confirmed.confirmedGoneCount).toBe(1);
 
     // T17 producer fired (interrupted), NOT the child-crash T13 path.
     const types = eventTypes(db, runId);
@@ -354,13 +368,13 @@ describe('W4-4 consumer resume-routing gate', () => {
     expect(engineState(db, runId).suspension.kind).toBe('none');
   });
 
-  it('variant 1: reap PRODUCES `interrupted` (T17) within the same resume call, then T12 drives re-entry', async () => {
+  it('variant 1: resume withholds after signaling an orphan; a later absence-confirming resume produces T17 then drives T12 re-entry', async () => {
     const ps = makeFakePs();
     const DEAD_OWNER = 59_999; // absent from the fake ps table → provably dead
     const SELF = 60_000;
     ps.identities.set(SELF, sampleFor(SELF));
     const { service, db } = await setup({ supervision: { ps: ps.client, selfPid: SELF } });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // Seed an ACTIVE generation whose owning orchestrator (DEAD_OWNER) crashed.
     const generation = processGenerationId('pgen_variant1');
@@ -385,7 +399,7 @@ describe('W4-4 consumer resume-routing gate', () => {
       }) as DomainEvent,
     );
     const childPid = 62_500;
-    ps.identities.set(childPid, sampleFor(childPid)); // child still alive → reap kills it
+    ps.identities.set(childPid, sampleFor(childPid)); // child still alive → first resume only signals it
     service.supervision.registry.store.put({
       generationId: generation,
       pid: childPid,
@@ -400,10 +414,22 @@ describe('W4-4 consumer resume-routing gate', () => {
     });
     expect(engineState(db, runId).suspension.kind).toBe('none');
 
-    const out = await executeCommand(service, db, { kind: 'resume', json: true, runId }, {}, {});
+    const pending = await executeCommand(service, db, { kind: 'resume', json: true, runId }, {}, {});
 
-    // The reap (first thing handleResume does) produced T17 `interrupted`, then
-    // the same call's `service.resume()` lifted it via T12 and drove re-entry.
+    // A successful SIGKILL request is not proof that the process exited. The
+    // first resume withholds re-entry, retains the identity record, and emits
+    // neither T17 nor T12.
+    expect(pending.exitCode).toBe(1);
+    expect(pending.json.outcome).toBe('orphan_exit_pending');
+    expect(eventTypes(db, runId)).not.toContain('recovery.initiated');
+    expect(eventTypes(db, runId)).not.toContain('resume.user.requested');
+    expect(engineState(db, runId).suspension.kind).toBe('none');
+    expect(service.supervision.registry.store.get(generation)).toBeDefined();
+
+    // The next resume independently observes absence, appends T17, applies T12,
+    // and re-drives the interrupted round in the same command.
+    ps.identities.delete(childPid);
+    const out = await executeCommand(service, db, { kind: 'resume', json: true, runId }, {}, {});
     expect(eventTypes(db, runId)).toContain('recovery.initiated'); // T17 (reap)
     expect(eventTypes(db, runId)).toContain('resume.user.requested'); // T12
     expect(engineState(db, runId).suspension.kind).toBe('none');
@@ -433,7 +459,7 @@ describe('W4-4 run-ownership lease closes the between-rounds double-drive gap', 
   async function driveToImplementorBoundary(
     service: OrchestrationService,
   ): Promise<RunId> {
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
     await service.runRole(runId, roleRunnerOnce('implementor'), CLAUDE_LOW, '/ws', {
       round: 1,
       advance: { from: 'approved', to: 'implementing' },
@@ -585,7 +611,7 @@ function deferred<T>(): Deferred<T> {
 describe('W4-2 S4 — a live coordinator round holds the exclusive run-ownership lease', () => {
   it('mid-coordinator-round the lease is HELD (isRunClaimedByLiveProcess TRUE) → a concurrent resume WITHHOLDS; released after (fails without the fix: runCoordination acquired NOTHING → the gate was a no-op → the resume double-drove the round)', async () => {
     const { service, db } = await setup({ factory: { turnsByRole: { coordinator: [{}] } } });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // Before the coordinator round runs, nobody owns the run.
     expect(service.isRunClaimedByLiveProcess(runId)).toBe(false);
@@ -633,7 +659,7 @@ describe('W4-2 F2 — the pending-re-entry carve-out is owner-liveness gated', (
     const { service, db } = await setup({
       factory: { turnsByRole: { implementor: [{ errorEnvelope: rateLimitErrorEnvelope() }] } },
     });
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
 
     // Drive an implementor round that pauses on a provider limit (T4), then take
     // the T9 resume so an UNACKNOWLEDGED pending re-entry is recorded
@@ -692,7 +718,7 @@ describe('W4-1 breaker wiring at the child-crash site', () => {
       factory: { onSetConfigOption: crashOnPin },
       config: { restarts: { windowMax: 3 } },
     });
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
     service.advanceWorkflowPhase(runId, 'approved', 'implementing'); // stable non-terminal home
 
     const outcomes: string[] = [];
@@ -710,7 +736,7 @@ describe('W4-1 breaker wiring at the child-crash site', () => {
       factory: { onSetConfigOption: crashOnPin },
       config: { restarts: { windowMax: 3 } },
     });
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
     service.advanceWorkflowPhase(runId, 'approved', 'implementing');
 
     for (let i = 0; i < 4; i += 1) await crashOnce(service, runId);
@@ -769,6 +795,7 @@ describe('F4 (§5x) breaker: durable window + no_progress/recordProgress wiring'
       db,
       ids,
       adapterFactory: factory,
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       ...(parsed?.ok === true ? { config: parsed.value } : {}),
     });
   }
@@ -786,7 +813,7 @@ describe('F4 (§5x) breaker: durable window + no_progress/recordProgress wiring'
       config: { restarts: { windowMax: 3 } },
       clock,
     });
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
     service.advanceWorkflowPhase(runId, 'approved', 'implementing');
 
     // THREE crashes on the first service — each interrupts (window not yet full).
@@ -815,7 +842,7 @@ describe('F4 (§5x) breaker: durable window + no_progress/recordProgress wiring'
     const db = handle.db;
     const asg = assignmentId('asg_f4_np');
     const service = serviceOn(db, scriptedFactory({ implementor: [[{ dieMidTurn: true }], [{ dieMidTurn: true }]] }));
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
     service.advanceWorkflowPhase(runId, 'approved', 'implementing');
 
     // A checkpoint bound to THIS round's assignment+spec sits in the log — F3's
@@ -860,7 +887,7 @@ describe('F4 (§5x) breaker: durable window + no_progress/recordProgress wiring'
     const asg = assignmentId('asg_f4_rp');
     // crash → success → crash, one turn-script per implementor spawn.
     const service = serviceOn(db, scriptedFactory({ implementor: [[{ dieMidTurn: true }], [{}], [{ dieMidTurn: true }]] }));
-    const runId = approvedRun(service);
+    const runId = await approvedRun(service);
     service.advanceWorkflowPhase(runId, 'approved', 'implementing');
     const dispatch = { round: 1, specHash: SPEC, assignmentId: asg };
 

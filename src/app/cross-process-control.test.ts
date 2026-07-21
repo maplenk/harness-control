@@ -17,6 +17,7 @@
  *    `process.kill`): a second service over the SAME durable database
  *    PHYSICALLY terminates the running child.
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -66,6 +67,7 @@ function makeFakePs(): FakePs {
     identities: new Map(),
     client: {
       sampleProcessTree(pgid: number) {
+        if (!fake.identities.has(pgid)) return undefined;
         return { pgid, rssBytes: 0, processCount: 1, pids: [pgid], sampledAt: isoTimestamp('2026-07-19T00:00:00.000Z') };
       },
       sampleIdentity(pid: number) {
@@ -137,6 +139,7 @@ async function setupSeed(opts: {
   const ps = makeFakePs();
   const signals: Array<{ pgid: number; signal: NodeJS.Signals }> = [];
   const service = new OrchestrationService({
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
     db,
     ids: new DeterministicIdFactory(),
     // The second process drives no spawns of its own in these tests.
@@ -194,7 +197,7 @@ function seedLiveChild(
 describe('W3-2 second-process pause/cancel — identity-verified stop via the durable registry', () => {
   it('second-process pause appends the intent AND delivers an identity-verified SIGTERM to the child group', async () => {
     const s = await setupSeed();
-    const { runId } = s.service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(s.service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const generation = processGenerationId('pgen_xp_pause');
     seedLiveChild(s, runId, 51_001, generation, segmentId('seg_xp_pause'));
 
@@ -212,7 +215,7 @@ describe('W3-2 second-process pause/cancel — identity-verified stop via the du
 
   it('second-process cancel escalates the §10.2 ladder — SIGTERM then SIGKILL — when the child outlives the terminate grace', async () => {
     const s = await setupSeed(); // instant grace; fake ps keeps the pid alive across it
-    const { runId } = s.service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(s.service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const generation = processGenerationId('pgen_xp_cancel');
     seedLiveChild(s, runId, 52_001, generation, segmentId('seg_xp_cancel'));
 
@@ -236,6 +239,7 @@ describe('W3-2 second-process pause/cancel — identity-verified stop via the du
     const ps = makeFakePs();
     const signals: Array<{ pgid: number; signal: NodeJS.Signals }> = [];
     const service = new OrchestrationService({
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       db,
       ids: new DeterministicIdFactory(),
       adapterFactory: { create: () => { throw new Error('never spawns'); } },
@@ -248,7 +252,7 @@ describe('W3-2 second-process pause/cancel — identity-verified stop via the du
       },
     });
     const s: SeedSetup = { service, db, ps, signals };
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     seedLiveChild(s, runId, pid, processGenerationId('pgen_xp_grace'), segmentId('seg_xp_grace'));
 
     expect(service.cancel(runId).status).toBe('applied');
@@ -260,7 +264,7 @@ describe('W3-2 second-process pause/cancel — identity-verified stop via the du
 
   it('identity-ambiguous (recycled pid) WITHHOLDS the signal and raises a durable §14 alert — never signals', async () => {
     const s = await setupSeed();
-    const { runId } = s.service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(s.service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const generation = processGenerationId('pgen_xp_recycled');
     seedLiveChild(s, runId, 53_001, generation, segmentId('seg_xp_recycled'));
     // The pid now names a DIFFERENT process (recycled): start-time diverges.
@@ -287,7 +291,7 @@ describe('W3-2 second-process pause/cancel — identity-verified stop via the du
 
   it('identity-ambiguous (nonce contradiction) also WITHHOLDS + alerts even when the ps identity matches', async () => {
     const s = await setupSeed({ envNonce: { verifyNonce: () => 'mismatch' } });
-    const { runId } = s.service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(s.service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const generation = processGenerationId('pgen_xp_nonce');
     seedLiveChild(s, runId, 54_001, generation, segmentId('seg_xp_nonce'));
 
@@ -323,11 +327,18 @@ describe('W3-2 second-process pause/cancel — identity-verified stop via the du
         return {
           adapter,
           captureProcessIdentity: (generationId: ProcessGenerationId) => identityFor(pid, generationId),
-          dispose: (): Promise<void> => adapter.close(),
+          dispose: async (): Promise<void> => {
+            await adapter.close();
+            // The fake transport returning is not exit evidence; fake ps
+            // separately removes the group so the live barrier can observe
+            // whole-PGID absence.
+            ps.identities.delete(pid);
+          },
         };
       },
     };
     const service = new OrchestrationService({
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       db,
       ids: new DeterministicIdFactory(),
       adapterFactory: factory,
@@ -338,7 +349,7 @@ describe('W3-2 second-process pause/cancel — identity-verified stop via the du
         sleep: async () => undefined,
       },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     let inProcessOutcome: unknown;
     await service.runCoordination(
@@ -355,7 +366,7 @@ describe('W3-2 second-process pause/cancel — identity-verified stop via the du
 
   it('no active child / no durable record → honest non-delivery, no signal', async () => {
     const s = await setupSeed();
-    const { runId } = s.service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(s.service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     // No spawn seeded at all.
     expect(await s.service.stopExternalChild(runId, { escalate: true })).toEqual({
       delivered: false,
@@ -440,6 +451,7 @@ describe('W3-2 real fake ACP child — a second service physically terminates th
     // Process B: a fresh service over the SAME durable database — it never ran
     // runRole for this generation, so it is genuinely cross-process.
     const serviceB = new OrchestrationService({
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       db,
       ids: new DeterministicIdFactory(),
       adapterFactory: { create: () => { throw new Error('service B never spawns'); } },
@@ -474,11 +486,12 @@ describe('W3-2 real fake ACP child — a second service physically terminates th
   it('second-process PAUSE terminates the real child (its transport observes the death)', async () => {
     handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
     const creator = new OrchestrationService({
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       db: handle.db,
       ids: new DeterministicIdFactory(),
       adapterFactory: { create: () => { throw new Error('creator never spawns'); } },
     });
-    const { runId } = creator.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(creator, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const generation = processGenerationId('pgen_real_pause');
     const { serviceB, ps, pid } = await bringUpChild(runId, generation);
 
@@ -492,11 +505,12 @@ describe('W3-2 real fake ACP child — a second service physically terminates th
   it('second-process CANCEL terminates the real child', async () => {
     handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
     const creator = new OrchestrationService({
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       db: handle.db,
       ids: new DeterministicIdFactory(),
       adapterFactory: { create: () => { throw new Error('creator never spawns'); } },
     });
-    const { runId } = creator.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(creator, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const generation = processGenerationId('pgen_real_cancel');
     const { serviceB, ps, pid } = await bringUpChild(runId, generation);
 

@@ -110,6 +110,20 @@ export interface WatchdogDeps {
    * signal. Defaults to a no-op (the deadline will simply always be hit).
    */
   readonly requestGracefulStop?: (target: WatchdogTarget, sample: ProcessTreeSample) => void | Promise<void>;
+  /**
+   * Called only when sampling proves the process tree is absent. Return
+   * `false` when the host still owns durable terminal-outcome work; in that
+   * case this entry remains watched until the host explicitly `unwatch`es it
+   * after commit. `void`/`true` acknowledges immediate retirement.
+   */
+  readonly onExitConfirmed?: (target: WatchdogTarget) => void | boolean | Promise<void | boolean>;
+  /**
+   * Called once when emergency signaling was withheld as ambiguous and the
+   * process tree is still present after a bounded observation window. The
+   * watchdog deliberately keeps sampling after this callback; it is a
+   * fail-closed decision for the host's exit waiter, not exit confirmation.
+   */
+  readonly onExitUnconfirmed?: (target: WatchdogTarget, error: unknown) => void;
   /** Ready `rss.soft_threshold`/`rss.hard_limit` events for the caller to persist via `applyTransition`. */
   readonly onEvent: (event: DomainEvent) => void;
   /** Raw RSS tick sink — wire to `ProcessSampleRepository.recordRawSample` (§12.1). Defaults to a no-op. */
@@ -129,13 +143,14 @@ export interface WatchdogDeps {
 // ---------------------------------------------------------------------------
 // Internal runtime state
 // ---------------------------------------------------------------------------
-type TargetPhase = 'normal' | 'soft_warned' | 'graceful_pending' | 'killing' | 'done';
+type TargetPhase = 'normal' | 'soft_warned' | 'graceful_pending' | 'killing' | 'ambiguous' | 'done';
 
 interface TargetRuntime {
   phase: TargetPhase;
   tickInFlight: boolean;
   sampleTimer?: ReturnType<typeof setTimeout> | undefined;
   deadlineTimer?: ReturnType<typeof setTimeout> | undefined;
+  ambiguityReported: boolean;
 }
 
 interface TargetEntry {
@@ -163,6 +178,8 @@ export class Watchdog {
   readonly #onEvent: (event: DomainEvent) => void;
   readonly #onSample: (target: WatchdogTarget, sample: ProcessTreeSample) => void;
   readonly #onSupervisionFailure: (target: WatchdogTarget, error: unknown) => void;
+  readonly #onExitConfirmed: (target: WatchdogTarget) => void | boolean | Promise<void | boolean>;
+  readonly #onExitUnconfirmed: (target: WatchdogTarget, error: unknown) => void;
 
   readonly #entries = new Map<ProcessGenerationId, TargetEntry>();
 
@@ -181,12 +198,17 @@ export class Watchdog {
     this.#onEvent = deps.onEvent;
     this.#onSample = deps.onSample ?? ((): void => undefined);
     this.#onSupervisionFailure = deps.onSupervisionFailure ?? ((): void => undefined);
+    this.#onExitConfirmed = deps.onExitConfirmed ?? ((): void => undefined);
+    this.#onExitUnconfirmed = deps.onExitUnconfirmed ?? ((): void => undefined);
   }
 
   /** Idempotent: watching an already-tracked generation id is a no-op. */
   watch(target: WatchdogTarget): void {
     if (this.#entries.has(target.generationId)) return;
-    this.#entries.set(target.generationId, { target, runtime: { phase: 'normal', tickInFlight: false } });
+    this.#entries.set(target.generationId, {
+      target,
+      runtime: { phase: 'normal', tickInFlight: false, ambiguityReported: false },
+    });
     this.#scheduleNext(target.generationId, this.#sampleIntervalMs);
   }
 
@@ -274,13 +296,20 @@ export class Watchdog {
         // Process tree gone (CONFIRMED exit): whatever phase we were in
         // (including a successful graceful stop or an issued emergency kill),
         // there is nothing left to supervise.
-        this.#finish(generationId);
+        await this.#finish(generationId, true);
         return undefined;
       }
       this.#onSample(target, sample);
       if (runtime.phase === 'killing') {
         // must-fix 5: the SIGKILL was already issued and the tree is still
         // present — keep supervising (re-sample) until it exits; never re-kill.
+        return sample;
+      }
+      if (runtime.phase === 'ambiguous') {
+        // Identity verification withheld the signal, so it is unsafe to act
+        // on this tree. Keep observing until absence is proven; the separate
+        // bounded timer only fails the host waiter closed and never deletes
+        // this supervision entry.
         return sample;
       }
 
@@ -293,8 +322,17 @@ export class Watchdog {
 
       if (ratio >= 1) {
         if (runtime.phase !== 'graceful_pending') {
+          const priorPhase = runtime.phase;
           runtime.phase = 'graceful_pending';
-          this.#emit(this.#buildRssHardLimitEvent(target, sample, 'graceful'));
+          try {
+            this.#emit(this.#buildRssHardLimitEvent(target, sample, 'graceful'));
+          } catch (error) {
+            // Durable intent is the gate for every graceful side effect. If
+            // persistence fails, roll the latch back so a later sample can
+            // retry; no deadline or callback was installed.
+            runtime.phase = priorPhase;
+            throw error;
+          }
           // F6: arm the SIGKILL deadline BEFORE launching the graceful stop
           // callback. Previously the callback was awaited first and the deadline
           // armed only after it returned — but the host callback unregisters the
@@ -312,7 +350,12 @@ export class Watchdog {
           }, this.#memory.gracefulStopDeadlineMs);
           deadlineTimer.unref?.();
           runtime.deadlineTimer = deadlineTimer;
-          await this.#requestGracefulStop(target, sample);
+          // The stop callback is intentionally detached from the sampling
+          // tick. A hung checkpoint/cancel/dispose must never hold
+          // `tickInFlight` true or prevent later samples from confirming exit.
+          void Promise.resolve()
+            .then(() => this.#requestGracefulStop(target, sample))
+            .catch((error: unknown) => this.#onSupervisionFailure(target, error));
         }
         return sample;
       }
@@ -338,7 +381,7 @@ export class Watchdog {
     if (!entry || entry.runtime.phase !== 'graceful_pending') return;
     const sample = this.#ps.sampleProcessTree(entry.target.pgid);
     if (!sample) {
-      this.#finish(generationId);
+      await this.#finish(generationId, true);
       return;
     }
     await this.#emergencyKill(generationId, sample, 'deadline');
@@ -372,15 +415,26 @@ export class Watchdog {
     if (cause === 'deadline' && this.#gitOpLease) {
       const outcome = await this.#raceLeaseAgainstCeiling(target);
       if (outcome === 'gone') {
-        this.#finish(generationId);
+        await this.#finish(generationId, true);
         return;
       }
       if (outcome === 'ceiling') taintReason = 'emergency_kill';
     }
 
-    this.#emit(this.#buildRssHardLimitEvent(target, sample, 'emergency_kill'));
-
-    const verification = this.#registry.signalVerified(target.generationId, 'SIGKILL');
+    const event = this.#buildRssHardLimitEvent(target, sample, 'emergency_kill');
+    let verification;
+    try {
+      verification = this.#registry.signalVerified(target.generationId, 'SIGKILL', {
+        // Identity has matched, but the signal has not gone out yet. Persist
+        // the v2 stop intent now; if persistence fails, no signal is sent.
+        beforeSignal: () => this.#emit(event),
+      });
+    } catch (error) {
+      // Allow a later sample to retry rather than leaving a live process in a
+      // permanent `killing` state after a persistence/signal failure.
+      runtime.phase = cause === 'deadline' ? 'graceful_pending' : 'normal';
+      throw error;
+    }
     if (verification.verdict === 'match') {
       if (target.assignmentId !== undefined) {
         this.#worktreeTaint?.markTainted(target.assignmentId, taintReason);
@@ -393,9 +447,53 @@ export class Watchdog {
       // also unwatches on its own exit path once its shared dispose confirms it.
     } else {
       // On mismatch/gone, `registry.signalVerified` already WITHHELD the signal
-      // and raised its own alert (§14: "ambiguity -> never kill"). Nothing was
-      // killed and nothing can be confirmed — stop supervising.
-      this.#finish(generationId);
+      // and raised its own alert (§14: "ambiguity -> never kill"). A `gone`
+      // leader verdict is still ambiguous while this PGID sample proves live
+      // descendants. Keep supervising the whole tree until it disappears.
+      // The bounded decision timer prevents the host's exit barrier from
+      // waiting forever when disposal is also hung/failed; it reports
+      // UNCONFIRMED without deleting this entry or claiming process exit.
+      runtime.phase = 'ambiguous';
+      const ambiguityTimer = setTimeout(() => {
+        this.#onAmbiguityDeadline(generationId);
+      }, this.#memory.gracefulStopDeadlineMs);
+      ambiguityTimer.unref?.();
+      runtime.deadlineTimer = ambiguityTimer;
+    }
+  }
+
+  #onAmbiguityDeadline(generationId: ProcessGenerationId): void {
+    const entry = this.#entries.get(generationId);
+    if (!entry || entry.runtime.phase !== 'ambiguous' || entry.runtime.ambiguityReported) return;
+    try {
+      const sample = this.#ps.sampleProcessTree(entry.target.pgid);
+      if (!sample) {
+        void this.#finish(generationId, true).catch((error: unknown) =>
+          this.#onSupervisionFailure(entry.target, error),
+        );
+        return;
+      }
+      entry.runtime.ambiguityReported = true;
+      entry.runtime.deadlineTimer = undefined;
+      this.#onExitUnconfirmed(
+        entry.target,
+        new Error(
+          `process exit remains unconfirmed for generation ${entry.target.generationId}: ` +
+            'identity verification withheld emergency signaling while the process tree remains present',
+        ),
+      );
+      // Deliberately remain in `ambiguous`: periodic samples continue and a
+      // later absent tree still calls onExitConfirmed.
+    } catch (error) {
+      entry.runtime.deadlineTimer = undefined;
+      this.#onSupervisionFailure(entry.target, error);
+      // Do not leave the host waiter unbounded merely because the final
+      // deadline sample failed. The failure itself is an unconfirmed exit
+      // decision, while regular sampling remains armed for later recovery.
+      if (!entry.runtime.ambiguityReported) {
+        entry.runtime.ambiguityReported = true;
+        this.#onExitUnconfirmed(entry.target, error);
+      }
     }
   }
 
@@ -416,9 +514,24 @@ export class Watchdog {
   // -------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------
-  #finish(generationId: ProcessGenerationId): void {
+  async #finish(generationId: ProcessGenerationId, exitConfirmed = false): Promise<void> {
     const entry = this.#entries.get(generationId);
     if (!entry) return;
+    if (exitConfirmed) {
+      // An observed-absent tree makes any ambiguity/grace deadline obsolete.
+      // Keep the periodic sampler alive if the host retains the entry for a
+      // durable-outcome retry, but never allow the old deadline to publish a
+      // contradictory unconfirmed decision.
+      if (entry.runtime.deadlineTimer) {
+        clearTimeout(entry.runtime.deadlineTimer);
+        entry.runtime.deadlineTimer = undefined;
+      }
+      const acknowledged = await this.#onExitConfirmed(entry.target);
+      // The service returns false until the generation's durable terminal
+      // outcome commits. Retain the watchdog entry so a finalization failure
+      // has an in-process absence/retry path; service cleanup later unwatches.
+      if (acknowledged === false) return;
+    }
     this.#clearTimers(entry.runtime);
     entry.runtime.phase = 'done';
     this.#entries.delete(generationId);
@@ -467,6 +580,7 @@ export class Watchdog {
       type: 'rss.hard_limit',
       runId: target.runId,
       payload: {
+        semanticsVersion: 2,
         rssBytes: sample.rssBytes,
         budgetBytes: this.#budgetBytes(target),
         escalation,

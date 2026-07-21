@@ -27,6 +27,7 @@
  *     THIS FILE (real-path: `child.spawned` committed, the ack append dies;
  *     the next re-entry drive acks exactly once, no fresh T9 consumed).
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock } from '../lib/clock.js';
 import { runId as toRunId, type RunId } from '../domain/ids.js';
@@ -118,6 +119,7 @@ async function setup(scripts: readonly (readonly InProcessTurnScript[])[]): Prom
     db: handle.db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
   });
   return { service, db: handle.db, clock, createdCount };
 }
@@ -178,7 +180,12 @@ function successorService(
           },
         };
   // RandomIdFactory: a restarted process never re-mints the dead one's ids.
-  return new OrchestrationService({ db, ids: new RandomIdFactory(), adapterFactory: factory });
+  return new OrchestrationService({
+    db,
+    ids: new RandomIdFactory(),
+    adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +194,7 @@ function successorService(
 describe('crash after the atomic pause append, before the stop confirmation (real path)', () => {
   it('restart finds the committed stop-intent, reclaims it idempotently, and the round re-enters to completion', async () => {
     const { service, db } = await setup([limitOnTurnN(1)]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const crash = crashOnAppendOf(db, 'child.stopped');
     const error: unknown = await service
@@ -250,7 +257,7 @@ describe('crash after the probe claim committed, before the outcome (real path)'
       limitOnTurnN(1), // the paused round
       [{}], // every probe attempt is healthy
     ]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(runId, promptOnceRunner()).catch(() => undefined);
     expect(service.status(runId).suspension).toBe('paused_limit');
     clock.advanceMs(DEADLINE1_OFFSET_MS + 1000);
@@ -298,7 +305,7 @@ describe('crash after the re-entry spawn committed, before resume_reentry.comple
       [{}], // generation 2: the crashed re-entry attempt
       [{}], // generation 3: the successful re-drive
     ]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(runId, promptOnceRunner()).catch(() => undefined);
     expect(service.resume(runId).status).toBe('applied'); // T9, pending recorded
 
@@ -348,7 +355,7 @@ describe('crash after the re-entry spawn committed, before resume_reentry.comple
 describe('crash-injection hygiene', () => {
   it('an injected append failure is a raw error, never converted into a LimitPausedError', async () => {
     const { service, db } = await setup([[{ errorEnvelope: rateLimitErrorEnvelope() }]]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const crash = crashOnAppendOf(db, 'child.stopped');
     const error: unknown = await service
       .runCoordination(runId, promptOnceRunner())

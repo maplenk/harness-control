@@ -10,6 +10,8 @@ export const WORKTREE_ERROR_KINDS = [
   'not_a_git_repo',
   /** A `git` subprocess exited non-zero; `.detail` carries stdout+stderr. */
   'git_command_failed',
+  /** A fresh worktree was not bound to an exact, full, resolvable commit SHA. */
+  'invalid_base_commit',
   /** `createWorktree`/`reacquireLease`/`reattach` for an assignment that already holds an active lease. */
   'already_leased',
   /** The target worktree path is already leased by a DIFFERENT assignment. */

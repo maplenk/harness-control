@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock } from '../lib/clock.js';
-import { assignmentId } from '../domain/ids.js';
+import { assignmentId, gitSha } from '../domain/ids.js';
 import {
   AdvisoryGitLease,
   AdvisoryGitLeaseTimeoutError,
@@ -262,14 +262,15 @@ describe('W3-5 — two GitWorktreeManagers on one repo serialize worktree ops', 
       const managerB = await GitWorktreeManager.open({ primaryRepoRoot: repo.dir, clock, advisoryLease: leaseB });
       const asgA = assignmentId('asg_two_mgr_a');
       const asgB = assignmentId('asg_two_mgr_b');
+      const baseCommit = gitSha(await repo.headSha());
       cleanups.push(async () => {
         await managerA.removeWorktree(asgA).catch(() => undefined);
         await managerB.removeWorktree(asgB).catch(() => undefined);
       });
 
       const [handleA, handleB] = await Promise.all([
-        managerA.createWorktree({ assignmentId: asgA }),
-        managerB.createWorktree({ assignmentId: asgB }),
+        managerA.createWorktree({ assignmentId: asgA, baseCommit }),
+        managerB.createWorktree({ assignmentId: asgB, baseCommit }),
       ]);
 
       expect(handleA.leased).toBe(true);

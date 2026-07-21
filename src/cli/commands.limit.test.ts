@@ -25,7 +25,14 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock } from '../lib/clock.js';
 import { DeterministicIdFactory } from '../lib/id-factory.js';
-import { artifactHash, specHash as toSpecHash, specVersionId as toSpecVersionId, type RunId } from '../domain/ids.js';
+import {
+  artifactHash,
+  idempotencyKey,
+  specHash as toSpecHash,
+  specVersionId as toSpecVersionId,
+  type RunId,
+} from '../domain/ids.js';
+import { draftEvent, type DomainEvent } from '../domain/events.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../persistence/test-support.js';
 import { ArtifactStore } from '../artifacts/store.js';
 import { loadProfileFile, type Profile } from '../config/profile.js';
@@ -52,6 +59,7 @@ import {
 import { CoordinatorRunner } from '../app/flows/coordinator.js';
 import type { EvidenceRecorder } from '../app/flows/verifier.js';
 import type { VerificationRunner } from '../app/flows/implementor.js';
+import { createRunFixture } from '../app/test-support.js';
 import {
   EXIT_LIMIT_PAUSED,
   executeCommand,
@@ -252,13 +260,14 @@ async function setup(
   const flows: CliFlowDeps = {
     ids,
     clock,
-    buildCoordinatorRunner: ({ goal, revise }) =>
+    buildCoordinatorRunner: ({ goal, revise, baseCommit }) =>
       new CoordinatorRunner({
         goal,
         profile,
         artifactStore: store,
         ids: flowIds,
         clock,
+        baseCommit,
         ...(revise !== undefined ? { revise } : {}),
       }),
     openWorktrees: async () => mgr,
@@ -279,7 +288,7 @@ async function startAndApprove(w: Wired): Promise<RunId> {
     {},
     w.deps,
   );
-  expect(start.exitCode).toBe(0);
+  expect(start.exitCode, start.text).toBe(0);
   const runId = start.json['runId'] as RunId;
   const spec = start.json['spec'] as { specVersionId: string; specHash: string };
   const approve = await executeCommand(
@@ -345,6 +354,81 @@ describe('run on a limit pause', () => {
     const types = w.db.events.listByRun(runId).map((e) => e.type);
     expect(types).toContain('resume.limit.requested');
     expect(types).toContain('resume_reentry.completed'); // acked when the round ran
+    expect(w.service.status(runId).resumeReentryPending).toBeUndefined();
+  });
+
+  it('set-budget --resume applies T12 and drives the pending round through resume_reentry.completed', async () => {
+    const w = await setup(
+      {
+        coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+        implementor: [
+          { turns: [{ errorEnvelope: rateLimitErrorEnvelope() }] },
+          {
+            writes: [{ relPath: 'src/f.ts', content: 'export const f = 1;\n' }],
+            turns: [implementorTurn()],
+          },
+        ],
+        verifier: [{ turns: [verifierPassTurn()] }],
+      },
+      { memory: { budgetMb: 64 } },
+    );
+    const runId = await startAndApprove(w);
+
+    // Establish the same durable, resumable implementor round/worktree that a
+    // real RSS stop leaves behind. The initial limit pause gives us a stopped,
+    // generation-bound round; clear that pause without driving it, then fold
+    // the confirmed RSS incident for the same generation.
+    const paused = await executeCommand(w.service, w.db, RUN_CMD(runId, true), {}, w.deps);
+    expect(paused.exitCode).toBe(EXIT_LIMIT_PAUSED);
+    expect(w.service.resume(runId).status).toBe('applied');
+    const child = w.service.status(runId).activeChild;
+    expect(child).toBeDefined();
+    w.service.ingest(
+      draftEvent({
+        type: 'resource.exhausted',
+        runId,
+        payload: {
+          generationId: child!.generationId,
+          role: 'implementor',
+          rssBytes: 70 * 1024 * 1024,
+          budgetBytes: 64 * 1024 * 1024,
+        },
+        idempotencyKey: idempotencyKey('cli-set-budget-resource-exhausted'),
+        occurredAt: w.db.clock.nowIso(),
+      }) as DomainEvent,
+    );
+    expect(w.service.status(runId).suspension).toBe('resource_exhausted');
+    expect(w.db.events.listByRun(runId).some((event) => event.type === 'resume_reentry.completed')).toBe(false);
+
+    const out = await executeCommand(
+      w.service,
+      w.db,
+      {
+        kind: 'set_budget',
+        json: true,
+        runId,
+        role: 'implementor',
+        budgetMb: 128,
+        resume: true,
+      },
+      {},
+      w.deps,
+    );
+
+    expect(out.exitCode).toBe(0);
+    expect(out.json).toMatchObject({
+      command: 'set_budget',
+      ok: true,
+      outcome: 'raised_and_resumed',
+      role: 'implementor',
+      budgetMb: 128,
+      reentry: 'completed',
+      phase: 'merge_ready',
+    });
+    const types = w.db.events.listByRun(runId).map((event) => event.type);
+    expect(types).toContain('run.memory_budget.overridden');
+    expect(types).toContain('resume.user.requested');
+    expect(types).toContain('resume_reentry.completed');
     expect(w.service.status(runId).resumeReentryPending).toBeUndefined();
   });
 
@@ -651,7 +735,7 @@ describe('resume eligibility and status while paused', () => {
 
     // Not paused → no limit block (the block is a pause fact, not a fixture).
     const w2 = w; // same rig; a fresh run without a pause
-    const fresh = w2.service.createRun({ goal: 'g', workspacePath: repo!.dir, coordinator: COORDINATOR });
+    const fresh = createRunFixture(w2.service, { goal: 'g', workspacePath: repo!.dir, coordinator: COORDINATOR });
     const freshStatus = await executeCommand(w2.service, w2.db, { kind: 'status', json: true, runId: fresh.runId }, {});
     expect(freshStatus.json['limit']).toBeUndefined();
   });

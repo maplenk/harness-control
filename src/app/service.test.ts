@@ -43,6 +43,7 @@ import {
   BudgetExceededError,
   ModelPinError,
   OrchestrationService,
+  WorkspaceDriftError,
   WorkflowDispatchIngestError,
   loadRunConfig,
   type RoleAdapterFactory,
@@ -57,6 +58,12 @@ import {
 } from './projections.js';
 import type { RoleRunner } from './role-runner.js';
 import type { AppliedConfigOption, Harness } from './model-resolution.js';
+import {
+  CLEAN_PINNED_WORKSPACE_GIT,
+  TEST_BASE_COMMIT,
+  createLegacyRunFixture,
+  createRunFixture,
+} from './test-support.js';
 
 // ---------------------------------------------------------------------------
 // Fake adapter factory (records every adapter it spawns for assertions)
@@ -156,6 +163,7 @@ async function setup(opts?: FakeFactoryOptions, config?: EngineConfig): Promise<
     db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
     ...(config !== undefined ? { config } : {}),
   });
   return { service, db, created };
@@ -194,9 +202,195 @@ function readyMergeReadiness(forRunId: Parameters<OrchestrationService['status']
 // Run lifecycle + role-flow seam
 // ---------------------------------------------------------------------------
 describe('OrchestrationService — run lifecycle', () => {
+  it('C1: fresh creation rejects an absent or malformed base at the engine boundary', async () => {
+    const { service } = await setup();
+    const common = { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW };
+
+    expect('createLegacyRun' in service).toBe(false);
+
+    expect(() =>
+      service.createRun(common as unknown as Parameters<OrchestrationService['createRun']>[0]),
+    ).toThrow(/requires baseCommit .*40-character lowercase commit SHA/i);
+    expect(() =>
+      service.createRun({ ...common, baseCommit: gitSha('main') }),
+    ).toThrow(/requires baseCommit .*40-character lowercase commit SHA/i);
+    const baseCommit = gitSha('a'.repeat(40));
+    const { runId } = service.createRun({ ...common, baseCommit });
+    expect(String(runId)).toBe('run_000001');
+    expect(service.getRunBaseCommit(runId)).toBe(baseCommit);
+  });
+
+  it('C2: assertPinnedCleanWorkspace refuses when HEAD changes during its status read', async () => {
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+    const pinnedSha = gitSha('a'.repeat(40));
+    const currentSha = gitSha('b'.repeat(40));
+    const service = new OrchestrationService({
+      db: handle.db,
+      ids: new DeterministicIdFactory(),
+      workspaceGit: {
+        resolveTopLevel: async () => '/repo',
+        readStableHeadAndStatus: async () => ({
+          headBefore: pinnedSha,
+          headAfter: currentSha,
+          statusPorcelain: '',
+          stable: false,
+        }),
+        porcelainPaths: () => [],
+      },
+    });
+    const { runId } = service.createRun({
+      goal: 'g',
+      workspacePath: '/repo',
+      coordinator: CLAUDE_LOW,
+      baseCommit: pinnedSha,
+    });
+
+    const error = await service.assertPinnedCleanWorkspace(runId).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(WorkspaceDriftError);
+    expect(error).toMatchObject({ kind: 'base_drift', pinnedSha, currentSha });
+  });
+
+  it('C2/C3: direct approval refuses a dirty workspace before T1 mutates state', async () => {
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+    const dirtyPath = 'src/dirty.ts';
+    const service = new OrchestrationService({
+      db: handle.db,
+      ids: new DeterministicIdFactory(),
+      workspaceGit: {
+        resolveTopLevel: async () => '/repo',
+        readStableHeadAndStatus: async () => ({
+          headBefore: TEST_BASE_COMMIT,
+          headAfter: TEST_BASE_COMMIT,
+          statusPorcelain: `?? ${dirtyPath}`,
+          stable: true,
+        }),
+        porcelainPaths: () => [dirtyPath],
+      },
+    });
+    const { runId } = createRunFixture(service, {
+      goal: 'g',
+      workspacePath: '/repo',
+      coordinator: CLAUDE_LOW,
+    });
+    service.advanceWorkflowPhase(runId, 'created', 'specifying');
+    service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
+
+    await expect(
+      service.approve(runId, {
+        specVersionId: specVersionId('spec_guard'),
+        specHash: specHash('hash_guard'),
+      }),
+    ).rejects.toMatchObject({ kind: 'workspace_dirty', dirtyPaths: [dirtyPath] });
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+    expect(handle.db.events.listByRun(runId).some((event) => event.type === 'spec.approved')).toBe(false);
+  });
+
+  it('C2: direct spec revision refuses HEAD drift before T2 mutates state', async () => {
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+    const driftedSha = gitSha('2'.repeat(40));
+    const service = new OrchestrationService({
+      db: handle.db,
+      ids: new DeterministicIdFactory(),
+      workspaceGit: {
+        resolveTopLevel: async () => '/repo',
+        readStableHeadAndStatus: async () => ({
+          headBefore: driftedSha,
+          headAfter: driftedSha,
+          statusPorcelain: '',
+          stable: true,
+        }),
+        porcelainPaths: () => [],
+      },
+    });
+    const { runId } = createRunFixture(service, {
+      goal: 'g',
+      workspacePath: '/repo',
+      coordinator: CLAUDE_LOW,
+    });
+    service.advanceWorkflowPhase(runId, 'created', 'specifying');
+    service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
+
+    await expect(service.reviseSpec(runId, 'change it')).rejects.toMatchObject({
+      kind: 'base_drift',
+      pinnedSha: TEST_BASE_COMMIT,
+      currentSha: driftedSha,
+    });
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+    expect(handle.db.events.listByRun(runId).some((event) => event.type === 'spec.revise.requested')).toBe(false);
+  });
+
+  it('C2: direct coordinator completion refuses dirt before saving the draft or advance', async () => {
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+    const service = new OrchestrationService({
+      db: handle.db,
+      ids: new DeterministicIdFactory(),
+      workspaceGit: {
+        resolveTopLevel: async () => '/repo',
+        readStableHeadAndStatus: async () => ({
+          headBefore: TEST_BASE_COMMIT,
+          headAfter: TEST_BASE_COMMIT,
+          statusPorcelain: ' M src/late.ts',
+          stable: true,
+        }),
+        porcelainPaths: () => ['src/late.ts'],
+      },
+    });
+    const { runId } = createRunFixture(service, {
+      goal: 'g',
+      workspacePath: '/repo',
+      coordinator: CLAUDE_LOW,
+    });
+    service.advanceWorkflowPhase(runId, 'created', 'specifying');
+
+    await expect(
+      service.completeCoordinationRound(runId, {
+        specVersionId: specVersionId('spec_late'),
+        specHash: specHash('hash_late'),
+        canonicalSpec: '{}',
+        goal: 'g',
+        criteria: [],
+        proposedImplementorProfile: 'codex',
+        proposedVerifierProfile: 'claude',
+        revision: 1,
+      }),
+    ).rejects.toMatchObject({ kind: 'workspace_dirty' });
+    expect(service.getSpecDraft(runId)).toBeUndefined();
+    expect(service.status(runId).phase).toBe('specifying');
+  });
+
+  it('C2/C4: a direct legacy coordinator run takes one audited pin before spawning', async () => {
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+    const { factory } = makeFakeFactory();
+    const service = new OrchestrationService({
+      db: handle.db,
+      ids: new DeterministicIdFactory(),
+      adapterFactory: factory,
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
+    });
+    const { runId } = createLegacyRunFixture(service, handle.db, {
+      goal: 'g',
+      workspacePath: '/repo',
+      coordinator: CLAUDE_LOW,
+    });
+    expect(service.getRunBaseCommit(runId)).toBeUndefined();
+
+    await service.runCoordination(runId, {
+      role: 'coordinator',
+      run: async () => ({}),
+    });
+
+    expect(service.getRunBaseCommit(runId)).toBe(TEST_BASE_COMMIT);
+    expect(
+      handle.db.events.listByRun(runId).filter((event) => event.type === 'run.base_commit.pinned'),
+    ).toHaveLength(1);
+  });
+
   it('forwards a verifier flow exact evidence commands to the provider factory', async () => {
     const { service, created } = await setup();
-    const { runId } = service.createRun({
+    const { runId } = createRunFixture(service, {
       goal: 'Verify exact commands',
       workspacePath: '/ws',
       coordinator: CLAUDE_LOW,
@@ -221,7 +415,7 @@ describe('OrchestrationService — run lifecycle', () => {
 
   it('persists the opt-in planning-chat choice in immutable run metadata', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({
+    const { runId } = createRunFixture(service, {
       goal: 'Discuss the plan',
       workspacePath: '/ws',
       coordinator: CLAUDE_LOW,
@@ -235,7 +429,7 @@ describe('OrchestrationService — run lifecycle', () => {
 
   it('advances created → specifying → awaiting_approval on a fake coordinator turn (§6.2, §20 P3)', async () => {
     const { service, created } = await setup();
-    const { runId } = service.createRun({ goal: 'Add a flag', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'Add a flag', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     expect(service.status(runId).phase).toBe('created');
     expect(service.status(runId).uiState).toBe('idle');
 
@@ -266,7 +460,7 @@ describe('OrchestrationService — run lifecycle', () => {
 
   it('runs an OpenCode coordinator with its exact dynamic model and effort pins', async () => {
     const { service, created } = await setup();
-    const { runId } = service.createRun({
+    const { runId } = createRunFixture(service, {
       goal: 'Draft with OpenCode',
       workspacePath: '/ws',
       coordinator: OPENCODE_HIGH,
@@ -291,7 +485,7 @@ describe('OrchestrationService — run lifecycle', () => {
 
   it('runs a Grok Build coordinator with its exact spawn-pin vocabulary', async () => {
     const { service, created } = await setup();
-    const { runId } = service.createRun({
+    const { runId } = createRunFixture(service, {
       goal: 'Draft with first-party Grok Build',
       workspacePath: '/ws',
       coordinator: GROK_HIGH,
@@ -316,11 +510,11 @@ describe('OrchestrationService — run lifecycle', () => {
 
   it('applies T1 approval atomically, then permits a workflow dispatch advance to implementing', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     service.advanceWorkflowPhase(runId, 'created', 'specifying');
     service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
 
-    const approved = service.approve(runId, {
+    const approved = await service.approve(runId, {
       specVersionId: specVersionId('spec_1'),
       specHash: specHash('hash_abc'),
     });
@@ -344,10 +538,10 @@ describe('OrchestrationService — run lifecycle', () => {
 describe('OrchestrationService.ingest — the single authoritative §6.3 path', () => {
   it('rejects an illegal transition with transition.rejected and leaves state unchanged', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // T1 requires phase=awaiting_approval; the run is at created → precondition_failed.
-    const result = service.approve(runId, {
+    const result = await service.approve(runId, {
       specVersionId: specVersionId('spec_1'),
       specHash: specHash('hash_1'),
     });
@@ -364,7 +558,7 @@ describe('OrchestrationService.ingest — the single authoritative §6.3 path', 
   it('ingests supervisor DomainEvents: breaker T13 interrupts (W2-1) + emits effects; heartbeat is recorded', async () => {
     const { service, db } = await setup();
     const ids = new DeterministicIdFactory();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const now = db.clock.nowIso();
 
     // W2-1: a generation must be ACTIVE for a crash to interrupt anything —
@@ -435,7 +629,7 @@ describe('OrchestrationService.ingest — the single authoritative §6.3 path', 
 
   it('W2-0: rejects workflow.dispatch.advanced through public ingest with a typed error — advanceWorkflowPhase stays the only producer', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const forged = draftEvent({
       type: 'workflow.dispatch.advanced',
@@ -459,7 +653,7 @@ describe('OrchestrationService.ingest — the single authoritative §6.3 path', 
 
   it('W2-1: pause (T11) completes only on the generation-matched child.stopped; resume records the pending re-entry; replay reconstructs it all', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const now = db.clock.nowIso();
     const generation = processGenerationId('pgen_pause_1');
 
@@ -543,7 +737,7 @@ describe('OrchestrationService.ingest — the single authoritative §6.3 path', 
 
   it('W2-1: resume() routes interrupted through T12 (manual re-entry after a crash)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const now = db.clock.nowIso();
     const generation = processGenerationId('pgen_int_1');
 
@@ -595,7 +789,7 @@ describe('OrchestrationService — cost accounting (§17.2)', () => {
       },
     ];
     const { service } = await setup({ turns });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const runner: RoleRunner = {
       role: 'coordinator',
       run: async (session) => {
@@ -634,7 +828,7 @@ describe('OrchestrationService — run-config durability (W1-F5)', () => {
       quotas: { perRunBytes: 1024, globalBytes: 2048 },
     });
     const { service, db } = await setup(undefined, config);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // The projection round-trips (schema-validated on the way out).
     const loaded = loadRunConfig(db, runId);
@@ -664,7 +858,7 @@ describe('OrchestrationService — run-config durability (W1-F5)', () => {
 
   it('loadRunConfig is undefined for a pre-durability run (caller falls back to defaults)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     db.driver
       .prepare('DELETE FROM run_projections WHERE run_id = ? AND projection_name = ?')
       .run([runId, RUN_CONFIG_PROJECTION]);
@@ -683,7 +877,7 @@ describe('OrchestrationService — estimated-only spend trips the soft budget (�
     };
     const config = mustParseConfig({ budget: { maxBudgetUsd: 1.2, conservativeReservationUsd: 0.5 } });
     const { service, db } = await setup({ turns: [unpriced, unpriced] }, config);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     let prompts = 0;
     const runner: RoleRunner = {
@@ -732,7 +926,7 @@ describe('OrchestrationService — estimated-only spend trips the soft budget (�
 describe('OrchestrationService.recover — replay-by-sequence (§12.3)', () => {
   it('rebuilds EngineState by folding events the projection never saw (crash between append and projection)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // Simulate a crash: a cancel trigger reaches the event log but the
     // projection update is lost (append directly, bypassing ingest).
@@ -755,10 +949,10 @@ describe('OrchestrationService.recover — replay-by-sequence (§12.3)', () => {
 
   it('rebuilds workflow dispatch advances from the event log after the projection is corrupted (W1-F6)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     service.advanceWorkflowPhase(runId, 'created', 'specifying');
     service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
-    const approved = service.approve(runId, {
+    const approved = await service.approve(runId, {
       specVersionId: specVersionId('spec_1'),
       specHash: specHash('hash_f6'),
     });
@@ -806,7 +1000,7 @@ describe('OrchestrationService.recover — replay-by-sequence (§12.3)', () => {
 
   it('rebuilds the exact phase from NOTHING after the projection row is deleted outright (W1-F6)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     service.advanceWorkflowPhase(runId, 'created', 'specifying');
     service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
 
@@ -818,7 +1012,7 @@ describe('OrchestrationService.recover — replay-by-sequence (§12.3)', () => {
     expect(recovered.phase).toBe('awaiting_approval');
 
     // A subsequent §6.3 transition applies against the recovered phase.
-    const approved = service.approve(runId, {
+    const approved = await service.approve(runId, {
       specVersionId: specVersionId('spec_2'),
       specHash: specHash('hash_f6b'),
     });
@@ -830,7 +1024,7 @@ describe('OrchestrationService.recover — replay-by-sequence (§12.3)', () => {
     const { service, db } = await setup();
 
     // A LISTED edge folded from the wrong phase (run is still at created).
-    const { runId: wrongPhaseRun } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId: wrongPhaseRun } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     db.events.append(
       draftEvent({
         type: 'workflow.dispatch.advanced',
@@ -843,7 +1037,7 @@ describe('OrchestrationService.recover — replay-by-sequence (§12.3)', () => {
     expect(() => service.recover(wrongPhaseRun)).toThrow(WorkflowDispatchReplayError);
 
     // An edge that is not in WORKFLOW_DISPATCH_EDGES at all.
-    const { runId: nonEdgeRun } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId: nonEdgeRun } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     db.events.append(
       draftEvent({
         type: 'workflow.dispatch.advanced',
@@ -889,7 +1083,7 @@ describe('OrchestrationService.runRole — §11.2 model-pin enforcement (W1-F8)'
         { id: 'thinking', kind: 'reasoning', values: ['medium', 'high'], current: 'medium' },
       ],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const probe = runnerProbe();
 
     const error: unknown = await service
@@ -937,7 +1131,7 @@ describe('OrchestrationService.runRole — §11.2 model-pin enforcement (W1-F8)'
         return { effectiveValue: input.value, echoed: true };
       },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const probe = runnerProbe();
 
     await service.runRole(runId, probe.runner, CLAUDE_LOW, '/ws');
@@ -960,7 +1154,7 @@ describe('OrchestrationService.runRole — §11.2 model-pin enforcement (W1-F8)'
     const { service, created } = await setup({
       onSetConfigOption: (input) => ({ effectiveValue: input.value, echoed: false }),
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const probe = runnerProbe();
 
     await service.runRole(runId, probe.runner, CLAUDE_LOW, '/ws');

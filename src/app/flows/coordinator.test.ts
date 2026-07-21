@@ -27,6 +27,11 @@ import {
   type InProcessTurnScript,
 } from '../../adapters/index.js';
 import { OrchestrationService, type RoleAdapterFactory, type RoleAdapterOptions } from '../service.js';
+import {
+  CLEAN_PINNED_WORKSPACE_GIT,
+  TEST_BASE_COMMIT,
+  createRunFixture,
+} from '../test-support.js';
 import type {
   PlanningChatFactory,
   PlanningChatMessage,
@@ -203,6 +208,7 @@ async function harness(turnsPerAdapter: readonly (readonly InProcessTurnScript[]
     db: dbHandle.db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
   });
   const profileResult = loadProfileFile(PROFILE_PATH);
   if (!profileResult.ok) {
@@ -218,6 +224,7 @@ function makeRunner(h: Harnessed, extra?: Partial<ConstructorParameters<typeof C
     artifactStore: h.store,
     ids: h.flowIds,
     clock: h.flowClock,
+    baseCommit: TEST_BASE_COMMIT,
     explorationContext: 'src/cli/index.ts (base commit deadbeef): a hand-rolled arg parser.',
     ...extra,
   });
@@ -405,7 +412,7 @@ describe('extractSpecEmission + canonicalizeSpec', () => {
 describe('CoordinatorRunner via OrchestrationService.runCoordination (§7, §20 P3)', () => {
   it('drafts a valid spec in one turn: immutable content-addressed SpecVersion, awaiting_approval, read-only', async () => {
     const h = await harness([[specTurn(validSpec())]]);
-    const { runId } = h.service.createRun({ goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(h.service, { goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const outcome: CoordinatorOutcome = await h.service.runCoordination(runId, makeRunner(h));
 
@@ -426,6 +433,9 @@ describe('CoordinatorRunner via OrchestrationService.runCoordination (§7, §20 
     expect(sha256Hex(await h.store.getText(outcome.specArtifact.hash))).toBe(String(outcome.specArtifact.hash));
     // §15 exploration artifact stored (notes present), bound to its own object.
     expect(outcome.explorationArtifact?.kind).toBe('exploration');
+    expect(
+      JSON.parse(await h.store.getText(outcome.explorationArtifact!.hash)),
+    ).toMatchObject({ baseCommit: String(TEST_BASE_COMMIT) });
 
     // The workflow reached the human approval gate (T1 is outside the flow).
     expect(h.service.status(runId).phase).toBe('awaiting_approval');
@@ -441,7 +451,7 @@ describe('CoordinatorRunner via OrchestrationService.runCoordination (§7, §20 
     expect(h.prompts[0]).toContain(h.profile.frontmatter.roleReminder);
 
     // The exact SpecVersion hash is bindable by the human approval step (T1).
-    const approved = h.service.approve(runId, {
+    const approved = await h.service.approve(runId, {
       specVersionId: outcome.specVersion.id,
       specHash: outcome.specVersion.contentHash,
     });
@@ -451,7 +461,7 @@ describe('CoordinatorRunner via OrchestrationService.runCoordination (§7, §20 
 
   it('re-drives with actionable feedback when the emission is untestable, then stores the fixed spec', async () => {
     const h = await harness([[specTurn(untestableSpec()), specTurn(validSpec())]]);
-    const { runId } = h.service.createRun({ goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(h.service, { goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const outcome = await h.service.runCoordination(runId, makeRunner(h));
 
@@ -469,7 +479,7 @@ describe('CoordinatorRunner via OrchestrationService.runCoordination (§7, §20 
 
   it('throws CoordinatorSpecError and stays in specifying when no valid spec arrives in the round budget', async () => {
     const h = await harness([[specTurn(untestableSpec()), specTurn(untestableSpec())]]);
-    const { runId } = h.service.createRun({ goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(h.service, { goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     await expect(h.service.runCoordination(runId, makeRunner(h, { maxRounds: 2 }))).rejects.toBeInstanceOf(
       CoordinatorSpecError,
@@ -492,7 +502,7 @@ describe('CoordinatorRunner via OrchestrationService.runCoordination (§7, §20 
         ),
       ]),
     ]);
-    const { runId } = h.service.createRun({ goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(h.service, { goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const outcome = await h.service.runCoordination(
       runId,
@@ -539,7 +549,7 @@ describe('CoordinatorRunner via OrchestrationService.runCoordination (§7, §20 
         { addressedOnly: true, shouldRespond: true },
       ),
     ]);
-    const { runId } = h.service.createRun({ goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(h.service, { goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const outcome = await h.service.runCoordination(
       runId,
@@ -562,7 +572,7 @@ describe('CoordinatorRunner via OrchestrationService.runCoordination (§7, §20 
 describe('CoordinatorRunner — spec revise (T2)', () => {
   it('produces revision N+1 that supersedes the prior version, injecting the human feedback + prior spec', async () => {
     const h = await harness([[specTurn(validSpec())], [specTurn(revisedSpec())]]);
-    const { runId } = h.service.createRun({ goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(h.service, { goal: GOAL, workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // v1: the initial approved-pending draft.
     const v1 = await h.service.runCoordination(runId, makeRunner(h));
@@ -571,7 +581,7 @@ describe('CoordinatorRunner — spec revise (T2)', () => {
 
     // T2: `spec revise --feedback` returns the run to `specifying` (real path).
     const feedback = 'Also require the flag to appear in --help output.';
-    const t2 = h.service.reviseSpec(runId, feedback);
+    const t2 = await h.service.reviseSpec(runId, feedback);
     expect(t2.status).toBe('applied');
     expect(h.service.status(runId).phase).toBe('specifying');
 

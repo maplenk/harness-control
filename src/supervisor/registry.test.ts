@@ -3,14 +3,15 @@
  * owned by a different process is NEVER killed (simulate by recording fake
  * identity for a live unrelated process you spawned)."
  *
- * All scenarios below use REAL spawned processes and the REAL `ps`-backed
- * client (`./ps.ts`) — no fakes stand in for the OS.
+ * Identity/reaping scenarios below use real spawned processes and the real
+ * `ps` client except for the focused leader-gone/live-descendant regression,
+ * whose scripted process-tree sample makes that narrow crash window exact.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock } from '../lib/clock.js';
 import { processGenerationId } from '../domain/ids.js';
-import { createEnvNonceVerifier, createPsClient, type EnvNonceVerifier } from './ps.js';
+import { createEnvNonceVerifier, createPsClient, type EnvNonceVerifier, type PsClient } from './ps.js';
 import {
   InMemoryProcessRegistryStore,
   ProcessRegistry,
@@ -155,6 +156,30 @@ describe('ProcessRegistry.signalVerified — every signal is identity-gated', ()
     expect(isAliveReal(child.pid!)).toBe(false);
   });
 
+  it('runs the pre-signal persistence hook after identity match and withholds the signal when it throws', async () => {
+    const registry = makeRegistry();
+    const child = spawnDetachedNode();
+    await settle();
+    const record = registry.register({
+      generationId: processGenerationId('gen_persist_before_kill'),
+      pid: child.pid!,
+      pgid: child.pid!,
+      spawnNonce: 'nonce-persist',
+    });
+    let hookCalls = 0;
+    expect(() =>
+      registry.signalVerified(record.generationId, 'SIGKILL', {
+        beforeSignal: () => {
+          hookCalls += 1;
+          throw new Error('persistence failed');
+        },
+      }),
+    ).toThrow('persistence failed');
+    expect(hookCalls).toBe(1);
+    await settle(100);
+    expect(isAliveReal(child.pid!)).toBe(true);
+  });
+
   it('withholds the signal and raises an alert when the pid now identifies a DIFFERENT process (mismatch)', async () => {
     const alerts: IdentityAlert[] = [];
     const registry = makeRegistry((alert) => alerts.push(alert));
@@ -247,17 +272,27 @@ describe('ProcessRegistry.reapOrphans — PLAN §19 test 28', () => {
 
     const summary = registry.reapOrphans('SIGKILL');
 
-    expect(summary.killedCount).toBe(1);
+    expect(summary.signalSentCount).toBe(1);
+    expect(summary.confirmedGoneCount).toBe(0);
     expect(summary.skippedCount).toBe(1);
-    const killedEntry = summary.entries.find((e) => e.generationId === orphanRecord.generationId);
+    const signaledEntry = summary.entries.find((e) => e.generationId === orphanRecord.generationId);
     const skippedEntry = summary.entries.find((e) => e.generationId === staleRecord.generationId);
-    expect(killedEntry?.action).toBe('killed');
+    expect(signaledEntry?.action).toBe('signal_sent');
     expect(skippedEntry?.action).toBe('skipped');
     expect(skippedEntry?.verification.verdict).toBe('mismatch');
 
-    // The genuine orphan is dead; the record is gone from the store.
+    // Signal acceptance retains ownership. Only a later whole-tree absence
+    // confirms exit; service-level durable acknowledgement removes the record.
+    expect(registry.store.get(orphanRecord.generationId)).toBeDefined();
     await waitExit(orphan);
     expect(isAliveReal(orphan.pid!)).toBe(false);
+    const confirmed = registry.reapOrphans('SIGKILL');
+    expect(confirmed.confirmedGoneCount).toBe(1);
+    expect(confirmed.entries[0]?.action).toBe('confirmed_gone');
+    // R1: confirmed absence is only a report. The durable owner survives until
+    // the service commits its recovery outcome and explicitly acknowledges it.
+    expect(registry.store.get(orphanRecord.generationId)).toBeDefined();
+    registry.store.remove(orphanRecord.generationId);
     expect(registry.store.get(orphanRecord.generationId)).toBeUndefined();
 
     // The live unrelated process was NEVER killed, and its (now-proven-stale)
@@ -266,13 +301,132 @@ describe('ProcessRegistry.reapOrphans — PLAN §19 test 28', () => {
     expect(isAliveReal(unrelated.pid!)).toBe(true);
     expect(registry.store.get(staleRecord.generationId)).toBeDefined();
 
-    // Exactly one alert, for the mismatch only.
-    expect(alerts).toHaveLength(1);
-    expect(alerts[0]!.attemptedAction).toBe('reap');
-    expect(alerts[0]!.record.generationId).toBe(staleRecord.generationId);
+    // The stale record is re-checked on both passes and alerts both times;
+    // the confirmed-gone record never alerts.
+    expect(alerts).toHaveLength(2);
+    for (const alert of alerts) {
+      expect(alert.attemptedAction).toBe('reap');
+      expect(alert.record.generationId).toBe(staleRecord.generationId);
+    }
   });
 
-  it('a fully-gone record (process already exited) is skipped, never signaled, and left for the caller to interpret', async () => {
+  it('does not confirm exit when the leader is gone but descendants remain in the recorded process group', () => {
+    const pgid = 41_700;
+    const descendantPid = 41_701;
+    let treeAlive = true;
+    const signals: Array<{ pgid: number; signal: NodeJS.Signals }> = [];
+    const ps: PsClient = {
+      // The registered group leader is already gone.
+      sampleIdentity: () => undefined,
+      // A descendant remains in the original group until the test removes it.
+      sampleProcessTree: (sampledPgid) =>
+        treeAlive
+          ? {
+              pgid: sampledPgid,
+              rssBytes: 64_000,
+              processCount: 1,
+              pids: [descendantPid],
+              sampledAt: clock.nowIso(),
+            }
+          : undefined,
+      isAlive: () => false,
+    };
+    const registry = new ProcessRegistry({
+      clock,
+      ps,
+      selfPid: 41_799,
+      sendSignal: (signaledPgid, signal) => signals.push({ pgid: signaledPgid, signal }),
+    });
+    const record: ProcessIdentityRecord = {
+      generationId: processGenerationId('gen_leader_gone_descendant_live'),
+      pid: pgid,
+      pgid,
+      startedAt: 'leader-start',
+      executablePath: '/fake/leader',
+      spawnNonce: 'leader-nonce',
+      recordedAt: clock.nowIso(),
+      ownerPid: CRASHED_OWNER_PID,
+    };
+    registry.store.put(record);
+
+    const pending = registry.reapOrphans('SIGKILL');
+
+    expect(pending.signalSentCount).toBe(0);
+    expect(pending.exitPendingCount).toBe(1);
+    expect(pending.confirmedGoneCount).toBe(0);
+    expect(pending.entries[0]).toMatchObject({
+      generationId: record.generationId,
+      action: 'exit_pending',
+      verification: { verdict: 'gone' },
+    });
+    expect(signals).toEqual([]);
+    expect(registry.store.get(record.generationId)).toBeDefined();
+
+    treeAlive = false;
+    const absent = registry.reapOrphans('SIGKILL');
+    expect(absent.signalSentCount).toBe(0);
+    expect(absent.confirmedGoneCount).toBe(1);
+    expect(absent.entries[0]?.action).toBe('confirmed_gone');
+    // R1: even confirmed absence remains retryable until the durable outcome
+    // has committed and the service explicitly removes this owner record.
+    expect(registry.store.get(record.generationId)).toBeDefined();
+    expect(registry.reapOrphans('SIGKILL').confirmedGoneCount).toBe(1);
+  });
+
+  it('reconciles a startup identity mismatch when the recorded PGID is independently absent', () => {
+    const pgid = 41_800;
+    const alerts: IdentityAlert[] = [];
+    const signals: Array<{ pgid: number; signal: NodeJS.Signals }> = [];
+    const ps: PsClient = {
+      // The pid was recycled: identity verification must still forbid a
+      // signal, but the old recorded process group no longer has any member.
+      sampleIdentity: (pid) => ({
+        pid,
+        ppid: 1,
+        pgid: pid,
+        startedAt: 'recycled-start',
+        executablePath: '/unrelated/process',
+      }),
+      sampleProcessTree: () => undefined,
+      isAlive: () => false,
+    };
+    const registry = new ProcessRegistry({
+      clock,
+      ps,
+      selfPid: 41_899,
+      sendSignal: (signaledPgid, signal) => signals.push({ pgid: signaledPgid, signal }),
+      onAlert: (alert) => alerts.push(alert),
+    });
+    const record: ProcessIdentityRecord = {
+      generationId: processGenerationId('gen_mismatch_tree_absent'),
+      pid: pgid,
+      pgid,
+      startedAt: 'original-start',
+      executablePath: '/original/process',
+      spawnNonce: 'original-nonce',
+      recordedAt: clock.nowIso(),
+      ownerPid: CRASHED_OWNER_PID,
+    };
+    registry.store.put(record);
+
+    const summary = registry.reapOrphans('SIGKILL');
+
+    expect(summary.signalSentCount).toBe(0);
+    expect(summary.skippedCount).toBe(0);
+    expect(summary.confirmedGoneCount).toBe(1);
+    expect(summary.entries[0]).toMatchObject({
+      generationId: record.generationId,
+      action: 'confirmed_gone',
+      verification: { verdict: 'mismatch' },
+    });
+    expect(signals).toEqual([]);
+    expect(alerts).toHaveLength(1);
+    // Durable ownership is still retained until the service commits and
+    // explicitly acknowledges the recovered terminal outcome.
+    expect(registry.store.get(record.generationId)).toBeDefined();
+  });
+
+  it('a fully-gone record is confirmed without signaling and retained until durable acknowledgement', async () => {
     const alerts: IdentityAlert[] = [];
     const registry = makeRegistry((alert) => alerts.push(alert));
     const child = spawnDetachedNode('setTimeout(() => process.exit(0), 400);');
@@ -288,11 +442,15 @@ describe('ProcessRegistry.reapOrphans — PLAN §19 test 28', () => {
     await settle();
 
     const summary = registry.reapOrphans('SIGKILL');
-    expect(summary.killedCount).toBe(0);
-    expect(summary.skippedCount).toBe(1);
+    expect(summary.signalSentCount).toBe(0);
+    expect(summary.confirmedGoneCount).toBe(1);
+    expect(summary.skippedCount).toBe(0);
+    expect(summary.entries[0]!.action).toBe('confirmed_gone');
     expect(summary.entries[0]!.verification.verdict).toBe('gone');
-    expect(alerts).toHaveLength(1);
+    expect(alerts).toHaveLength(0);
     expect(registry.store.get(record.generationId)).toBeDefined();
+    registry.store.remove(record.generationId);
+    expect(registry.store.get(record.generationId)).toBeUndefined();
   });
 });
 
@@ -315,10 +473,16 @@ describe('ProcessRegistry.reapOrphans — W2-6 env-nonce re-verification (§14)'
       asOrphanOfCrashedOwner(registry, record); // owner (prior orchestrator) is dead
 
       const summary = registry.reapOrphans('SIGKILL');
-      expect(summary.killedCount).toBe(1);
+      expect(summary.signalSentCount).toBe(1);
+      expect(summary.confirmedGoneCount).toBe(0);
+      expect(summary.entries[0]!.action).toBe('signal_sent');
       expect(summary.entries[0]!.verification.verdict).toBe('match');
+      expect(registry.store.get(record.generationId)).toBeDefined();
       await waitExit(child);
       expect(isAliveReal(child.pid!)).toBe(false);
+      expect(registry.reapOrphans('SIGKILL').confirmedGoneCount).toBe(1);
+      expect(registry.store.get(record.generationId)).toBeDefined();
+      registry.store.remove(record.generationId);
       expect(registry.store.get(record.generationId)).toBeUndefined();
       expect(alerts).toHaveLength(0);
     },
@@ -342,7 +506,8 @@ describe('ProcessRegistry.reapOrphans — W2-6 env-nonce re-verification (§14)'
       asOrphanOfCrashedOwner(registry, record); // owner (prior orchestrator) is dead
 
       const summary = registry.reapOrphans('SIGKILL');
-      expect(summary.killedCount).toBe(0);
+      expect(summary.signalSentCount).toBe(0);
+      expect(summary.confirmedGoneCount).toBe(0);
       expect(summary.entries[0]!.action).toBe('skipped');
       expect(summary.entries[0]!.verification.verdict).toBe('nonce_unverifiable');
 
@@ -371,7 +536,8 @@ describe('ProcessRegistry.reapOrphans — W2-6 env-nonce re-verification (§14)'
     asOrphanOfCrashedOwner(registry, record); // owner (prior orchestrator) is dead
 
     const summary = registry.reapOrphans('SIGKILL');
-    expect(summary.killedCount).toBe(0);
+    expect(summary.signalSentCount).toBe(0);
+    expect(summary.confirmedGoneCount).toBe(0);
     expect(summary.entries[0]!.verification.verdict).toBe('nonce_mismatch');
     await settle(150);
     expect(isAliveReal(child.pid!)).toBe(true);
@@ -412,7 +578,8 @@ describe('ProcessRegistry.reapOrphans — W4-0 owner-liveness gate (§14:139)', 
 
     // The live peer's child was untouched: not killed, not signaled, not
     // removed, not even identity-verified (no entry, no alert).
-    expect(summary.killedCount).toBe(0);
+    expect(summary.signalSentCount).toBe(0);
+    expect(summary.confirmedGoneCount).toBe(0);
     expect(summary.skippedCount).toBe(0);
     expect(summary.ownerLiveSkippedCount).toBe(1);
     expect(summary.entries).toEqual([]);
@@ -441,10 +608,15 @@ describe('ProcessRegistry.reapOrphans — W4-0 owner-liveness gate (§14:139)', 
     const summary = reaper.reapOrphans('SIGKILL');
 
     expect(summary.ownerLiveSkippedCount).toBe(0);
-    expect(summary.killedCount).toBe(1);
-    expect(summary.entries[0]!.action).toBe('killed');
+    expect(summary.signalSentCount).toBe(1);
+    expect(summary.confirmedGoneCount).toBe(0);
+    expect(summary.entries[0]!.action).toBe('signal_sent');
+    expect(store.get(record.generationId)).toBeDefined();
     await waitExit(child);
     expect(isAliveReal(child.pid!)).toBe(false);
+    expect(reaper.reapOrphans('SIGKILL').confirmedGoneCount).toBe(1);
+    expect(store.get(record.generationId)).toBeDefined();
+    store.remove(record.generationId);
     expect(store.get(record.generationId)).toBeUndefined();
   });
 
@@ -472,9 +644,12 @@ describe('ProcessRegistry.reapOrphans — W4-0 owner-liveness gate (§14:139)', 
     const summary = reaper.reapOrphans('SIGKILL');
 
     expect(summary.ownerLiveSkippedCount).toBe(0);
-    expect(summary.killedCount).toBe(1);
+    expect(summary.signalSentCount).toBe(1);
+    expect(summary.confirmedGoneCount).toBe(0);
+    expect(store.get(childIdentity.generationId)).toBeDefined();
     await waitExit(child);
     expect(isAliveReal(child.pid!)).toBe(false);
+    expect(reaper.reapOrphans('SIGKILL').confirmedGoneCount).toBe(1);
     // The recycled owner process itself was never touched.
     expect(isAliveReal(recycled.pid!)).toBe(true);
   });

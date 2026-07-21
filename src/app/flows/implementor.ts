@@ -122,6 +122,7 @@ import { isSecretKeyName, redactText } from '../../redaction/index.js';
 import type { AppliedConfigOption, RoleModelSpec } from '../model-resolution.js';
 import type { RoleRunner, RoleSession } from '../role-runner.js';
 import type { OrchestrationService } from '../service.js';
+import { adjudicateImplementorDeliverable } from './deliverable.js';
 
 // ---------------------------------------------------------------------------
 // Verification command runner (§8 "runs declared verification commands")
@@ -807,7 +808,7 @@ export function buildImplementorPrompt(context: ImplementorContext, cwd: string)
  * `runImplementor` is the entry point that creates the worktree and wires the
  * engine to this runner with the worktree path as `cwd`.
  */
-export class ImplementorFlow implements RoleRunner<ImplementorResult> {
+export class ImplementorFlow {
   readonly role = 'implementor' as const;
   readonly #handle: WorktreeHandle;
   readonly #context: ImplementorContext;
@@ -1000,12 +1001,8 @@ export interface RunImplementorInput {
   /** The implementor's resolved harness/model/effort (§7 spec proposal → run default). */
   readonly implementor: RoleModelSpec;
   readonly context: ImplementorContext;
-  /** F5: the run's PINNED base commit (start-time HEAD) — takes precedence over
-   * `baseRef` so the standalone entry never branches from a drifted live HEAD. */
-  readonly baseCommit?: GitSha;
-  /** Ref to branch the worktree from; defaults to `'HEAD'` → immutable base SHA
-   * (§16 item 1). Legacy/test fallback ONLY — a pinned `baseCommit` wins. */
-  readonly baseRef?: string;
+  /** F5: the run's exact, immutable start-time base commit. */
+  readonly baseCommit: GitSha;
   readonly options?: ImplementorFlowOptions;
 }
 
@@ -1026,22 +1023,46 @@ export async function runImplementor(
   deps: ImplementorFlowDeps,
   input: RunImplementorInput,
 ): Promise<ImplementorResult> {
-  // F5: the pinned base commit wins over `baseRef`, and one of them is REQUIRED
-  // — the standalone implementor entry never branches from a drifted live HEAD.
-  const pinnedBase = input.baseCommit !== undefined ? String(input.baseCommit) : input.baseRef;
-  if (pinnedBase === undefined) {
+  // F5: this standalone entry point is a fresh-worktree boundary too. Check
+  // the primary checkout before creating anything, audit-pin only a persisted
+  // legacy run, and bind the caller's base to that durable run pin. The
+  // worktree manager can prove that a supplied SHA resolves, but it cannot
+  // know whether that SHA belongs to this run.
+  if (typeof input.baseCommit !== 'string' || !/^[0-9a-f]{40}$/.test(input.baseCommit)) {
     throw new WorktreeError(
-      'not_found',
-      `runImplementor: a pinned baseCommit (or explicit baseRef) is REQUIRED — refusing to branch from live HEAD (F5).`,
+      'invalid_base_commit',
+      `runImplementor requires baseCommit to be an exact 40-character lowercase commit SHA; got ${JSON.stringify(input.baseCommit)}`,
+    );
+  }
+  const pinnedWorkspace = await deps.service.assertOrPinLegacyCleanWorkspace(input.runId);
+  if (String(input.baseCommit) !== String(pinnedWorkspace.pinnedSha)) {
+    throw new WorktreeError(
+      'invalid_base_commit',
+      `runImplementor baseCommit ${input.baseCommit} does not match run ${input.runId} pinned base ${pinnedWorkspace.pinnedSha}`,
     );
   }
   const handle = await deps.worktrees.createWorktree({
     assignmentId: input.assignmentId,
-    baseRef: pinnedBase,
+    baseCommit: input.baseCommit,
   });
   const flow = new ImplementorFlow(handle, input.context, input.options ?? {});
+  const runner: RoleRunner<ImplementorResult> = {
+    role: 'implementor',
+    run: (session) => flow.run(session),
+    adjudicateRoundOutcome: async (result) =>
+      adjudicateImplementorDeliverable(
+        result,
+        1,
+        gitSha(await resolveSha(handle.worktreePath, 'HEAD')),
+      ),
+  };
   try {
-    return await deps.service.runRole(input.runId, flow, input.implementor, handle.worktreePath);
+    return await deps.service.runRole(input.runId, runner, input.implementor, handle.worktreePath, {
+      round: 1,
+      assignmentId: input.assignmentId,
+      baseCommit: input.baseCommit,
+      specHash: input.context.specHash,
+    });
   } finally {
     deps.worktrees.releaseLease(input.assignmentId);
   }

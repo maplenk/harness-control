@@ -53,6 +53,7 @@ import {
   type RoleAdapterOptions,
 } from '../service.js';
 import type { Harness, RoleModelSpec } from '../model-resolution.js';
+import { createRunFixture } from '../test-support.js';
 import { LoopCompositionError, runImplementVerifyLoop } from './orchestrate.js';
 import { RunOwnershipConflictError } from '../run-ownership-store.js';
 import { rebuildFixRequestsFromT23, type EvidenceRecorder } from './verifier.js';
@@ -196,6 +197,7 @@ interface Rig {
   readonly created: CreatedAdapter[];
   readonly ids: DeterministicIdFactory;
   readonly runId: RunId;
+  readonly baseCommit: ReturnType<typeof gitSha>;
 }
 
 /** Open the rig at phase `approved` with the loop's spec hash bound (T1). */
@@ -209,13 +211,19 @@ async function openRig(scripts: {
   const ids = new DeterministicIdFactory();
   const { factory, created } = makeFactory(scripts);
   const service = new OrchestrationService({ db: dbHandle.db, ids, adapterFactory: factory });
-  const { runId } = service.createRun({ goal: 'g', workspacePath: repo.dir, coordinator: COORDINATOR });
+  const baseCommit = gitSha(await repo.headSha());
+  const { runId } = createRunFixture(service, {
+    goal: 'g',
+    workspacePath: repo.dir,
+    coordinator: COORDINATOR,
+    baseCommit,
+  });
   service.advanceWorkflowPhase(runId, 'created', 'specifying');
   service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
   expect(
-    service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH }).status,
+    (await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH })).status,
   ).toBe('applied');
-  return { service, db: dbHandle.db, worktrees, created, ids, runId };
+  return { service, db: dbHandle.db, worktrees, created, ids, runId, baseCommit };
 }
 
 function loopInput(rig: Rig) {
@@ -231,9 +239,7 @@ function loopInput(rig: Rig) {
     criteria: CRITERIA,
     evidence: fakeEvidence(),
     runVerificationCommands: PASS_VERIFY,
-    // F5: the fresh test repo's HEAD IS the intended base — pin it explicitly
-    // (the loop refuses to silently default to live HEAD).
-    baseRef: 'HEAD',
+    baseCommit: rig.baseCommit,
   };
 }
 

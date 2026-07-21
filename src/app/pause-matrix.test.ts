@@ -26,6 +26,7 @@
  * (app/limit-probe.test.ts), and the pure T11/generation folds
  * (domain/transitions.conformance.test.ts).
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock } from '../lib/clock.js';
 import { idempotencyKey, processGenerationId, type RunId } from '../domain/ids.js';
@@ -128,6 +129,7 @@ async function setup(scripts: readonly (readonly InProcessTurnScript[])[]): Prom
     db: handle.db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
   });
   return { service, db: handle.db, created, clock };
 }
@@ -222,7 +224,7 @@ describe('W2-7: limit envelope on turn N — all four shapes through pauseForLim
 
   it.each(CASES)('$name: pause on turn 2, exact incident facts, checkpoint, clean stop, zero respawns', async (c) => {
     const { service, db, created } = await setup([limitOnTurnN(2, c.envelope)]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: c.spec });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: c.spec });
 
     const error: unknown = await service
       .runCoordination(runId, promptTimesRunner(2))
@@ -298,7 +300,7 @@ describe('W2-7: agent TEXT mentioning limits NEVER pauses a run (§9/§13)', () 
         { updates: [{ kind: 'agent_message_chunk', text: CODEX_AGENT_TEXT_MENTIONING_LIMITS }] },
       ],
     ]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     await service.runCoordination(runId, promptTimesRunner(2));
 
@@ -323,7 +325,7 @@ describe('W2-7: repeated T16 incidents never count toward the breaker', () => {
       [{ errorEnvelope: unknownProviderErrorEnvelope() }],
       [{ errorEnvelope: unknownProviderErrorEnvelope() }],
     ]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const first: unknown = await service
       .runRole(runId, promptTimesRunner(1), CLAUDE_LOW, '/ws')
@@ -368,7 +370,7 @@ describe('W2-7: dieMidTurn — child death mid-turn interrupts via T13, never pa
         },
       ],
     ]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const error: unknown = await service
       .runCoordination(runId, promptTimesRunner(1))
@@ -404,7 +406,7 @@ describe('W2-7: a DELAYED stop from the pre-pause generation never clears the re
       limitOnTurnN(1), // generation 1: pauses on its first turn
       [{}], // generation 2: the re-entered round completes
     ]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(runId, promptTimesRunner(1)).catch(() => undefined);
     expect(service.status(runId).suspension).toBe('paused_limit');
 
@@ -491,7 +493,7 @@ describe('W2-7: a DELAYED stop from the pre-pause generation never clears the re
 describe('W2-7: T11 pause completes only on the generation-matched stop confirmation', () => {
   it('pause() marks stopping (suspension STILL none); paused_user folds on child.stopped; T12 resumes', async () => {
     const { service, db } = await setup([[{}, {}]]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     await service.runRole(
       runId,

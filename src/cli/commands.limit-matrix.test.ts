@@ -246,13 +246,14 @@ async function setup(scripts: {
   const flows: CliFlowDeps = {
     ids,
     clock,
-    buildCoordinatorRunner: ({ goal, revise }) =>
+    buildCoordinatorRunner: ({ goal, revise, baseCommit }) =>
       new CoordinatorRunner({
         goal,
         profile,
         artifactStore: store,
         ids: flowIds,
         clock,
+        baseCommit,
         ...(revise !== undefined ? { revise } : {}),
       }),
     openWorktrees: async () => mgr,

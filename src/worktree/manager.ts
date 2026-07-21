@@ -77,8 +77,8 @@ export interface WorktreeHandle {
 
 export interface CreateWorktreeInput {
   readonly assignmentId: AssignmentId;
-  /** Ref to branch from; defaults to `'HEAD'` — resolved to an immutable SHA immediately (§16 item 1). */
-  readonly baseRef?: string;
+  /** Exact immutable commit selected when the run was created (§16 item 1). */
+  readonly baseCommit: GitSha;
 }
 
 export interface ReattachInput {
@@ -209,6 +209,13 @@ export class GitWorktreeManager {
    */
   async createWorktree(input: CreateWorktreeInput): Promise<WorktreeHandle> {
     const { assignmentId } = input;
+    const requestedBase = (input as Partial<CreateWorktreeInput>).baseCommit;
+    if (typeof requestedBase !== 'string' || !/^[0-9a-f]{40}$/.test(requestedBase)) {
+      throw new WorktreeError(
+        'invalid_base_commit',
+        `createWorktree requires baseCommit to be an exact 40-character lowercase commit SHA; got ${JSON.stringify(requestedBase)}`,
+      );
+    }
     if (this.#handles.has(assignmentId)) {
       throw new WorktreeError('already_leased', `Assignment already has a tracked worktree: ${String(assignmentId)}`);
     }
@@ -226,7 +233,17 @@ export class GitWorktreeManager {
     // the `git worktree add`, which alone can corrupt `.git/worktrees` if raced.
     return this.#mutex.runExclusive(this.#primaryRepoRoot, 'worktree_add', { assignmentId, worktreePath }, () =>
       this.#advisoryLease.withLease(async () => {
-        const baseSha = await git.resolveSha(this.#primaryRepoRoot, input.baseRef ?? 'HEAD');
+        // Do not trust the GitSha brand at runtime: JavaScript, casts, and
+        // deserialized input can still supply HEAD, a short id, or another
+        // symbolic ref. Resolve the supplied full id and require byte-for-byte
+        // equality before it is allowed to become a worktree base.
+        const baseSha = await git.resolveSha(this.#primaryRepoRoot, requestedBase);
+        if (baseSha !== requestedBase) {
+          throw new WorktreeError(
+            'invalid_base_commit',
+            `baseCommit resolved to a different commit: supplied=${requestedBase} resolved=${baseSha}`,
+          );
+        }
         fs.mkdirSync(this.#baseDir, { recursive: true });
         await git.worktreeAdd(this.#primaryRepoRoot, worktreePath, branch, baseSha);
         const handle: WorktreeHandle = {

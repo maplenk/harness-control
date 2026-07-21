@@ -17,12 +17,14 @@
  *  5. a STALE-generation crash does NOT respawn (gate on the applied,
  *     generation-matched T13 — NOT `evaluateCrash`'s generation-blind advice, S4).
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   assignmentId as toAssignmentId,
   criterionId,
+  gitSha,
   idempotencyKey,
   processGenerationId,
   segmentId,
@@ -203,6 +205,7 @@ interface LoopRig {
   readonly worktrees: GitWorktreeManager;
   readonly runId: RunId;
   readonly assignmentId: ReturnType<typeof toAssignmentId>;
+  readonly baseCommit: ReturnType<typeof gitSha>;
 }
 
 async function openLoopRig(
@@ -238,13 +241,26 @@ async function openLoopRig(
     adapterFactory: factory,
     config: opts.config,
   });
-  const { runId } = service.createRun({ goal: 'g', workspacePath: repo.dir, coordinator: CLAUDE_LOW });
+  const baseCommit = gitSha(await repo.headSha());
+  const { runId } = createRunFixture(service, {
+    goal: 'g',
+    workspacePath: repo.dir,
+    coordinator: CLAUDE_LOW,
+    baseCommit,
+  });
   service.advanceWorkflowPhase(runId, 'created', 'specifying');
   service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
-  expect(service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH }).status).toBe(
+  expect((await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH })).status).toBe(
     'applied',
   );
-  return { service, db: handle.db, worktrees, runId, assignmentId: toAssignmentId(`asg_${runId}`) };
+  return {
+    service,
+    db: handle.db,
+    worktrees,
+    runId,
+    assignmentId: toAssignmentId(`asg_${runId}`),
+    baseCommit,
+  };
 }
 
 function loopInput(rig: LoopRig) {
@@ -260,7 +276,7 @@ function loopInput(rig: LoopRig) {
     criteria: CRITERIA,
     evidence: fakeEvidence(),
     runVerificationCommands: PASS_VERIFY,
-    baseRef: 'HEAD', // F5: pin the fresh test repo HEAD explicitly
+    baseCommit: rig.baseCommit,
   };
 }
 
@@ -296,6 +312,7 @@ async function serviceRig(
     handle.cleanup();
   });
   const service = new OrchestrationService({
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
     db: handle.db,
     ids: new DeterministicIdFactory(),
     adapterFactory: opts.factory ?? makeRepeatingFactory({ coordinator: [{ turns: [DIE] }] }),
@@ -425,10 +442,10 @@ describe.each(DRIVER_KINDS)('P4b-2 auto-respawn (%s)', (kind) => {
         sendSignal: () => undefined, // synthetic pids: never touch a real process
       },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     service.advanceWorkflowPhase(runId, 'created', 'specifying');
     service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
-    expect(service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH }).status).toBe(
+    expect((await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH })).status).toBe(
       'applied',
     );
     service.advanceWorkflowPhase(runId, 'approved', 'implementing'); // non-terminal home
@@ -458,7 +475,7 @@ describe.each(DRIVER_KINDS)('P4b-2 auto-respawn (%s)', (kind) => {
       }) as DomainEvent,
     );
     const childPid = 61_300;
-    ps.identities.set(childPid, sampleFor(childPid)); // live child → reap reconciles it
+    ps.identities.set(childPid, sampleFor(childPid)); // live child → first reap only signals it
     service.supervision.registry.store.put({
       generationId: generation,
       pid: childPid,
@@ -472,7 +489,20 @@ describe.each(DRIVER_KINDS)('P4b-2 auto-respawn (%s)', (kind) => {
       ownerPid: DEAD_OWNER,
     });
 
-    service.reapOrphanProcesses();
+    const signaled = service.reapOrphanProcesses();
+
+    expect(signaled.signalSentCount).toBe(1);
+    expect(signaled.confirmedGoneCount).toBe(0);
+    expect(eventTypes(db, runId)).not.toContain('recovery.running_segment_found');
+    expect(service.status(runId).suspension).toBe('none');
+    expect(service.supervision.registry.store.get(generation)).toBeDefined();
+
+    // Signal delivery is not exit confirmation. Only a later reap that
+    // independently observes absence may release ownership and append T17.
+    ps.identities.delete(childPid);
+    const confirmed = service.reapOrphanProcesses();
+    expect(confirmed.signalSentCount).toBe(0);
+    expect(confirmed.confirmedGoneCount).toBe(1);
 
     const types = eventTypes(db, runId);
     expect(types).toContain('recovery.running_segment_found'); // T17
@@ -493,7 +523,7 @@ describe.each(DRIVER_KINDS)('P4b-2 auto-respawn (%s)', (kind) => {
   it('a stale-generation crash does NOT respawn — the T13 is generation-mismatched (rejected), so the generation-blind restart advice is ignored', async () => {
     const factory = makeRepeatingFactory({ coordinator: [{ turns: [DIE] }] });
     const { service, db } = await serviceRig(kind, { config: cfg({ autoRespawn: 'bounded' }), factory });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     // The loop-equivalent owner: in-process run ownership (the owner-alive gate).
     expect(service.acquireRunOwnership(runId)).toBe(true);
 

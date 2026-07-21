@@ -52,6 +52,7 @@ import { buildCheckpointContent } from '../../checkpoint/content.js';
 import { makeTempGitRepo } from '../../worktree/test-support.js';
 import { OrchestrationService, type RoleAdapterFactory } from '../service.js';
 import type { Harness, RoleModelSpec } from '../model-resolution.js';
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from '../test-support.js';
 import {
   MergeReadinessCommitMismatchError,
   MergeReadinessProbeMissingError,
@@ -216,16 +217,21 @@ async function setup(turns?: readonly InProcessTurnScript[]): Promise<{
   const db = dbHandle.db;
   const ids = new DeterministicIdFactory();
   const { factory, created } = makeFakeFactory(turns);
-  const service = new OrchestrationService({ db, ids, adapterFactory: factory });
-  const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+  const service = new OrchestrationService({
+    db,
+    ids,
+    adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
+  });
+  const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
   return { service, db, ids, created, runId };
 }
 
 /** Drive the run created → … → verifying (the phase T23/T24 require). */
-function driveToVerifying(service: OrchestrationService, runId: RunId): void {
+async function driveToVerifying(service: OrchestrationService, runId: RunId): Promise<void> {
   service.advanceWorkflowPhase(runId, 'created', 'specifying');
   service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
-  const approved = service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH });
+  const approved = await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH });
   expect(approved.status).toBe('applied');
   service.advanceWorkflowPhase(runId, 'approved', 'implementing');
   service.advanceWorkflowPhase(runId, 'implementing', 'verifying');
@@ -276,7 +282,7 @@ describe('verifier flow — mixed verdicts drive remediation (T23, §8)', () => 
       ]),
     ];
     const { service, db, ids, runId } = await setup(turns);
-    driveToVerifying(service, runId);
+    await driveToVerifying(service, runId);
     const { recorder } = fakeEvidence();
 
     const result = await runVerification({
@@ -327,7 +333,7 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
       ]),
     ];
     const { service, db, ids, runId } = await setup(turns);
-    driveToVerifying(service, runId);
+    await driveToVerifying(service, runId);
     const { recorder, records } = fakeEvidence();
 
     const result = await runVerification({
@@ -381,7 +387,7 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
     };
     const turns = [reportTurn([{ id: 'C1', verdict: 'passed', evidence: 'ran run-C1: ok' }])];
     const { service, db, ids, runId } = await setup(turns);
-    driveToVerifying(service, runId);
+    await driveToVerifying(service, runId);
     const { recorder } = fakeEvidence();
 
     const result = await runVerification({
@@ -416,7 +422,7 @@ describe('verifier flow — missing evidence blocks merge_ready (§19 test 12)',
       ]),
     ];
     const { service, db, ids, runId } = await setup(turns);
-    driveToVerifying(service, runId);
+    await driveToVerifying(service, runId);
     const { recorder, records } = fakeEvidence();
 
     const result = await runVerification({
@@ -477,7 +483,7 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
       options.turns ??
       [reportTurn(criteria.map((c) => ({ id: String(c.id), verdict: 'passed', evidence: `ran run-${String(c.id)}: ok` })))];
     const { service, db, ids, runId } = await setup(turns);
-    driveToVerifying(service, runId);
+    await driveToVerifying(service, runId);
     const { recorder } = fakeEvidence();
     const result = await runVerification({
       engine: service,
@@ -633,7 +639,7 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
     const { service, db, ids, runId } = await setup([
       reportTurn([{ id: 'C1', verdict: 'passed', evidence: 'ran run-C1: ok' }]),
     ]);
-    driveToVerifying(service, runId);
+    await driveToVerifying(service, runId);
     const { recorder } = fakeEvidence();
     await expect(
       runVerification({
@@ -699,7 +705,7 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
     const { service, db, ids, runId } = await setup([
       reportTurn([{ id: 'C1', verdict: 'passed', evidence: 'ran run-C1: ok' }]),
     ]);
-    driveToVerifying(service, runId);
+    await driveToVerifying(service, runId);
     const { recorder } = fakeEvidence();
     await expect(
       runVerification({
@@ -887,7 +893,7 @@ describe('verifier flow — successor resumes from checkpoint alone (§19 test 2
     // The successor only needs to verify C2.
     const turns = [reportTurn([{ id: 'C2', verdict: 'passed', evidence: 'ran run-C2: ok' }])];
     const { service, db, ids, created, runId } = await setup(turns);
-    driveToVerifying(service, runId);
+    await driveToVerifying(service, runId);
     const { recorder } = fakeEvidence();
 
     const result = await runVerification({

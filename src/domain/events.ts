@@ -144,7 +144,13 @@ export interface ChildPinRecord {
 }
 
 /** How a generation's stop was confirmed (`child.stopped`, W2-1/W2-3). */
-export type ChildStopReason = 'graceful' | 'terminated' | 'exited' | 'startup_cleanup';
+export type ChildStopReason =
+  | 'graceful'
+  | 'terminated'
+  | 'exited'
+  | 'startup_cleanup'
+  /** A natural end_turn committed after a T22 v2 stop intent. */
+  | 'rss_race_completed';
 
 type Empty = Record<string, never>;
 
@@ -311,6 +317,11 @@ export interface EventPayloads {
    * (which role's generation crossed which budget) and the service can bind a
    * generation-scoped resource-exhaustion cause off it. */
   'rss.hard_limit': {
+    /**
+     * Version 2 turns T22 into a durable generation stop-intent. Absent means
+     * the historical T22 semantics and MUST replay unchanged.
+     */
+    readonly semanticsVersion?: 2;
     readonly segmentId?: SegmentId;
     readonly generationId?: ProcessGenerationId;
     readonly role?: RoleName;

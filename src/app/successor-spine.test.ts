@@ -21,6 +21,7 @@
  *
  * Runs on BOTH sqlite drivers (crash-safety is driver-sensitive).
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock } from '../lib/clock.js';
 import { runId as toRunId, type RunId } from '../domain/ids.js';
@@ -111,6 +112,7 @@ async function setup(
     db: handle.db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
   });
   return { service, db: handle.db, clock, createdCount };
 }
@@ -128,7 +130,12 @@ function successorService(
             throw new Error('this recovery path must not spawn adapters');
           },
         };
-  return new OrchestrationService({ db, ids: new RandomIdFactory(), adapterFactory: factory });
+  return new OrchestrationService({
+    db,
+    ids: new RandomIdFactory(),
+    adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
+  });
 }
 
 function promptOnceRunner(): RoleRunner {
@@ -170,7 +177,7 @@ function crashOnAppendOf(db: TestDatabaseHandle['db'], type: string): { restore:
 /** Drive a fresh coordinator round to a `paused_limit` state with a §12.2
  * pre-pause checkpoint recorded — the spine's seed. */
 async function pauseOnLimit(service: OrchestrationService): Promise<RunId> {
-  const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+  const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
   await service.runCoordination(runId, promptOnceRunner()).catch(() => undefined);
   expect(service.status(runId).suspension).toBe('paused_limit');
   return runId;
@@ -435,7 +442,7 @@ describe.each(DRIVER_KINDS)('P4b-2 successor spine (%s)', (kind) => {
   // -------------------------------------------------------------------------
   it('refuses to seed a successor from a non-suspended run (never fabricates a marker)', async () => {
     const { service } = await setup(kind, [[{}]]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     expect(() => service.recordSuccessorIntent(runId)).toThrow(/paused_limit or interrupted/);
     expect(service.status(runId).successorIntent).toBeUndefined();
   });

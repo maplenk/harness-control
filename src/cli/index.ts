@@ -256,7 +256,7 @@ export function buildCliFlows(db: Database, config: EngineConfig = DEFAULT_ENGIN
         clock: db.clock,
         // F5 (must-fix 4): bind the coordinator's exploration to the PINNED base
         // commit so a spec drafted against a drifted tree is detectable.
-        ...(baseCommit !== undefined ? { baseCommit } : {}),
+        baseCommit,
         ...(revise !== undefined ? { revise } : {}),
         ...(enableChat === true ? { planningChat } : {}),
       });

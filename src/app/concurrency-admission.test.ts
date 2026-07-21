@@ -14,6 +14,7 @@
  * Deterministic: in-process fake adapters + injected fake `ps` (identity table
  * + liveness), mirroring supervision.test.ts.
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -72,6 +73,7 @@ function makeFakePs(): FakePs {
     identities: new Map(),
     client: {
       sampleProcessTree(pgid: number) {
+        if (!fake.identities.has(pgid)) return undefined;
         return { pgid, rssBytes: 0, processCount: 1, pids: [pgid], sampledAt: isoTimestamp('2026-07-19T00:00:00.000Z') };
       },
       sampleIdentity(pid: number) {
@@ -106,7 +108,13 @@ function makeFactory(ps: FakePs, firstPid: number): RoleAdapterFactory {
       return {
         adapter,
         captureProcessIdentity: (generationId: ProcessGenerationId) => identityFor(pid, generationId),
-        dispose: (): Promise<void> => adapter.close(),
+        dispose: async (): Promise<void> => {
+          await adapter.close();
+          // Disposal and exit confirmation are separate contracts. The fake
+          // transport closes first; then fake ps independently observes that
+          // this process group has no remaining members.
+          ps.identities.delete(pid);
+        },
       };
     },
   };
@@ -140,6 +148,7 @@ describe('W3-5 in-process max-live-children guard wired into runRole', () => {
     const db = handle.db;
     const ps = makeFakePs();
     const service = new OrchestrationService({
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       db,
       ids: new DeterministicIdFactory(),
       adapterFactory: makeFactory(ps, 61_001),
@@ -158,9 +167,9 @@ describe('W3-5 in-process max-live-children guard wired into runRole', () => {
         await barrier;
       });
 
-    const run1 = service.createRun({ goal: 'g1', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
-    const run2 = service.createRun({ goal: 'g2', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
-    const run3 = service.createRun({ goal: 'g3', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
+    const run1 = createRunFixture(service, { goal: 'g1', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
+    const run2 = createRunFixture(service, { goal: 'g2', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
+    const run3 = createRunFixture(service, { goal: 'g3', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
 
     const p1 = service.runCoordination(run1, blocking('1'));
     const p2 = service.runCoordination(run2, blocking('2'));
@@ -195,6 +204,7 @@ describe('W3-5 durable cross-process max-live-children cap', () => {
     const config = unwrap(parseEngineConfig({ maxLiveChildren: 1 }));
 
     const serviceA = new OrchestrationService({
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       db,
       ids: new RandomIdFactory(),
       adapterFactory: makeFactory(ps, 62_001),
@@ -202,6 +212,7 @@ describe('W3-5 durable cross-process max-live-children cap', () => {
       supervision: { ps: ps.client, sendSignal: () => undefined, envNonce: { verifyNonce: () => 'match' } },
     });
     const serviceB = new OrchestrationService({
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       db,
       ids: new RandomIdFactory(),
       adapterFactory: makeFactory(ps, 63_001),
@@ -215,8 +226,8 @@ describe('W3-5 durable cross-process max-live-children cap', () => {
       releaseBarrier = resolve;
     });
 
-    const runA = serviceA.createRun({ goal: 'gA', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
-    const runB = serviceB.createRun({ goal: 'gB', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
+    const runA = createRunFixture(serviceA, { goal: 'gA', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
+    const runB = createRunFixture(serviceB, { goal: 'gB', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
 
     // A's child goes live and stays live (its identity is durably registered).
     const pA = serviceA.runCoordination(runA, runnerWith(async () => {
@@ -242,6 +253,94 @@ describe('W3-5 durable cross-process max-live-children cap', () => {
     await serviceB.runCoordination(runB, runnerWith(async () => { ranB = true; }));
     expect(ranB).toBe(true);
   });
+
+  it.each(DRIVER_KINDS)(
+    'a dead leader with a live process-group descendant holds capacity until confirmed whole-tree absence [%s]',
+    async (kind) => {
+      handle = await openTestDatabase({ kind, file: false });
+      const db = handle.db;
+      const orphanPgid = 62_101;
+      let orphanTreeAlive = true;
+      const ps: FakePs = {
+        identities: new Map(),
+        client: {
+          sampleProcessTree(pgid: number) {
+            const pids =
+              pgid === orphanPgid
+                ? orphanTreeAlive
+                  ? [orphanPgid + 1]
+                  : undefined
+                : ps.identities.has(pgid)
+                  ? [pgid]
+                  : undefined;
+            return pids === undefined
+              ? undefined
+              : {
+                  pgid,
+                  rssBytes: 0,
+                  processCount: pids.length,
+                  pids,
+                  sampledAt: isoTimestamp('2026-07-19T00:00:00.000Z'),
+                };
+          },
+          sampleIdentity(pid: number) {
+            return ps.identities.get(pid);
+          },
+          isAlive(pid: number) {
+            return ps.identities.has(pid);
+          },
+        },
+      };
+      const service = new OrchestrationService({
+        workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
+        db,
+        ids: new RandomIdFactory(),
+        adapterFactory: makeFactory(ps, 62_201),
+        config: unwrap(parseEngineConfig({ maxLiveChildren: 1 })),
+        supervision: {
+          ps: ps.client,
+          sendSignal: () => undefined,
+          envNonce: { verifyNonce: () => 'match' },
+        },
+      });
+      const orphanGeneration = processGenerationId('gen_leader_gone_descendant_live_capacity');
+      service.supervision.registry.store.put({
+        generationId: orphanGeneration,
+        pid: orphanPgid,
+        pgid: orphanPgid,
+        startedAt: 'gone-leader-start',
+        executablePath: '/fake/gone-leader',
+        spawnNonce: 'gone-leader-nonce',
+        recordedAt: isoTimestamp('2026-07-19T00:00:00.000Z'),
+      });
+
+      // Startup reaping observes that the leader is gone but a descendant is
+      // still in the recorded pgid. Durable ownership therefore remains.
+      const pending = service.reapOrphanProcesses();
+      expect(pending.exitPendingCount).toBe(1);
+      expect(service.supervision.registry.store.get(orphanGeneration)).toBeDefined();
+
+      const run = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
+      let ran = false;
+      let refusal: unknown;
+      await service.runCoordination(run, runnerWith(async () => { ran = true; })).catch((error: unknown) => {
+        refusal = error;
+      });
+      expect(refusal).toBeInstanceOf(MaxLiveChildrenExceededError);
+      expect(ran).toBe(false);
+      expect(service.supervision.registry.store.get(orphanGeneration)).toBeDefined();
+
+      // Only a later whole-group absence confirms exit. Reaping then releases
+      // the durable record, and the same pending round can acquire the slot.
+      orphanTreeAlive = false;
+      const gone = service.reapOrphanProcesses();
+      expect(gone.confirmedGoneCount).toBe(1);
+      expect(service.supervision.registry.store.get(orphanGeneration)).toBeUndefined();
+
+      await service.runCoordination(run, runnerWith(async () => { ran = true; }));
+      expect(ran).toBe(true);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -262,6 +361,7 @@ describe('W3-5(a) atomic cross-process admission (count-and-reserve)', () => {
 
       const makeService = (selfPid: number, firstChildPid: number): OrchestrationService =>
         new OrchestrationService({
+          workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
           db,
           ids: new RandomIdFactory(),
           adapterFactory: makeFactory(ps, firstChildPid),
@@ -284,8 +384,8 @@ describe('W3-5(a) atomic cross-process admission (count-and-reserve)', () => {
         await barrier;
       });
 
-      const runA = serviceA.createRun({ goal: 'gA', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
-      const runB = serviceB.createRun({ goal: 'gB', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
+      const runA = createRunFixture(serviceA, { goal: 'gA', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
+      const runB = createRunFixture(serviceB, { goal: 'gB', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
 
       // Fire BOTH without awaiting between them (concurrent admission). Each
       // runRole runs synchronously through #admitSpawn before its first await,
@@ -328,6 +428,7 @@ describe('W3-5(a) atomic cross-process admission (count-and-reserve)', () => {
 
       const makeService = (selfPid: number, firstChildPid: number): OrchestrationService =>
         new OrchestrationService({
+          workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
           db,
           ids: new RandomIdFactory(),
           adapterFactory: makeFactory(ps, firstChildPid),
@@ -354,7 +455,7 @@ describe('W3-5(a) atomic cross-process admission (count-and-reserve)', () => {
       });
 
       const runs = services.map(
-        (svc, i) => svc.createRun({ goal: `g${i}`, workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId,
+        (svc, i) => createRunFixture(svc, { goal: `g${i}`, workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId,
       );
 
       // Fire ALL THREE without awaiting between them (concurrent admission).
@@ -398,6 +499,7 @@ describe('W3-5(a) atomic cross-process admission (count-and-reserve)', () => {
       });
 
       const service = new OrchestrationService({
+        workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
         db,
         ids: new RandomIdFactory(),
         adapterFactory: makeFactory(ps, 73_001),
@@ -411,7 +513,7 @@ describe('W3-5(a) atomic cross-process admission (count-and-reserve)', () => {
       });
       ps.identities.set(73_000, sampleFor(73_000));
 
-      const run = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
+      const run = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW }).runId;
       let ran = false;
       // The dead-owner reservation is reclaimed, so this admission succeeds.
       await service.runCoordination(run, runnerWith(async () => { ran = true; }));
@@ -466,6 +568,7 @@ describe('W4-8 admission refusal creates no provider resource and no durable rou
           captureProcessIdentity: (generationId: ProcessGenerationId) => identityFor(pid, generationId),
           dispose: async (): Promise<void> => {
             await adapter.close();
+            ps.identities.delete(pid);
             rmSync(dir, { recursive: true, force: true });
             entry.disposed = true;
           },
@@ -474,6 +577,7 @@ describe('W4-8 admission refusal creates no provider resource and no durable rou
     };
 
     const service = new OrchestrationService({
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       db,
       ids: new DeterministicIdFactory(),
       adapterFactory: factory,
@@ -488,8 +592,8 @@ describe('W4-8 admission refusal creates no provider resource and no durable rou
       });
       let live = false;
 
-      const run1 = service.createRun({ goal: 'g1', workspacePath: '/ws', coordinator: CODEX_LOW }).runId;
-      const run2 = service.createRun({ goal: 'g2', workspacePath: '/ws', coordinator: CODEX_LOW }).runId;
+      const run1 = createRunFixture(service, { goal: 'g1', workspacePath: '/ws', coordinator: CODEX_LOW }).runId;
+      const run2 = createRunFixture(service, { goal: 'g2', workspacePath: '/ws', coordinator: CODEX_LOW }).runId;
 
       // One Codex child goes live and holds the only slot (cap=1).
       const p1 = service.runCoordination(

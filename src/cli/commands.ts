@@ -24,6 +24,7 @@
  * and validate everything the engine exposes today and report the plan; the
  * flow execution slots in behind these same commands without changing the surface.
  */
+import { realpath } from 'node:fs/promises';
 import type { Database } from '../persistence/index.js';
 import type { LimitClassification, SpecDraftRef } from '../domain/events.js';
 import {
@@ -45,6 +46,7 @@ import {
   LimitPausedError,
   RUN_META_PROJECTION,
   ResumeEligibilityError,
+  WorkspaceDriftError,
   resolveRoleModel,
   type DesiredModelRecord,
   type IngestResult,
@@ -150,7 +152,7 @@ export interface CliFlowDeps {
     /** F5 (must-fix 4): the run's PINNED base commit — the coordinator binds its
      * exploration artifact to it, so a spec drafted against a drifted tree is
      * detectable (and refused at coordination completion). */
-    readonly baseCommit?: GitSha;
+    readonly baseCommit: GitSha;
     /** Opt-in Agent Room discussion before final spec synthesis. */
     readonly enableChat?: boolean;
     /** T2 revision context (prior version + human feedback); absent for the initial draft. */
@@ -207,7 +209,7 @@ export async function executeCommand(
       case 'spec_revise':
         return await handleSpecRevise(service, db, command, deps.flows);
       case 'approve':
-        return handleApprove(service, command, env);
+        return await handleApprove(service, command, env);
       case 'run':
         return await handleRun(service, command, deps.flows);
       case 'recheck':
@@ -237,7 +239,7 @@ export async function executeCommand(
       case 'switch_model':
         return handleSwitchModel(service, db, command);
       case 'set_budget':
-        return handleSetBudget(service, command);
+        return await handleSetBudget(service, db, command, deps);
       case 'cancel':
         return await handleCancel(service, command);
     }
@@ -376,38 +378,49 @@ function draftLossRecoveryHint(runId: RunId): string {
 // start
 // ---------------------------------------------------------------------------
 /**
- * F5: resolve the base commit to pin at `start` from the workspace HEAD, and
- * flag a dirty tree. A non-git / unborn-HEAD workspace yields no base but a
- * PROMINENT warning (the run is UNPINNED and `run` will refuse until the
- * workspace is a git repository) — never a silent swallow, never a live-HEAD
- * fallback.
+ * F5: canonicalize and pin the source before a run exists. Non-git,
+ * unborn/unresolvable HEAD, and ordinary porcelain dirt are fail-closed: the
+ * caller returns a structured refusal and creates no run.
  */
-async function resolveStartBase(
-  workspace: string,
-): Promise<{ baseCommit?: GitSha; warning?: string }> {
+async function resolveStartBase(workspace: string): Promise<{ repoRoot: string; baseCommit: GitSha }> {
+  let repoRoot: string;
   let baseCommit: GitSha;
+  let status: string;
   try {
-    baseCommit = gitSha(await git.resolveSha(workspace, 'HEAD'));
-  } catch {
-    // Not a git repo / no commit yet: the run is UNPINNED. Surface it loudly —
-    // `run` is the hard gate that refuses to branch from live HEAD (must-fix 4).
-    return {
-      warning:
-        `workspace '${workspace}' is not a git repository (or has no commit) — this run is ` +
-        `UNPINNED and \`run\` will REFUSE until it is a committed git repository (F5).`,
-    };
-  }
-  let warning: string | undefined;
-  try {
-    if ((await git.statusPorcelain(workspace)).trim().length > 0) {
-      warning =
-        `workspace has uncommitted changes — they are EXCLUDED from the pinned base ${baseCommit}. ` +
-        `Commit them before \`start\` to include them in the implementation base (F5).`;
+    repoRoot = await realpath(await git.resolveTopLevel(workspace));
+    const snapshot = await git.readStableHeadAndStatus(repoRoot);
+    baseCommit = gitSha(snapshot.headAfter);
+    status = snapshot.statusPorcelain;
+    if (!snapshot.stable) {
+      throw new WorkspaceDriftError({
+        kind: 'base_drift',
+        pinnedSha: gitSha(snapshot.headBefore),
+        currentSha: baseCommit,
+        detail:
+          `workspace HEAD changed while the start-time source pin was being established ` +
+          `(${snapshot.headBefore} -> ${snapshot.headAfter}); retry from a stable checkout`,
+      });
     }
-  } catch {
-    // status is best-effort — a resolvable HEAD is enough to pin.
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) throw error;
+    throw new WorkspaceDriftError({
+      kind: 'workspace_unresolvable',
+      detail:
+        `workspace '${workspace}' must be a Git worktree with a resolvable HEAD commit: ` +
+        redactText(error instanceof Error ? error.message : String(error)),
+    });
   }
-  return { baseCommit, ...(warning !== undefined ? { warning } : {}) };
+  const dirtyPaths = git.porcelainPaths(status);
+  if (dirtyPaths.length > 0) {
+    throw new WorkspaceDriftError({
+      kind: 'workspace_dirty',
+      pinnedSha: baseCommit,
+      currentSha: baseCommit,
+      dirtyPaths,
+      detail: `workspace must be clean before start; found ${dirtyPaths.length} dirty path(s)`,
+    });
+  }
+  return { repoRoot, baseCommit };
 }
 
 /**
@@ -431,6 +444,27 @@ async function detectBaseDrift(
     : { pinnedBase: String(pinnedBase), currentHead: head };
 }
 
+function workspaceRefusalOutput(
+  command: string,
+  error: WorkspaceDriftError,
+  runId?: RunId,
+): CommandOutput {
+  const body = {
+    ...(runId !== undefined ? { runId } : {}),
+    refused: error.kind,
+    ...(error.pinnedSha !== undefined ? { pinnedSha: String(error.pinnedSha) } : {}),
+    ...(error.currentSha !== undefined ? { currentSha: String(error.currentSha) } : {}),
+    ...(error.dirtyPaths !== undefined ? { dirtyPaths: error.dirtyPaths } : {}),
+    detail: error.message,
+  };
+  const text = [
+    `${command} refused: ${error.message}`,
+    ...(error.pinnedSha !== undefined ? [`pinned SHA: ${error.pinnedSha}`] : []),
+    ...(error.currentSha !== undefined ? [`current SHA: ${error.currentSha}`] : []),
+  ].join('\n');
+  return finish(command, body, text, 2);
+}
+
 async function handleStart(
   service: OrchestrationService,
   cmd: Extract<RunCommand, { kind: 'start' }>,
@@ -450,17 +484,21 @@ async function handleStart(
   // snapshot (the coordinator reads the repo immediately below). Every fresh
   // implement→verify worktree branches from THIS SHA, so a commit landing
   // between `start` and `run` can never drift the base (the exact dogfood bug).
-  // must-fix 4: when the base cannot be resolved (a non-git / unborn-HEAD
-  // workspace) the run is created UNPINNED with a PROMINENT warning — it is NOT
-  // silently swallowed — and `run` is the hard gate that REFUSES to proceed
-  // without an immutable base (never a live-HEAD fallback). Production
-  // workspaces are always git repositories, so this pins in practice.
-  const startBase = await resolveStartBase(cmd.workspace);
+  // C1: a non-git/unborn/dirty/unstable workspace is refused BEFORE createRun;
+  // the service boundary independently requires the exact full commit, so no
+  // fresh caller can create an unpinned run by bypassing this CLI check.
+  let startBase: Awaited<ReturnType<typeof resolveStartBase>>;
+  try {
+    startBase = await resolveStartBase(cmd.workspace);
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) return workspaceRefusalOutput('start', error);
+    throw error;
+  }
   const { runId } = service.createRun({
     goal: cmd.goal,
-    workspacePath: cmd.workspace,
+    workspacePath: startBase.repoRoot,
     coordinator: cmd.coordinator,
-    ...(startBase.baseCommit !== undefined ? { baseCommit: startBase.baseCommit } : {}),
+    baseCommit: startBase.baseCommit,
     ...(cmd.enableChat === true ? { planningChatEnabled: true } : {}),
   });
 
@@ -475,19 +513,23 @@ async function handleStart(
     runId,
     goal: cmd.goal,
     coordinator: cmd.coordinator,
-    workspacePath: cmd.workspace,
-    ...(startBase.baseCommit !== undefined ? { baseCommit: startBase.baseCommit } : {}),
+    workspacePath: startBase.repoRoot,
+    baseCommit: startBase.baseCommit,
     ...(cmd.enableChat === true ? { enableChat: true } : {}),
   });
-  const outcome = await service.runCoordination(runId, runner, (o) =>
-    draftFromOutcome(cmd.goal, o),
-  );
+  let outcome: CoordinatorOutcome;
+  try {
+    outcome = await service.runCoordination(runId, runner, (o) => draftFromOutcome(cmd.goal, o));
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) return workspaceRefusalOutput('start', error, runId);
+    throw error;
+  }
 
   // F5 (must-fix 4): close coordinator drift — if the workspace HEAD moved DURING
   // drafting, the coordinator read a tree different from the immutable base
   // pinned at start. Refuse (the drafted spec cannot be trusted against the
   // pinned base); the operator restarts to re-pin.
-  const drift = await detectBaseDrift(cmd.workspace, startBase.baseCommit);
+  const drift = await detectBaseDrift(startBase.repoRoot, startBase.baseCommit);
   if (drift !== undefined) {
     const text =
       `start: workspace HEAD (${drift.currentHead}) DRIFTED from the base pinned at start ` +
@@ -508,11 +550,10 @@ async function handleStart(
     phase: st.phase,
     uiState: st.uiState,
     goal: cmd.goal,
-    workspacePath: cmd.workspace,
+    workspacePath: startBase.repoRoot,
     // F5: the pinned base commit (and any dirty-tree warning) is surfaced so the
     // operator sees exactly which snapshot the run implements against.
-    ...(startBase.baseCommit !== undefined ? { baseCommit: String(startBase.baseCommit) } : {}),
-    ...(startBase.warning !== undefined ? { warnings: [startBase.warning] } : {}),
+    baseCommit: String(startBase.baseCommit),
     coordinator: resolvedView(resolveRoleModel(cmd.coordinator)),
     ...(cmd.enableChat === true ? { planningChat: outcome.planningChat ?? { enabled: true } } : {}),
     spec: {
@@ -562,8 +603,25 @@ async function handleSpecRevise(
   cmd: Extract<RunCommand, { kind: 'spec_revise' }>,
   flows: CliFlowDeps | undefined,
 ): Promise<CommandOutput> {
+  let pinnedWorkspace: Awaited<ReturnType<OrchestrationService['assertOrPinLegacyCleanWorkspace']>>;
+  try {
+    pinnedWorkspace = await service.assertOrPinLegacyCleanWorkspace(cmd.runId);
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) {
+      return workspaceRefusalOutput('spec_revise', error, cmd.runId);
+    }
+    throw error;
+  }
   const priorDraft = service.getSpecDraft(cmd.runId);
-  const revised = service.reviseSpec(cmd.runId, cmd.feedback);
+  let revised: IngestResult;
+  try {
+    revised = await service.reviseSpec(cmd.runId, cmd.feedback);
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) {
+      return workspaceRefusalOutput('spec_revise', error, cmd.runId);
+    }
+    throw error;
+  }
   if (revised.status !== 'applied') {
     return ingestOutput('spec_revise', cmd.runId, revised, {
       appliedText: `spec revise accepted; run ${cmd.runId} -> specifying (T2).`,
@@ -625,7 +683,7 @@ async function handleSpecRevise(
     coordinator: meta.coordinator,
     workspacePath: meta.workspacePath,
     // F5 (must-fix 4): the revise round binds the SAME pinned base as the run.
-    ...(meta.baseCommit !== undefined ? { baseCommit: meta.baseCommit } : {}),
+    baseCommit: pinnedWorkspace.pinnedSha,
     ...(meta.planningChatEnabled === true ? { enableChat: true } : {}),
     revise,
   });
@@ -633,19 +691,35 @@ async function handleSpecRevise(
   // (T2 already moved the phase — no advance to take at activation); the
   // pending round is retryable on a non-limit pin failure, and completion
   // advances `specifying → awaiting_approval` below.
-  const outcome = await service.runRole(cmd.runId, runner, meta.coordinator, meta.workspacePath, {
-    round,
-    completionAdvance: { from: 'specifying', to: 'awaiting_approval' },
-    inputs: JSON.stringify({
-      goal,
-      revise: { feedback: cmd.feedback, priorSpecVersionId: String(revise.priorVersion.id) },
-    }),
-  });
+  let outcome: CoordinatorOutcome;
+  try {
+    outcome = await service.runRole(cmd.runId, runner, meta.coordinator, meta.workspacePath, {
+      round,
+      completionAdvance: { from: 'specifying', to: 'awaiting_approval' },
+      inputs: JSON.stringify({
+        goal,
+        revise: { feedback: cmd.feedback, priorSpecVersionId: String(revise.priorVersion.id) },
+      }),
+    });
+    await service.assertPinnedCleanWorkspace(cmd.runId);
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) {
+      return workspaceRefusalOutput('spec_revise', error, cmd.runId);
+    }
+    throw error;
+  }
 
   // W3-4: the superseding draft (revision N+1) persists BEFORE the final
   // advance — one transaction — so approve/run bind the NEW hash and a crash
   // can never leave `awaiting_approval` without it.
-  service.completeCoordinationRound(cmd.runId, draftFromOutcome(goal, outcome));
+  try {
+    await service.completeCoordinationRound(cmd.runId, draftFromOutcome(goal, outcome));
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) {
+      return workspaceRefusalOutput('spec_revise', error, cmd.runId);
+    }
+    throw error;
+  }
 
   const st = service.status(cmd.runId);
   const body = {
@@ -692,11 +766,32 @@ async function handleSpecRevise(
 // ---------------------------------------------------------------------------
 // approve (explicit human approval — the only production path; §4.1/§18)
 // ---------------------------------------------------------------------------
-function handleApprove(
+async function handleApprove(
   service: OrchestrationService,
   cmd: Extract<RunCommand, { kind: 'approve' }>,
   env: NodeJS.ProcessEnv,
-): CommandOutput {
+): Promise<CommandOutput> {
+  try {
+    await service.assertOrPinLegacyCleanWorkspace(cmd.runId);
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) {
+      return workspaceRefusalOutput('approve', error, cmd.runId);
+    }
+    throw error;
+  }
+  const applyApproval = async (
+    input: Parameters<OrchestrationService['approve']>[1],
+    text: IngestText,
+  ): Promise<CommandOutput> => {
+    try {
+      return ingestOutput('approve', cmd.runId, await service.approve(cmd.runId, input), text);
+    } catch (error) {
+      if (error instanceof WorkspaceDriftError) {
+        return workspaceRefusalOutput('approve', error, cmd.runId);
+      }
+      throw error;
+    }
+  };
   // W1-F3: approval BINDS execution to the drafted spec. When `start` (or a
   // completed revise round) persisted a draft, the approved hash MUST be that
   // draft's hash — a supplied --spec-hash is validated against it, an omitted
@@ -743,7 +838,7 @@ function handleApprove(
     // Bind the REAL draft hash when a draft exists (W1-F3); the synthetic
     // hash remains only for pure-unit runs that never drafted a spec.
     const hash = draft?.specHash ?? cmd.specHash ?? toSpecHash(`test-approve:${cmd.specVersionId}`);
-    return ingestOutput('approve', cmd.runId, service.approve(cmd.runId, { specVersionId: cmd.specVersionId, specHash: hash }), {
+    return applyApproval({ specVersionId: cmd.specVersionId, specHash: hash }, {
       appliedText: `TEST approval applied (HARNESS_TEST_MODE=1) for ${cmd.specVersionId} [hash ${hash}]; run -> approved.`,
       rejectedHint: 'approval is legal only while awaiting_approval (T1).',
       extra: { specVersionId: cmd.specVersionId, specHash: hash, mode: 'test' },
@@ -787,7 +882,7 @@ function handleApprove(
       );
     }
     const hash = cmd.specHash ?? draft.specHash; // omitted --spec-hash binds the draft hash
-    return ingestOutput('approve', cmd.runId, service.approve(cmd.runId, { specVersionId: cmd.specVersionId, specHash: hash }), {
+    return applyApproval({ specVersionId: cmd.specVersionId, specHash: hash }, {
       appliedText: `approved ${cmd.specVersionId} [hash ${hash}]; run -> approved.`,
       rejectedHint: 'approval is legal only while awaiting_approval (T1).',
       extra: { specVersionId: cmd.specVersionId, specHash: hash, mode: 'human' },
@@ -801,7 +896,7 @@ function handleApprove(
       '(HARNESS_TEST_MODE=1) for automated acceptance.';
     return finish('approve', { runId: cmd.runId, error: 'spec_hash_required', detail: text }, text, 2);
   }
-  return ingestOutput('approve', cmd.runId, service.approve(cmd.runId, { specVersionId: cmd.specVersionId, specHash: cmd.specHash }), {
+  return applyApproval({ specVersionId: cmd.specVersionId, specHash: cmd.specHash }, {
     appliedText: `approved ${cmd.specVersionId} [hash ${cmd.specHash}]; run -> approved.`,
     rejectedHint: 'approval is legal only while awaiting_approval (T1).',
     extra: { specVersionId: cmd.specVersionId, specHash: cmd.specHash, mode: 'human' },
@@ -937,23 +1032,30 @@ async function handleRun(
     service.pinRunBaseCommit(cmd.runId, resolved); // one-time audited legacy pin (transactional)
     baseCommit = resolved;
   }
-  const result = await runImplementVerifyLoop(
-    { service, worktrees, ids: flows.ids, clock: flows.clock },
-    {
-      runId: cmd.runId,
-      assignmentId: asg,
-      baseCommit,
-      implementor: implementorSpec,
-      verifier: verifierSpec,
-      specHash: draft.specHash,
-      specDocument: draft.canonicalSpec,
-      goal: draft.goal,
-      taskScope: `Implement the approved specification end to end: ${draft.goal}`,
-      criteria: draft.criteria,
-      evidence: flows.evidence,
-      ...(flows.runVerification !== undefined ? { runVerificationCommands: flows.runVerification } : {}),
-    },
-  );
+  let result: ImplementVerifyLoopResult;
+  try {
+    await service.assertPinnedCleanWorkspace(cmd.runId);
+    result = await runImplementVerifyLoop(
+      { service, worktrees, ids: flows.ids, clock: flows.clock },
+      {
+        runId: cmd.runId,
+        assignmentId: asg,
+        baseCommit,
+        implementor: implementorSpec,
+        verifier: verifierSpec,
+        specHash: draft.specHash,
+        specDocument: draft.canonicalSpec,
+        goal: draft.goal,
+        taskScope: `Implement the approved specification end to end: ${draft.goal}`,
+        criteria: draft.criteria,
+        evidence: flows.evidence,
+        ...(flows.runVerification !== undefined ? { runVerificationCommands: flows.runVerification } : {}),
+      },
+    );
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) return workspaceRefusalOutput('run', error, cmd.runId);
+    throw error;
+  }
 
   return loopResultOutput('run', service, cmd.runId, result, implementorSpec, verifierSpec);
 }
@@ -1239,8 +1341,32 @@ async function handleResume(
   const reap = service.reapOrphanProcesses();
   const reapExtra =
     reap.entries.length > 0
-      ? { orphanReap: { killed: reap.killedCount, withheld: reap.skippedCount } }
+      ? {
+          orphanReap: {
+            signalSent: reap.signalSentCount,
+            exitPending: reap.exitPendingCount,
+            confirmedGone: reap.confirmedGoneCount,
+            withheld: reap.skippedCount,
+          },
+        }
       : {};
+  const thisRunExitPending = reap.entries.some(
+    (entry) =>
+      (entry.action === 'signal_sent' || entry.action === 'exit_pending') &&
+      entry.runId === cmd.runId,
+  );
+  if (thisRunExitPending) {
+    return withExtraJson(
+      finish(
+        'resume',
+        { runId: cmd.runId, outcome: 'orphan_exit_pending' },
+        `run ${cmd.runId}: orphan cleanup is pending; process-tree exit is not yet confirmed. ` +
+          'No re-entry was started; retry `harness resume` after the process tree is absent.',
+        1,
+      ),
+      reapExtra,
+    );
+  }
 
   const st = service.status(cmd.runId);
   // W2-5 startup reclaim: T9/T12 already landed but the process died before
@@ -1574,6 +1700,13 @@ async function reenterCoordinator(
     const text = `run ${runId}: no run metadata persisted — cannot re-enter the coordinator round.`;
     return finish(kind, { runId, error: 'meta_missing', detail: text }, text, 1);
   }
+  let pinnedWorkspace: Awaited<ReturnType<OrchestrationService['assertOrPinLegacyCleanWorkspace']>>;
+  try {
+    pinnedWorkspace = await service.assertOrPinLegacyCleanWorkspace(runId);
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) return workspaceRefusalOutput(kind, error, runId);
+    throw error;
+  }
   const phase = service.status(runId).phase;
   if (phase === 'awaiting_approval') {
     return finish(
@@ -1608,6 +1741,7 @@ async function reenterCoordinator(
     goal,
     coordinator: meta.coordinator,
     workspacePath: meta.workspacePath,
+    baseCommit: pinnedWorkspace.pinnedSha,
     ...(meta.planningChatEnabled === true ? { enableChat: true } : {}),
     ...(revise !== undefined ? { revise } : {}),
   });
@@ -1615,21 +1749,27 @@ async function reenterCoordinator(
   // `runCoordination` via `toDraft` on the created-phase re-dispatch) — the
   // draft persists BEFORE the final advance, atomically, exactly like the
   // un-paused start/revise paths.
-  const outcome =
-    phase === 'created'
-      ? // The pin-window pause left the round PENDING and the phase at
-        // `created` — the whole coordination dispatch re-drives (W2-3
-        // retryable pending round).
-        await service.runCoordination(runId, runner, (o) => draftFromOutcome(goal, o))
-      : await (async () => {
-          const result = await service.runRole(runId, runner, meta.coordinator, meta.workspacePath, {
-            round: round.round,
-            completionAdvance: { from: 'specifying', to: 'awaiting_approval' },
-            ...(round.inputs !== undefined ? { inputs: round.inputs } : {}),
-          });
-          service.completeCoordinationRound(runId, draftFromOutcome(goal, result));
-          return result;
-        })();
+  let outcome: CoordinatorOutcome;
+  try {
+    outcome =
+      phase === 'created'
+        ? // The pin-window pause left the round PENDING and the phase at
+          // `created` — the whole coordination dispatch re-drives.
+          await service.runCoordination(runId, runner, (o) => draftFromOutcome(goal, o))
+        : await (async () => {
+            const result = await service.runRole(runId, runner, meta.coordinator, meta.workspacePath, {
+              round: round.round,
+              completionAdvance: { from: 'specifying', to: 'awaiting_approval' },
+              ...(round.inputs !== undefined ? { inputs: round.inputs } : {}),
+            });
+            await service.assertPinnedCleanWorkspace(runId);
+            await service.completeCoordinationRound(runId, draftFromOutcome(goal, result));
+            return result;
+          })();
+  } catch (error) {
+    if (error instanceof WorkspaceDriftError) return workspaceRefusalOutput(kind, error, runId);
+    throw error;
+  }
 
   const st = service.status(runId);
   const body = {
@@ -2061,14 +2201,72 @@ function handleSwitchModel(
  * re-enters the run after raising it (the resume guard requires the effective
  * budget to now exceed the exhausted one).
  */
-function handleSetBudget(
+async function handleSetBudget(
   service: OrchestrationService,
+  db: Database,
   cmd: Extract<RunCommand, { kind: 'set_budget' }>,
-): CommandOutput {
+  deps: CommandDeps,
+): Promise<CommandOutput> {
   service.raiseRoleMemoryBudget(cmd.runId, cmd.role, cmd.budgetMb);
   if (cmd.resume === true) {
-    service.resume(cmd.runId);
+    const completedBefore = db.events
+      .listByRun(cmd.runId)
+      .filter((event) => event.type === 'resume_reentry.completed').length;
+    const resumed = service.resume(cmd.runId);
+    if (resumed.status !== 'applied') {
+      const st = service.status(cmd.runId);
+      return finish(
+        'set_budget',
+        {
+          runId: cmd.runId,
+          outcome: 'raised_resume_pending',
+          role: cmd.role,
+          budgetMb: cmd.budgetMb,
+          suspension: st.suspension,
+          phase: st.phase,
+          reentry: 'resume_not_applied',
+          resumeStatus: resumed.status,
+        },
+        `run ${cmd.runId}: raised ${cmd.role} memory budget to ${cmd.budgetMb}MB (audited), ` +
+          `but T12 did not apply (${resumed.status}); the durable raise remains recorded and the round ` +
+          'was not re-entered.',
+        1,
+      );
+    }
+
+    // `--resume` is the one-shot form of `set-budget` followed by `resume`:
+    // after the audited raise and T12, drive the exact same durable re-entry
+    // composition as `harness resume`. Do not call the operation "resumed"
+    // merely because T12 cleared the suspension — the round is only re-entered
+    // once runRole appends `resume_reentry.completed`.
+    const reentry = await driveReentry(service, db, 'set_budget', cmd.runId, deps);
     const st = service.status(cmd.runId);
+    const completedAfter = db.events
+      .listByRun(cmd.runId)
+      .filter((event) => event.type === 'resume_reentry.completed').length;
+    if (completedAfter <= completedBefore) {
+      const reentryState =
+        typeof reentry.json['reentry'] === 'string' ? reentry.json['reentry'] : 'pending';
+      return finish(
+        'set_budget',
+        {
+          runId: cmd.runId,
+          outcome: 'raised_resume_pending',
+          role: cmd.role,
+          budgetMb: cmd.budgetMb,
+          suspension: st.suspension,
+          phase: st.phase,
+          reentry: reentryState,
+          durableRaise: true,
+        },
+        `run ${cmd.runId}: raised ${cmd.role} memory budget to ${cmd.budgetMb}MB (audited) and ` +
+          `applied T12, but the round was NOT re-entered (${reentryState}). ` +
+          'The durable raise and pending re-entry remain recoverable with `harness resume`.\n' +
+          reentry.text,
+        reentry.exitCode,
+      );
+    }
+
     return finish(
       'set_budget',
       {
@@ -2078,10 +2276,15 @@ function handleSetBudget(
         budgetMb: cmd.budgetMb,
         suspension: st.suspension,
         phase: st.phase,
+        reentry: 'completed',
+        ...(reentry.json['outcome'] !== undefined
+          ? { reentryOutcome: reentry.json['outcome'] }
+          : {}),
       },
-      `run ${cmd.runId}: raised ${cmd.role} memory budget to ${cmd.budgetMb}MB (audited) and resumed ` +
-        `(now ${st.suspension}/${st.phase}).`,
-      0,
+      `run ${cmd.runId}: raised ${cmd.role} memory budget to ${cmd.budgetMb}MB (audited); ` +
+        `the resumed round re-entered (now ${st.suspension}/${st.phase}).\n` +
+        reentry.text,
+      reentry.exitCode,
     );
   }
   return finish(

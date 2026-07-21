@@ -112,6 +112,7 @@ interface Harness {
 function buildHarness(opts: {
   readonly memory?: MemoryConfig;
   readonly requestGracefulStop?: (target: WatchdogTarget) => void | Promise<void>;
+  readonly onEvent?: (event: DomainEvent) => void;
   readonly gitOpLease?: GitOpLeaseObserver;
   readonly leaseWaitPollMs?: number;
 }): Harness {
@@ -138,7 +139,10 @@ function buildHarness(opts: {
       gracefulStopCalls.push(target);
       return opts.requestGracefulStop?.(target);
     },
-    onEvent: (event) => events.push(event),
+    onEvent: (event) => {
+      opts.onEvent?.(event);
+      events.push(event);
+    },
   });
   watchdogsToStop.push(watchdog);
   return { watchdog, events, taints, gracefulStopCalls, registry };
@@ -195,6 +199,41 @@ describe('Watchdog: soft warn (§14 75% threshold)', () => {
 });
 
 describe('Watchdog: graceful path at 100% (§14)', () => {
+  it('rolls back graceful_pending when T22 persistence throws, then retries on a later tick', async () => {
+    const child = spawnWithExtraMb(340 - baselineMb);
+    await settle(300);
+    let failPersistence = true;
+    const harness = buildHarness({
+      memory: buildMemoryConfig({ gracefulStopDeadlineMs: 2_000 }),
+      onEvent: (event) => {
+        if (event.type === 'rss.hard_limit' && failPersistence) {
+          failPersistence = false;
+          throw new Error('synthetic T22 persistence failure');
+        }
+      },
+      requestGracefulStop: (target) => {
+        try {
+          process.kill(-target.pgid, 'SIGKILL');
+        } catch {
+          // already gone
+        }
+      },
+    });
+    const target = watchTarget(harness, child);
+
+    const first = await harness.watchdog.sampleOnce(target.generationId).catch((error: unknown) => error);
+    expect(first).toBeInstanceOf(Error);
+    expect(String(first)).toContain('synthetic T22 persistence failure');
+    expect(harness.watchdog.phaseOf(target.generationId)).toBe('normal');
+    expect(harness.events).toEqual([]);
+    expect(harness.gracefulStopCalls).toEqual([]);
+
+    await harness.watchdog.sampleOnce(target.generationId);
+    await waitUntil(() => harness.gracefulStopCalls.length === 1, 2_000);
+    expect(hardLimitEvents(harness.events)).toEqual([{ escalation: 'graceful' }]);
+    await waitUntil(() => !isAliveReal(child.pid!), 2_000);
+  }, 10_000);
+
   it('requests a graceful stop; when it succeeds within the deadline, cleans up with NO taint and NO emergency event', async () => {
     // ~1.13x budget: over 100%, comfortably under the 150% ceiling.
     const child = spawnWithExtraMb(340 - baselineMb);
@@ -295,6 +334,79 @@ describe('Watchdog: immediate hard emergency ceiling (§14 150%)', () => {
     // must-fix 5: supervision is held until the tree is CONFIRMED gone.
     await waitUntil(() => !harness.watchdog.isWatching(target.generationId), 2_000);
   }, 10_000);
+});
+
+describe('Watchdog: ambiguous emergency identity remains supervised (round-5 R2)', () => {
+  it('fails the host waiter after a bound but keeps sampling until whole-tree absence is confirmed', async () => {
+    const generationId = processGenerationId('gen_ambiguous');
+    const target: WatchdogTarget = {
+      runId: runId('run_ambiguous'),
+      generationId,
+      pgid: 91_001,
+      segmentId: segmentId('seg_ambiguous'),
+    };
+    let treePresent = true;
+    const fakePs: PsClient = {
+      sampleProcessTree: (pgid) =>
+        treePresent
+          ? {
+              pgid,
+              rssBytes: 2 * 1024 * 1024,
+              processCount: 1,
+              pids: [pgid],
+              sampledAt: clock.nowIso(),
+            }
+          : undefined,
+      sampleIdentity: () => undefined,
+      isAlive: () => treePresent,
+    };
+    const unconfirmed: unknown[] = [];
+    const confirmed: WatchdogTarget[] = [];
+    const watchdog = new Watchdog({
+      clock,
+      ids: new DeterministicIdFactory(),
+      registry: {
+        signalVerified: () => ({
+          verdict: 'mismatch' as const,
+          observed: {
+            pid: target.pgid,
+            ppid: 1,
+            pgid: target.pgid,
+            startedAt: 'recycled',
+            executablePath: '/other/process',
+          },
+          reason: 'pid was recycled',
+        }),
+      },
+      ps: fakePs,
+      memory: buildMemoryConfig({ budgetMb: 1, gracefulStopDeadlineMs: 25 }),
+      sampleIntervalMs: 10_000,
+      elevatedSampleIntervalMs: 10_000,
+      onEvent: () => {
+        throw new Error('T22 must not persist when identity verification withholds the signal');
+      },
+      onExitUnconfirmed: (_target, error) => unconfirmed.push(error),
+      onExitConfirmed: (confirmedTarget) => {
+        confirmed.push(confirmedTarget);
+      },
+    });
+    watchdogsToStop.push(watchdog);
+    watchdog.watch(target);
+
+    await watchdog.sampleOnce(generationId);
+    expect(watchdog.phaseOf(generationId)).toBe('ambiguous');
+    await waitUntil(() => unconfirmed.length === 1, 1_000);
+    expect(String(unconfirmed[0])).toContain('identity verification withheld emergency signaling');
+    expect(watchdog.isWatching(generationId)).toBe(true);
+    expect(confirmed).toEqual([]);
+
+    // The bounded decision was fail-closed, not a permanent latch. A later
+    // whole-tree absence still confirms exit and retires supervision.
+    treePresent = false;
+    await watchdog.sampleOnce(generationId);
+    expect(confirmed).toEqual([target]);
+    expect(watchdog.isWatching(generationId)).toBe(false);
+  });
 });
 
 describe('Watchdog: kill respects an active git-op lease (§14/§16.2) — waits or taints', () => {
@@ -431,7 +543,7 @@ describe('Watchdog: a throwing sample tick never becomes an unhandled rejection 
 });
 
 describe('Watchdog: identity-gated kill (§14 bullet 1) — even the emergency path never bypasses it', () => {
-  it('an emergency-kill target whose registry record has gone stale is left alive and unwatched-but-unkilled, with no taint', async () => {
+  it('an emergency-kill target whose registry record has gone stale is left alive, supervised, and untainted', async () => {
     const child = spawnWithExtraMb(520 - baselineMb); // ceiling zone
     await settle(300);
     const harness = buildHarness({});
@@ -455,12 +567,15 @@ describe('Watchdog: identity-gated kill (§14 bullet 1) — even the emergency p
     };
     harness.watchdog.watch(target);
 
-    await waitUntil(() => eventTypes(harness.events).includes('rss.hard_limit'), 3_000);
+    await harness.watchdog.sampleOnce(generationId);
     await settle(200);
 
     // The registry withheld the signal (identity mismatch) — the process
     // must still be alive, and no taint was ever recorded for it.
     expect(isAliveReal(child.pid!)).toBe(true);
+    expect(eventTypes(harness.events)).not.toContain('rss.hard_limit');
     expect(harness.taints).toEqual([]);
+    expect(harness.watchdog.phaseOf(generationId)).toBe('ambiguous');
+    expect(harness.watchdog.isWatching(generationId)).toBe(true);
   }, 10_000);
 });

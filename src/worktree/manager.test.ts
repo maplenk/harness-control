@@ -122,6 +122,17 @@ async function withRepoAndManager(
   }
 }
 
+async function createAtHead(
+  repo: TempGitRepo,
+  manager: GitWorktreeManager,
+  assignmentIdValue: AssignmentId,
+) {
+  return manager.createWorktree({
+    assignmentId: assignmentIdValue,
+    baseCommit: gitSha(await repo.headSha()),
+  });
+}
+
 describe('GitWorktreeManager.open (PLAN §16 item 1)', () => {
   it('rejects a directory that is not a git repository', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'harness-not-a-repo-'));
@@ -145,7 +156,7 @@ describe('GitWorktreeManager.createWorktree (PLAN §16 items 1-3)', () => {
       const asg = assignmentId('asg_create');
       const before = await snapshotPrimaryCheckout(repo.dir);
 
-      const handle = await manager.createWorktree({ assignmentId: asg });
+      const handle = await createAtHead(repo, manager, asg);
 
       expect(handle.baseSha).toBe(await repo.headSha());
       expect(handle.branch).toBe('harness/assignment/asg_create');
@@ -169,32 +180,62 @@ describe('GitWorktreeManager.createWorktree (PLAN §16 items 1-3)', () => {
   });
 
   it('throws already_leased when creating twice for the same assignment', async () => {
-    await withRepoAndManager(async (_repo, manager) => {
+    await withRepoAndManager(async (repo, manager) => {
       const asg = assignmentId('asg_dup');
-      await manager.createWorktree({ assignmentId: asg });
-      await expectRejectsWithKind(manager.createWorktree({ assignmentId: asg }), 'already_leased');
+      const baseCommit = gitSha(await repo.headSha());
+      await manager.createWorktree({ assignmentId: asg, baseCommit });
+      await expectRejectsWithKind(manager.createWorktree({ assignmentId: asg, baseCommit }), 'already_leased');
     });
   });
 
-  it('branches from an explicit baseRef, not just HEAD', async () => {
+  it('branches from the exact pinned baseCommit, not live HEAD', async () => {
     await withRepoAndManager(async (repo, manager) => {
       const firstSha = await repo.headSha();
       await repo.writeFile('second.txt', 'more content\n');
       await repo.commitAll('second commit');
 
       const asg = assignmentId('asg_baseref');
-      const handle = await manager.createWorktree({ assignmentId: asg, baseRef: firstSha });
+      const handle = await manager.createWorktree({ assignmentId: asg, baseCommit: gitSha(firstSha) });
       expect(handle.baseSha).toBe(firstSha);
       expect(existsSync(path.join(handle.worktreePath, 'second.txt'))).toBe(false);
+    });
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['symbolic', 'HEAD'],
+    ['short', 'deadbeef'],
+    ['case-mismatched', 'A'.repeat(40)],
+  ])('rejects a %s base even when the caller bypasses TypeScript', async (_label, supplied) => {
+    await withRepoAndManager(async (_repo, manager) => {
+      await expectRejectsWithKind(
+        manager.createWorktree({
+          assignmentId: assignmentId(`asg_invalid_${_label}`),
+          baseCommit: supplied,
+        } as never),
+        'invalid_base_commit',
+      );
+    });
+  });
+
+  it('rejects a full SHA that does not resolve to a commit', async () => {
+    await withRepoAndManager(async (_repo, manager) => {
+      await expectRejectsWithKind(
+        manager.createWorktree({
+          assignmentId: assignmentId('asg_unresolvable_base'),
+          baseCommit: gitSha('f'.repeat(40)),
+        }),
+        'git_command_failed',
+      );
     });
   });
 });
 
 describe('GitWorktreeManager lease lifecycle', () => {
   it('releaseLease releases without deleting the worktree; reacquireLease grants it back', async () => {
-    await withRepoAndManager(async (_repo, manager) => {
+    await withRepoAndManager(async (repo, manager) => {
       const asg = assignmentId('asg_lease');
-      const created = await manager.createWorktree({ assignmentId: asg });
+      const created = await createAtHead(repo, manager, asg);
       expect(created.leased).toBe(true);
 
       manager.releaseLease(asg);
@@ -223,7 +264,7 @@ describe('GitWorktreeManager lease lifecycle', () => {
   it('removeWorktree deletes the worktree, clears bookkeeping, and never touches the primary checkout', async () => {
     await withRepoAndManager(async (repo, manager) => {
       const asg = assignmentId('asg_remove');
-      const handle = await manager.createWorktree({ assignmentId: asg });
+      const handle = await createAtHead(repo, manager, asg);
       const before = await snapshotPrimaryCheckout(repo.dir);
 
       await manager.removeWorktree(asg);
@@ -238,7 +279,7 @@ describe('GitWorktreeManager lease lifecycle', () => {
   it('reattach re-registers a worktree from persisted data after a simulated process restart', async () => {
     await withRepoAndManager(async (repo, manager) => {
       const asg = assignmentId('asg_reattach');
-      const created = await manager.createWorktree({ assignmentId: asg });
+      const created = await createAtHead(repo, manager, asg);
 
       // Simulate a fresh orchestrator process: a brand new manager instance
       // with empty in-memory bookkeeping, pointed at the SAME repo.
@@ -283,7 +324,7 @@ describe('GitWorktreeManager lease lifecycle', () => {
   it('reattach carrying prior taint flags refuses reuse until validated (§16.3)', async () => {
     await withRepoAndManager(async (repo, manager) => {
       const asg = assignmentId('asg_reattach_tainted');
-      const created = await manager.createWorktree({ assignmentId: asg });
+      const created = await createAtHead(repo, manager, asg);
       manager.releaseLease(asg);
 
       const restarted = await GitWorktreeManager.open({ primaryRepoRoot: repo.dir, clock: new ManualClock() });
@@ -323,7 +364,8 @@ describe('mutex race: parallel add/remove attempts serialize (real temp git repo
       })();
 
       const before = await snapshotPrimaryCheckout(repo.dir);
-      const handles = await Promise.all(ids.map((id) => manager.createWorktree({ assignmentId: id })));
+      const baseCommit = gitSha(await repo.headSha());
+      const handles = await Promise.all(ids.map((id) => manager.createWorktree({ assignmentId: id, baseCommit })));
       settled = true;
       await poll;
 
@@ -365,7 +407,7 @@ describe('mutex race: parallel add/remove attempts serialize (real temp git repo
       const survivor1 = assignmentId('asg_survivor_1');
       const toRemove = assignmentId('asg_to_remove');
       for (const id of [survivor0, survivor1, toRemove]) {
-        await manager.createWorktree({ assignmentId: id });
+        await createAtHead(repo, manager, id);
       }
 
       const before = await snapshotPrimaryCheckout(repo.dir);
@@ -374,8 +416,8 @@ describe('mutex race: parallel add/remove attempts serialize (real temp git repo
 
       const results = await Promise.allSettled([
         manager.removeWorktree(toRemove),
-        manager.createWorktree({ assignmentId: fresh0 }),
-        manager.createWorktree({ assignmentId: fresh1 }),
+        createAtHead(repo, manager, fresh0),
+        createAtHead(repo, manager, fresh1),
       ]);
       for (const result of results) expect(result.status).toBe('fulfilled');
 
@@ -401,13 +443,13 @@ describe('GitWorktreeManager.validate — §16.3 taint + validation (PLAN §19 t
   ): Promise<void> {
     await withRepoAndManager(async (repo, manager) => {
       const asg = assignmentId('asg_validate');
-      await manager.createWorktree({ assignmentId: asg });
+      await createAtHead(repo, manager, asg);
       await run(repo, manager, asg);
     });
   }
 
   it('removes a stale index.lock, and does so within the SAME mutex that serializes worktree add/remove', async () => {
-    await withValidatedWorktree(async (_repo, manager, asg) => {
+    await withValidatedWorktree(async (repo, manager, asg) => {
       const handle = manager.handleFor(asg);
       if (!handle) throw new Error('expected a handle');
       const gitDir = (await runGit(['rev-parse', '--absolute-git-dir'], handle.worktreePath)).stdout.trim();
@@ -430,7 +472,7 @@ describe('GitWorktreeManager.validate — §16.3 taint + validation (PLAN §19 t
         }
       })();
 
-      const [result] = await Promise.all([manager.validate(asg), manager.createWorktree({ assignmentId: other })]);
+      const [result] = await Promise.all([manager.validate(asg), createAtHead(repo, manager, other)]);
       settled = true;
       await poll;
 

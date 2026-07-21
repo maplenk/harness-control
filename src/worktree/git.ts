@@ -104,6 +104,38 @@ export async function statusPorcelain(worktreePath: string): Promise<string> {
 }
 
 /**
+ * Read HEAD and porcelain status without accepting a cached-HEAD race. Git
+ * does not expose a transaction spanning rev-parse and status, so bracket the
+ * status read with two HEAD resolutions; callers must refuse `stable:false`.
+ */
+export interface StableHeadReadDeps {
+  readonly resolveSha?: (dir: string, ref: string) => Promise<string>;
+  readonly statusPorcelain?: (dir: string) => Promise<string>;
+}
+
+export async function readStableHeadAndStatus(
+  worktreePath: string,
+  deps: StableHeadReadDeps = {},
+): Promise<{
+  readonly headBefore: string;
+  readonly headAfter: string;
+  readonly statusPorcelain: string;
+  readonly stable: boolean;
+}> {
+  const resolve = deps.resolveSha ?? resolveSha;
+  const readStatus = deps.statusPorcelain ?? statusPorcelain;
+  const headBefore = await resolve(worktreePath, 'HEAD');
+  const status = await readStatus(worktreePath);
+  const headAfter = await resolve(worktreePath, 'HEAD');
+  return {
+    headBefore,
+    headAfter,
+    statusPorcelain: status,
+    stable: headBefore === headAfter,
+  };
+}
+
+/**
  * Parse `git status --porcelain` output into the touched paths. Rename/copy
  * lines (`XY orig -> dest`) report the DESTINATION path; git's quoting of
  * unusual paths is left verbatim (the list feeds human-facing blocker text,

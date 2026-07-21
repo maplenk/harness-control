@@ -123,7 +123,36 @@ export type ChildStatus = (typeof CHILD_STATUSES)[number];
 
 /** Why a durable stop-intent was recorded for the active generation (W2-3
  * pause spine causes; T18's terminal stop needs no intent — it is final). */
-export type StopIntentCause = 'limit_pause' | 'unknown_error_pause' | 'user_pause';
+export const STOP_INTENT_CAUSES = [
+  'limit_pause',
+  'unknown_error_pause',
+  'user_pause',
+  'resource_exhaustion',
+] as const;
+export type StopIntentCause = (typeof STOP_INTENT_CAUSES)[number];
+
+/**
+ * The confirmation action for every durable child-stop intent. Keep this
+ * switch exhaustive: adding a cause must fail typecheck until its stop
+ * confirmation semantics are chosen deliberately.
+ */
+export function stopIntentConfirmation(
+  cause: StopIntentCause,
+): 'confirm_only' | 'pause_user' | 'resource_exhaustion' {
+  switch (cause) {
+    case 'limit_pause':
+    case 'unknown_error_pause':
+      return 'confirm_only';
+    case 'user_pause':
+      return 'pause_user';
+    case 'resource_exhaustion':
+      return 'resource_exhaustion';
+    default: {
+      const exhaustive: never = cause;
+      return exhaustive;
+    }
+  }
+}
 
 /**
  * The run's child process, tracked BY GENERATION (W2-1): `child.spawned`

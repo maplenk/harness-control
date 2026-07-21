@@ -152,13 +152,22 @@ export interface RegisterProcessInput {
 
 export interface ReapResultEntry {
   readonly generationId: ProcessGenerationId;
-  readonly action: 'killed' | 'skipped';
+  readonly runId?: RunId;
+  /** `signal_sent` is deliberately not exit confirmation. `exit_pending`
+   * means the leader is gone but descendants still occupy its recorded pgid;
+   * no additional signal is sent without a verifiable leader identity. The
+   * durable record stays owned until a later verification observes the whole
+   * process group absent. `confirmed_gone` also retains ownership: the service
+   * releases it only after the matching durable recovery outcome commits. */
+  readonly action: 'signal_sent' | 'exit_pending' | 'confirmed_gone' | 'skipped';
   readonly verification: IdentityVerification;
 }
 
 export interface ReapSummary {
   readonly entries: readonly ReapResultEntry[];
-  readonly killedCount: number;
+  readonly signalSentCount: number;
+  readonly exitPendingCount: number;
+  readonly confirmedGoneCount: number;
   readonly skippedCount: number;
   /**
    * W4-0: records left completely untouched because their owning orchestrator
@@ -207,7 +216,11 @@ function defaultSendSignal(pgid: number, signal: NodeJS.Signals): void {
  * registry.
  */
 export interface VerifiedSignaler {
-  signalVerified(generationId: ProcessGenerationId, signal: NodeJS.Signals): IdentityVerification;
+  signalVerified(
+    generationId: ProcessGenerationId,
+    signal: NodeJS.Signals,
+    options?: { readonly beforeSignal?: () => void },
+  ): IdentityVerification;
 }
 
 export class ProcessRegistry implements VerifiedSignaler {
@@ -337,10 +350,18 @@ export class ProcessRegistry implements VerifiedSignaler {
    * surface it to an operator) without ever having to guess whether a kill
    * actually happened.
    */
-  signalVerified(generationId: ProcessGenerationId, signal: NodeJS.Signals): IdentityVerification {
+  signalVerified(
+    generationId: ProcessGenerationId,
+    signal: NodeJS.Signals,
+    options: { readonly beforeSignal?: () => void } = {},
+  ): IdentityVerification {
     const record = this.#store.get(generationId);
-    const verification = record ? this.#compare(record, this.#ps.sampleIdentity(record.pid)) : { verdict: 'gone' as const };
+    const verification = record ? this.#verifyWithNonce(record) : { verdict: 'gone' as const };
     if (verification.verdict === 'match' && record) {
+      // The hook runs only AFTER identity verification and synchronously
+      // BEFORE the signal. The RSS watchdog uses it to make its durable stop
+      // intent crash-safe without ever claiming termination for a mismatch.
+      options.beforeSignal?.();
       this.#sendSignal(record.pgid, signal);
     } else if (record) {
       this.#raiseAlert(record, verification, 'signal', signal);
@@ -382,12 +403,18 @@ export class ProcessRegistry implements VerifiedSignaler {
   }
 
   /**
-   * Startup orphan reaping (§14): verify every persisted record; SIGKILL
-   * (or `signal`) the process group ONLY for identity-verified matches —
-   * removed from the registry once handled. Mismatched/gone records are
-   * left exactly as they are (never killed, never silently dropped) and
-   * reported back via `onAlert` + the returned summary, so a caller can
-   * decide what stale bookkeeping means for its own recovery flow.
+   * Startup orphan reaping (§14): verify every persisted record and SIGKILL
+   * (or `signal`) ONLY an identity-verified leader. Sending a signal is NOT
+   * proof of exit: the record remains durable and the result is
+   * `signal_sent` until a later invocation observes the WHOLE process group
+   * absent. A missing leader pid is insufficient: descendants can remain in
+   * the recorded pgid. That state is reported as `exit_pending` without an
+   * additional signal because every signal still requires a full leader
+   * identity match.
+   * `confirmed_gone` is only a report; ownership remains durable until the
+   * service commits the matching recovery outcome and explicitly releases it.
+   * Ambiguous identity is retained and reported through `onAlert` + the
+   * returned summary.
    *
    * W2-6: when an `envNonce` verifier is configured, a ps-identity match is
    * additionally re-verified against the recorded `HARNESS_SPAWN_ID` nonce
@@ -412,16 +439,62 @@ export class ProcessRegistry implements VerifiedSignaler {
       const verification = this.#verifyWithNonce(record);
       if (verification.verdict === 'match') {
         this.#sendSignal(record.pgid, signal);
-        this.#store.remove(record.generationId);
-        entries.push({ generationId: record.generationId, action: 'killed', verification });
+        entries.push({
+          generationId: record.generationId,
+          ...(record.runId !== undefined ? { runId: record.runId } : {}),
+          action: 'signal_sent',
+          verification,
+        });
+      } else if (verification.verdict === 'gone') {
+        // The identity sample covers only the original group leader. Its exit
+        // does NOT prove the child process tree is gone: descendants retain
+        // the pgid after the leader exits. A live group with this pgid is the
+        // same group (a new group cannot be created with the dead leader's pid
+        // while members of the old group still exist). Retain ownership and
+        // report it pending, but do not signal: the global safety invariant is
+        // that EVERY signal requires a full live-leader identity match.
+        const tree = this.#ps.sampleProcessTree(record.pgid);
+        if (tree !== undefined) {
+          entries.push({
+            generationId: record.generationId,
+            ...(record.runId !== undefined ? { runId: record.runId } : {}),
+            action: 'exit_pending',
+            verification,
+          });
+        } else {
+          // R1: reporting confirmed absence must not itself release the only
+          // retry record. The service removes it only AFTER its durable stop /
+          // recovery transaction succeeds. If that transaction throws, the
+          // next startup reap returns confirmed_gone again and can retry.
+          entries.push({
+            generationId: record.generationId,
+            ...(record.runId !== undefined ? { runId: record.runId } : {}),
+            action: 'confirmed_gone',
+            verification,
+          });
+        }
       } else {
         this.#raiseAlert(record, verification, 'reap', signal);
-        entries.push({ generationId: record.generationId, action: 'skipped', verification });
+        // A stale/recycled leader identity forbids signaling, but it does not
+        // make the registry record permanent. Independently sample the
+        // recorded process group: if no member remains, whole-tree absence is
+        // sufficient to reconcile the old generation without touching the
+        // unrelated process that caused the mismatch. A present group stays
+        // skipped/fail-closed exactly as before.
+        const tree = this.#ps.sampleProcessTree(record.pgid);
+        entries.push({
+          generationId: record.generationId,
+          ...(record.runId !== undefined ? { runId: record.runId } : {}),
+          action: tree === undefined ? 'confirmed_gone' : 'skipped',
+          verification,
+        });
       }
     }
     return {
       entries,
-      killedCount: entries.filter((e) => e.action === 'killed').length,
+      signalSentCount: entries.filter((e) => e.action === 'signal_sent').length,
+      exitPendingCount: entries.filter((e) => e.action === 'exit_pending').length,
+      confirmedGoneCount: entries.filter((e) => e.action === 'confirmed_gone').length,
       skippedCount: entries.filter((e) => e.action === 'skipped').length,
       ownerLiveSkippedCount: ownerLiveSkipped,
     };

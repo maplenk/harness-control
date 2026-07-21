@@ -16,7 +16,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock } from '../lib/clock.js';
 import { DeterministicIdFactory } from '../lib/id-factory.js';
-import { assignmentId, processGenerationId, runId } from '../domain/ids.js';
+import { assignmentId, gitSha, processGenerationId, runId } from '../domain/ids.js';
 import type { DomainEvent } from '../domain/events.js';
 import { GitWorktreeManager, WorktreeError } from '../worktree/index.js';
 import { makeTempGitRepo, type TempGitRepo } from '../worktree/test-support.js';
@@ -54,8 +54,9 @@ function stubSignaler(): { signaler: VerifiedSignaler; readonly calls: string[] 
   return {
     calls,
     signaler: {
-      signalVerified: (generationId, signal) => {
+      signalVerified: (generationId, signal, options) => {
         calls.push(`${String(generationId)}:${signal}`);
+        options?.beforeSignal?.();
         return {
           verdict: 'match',
           observed: { pid: 12345, ppid: 1, pgid: 12345, startedAt: 'x', executablePath: 'node' },
@@ -94,7 +95,7 @@ describe('GitWorktreeManager satisfies the watchdog structural interfaces (§14/
       cleanups.push(() => repo.cleanup());
       const manager = await GitWorktreeManager.open({ primaryRepoRoot: repo.dir, clock });
       const asg = assignmentId('asg_watchdog_kill');
-      const handle = await manager.createWorktree({ assignmentId: asg });
+      const handle = await manager.createWorktree({ assignmentId: asg, baseCommit: gitSha(await repo.headSha()) });
       cleanups.push(async () => {
         await manager.removeWorktree(asg).catch(() => undefined);
       });

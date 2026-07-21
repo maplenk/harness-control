@@ -103,8 +103,7 @@ export interface RoleSession {
  */
 export type RoleRoundOutcome = 'completed' | 'no_deliverable';
 
-export interface RoleRunner<TResult = unknown> {
-  readonly role: RoleName;
+interface RoleRunnerBase<TResult> {
   /**
    * Exact shell commands this flow must execute as evidence. Native Claude
    * uses these to build narrow `Bash(command)` permissions; other transports
@@ -112,12 +111,26 @@ export interface RoleRunner<TResult = unknown> {
    */
   readonly allowedShellCommands?: readonly string[];
   run(session: RoleSession): Promise<TResult>;
+}
+
+export interface ImplementorRoleRunner<TResult = unknown> extends RoleRunnerBase<TResult> {
+  readonly role: 'implementor';
   /**
    * F2: adjudicate the round's deliverable AT completion time. `runRole` calls
-   * this with the flow's result and persists the returned stage in the SAME
-   * write that would have marked the round `completed` — so the decision is
-   * atomic with round completion (no `completed`-then-overwrite crash window).
-   * Absent = always `completed` (coordinator/verifier rounds).
+   * this with the flow's result for every implementor invocation, including a
+   * dispatchless/standalone call. Dispatched rounds persist the returned stage
+   * in the SAME write that would have marked the round `completed`; standalone
+   * calls still reject `no_deliverable` before returning.
    */
-  adjudicateRoundOutcome?(result: TResult): Promise<RoleRoundOutcome> | RoleRoundOutcome;
+  adjudicateRoundOutcome(result: TResult): Promise<RoleRoundOutcome> | RoleRoundOutcome;
 }
+
+export interface ReadOnlyRoleRunner<TResult = unknown> extends RoleRunnerBase<TResult> {
+  readonly role: Exclude<RoleName, 'implementor'>;
+  readonly adjudicateRoundOutcome?: never;
+}
+
+/** Role-discriminated contract: implementors cannot omit deliverable adjudication. */
+export type RoleRunner<TResult = unknown> =
+  | ImplementorRoleRunner<TResult>
+  | ReadOnlyRoleRunner<TResult>;

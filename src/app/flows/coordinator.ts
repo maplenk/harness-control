@@ -51,7 +51,7 @@ import type { AcceptanceCriterion, Artifact, SpecVersion } from '../../domain/en
 import type { SessionUpdate } from '../../adapters/spi.js';
 import type { ArtifactSink } from '../../artifacts/store.js';
 import type { Profile } from '../../config/profile.js';
-import type { RoleRunner, RoleSession } from '../role-runner.js';
+import type { ReadOnlyRoleRunner, RoleSession } from '../role-runner.js';
 import type {
   PlanningChatFactory,
   PlanningChatMessage,
@@ -309,7 +309,7 @@ export interface CoordinatorRunnerDeps {
   /** Read-only workspace exploration context injected on the first turn (§15). */
   readonly explorationContext?: string;
   /** Base commit the exploration was observed at (§15 binding). */
-  readonly baseCommit?: GitSha;
+  readonly baseCommit: GitSha;
   /** Present for T2 `spec revise` re-drives; absent for the initial draft. */
   readonly revise?: CoordinatorReviseContext;
   /** Bounded validation re-prompt rounds (default 3). */
@@ -398,7 +398,7 @@ type SpecAssessment =
  * (initial draft) or `runRole` at phase `specifying` (a T2 revise re-drive);
  * the service owns the surrounding provider lifecycle and phase advances.
  */
-export class CoordinatorRunner implements RoleRunner<CoordinatorOutcome> {
+export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome> {
   readonly role = 'coordinator' as const;
   readonly #deps: CoordinatorRunnerDeps;
   readonly #maxRounds: number;
@@ -406,6 +406,11 @@ export class CoordinatorRunner implements RoleRunner<CoordinatorOutcome> {
   readonly #chatWaitSeconds: number;
 
   constructor(deps: CoordinatorRunnerDeps) {
+    if (typeof deps.baseCommit !== 'string' || !/^[0-9a-f]{40}$/.test(deps.baseCommit)) {
+      throw new TypeError(
+        `CoordinatorRunner requires baseCommit to be an exact 40-character lowercase commit SHA; got ${JSON.stringify(deps.baseCommit)}`,
+      );
+    }
     this.#deps = deps;
     this.#maxRounds = Math.max(1, deps.maxRounds ?? DEFAULT_MAX_SPEC_ROUNDS);
     this.#maxChatTurns = Math.max(2, deps.maxChatTurns ?? DEFAULT_MAX_CHAT_TURNS);
@@ -649,7 +654,7 @@ export class CoordinatorRunner implements RoleRunner<CoordinatorOutcome> {
       // §15: exploration findings stored bound to the observed source commit.
       const explorationDoc = JSON.stringify(
         {
-          baseCommit: this.#deps.baseCommit !== undefined ? String(this.#deps.baseCommit) : null,
+          baseCommit: String(this.#deps.baseCommit),
           notes: doc.explorationNotes,
         },
         null,

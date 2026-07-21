@@ -68,6 +68,16 @@ current source, never a stale local `dist/`. CI should still assert
 
 Every command accepts `--json` for a stable machine-readable payload.
 
+`start` requires the primary workspace to be a clean Git checkout with a
+resolvable full HEAD commit. That commit is pinned for the run. The coordinator
+still reads the primary checkout, so any tracked, staged, modified, or
+untracked path—or any HEAD change—during coordination, revision, re-entry, or
+approval invalidates the result with a structured workspace-drift refusal.
+Restore the checkout to the pinned clean state and retry the same round.
+Ignored build/cache files are outside this policy. The engine deliberately
+uses strict rejection here; it does not create or manage a detached coordinator
+checkout.
+
 ```sh
 # 1. Diagnose the environment: adapter binaries + versions, auth (validated
 #    evidence only — key presence never reports as "supported"), host
@@ -130,6 +140,12 @@ harness-orchestrator status RUN_ID --json
 #    live role flow records a durable interrupt so the run stays resumable
 #    (never stranded); a terminal composition breach stays terminal.
 harness-orchestrator resume RUN_ID
+
+# If RSS supervision paused the run, raise that role's audited memory budget
+# and drive the same durable resume/re-entry path in one command. Success is
+# reported only after re-entry actually occurs.
+harness-orchestrator set-budget RUN_ID \
+  --role implementor --memory-budget-mb 2048 --resume
 ```
 
 Also available: `pause` (stop at a safe point), `cancel` (idempotent
@@ -374,6 +390,44 @@ automation is possible only through `--test-approve` with
   `--test-approve` seam refuses to run unless `HARNESS_TEST_MODE=1` and, when
   a draft exists, binds the real draft hash. `run` refuses to execute if the
   approved hash does not match the current draft.
+- **Source pinning is fail-closed.** New runs are not created from non-Git,
+  unborn, dirty, unresolvable, or drifting workspaces. Every fresh
+  implementation worktree is created from the run's branded full commit SHA;
+  symbolic, short, missing, or mismatched bases are rejected. The service
+  itself guards coordination completion, revision/re-entry, approval, and
+  worktree admission, closing direct-caller and in-check HEAD/status races.
+  Both standalone and loop-driven implementation compare their supplied base
+  exactly with the durable run pin before creating a worktree. There is no
+  public production legacy-run creator; persisted legacy runs retain only the
+  one-time audited pin compatibility path, modeled in tests by a production-
+  build-excluded fixture. This is deliberately reject-all-drift in the primary
+  checkout — no detached-checkout lifecycle subsystem exists.
+- **RSS shutdown is durable and exit-confirmed.** The watchdog persists a
+  generation-bound stop intent before a verified emergency signal, keeps
+  sampling while graceful cleanup is pending, and retains supervision and
+  concurrency ownership until observed WHOLE-PGID absence confirms an
+  identity-backed exit. Successful transport disposal triggers a resample but
+  is not confirmation: adapters may return after leader exit while descendants
+  remain. Opaque handles without a process identity retain their owned-disposal
+  contract because there is no PGID to sample. Signal delivery alone never
+  confirms exit: startup recovery
+  retains registry ownership and withholds re-entry until a later observation
+  proves the entire process group gone. RSS and provider-limit stops share one
+  generation barrier; it commits the durable terminal outcome before cleanup
+  or reservation/concurrency release, and retries failures while capacity
+  remains held. A late absent PGID after an abnormal/no-T22 ambiguity timeout
+  records a breaker-exempt recovery interrupt before releasing ownership.
+  Startup identity mismatch still withholds signaling, but an independently
+  absent recorded PGID is reconciled instead of permanently skipped. Startup
+  stop/recovery processing reloads durable state before removing that registry
+  record; a rejected T17 that leaves the generation live retains the record
+  for retry.
+  Identityless cancel, confirmation, and outcome-retry timers
+  stay referenced because no registry recovery route exists. Failed disposal
+  without a captured identity also fails closed, while a failed graceful-
+  intent write rolls back for retry. A rejected T22 write launches no cancel,
+  dispose, signal, or taint side effect. Identity mismatch never records a
+  false resource-exhaustion outcome.
 - **Child-harness isolation (H-1).** Codex children run with an isolated
   `CODEX_HOME` carrying auth material only, plus orchestrator-owned config
   that routes approvals to the orchestrator — host-level provider config can

@@ -17,7 +17,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { assignmentId, criterionId, specHash } from '../../domain/ids.js';
+import { assignmentId, criterionId, gitSha, specHash } from '../../domain/ids.js';
 import { DeterministicIdFactory } from '../../lib/id-factory.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
 import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
@@ -35,11 +35,13 @@ import {
   type PromptResult,
 } from '../../adapters/index.js';
 import {
+  NoDeliverableError,
   OrchestrationService,
   type RoleAdapterFactory,
   type RoleAdapterOptions,
 } from '../service.js';
 import type { RoleSession } from '../role-runner.js';
+import { createRunFixture } from '../test-support.js';
 import {
   ImplementorFlow,
   VerificationRunnerEnvError,
@@ -200,7 +202,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
       writes: [{ relPath: 'feature.txt', content: 'the new feature flag\n' }],
       turns: [REPORTING_TURN],
     });
-    const { runId } = service.createRun({
+    const { runId } = createRunFixture(service, {
       goal: 'Add a --feature flag to the CLI',
       workspacePath: r.dir,
       coordinator: CLAUDE_LOW,
@@ -213,7 +215,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
       runId,
       assignmentId: asg,
       implementor: CODEX_IMPLEMENTOR,
-      baseRef: 'HEAD', context: baseContext(),
+      baseCommit: gitSha(await r.headSha()), context: baseContext(),
       options: { runVerification: PASS_VERIFY },
     };
     const result = await runImplementor({ service, worktrees: wt }, input);
@@ -277,22 +279,112 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
     await wt.removeWorktree(asg);
   });
 
+  it('standalone runImplementor persists and rejects a no-deliverable verdict', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [],
+      turns: [{ result: { stopReason: 'refusal' } }],
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const asg = assignmentId('asg_impl_standalone_refusal');
+
+    const error = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(NoDeliverableError);
+    expect(service.getRoleRound(runId)).toMatchObject({
+      role: 'implementor',
+      round: 1,
+      assignmentId: asg,
+      stage: 'no_deliverable',
+    });
+    await wt.removeWorktree(asg);
+  });
+
   it('must-fix 4: runImplementor REFUSES a fresh worktree with NO pinned base (never live HEAD)', async () => {
     const { service, worktrees: wt, repo: r } = await setup({ writes: [], turns: [REPORTING_TURN] });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const err: unknown = await runImplementor(
       { service, worktrees: wt },
       {
         runId,
         assignmentId: assignmentId('asg_impl_nobase'),
         implementor: CODEX_IMPLEMENTOR,
-        // NO baseCommit and NO baseRef → refuse (never branch from live HEAD).
+        // Runtime callers can still bypass the required TypeScript field.
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      } as never,
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(WorktreeError);
+    expect(String(err)).toMatch(/requires baseCommit .*exact 40-character/i);
+  });
+
+  it('F5: standalone runImplementor refuses a valid SHA that differs from the run pin before creating a worktree', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({ writes: [], turns: [REPORTING_TURN] });
+    const pinned = gitSha(await r.headSha());
+    const { runId } = createRunFixture(service, {
+      goal: 'g',
+      workspacePath: r.dir,
+      coordinator: CLAUDE_LOW,
+      baseCommit: pinned,
+    });
+    await r.writeFile('later.txt', 'another commit\n');
+    const other = gitSha(await r.commitAll('later'));
+    await r.run(['reset', '--hard', pinned]);
+    const asg = assignmentId('asg_impl_wrong_run_base');
+
+    const err: unknown = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: other,
         context: baseContext(),
         options: { runVerification: PASS_VERIFY },
       },
     ).catch((e: unknown) => e);
+
     expect(err).toBeInstanceOf(WorktreeError);
-    expect(String(err)).toMatch(/pinned baseCommit .*REQUIRED/i);
+    expect(err).toMatchObject({ kind: 'invalid_base_commit' });
+    expect(String(err)).toContain(`does not match run ${runId} pinned base ${pinned}`);
+    expect(wt.handleFor(asg)).toBeUndefined();
+  });
+
+  it('F5: standalone runImplementor refuses primary-checkout dirt before creating a worktree', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({ writes: [], turns: [REPORTING_TURN] });
+    const pinned = gitSha(await r.headSha());
+    const { runId } = createRunFixture(service, {
+      goal: 'g',
+      workspacePath: r.dir,
+      coordinator: CLAUDE_LOW,
+      baseCommit: pinned,
+    });
+    await r.writeFile('operator-scratch.txt', 'dirty\n');
+    const asg = assignmentId('asg_impl_dirty_primary');
+
+    const err: unknown = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: pinned,
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    ).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ kind: 'workspace_dirty' });
+    expect(wt.handleFor(asg)).toBeUndefined();
   });
 
   it('captures a FAILING verification command without hiding it, and still commits the work', async () => {
@@ -300,7 +392,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
       writes: [{ relPath: 'partial.txt', content: 'work in progress\n' }],
       turns: [REPORTING_TURN],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const failing: VerificationRunner = async () => ({
       exitCode: 1,
       stdout: '',
@@ -315,7 +407,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         runId,
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
-        baseRef: 'HEAD',
+        baseCommit: gitSha(await r.headSha()),
         context: baseContext({ verificationCommands: ['run-the-suite'] }),
         options: { runVerification: failing },
       },
@@ -338,7 +430,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
       writes: [{ relPath: 'feature.txt', content: 'the real work\n' }],
       turns: [REPORTING_TURN],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     // Simulates a build-style self-check that writes into the worktree.
     const mutating: VerificationRunner = async (command, cwd) => {
       fs.writeFileSync(path.join(cwd, 'generated.lock'), 'produced by the verification build\n');
@@ -352,7 +444,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         runId,
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
-        baseRef: 'HEAD', context: baseContext(),
+        baseCommit: gitSha(await r.headSha()), context: baseContext(),
         options: { runVerification: mutating },
       },
     );
@@ -371,7 +463,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
 
   it('honestly reports an empty implementation when the agent writes nothing', async () => {
     const { service, worktrees: wt, repo: r } = await setup({ writes: [], turns: [REPORTING_TURN] });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const asg = assignmentId('asg_impl_empty');
 
     const before = await snapshotPrimaryCheckout(r.dir);
@@ -381,7 +473,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         runId,
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
-        baseRef: 'HEAD', context: baseContext(),
+        baseCommit: gitSha(await r.headSha()), context: baseContext(),
         options: { runVerification: PASS_VERIFY },
       },
     );
@@ -400,12 +492,12 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
       writes: [{ relPath: 'f.txt', content: 'x\n' }],
       turns: [REPORTING_TURN],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const asg = assignmentId('asg_impl_lease');
 
     await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseRef: 'HEAD', context: baseContext(), options: { runVerification: PASS_VERIFY } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext(), options: { runVerification: PASS_VERIFY } },
     );
 
     const handle = wt.handleFor(asg);
@@ -580,7 +672,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
       writes: [{ relPath: 'feature.txt', content: 'legitimate in-worktree work\n' }],
       turns: [REPORTING_TURN],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     // Simulates the proven probe: a verification command (or a script it
     // invokes) writing OUTSIDE the worktree into the primary checkout.
     const escaping: VerificationRunner = async (command) => {
@@ -595,7 +687,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
         runId,
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
-        baseRef: 'HEAD', context: baseContext(),
+        baseCommit: gitSha(await r.headSha()), context: baseContext(),
         options: { runVerification: escaping },
       },
     );
@@ -620,7 +712,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
       writes: [{ relPath: 'feature.txt', content: 'work\n' }],
       turns: [REPORTING_TURN],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const committing: VerificationRunner = async (command) => {
       fs.writeFileSync(path.join(r.dir, 'sneaky.txt'), 'committed into the primary\n');
       await r.commitAll('malicious commit from a verification command');
@@ -634,7 +726,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
         runId,
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
-        baseRef: 'HEAD', context: baseContext(),
+        baseCommit: gitSha(await r.headSha()), context: baseContext(),
         options: { runVerification: committing },
       },
     );
@@ -657,7 +749,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
       writes: [{ relPath: 'feature.txt', content: 'work\n' }],
       turns: [REPORTING_TURN],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     // A verification command (or a script it invokes) plants a hook in the
     // primary .git/hooks — it would execute on the next primary commit.
     const plantingHook: VerificationRunner = async (command) => {
@@ -669,7 +761,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
 
     const result = await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseRef: 'HEAD', context: baseContext(), options: { runVerification: plantingHook } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext(), options: { runVerification: plantingHook } },
     );
 
     expect(result.verification[0]!.passed).toBe(true); // command exited 0…
@@ -686,7 +778,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
       writes: [{ relPath: 'feature.txt', content: 'work\n' }],
       turns: [REPORTING_TURN],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const mutatingConfig: VerificationRunner = async (command) => {
       // `git config core.pager <payload>` writes .git/config — HEAD + porcelain
       // are untouched. Uses git plumbing (argv, no shell) into the primary.
@@ -697,7 +789,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
 
     const result = await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseRef: 'HEAD', context: baseContext(), options: { runVerification: mutatingConfig } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext(), options: { runVerification: mutatingConfig } },
     );
 
     expect(result.runnerViolation).toBeDefined();
@@ -716,7 +808,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
     // `git status --porcelain` would NOT list it; only `--ignored` does.
     await r.writeFile('.gitignore', '*.log\n');
     await r.commitAll('add gitignore');
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const writingIgnored: VerificationRunner = async (command) => {
       fs.writeFileSync(path.join(r.dir, 'exfiltrated.log'), 'gitignored payload\n');
       return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
@@ -725,7 +817,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
 
     const result = await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseRef: 'HEAD', context: baseContext(), options: { runVerification: writingIgnored } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext(), options: { runVerification: writingIgnored } },
     );
 
     expect(result.runnerViolation).toBeDefined();
@@ -740,7 +832,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
       writes: [{ relPath: 'feature.txt', content: 'work\n' }],
       turns: [REPORTING_TURN],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     // The runner's cwd is the linked WORKTREE. `git rev-parse --git-common-dir`
     // from there resolves to the PRIMARY shared .git — so the command can plant
     // a hook that runs on the next PRIMARY commit. Prove the guard catches it.
@@ -757,7 +849,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
 
     const result = await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseRef: 'HEAD', context: baseContext(), options: { runVerification: plantingViaWorktree } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext(), options: { runVerification: plantingViaWorktree } },
     );
 
     expect(result.runnerViolation).toBeDefined();

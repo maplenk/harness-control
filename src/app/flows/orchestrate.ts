@@ -63,7 +63,7 @@ import {
 import { waitMs } from '../../supervisor/breaker.js';
 import { RunOwnershipConflictError } from '../run-ownership-store.js';
 import type { RoleRoundProjection } from '../projections.js';
-import type { RoleRunner, RoleRoundOutcome } from '../role-runner.js';
+import type { RoleRunner } from '../role-runner.js';
 import {
   ImplementorFlow,
   verificationRunnerViolationEvent,
@@ -112,22 +112,8 @@ export { NoDeliverableError } from '../service.js';
  * (round > 1) produced NO new commit. A FRESH round-1 clean zero-diff is a
  * legitimate pre-existing-satisfaction no-op and IS allowed into verification.
  */
-export function adjudicateImplementorDeliverable(
-  result: ImplementorResult,
-  round: number,
-  hostHead: GitSha,
-): RoleRoundOutcome {
-  if (result.stopReason !== 'end_turn') return 'no_deliverable';
-  if (
-    result.committed &&
-    result.commitSha !== undefined &&
-    String(result.commitSha) !== String(hostHead)
-  ) {
-    return 'no_deliverable';
-  }
-  if (round > 1 && !result.committed) return 'no_deliverable';
-  return 'completed';
-}
+export { adjudicateImplementorDeliverable } from './deliverable.js';
+import { adjudicateImplementorDeliverable } from './deliverable.js';
 
 export interface ImplementVerifyLoopDeps {
   readonly service: OrchestrationService;
@@ -142,7 +128,7 @@ export interface ImplementVerifyLoopDeps {
   readonly delay?: (ms: number) => Promise<void>;
 }
 
-export interface ImplementVerifyLoopInput {
+export interface ImplementVerifyLoopCommonInput {
   readonly runId: RunId;
   readonly assignmentId: AssignmentId;
   /** Resolved implementor harness/model/effort (§7 proposal → run default). */
@@ -166,16 +152,6 @@ export interface ImplementVerifyLoopInput {
   readonly evidence: EvidenceRecorder;
   /** §12.2 successor resume for the FIRST verification round (kill/restart). */
   readonly resumeFrom?: VerifierResumeState;
-  /**
-   * F5: the run's PINNED implementation base commit (from `RunMeta`, resolved at
-   * `start`). When present it is the authoritative base every fresh worktree
-   * branches from — a commit landing between `start` and `run` can never drift
-   * it. Takes precedence over `baseRef`. The production CLI always supplies it.
-   */
-  readonly baseCommit?: GitSha;
-  /** Ref to branch the worktree from; defaults to `'HEAD'` → immutable base (§16
-   * item 1). Legacy/test fallback ONLY — a pinned `baseCommit` always wins. */
-  readonly baseRef?: string;
   /** Runs the implementor's declared verification commands; injected in tests. */
   readonly runVerificationCommands?: VerificationRunner;
   readonly implementorOptions?: ImplementorFlowOptions;
@@ -187,13 +163,6 @@ export interface ImplementVerifyLoopInput {
   readonly destinationRef?: string;
   /** Caller safety cap; the engine's remediation bound is the real terminal. */
   readonly maxRounds?: number;
-  /**
-   * W2-5 resume mode: re-enter the loop at implementing/verifying/
-   * needs_remediation, driven ENTIRELY by the persisted `RoleRoundProjection`
-   * + §12.2 checkpoint — the worktree is ADOPTED through the manager (mutex
-   * + §16.3), never created. Omitted = the normal `approved` entry.
-   */
-  readonly resume?: ImplementVerifyResumeInput;
 }
 
 /** W2-5 resume re-entry input (see `ImplementVerifyLoopInput.resume`). */
@@ -210,6 +179,16 @@ export interface ImplementVerifyResumeInput {
    * durable facts). */
   readonly fixRequests?: readonly FixRequest[];
 }
+
+/**
+ * A fresh loop must carry the exact pinned base. Resume adopts an existing
+ * worktree and therefore neither resolves nor creates a base-bound worktree.
+ */
+export type ImplementVerifyLoopInput = ImplementVerifyLoopCommonInput &
+  (
+    | { readonly resume?: undefined; readonly baseCommit: GitSha }
+    | { readonly resume: ImplementVerifyResumeInput; readonly baseCommit?: GitSha }
+  );
 
 export interface LoopRound {
   readonly round: number;
@@ -478,21 +457,20 @@ export async function runImplementVerifyLoop(
   try {
     let destinationLabel: string;
     if (resume === undefined) {
-      // F5: branch from the PINNED base commit (start-time HEAD). REQUIRED for a
-      // fresh worktree — a run must NEVER branch from live HEAD, which may have
-      // advanced since `start`. (`baseRef` remains as an explicit test escape
-      // hatch.) The CLI always threads `RunMeta.baseCommit`; a run with no
-      // pinnable base is refused upstream (`handleRun`), never silently defaulted.
-      const pinnedBase = input.baseCommit !== undefined ? String(input.baseCommit) : input.baseRef;
-      if (pinnedBase === undefined) {
-        throw new LoopCompositionError(
-          `runImplementVerifyLoop: a pinned baseCommit is REQUIRED for a fresh worktree ` +
-            `(run ${String(input.runId)}) — refusing to branch from live HEAD (F5).`,
+      // Last primary-checkout source boundary before any implementation
+      // worktree exists. A commit or edit after approval refuses here.
+      const pinnedWorkspace = await service.assertOrPinLegacyCleanWorkspace(input.runId);
+      if (String(input.baseCommit) !== String(pinnedWorkspace.pinnedSha)) {
+        throw new WorktreeError(
+          'invalid_base_commit',
+          `runImplementVerifyLoop baseCommit ${input.baseCommit} does not match run ${input.runId} pinned base ${pinnedWorkspace.pinnedSha}`,
         );
       }
+      // F5: branch only from the run's start-time immutable commit. The
+      // worktree manager revalidates the branded value at runtime.
       handle = await worktrees.createWorktree({
         assignmentId: input.assignmentId,
-        baseRef: pinnedBase,
+        baseCommit: input.baseCommit,
       });
       // §16: the manual `git switch <dest>` hint targets the primary checkout's
       // ACTUAL branch (read from the repo, never trusting a hardcoded 'main'); an

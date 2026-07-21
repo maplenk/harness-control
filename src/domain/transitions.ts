@@ -36,6 +36,7 @@ import {
   type ResumeReentryPending,
   type RunPhase,
   type StopIntentCause,
+  stopIntentConfirmation,
   type SuccessorIntent,
   type SuccessorIntentSeed,
   type Suspension,
@@ -505,7 +506,7 @@ export const TRANSITION_TABLE: readonly TransitionRow[] = [
     id: 'T22',
     event: 'rss.hard_limit',
     description:
-      'RSS hard-limit path (§14): graceful checkpoint+stop by deadline, else emergency kill → worktree TAINTED; the subsequent exit counts as a restart via T13.',
+      'RSS hard-limit path (§14): legacy events retain their historical effects; semanticsVersion=2 additionally records a generation-bound resource_exhaustion stop intent, whose confirmed exit folds resource.exhausted (never T13).',
     preconditions: [{ kind: 'child_active', value: true }],
     effects: [{ kind: 'rss_hard_stop' }],
     invariants: ['phase_unchanged', 'suspension_unchanged'],
@@ -1188,6 +1189,26 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
       case 'rss_hard_stop': {
         const payload = (event as EventOfType<'rss.hard_limit'>).payload;
         const segment = payload.segmentId;
+        // Replay compatibility: an absent version is a historical T22 and
+        // deliberately keeps the old reducer behavior. Only new v2 producers
+        // turn the event into a durable generation-bound stop intent.
+        if (
+          payload.semanticsVersion === 2 &&
+          payload.generationId !== undefined &&
+          isLiveChild(draft.activeChild) &&
+          draft.activeChild?.generationId === payload.generationId
+        ) {
+          draft.activeChild = {
+            ...draft.activeChild,
+            status: 'stopping',
+            stopCause: 'resource_exhaustion',
+          };
+          emit('child.stop.intent', {
+            generationId: draft.activeChild.generationId,
+            segmentId: draft.activeChild.segmentId,
+            cause: 'resource_exhaustion',
+          });
+        }
         if (payload.escalation === 'graceful') {
           emit('checkpoint.requested', {
             reason: 'pre_graceful_stop',
@@ -1351,9 +1372,24 @@ export function foldChildStopped(
     return state; // late/unknown generation: never clears the current one
   }
   if (child.status === 'stopped') return state; // idempotent redelivery
+  // RSS stop confirmation carries role/RSS/budget on `resource.exhausted`.
+  // A bare `child.stopped` cannot truthfully synthesize that suspension, so
+  // leave the durable intent intact until the purpose-built confirmation
+  // event lands (runtime and startup recovery both use that path).
+  if (
+    child.stopCause !== undefined &&
+    stopIntentConfirmation(child.stopCause) === 'resource_exhaustion' &&
+    event.payload.reason !== 'rss_race_completed'
+  ) {
+    return state;
+  }
   const { stopCause, ...rest } = child;
   const next: EngineState = { ...state, activeChild: { ...rest, status: 'stopped' } };
-  if (stopCause === 'user_pause' && state.suspension.kind === 'none') {
+  if (
+    stopCause !== undefined &&
+    stopIntentConfirmation(stopCause) === 'pause_user' &&
+    state.suspension.kind === 'none'
+  ) {
     return {
       ...next,
       suspension: {

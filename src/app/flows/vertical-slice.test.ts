@@ -55,7 +55,7 @@ import {
   type PromptInput,
   type PromptResult,
 } from '../../adapters/index.js';
-import { GitWorktreeManager } from '../../worktree/index.js';
+import { GitWorktreeManager, WorktreeError } from '../../worktree/index.js';
 import * as git from '../../worktree/git.js';
 import {
   assertPrimaryCheckoutUntouched,
@@ -69,10 +69,11 @@ import {
   type RoleAdapterOptions,
 } from '../service.js';
 import type { Harness, RoleModelSpec } from '../model-resolution.js';
+import type { RoleRunner } from '../role-runner.js';
+import { createLegacyRunFixture, createRunFixture } from '../test-support.js';
 import { CoordinatorRunner, type CoordinatorOutcome } from './coordinator.js';
 import {
   adjudicateImplementorDeliverable,
-  LoopCompositionError,
   NoDeliverableError,
   runImplementVerifyLoop,
 } from './orchestrate.js';
@@ -294,6 +295,7 @@ interface Slice {
   readonly flowIds: DeterministicIdFactory;
   readonly created: CreatedAdapter[];
   readonly profile: Profile;
+  readonly baseCommit: ReturnType<typeof gitSha>;
 }
 
 async function openSlice(scripts: {
@@ -312,23 +314,39 @@ async function openSlice(scripts: {
   const service = new OrchestrationService({ db: dbHandle.db, ids, adapterFactory: factory });
   const profileResult = loadProfileFile(PROFILE_PATH);
   if (!profileResult.ok) throw new Error(`coordinator profile failed to load: ${JSON.stringify(profileResult.error)}`);
-  return { service, worktrees, repo, store, ids, flowIds, created, profile: profileResult.value };
+  return {
+    service,
+    worktrees,
+    repo,
+    store,
+    ids,
+    flowIds,
+    created,
+    profile: profileResult.value,
+    baseCommit: gitSha(await repo.headSha()),
+  };
 }
 
 /** created → specifying → awaiting_approval (coordinator) → approved (human T1). */
 async function coordinateAndApprove(slice: Slice): Promise<{ runId: RunId; outcome: CoordinatorOutcome }> {
-  const { runId } = slice.service.createRun({ goal: GOAL, workspacePath: slice.repo.dir, coordinator: COORDINATOR });
+  const { runId } = createRunFixture(slice.service, {
+    goal: GOAL,
+    workspacePath: slice.repo.dir,
+    coordinator: COORDINATOR,
+    baseCommit: slice.baseCommit,
+  });
   const runner = new CoordinatorRunner({
     goal: GOAL,
     profile: slice.profile,
     artifactStore: slice.store,
     ids: slice.flowIds,
     clock: dbHandle!.db.clock,
+    baseCommit: slice.baseCommit,
     explorationContext: 'src/cli/index.ts (base deadbeef): a hand-rolled arg parser.',
   });
   const outcome = await slice.service.runCoordination(runId, runner);
   expect(slice.service.status(runId).phase).toBe('awaiting_approval');
-  const approved = slice.service.approve(runId, {
+  const approved = await slice.service.approve(runId, {
     specVersionId: outcome.specVersion.id,
     specHash: outcome.specVersion.contentHash,
   });
@@ -381,7 +399,7 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
         criteria: outcome.specVersion.criteria,
         constraints: ['Touch only files under src/cli'],
         explorationArtifact: 'The arg parser lives in src/cli/index.ts (bound to base deadbeef).',
-        baseRef: 'HEAD', // F5: pin the fresh test repo HEAD explicitly
+        baseCommit: slice.baseCommit,
         evidence: recorder,
         runVerificationCommands: PASS_VERIFY,
       },
@@ -480,7 +498,7 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
         criteria: outcome.specVersion.criteria,
-        baseRef: 'HEAD', // F5: the fresh test repo HEAD IS the base (pin explicitly)
+        baseCommit: slice.baseCommit,
         evidence: recorder,
         runVerificationCommands: PASS_VERIFY,
         // NB: no destinationLabel — the loop must read the branch from the repo.
@@ -548,7 +566,7 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
         criteria: outcome.specVersion.criteria,
-        baseRef: 'HEAD', // F5: the fresh test repo HEAD IS the base (pin explicitly)
+        baseCommit: slice.baseCommit,
         evidence: recorder,
         runVerificationCommands: PASS_VERIFY,
       },
@@ -637,7 +655,7 @@ describe('W1-F1/W1-F4 — a mutating verification command never yields merge_rea
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
         criteria: outcome.specVersion.criteria,
-        baseRef: 'HEAD', // F5: the fresh test repo HEAD IS the base (pin explicitly)
+        baseCommit: slice.baseCommit,
         evidence: recorder,
         runVerificationCommands: mutatingVerify,
         maxRounds: 2,
@@ -738,7 +756,7 @@ describe('W3-1 — a verification command that writes into the PRIMARY checkout 
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
         criteria: outcome.specVersion.criteria,
-        baseRef: 'HEAD', // F5: the fresh test repo HEAD IS the base (pin explicitly)
+        baseCommit: slice.baseCommit,
         evidence: recorder,
         runVerificationCommands: escapingVerify,
         maxRounds: 1,
@@ -841,7 +859,7 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
     const asg = assignmentId('asg_slice_kill');
 
     // --- Predecessor implements + commits (real worktree, real commit) ------
-    const handle = await slice.worktrees.createWorktree({ assignmentId: asg });
+    const handle = await slice.worktrees.createWorktree({ assignmentId: asg, baseCommit: slice.baseCommit });
     slice.service.advanceWorkflowPhase(runId, 'approved', 'implementing');
     // Reuse the implementor flow via the loop's own machinery is overkill here;
     // drive it directly for the one predecessor round.
@@ -857,7 +875,16 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
       },
       { runVerification: PASS_VERIFY },
     );
-    const implResult = await slice.service.runRole(runId, implFlow, IMPLEMENTOR, handle.worktreePath);
+    const implResult = await slice.service.runRole(
+      runId,
+      {
+        role: 'implementor',
+        run: (session) => implFlow.run(session),
+        adjudicateRoundOutcome: () => 'completed',
+      },
+      IMPLEMENTOR,
+      handle.worktreePath,
+    );
     slice.worktrees.releaseLease(asg);
     const implCommit = implResult.commitSha!;
     expect(implCommit).toBeDefined();
@@ -1046,7 +1073,7 @@ describe('F2 — a round with no real deliverable never dispatches a verifier (p
       criteria: outcome.specVersion.criteria,
       constraints: ['Touch only files under src/cli'],
       explorationArtifact: 'The arg parser lives in src/cli/index.ts (bound to base deadbeef).',
-      baseRef: 'HEAD', // F5: pin the fresh test repo HEAD explicitly
+      baseCommit: slice.baseCommit,
       evidence: recorder,
       runVerificationCommands: PASS_VERIFY,
     };
@@ -1083,7 +1110,47 @@ describe('F2 — a round with no real deliverable never dispatches a verifier (p
     const types = dbHandle!.db.events.listByRun(runId).map((e) => e.type);
     expect(types).not.toContain('verification.completed.passed');
     expect(types).not.toContain('verification.completed.failed');
+    // Direct verifier call with no dispatch metadata still hits the role-based
+    // engine choke point before admission.
+    const direct = await slice.service.runRole(
+      runId,
+      { role: 'verifier', run: async () => ({}) },
+      VERIFIER,
+      slice.repo.dir,
+    ).catch((e: unknown) => e);
+    expect(direct).toBeInstanceOf(NoDeliverableError);
+    expect(slice.created.some((c) => c.role === 'verifier')).toBe(false);
     await slice.worktrees.removeWorktree(asg);
+  });
+
+  it('runtime-refuses an implementor runner missing adjudication before admission', async () => {
+    const slice = await openSlice({ coordinator: [{ turns: [coordinatorTurn(validSpec())] }] });
+    const { runId } = await coordinateAndApprove(slice);
+    const before = slice.created.length;
+    const missing = { role: 'implementor', run: async () => ({}) } as unknown as RoleRunner<{}>;
+    const err = await slice.service
+      .runRole(runId, missing, IMPLEMENTOR, slice.repo.dir)
+      .catch((e: unknown) => e);
+    expect(String(err)).toMatch(/require adjudicateRoundOutcome/i);
+    expect(slice.created).toHaveLength(before);
+  });
+
+  it('dispatchless runRole still adjudicates and rejects an implementor no-deliverable verdict', async () => {
+    const slice = await openSlice({ coordinator: [{ turns: [coordinatorTurn(validSpec())] }] });
+    const { runId } = await coordinateAndApprove(slice);
+    const error = await slice.service
+      .runRole(
+        runId,
+        {
+          role: 'implementor',
+          run: async () => ({ attempted: true }),
+          adjudicateRoundOutcome: () => 'no_deliverable',
+        },
+        IMPLEMENTOR,
+        slice.repo.dir,
+      )
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(NoDeliverableError);
   });
 
   it('valid zero-diff no-op on a FRESH round is ALLOWED into verification (not blocked)', async () => {
@@ -1220,7 +1287,7 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
   it('createRun records an immutable base commit; getRunBaseCommit reads it', async () => {
     const slice = await openSlice({ coordinator: [{ turns: [coordinatorTurn(validSpec())] }] });
     const base = gitSha(await slice.repo.headSha());
-    const { runId } = slice.service.createRun({
+    const { runId } = createRunFixture(slice.service, {
       goal: GOAL,
       workspacePath: slice.repo.dir,
       coordinator: COORDINATOR,
@@ -1232,7 +1299,11 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
   it('a LEGACY run (no pinned base) is pinned ONCE, audited; a re-pin to a DIFFERENT sha is refused', async () => {
     const slice = await openSlice({ coordinator: [{ turns: [coordinatorTurn(validSpec())] }] });
     // Legacy: created without a base.
-    const { runId } = slice.service.createRun({ goal: GOAL, workspacePath: slice.repo.dir, coordinator: COORDINATOR });
+    const { runId } = createLegacyRunFixture(slice.service, dbHandle!.db, {
+      goal: GOAL,
+      workspacePath: slice.repo.dir,
+      coordinator: COORDINATOR,
+    });
     expect(slice.service.getRunBaseCommit(runId)).toBeUndefined();
 
     const base = gitSha(await slice.repo.headSha());
@@ -1245,7 +1316,7 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
     expect(() => slice.service.pinRunBaseCommit(runId, gitSha('0'.repeat(40)))).toThrow(/already has a pinned base/i);
   });
 
-  it('the worktree branches from the START-pinned base even when HEAD advances before run', async () => {
+  it('strict F5 refuses HEAD drift before the first fresh implementation worktree', async () => {
     const slice = await openSlice({
       coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
       implementor: [
@@ -1273,12 +1344,12 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
 
     const { recorder } = fakeEvidence();
     const asg = assignmentId('asg_f5_pin');
-    const result = await runImplementVerifyLoop(
+    const err: unknown = await runImplementVerifyLoop(
       { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
       {
         runId,
         assignmentId: asg,
-        baseCommit: pinnedBase, // the CLI threads RunMeta.baseCommit here
+        baseCommit: pinnedBase,
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
         specHash: outcome.specVersion.contentHash,
@@ -1291,13 +1362,50 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
         evidence: recorder,
         runVerificationCommands: PASS_VERIFY,
       },
-    );
+    ).catch((e: unknown) => e);
+    expect(err).toMatchObject({ name: 'WorkspaceDriftError', kind: 'base_drift' });
+    expect(slice.service.status(runId).phase).toBe('approved');
+    expect(slice.service.getImplementVerifyLoopState(runId)).toBeUndefined();
+    expect(advancedHead).not.toBe(String(pinnedBase));
+  });
 
-    // The worktree branched from the START-pinned base, NOT the HEAD that
-    // advanced between start and run.
-    expect(String(result.rounds[0]!.implementation!.baseSha)).toBe(String(pinnedBase));
-    expect(String(result.rounds[0]!.implementation!.baseSha)).not.toBe(advancedHead);
-    await slice.worktrees.removeWorktree(asg);
+  it('strict F5 refuses a different exact base SHA before the first fresh implementation worktree', async () => {
+    const slice = await openSlice({ coordinator: [{ turns: [coordinatorTurn(validSpec())] }] });
+    const pinnedBase = gitSha(await slice.repo.headSha());
+    const { runId, outcome } = await coordinateAndApprove(slice);
+
+    await slice.repo.writeFile('OTHER.md', 'another reachable commit\n');
+    const otherBase = gitSha(await slice.repo.commitAll('other reachable base'));
+    await slice.repo.run(['reset', '--hard', pinnedBase]);
+
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_f5_wrong_exact_base');
+    const err: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        baseCommit: otherBase,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement --verbose.',
+        criteria: outcome.specVersion.criteria,
+        constraints: [],
+        explorationArtifact: 'bound to base',
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+      },
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(WorktreeError);
+    expect(err).toMatchObject({ kind: 'invalid_base_commit' });
+    expect(String(err)).toContain(`does not match run ${runId} pinned base ${pinnedBase}`);
+    expect(slice.worktrees.handleFor(asg)).toBeUndefined();
+    expect(slice.service.getImplementVerifyLoopState(runId)).toBeUndefined();
+    expect(slice.service.status(runId).phase).toBe('approved');
   });
 
   it('must-fix 4: the loop REFUSES a fresh worktree with NO pinned base (never live HEAD)', async () => {
@@ -1318,11 +1426,11 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
         criteria: outcome.specVersion.criteria,
         evidence: recorder,
         runVerificationCommands: PASS_VERIFY,
-        // NO baseCommit and NO baseRef → must refuse (never branch from live HEAD).
-      },
+        // Runtime callers can still bypass the required TypeScript field.
+      } as never,
     ).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(LoopCompositionError);
-    expect(String(err)).toMatch(/pinned baseCommit is REQUIRED/i);
+    expect(err).toBeInstanceOf(WorktreeError);
+    expect(err).toMatchObject({ kind: 'invalid_base_commit' });
   });
 });
 
@@ -1362,9 +1470,20 @@ describe('F2 adjudicateImplementorDeliverable — every non-normal stop + host-H
     expect(adjudicateImplementorDeliverable(result({ committed: true, commitSha: HEAD }), 1, HEAD)).toBe('completed');
   });
 
+  it('committed=true without a commitSha is never a deliverable', () => {
+    expect(adjudicateImplementorDeliverable(result({ committed: true }), 1, HEAD)).toBe('no_deliverable');
+  });
+
   it('a REMEDIATION round (round > 1) with no new commit is no_deliverable; round 1 zero-diff is allowed', () => {
     expect(adjudicateImplementorDeliverable(result({ committed: false }), 2, HEAD)).toBe('no_deliverable');
     // Fresh round-1 clean zero-diff no-op → allowed into independent verification.
     expect(adjudicateImplementorDeliverable(result({ committed: false }), 1, HEAD)).toBe('completed');
+    expect(
+      adjudicateImplementorDeliverable(
+        result({ committed: false, changedFiles: ['dirty.ts'], diff: '+dirty' }),
+        1,
+        HEAD,
+      ),
+    ).toBe('no_deliverable');
   });
 });

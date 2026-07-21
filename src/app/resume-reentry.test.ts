@@ -15,6 +15,7 @@
  *    the re-entered round goes ACTIVE (inside runRole), idempotently — the
  *    reclaim marker survives a crash-before-re-entry and clears on re-entry.
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   artifactHash,
@@ -48,7 +49,7 @@ import {
   type RoleAdapterOptions,
 } from './service.js';
 import { ROLE_ROUND_PROJECTION, type RoleRoundProjection, type SpecDraftState } from './projections.js';
-import type { RoleRunner } from './role-runner.js';
+import type { RoleRunner, RoleSession } from './role-runner.js';
 import type { Harness } from './model-resolution.js';
 
 // ---------------------------------------------------------------------------
@@ -109,6 +110,7 @@ async function setup(scripts: readonly FakeScript[]): Promise<{
     db: handle.db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
   });
   return { service, db: handle.db };
 }
@@ -119,13 +121,13 @@ const LIMIT_TURN: FakeScript = { turns: [{ errorEnvelope: rateLimitErrorEnvelope
 const OK_TURN: FakeScript = { turns: [{}] };
 
 function promptOnceRunner(role: 'coordinator' | 'implementor' | 'verifier' = 'implementor'): RoleRunner {
-  return {
-    role,
-    run: async (session) => {
-      await session.prompt({ prompt: 'go' });
-      return {};
-    },
+  const run = async (session: RoleSession): Promise<{}> => {
+    await session.prompt({ prompt: 'go' });
+    return {};
   };
+  return role === 'implementor'
+    ? { role, run, adjudicateRoundOutcome: () => 'completed' }
+    : { role, run };
 }
 
 function draft(hash: string): SpecDraftState {
@@ -147,11 +149,11 @@ function draft(hash: string): SpecDraftState {
 async function pauseImplementorRound(
   service: OrchestrationService,
 ): Promise<RunId> {
-  const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+  const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
   service.advanceWorkflowPhase(runId, 'created', 'specifying');
   service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
   service.saveSpecDraft(runId, draft('hash_1'));
-  expect(service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: HASH_1 }).status).toBe('applied');
+  expect((await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: HASH_1 })).status).toBe('applied');
   const error: unknown = await service
     .runRole(runId, promptOnceRunner(), CLAUDE_LOW, '/ws', {
       round: 1,
@@ -195,7 +197,7 @@ describe('RoleRoundProjection — complete generic shape', () => {
 
   it('a verifier-shaped dispatch persists the exact implementationCommit binding', async () => {
     const { service } = await setup([OK_TURN]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const impl = gitSha('b'.repeat(40));
     await service.runRole(runId, promptOnceRunner('verifier'), CLAUDE_LOW, '/ws', {
       round: 1,
@@ -295,7 +297,7 @@ describe('resume eligibility — the four-way spec binding chain', () => {
     expect(service.status(runId).resumeReentryPending).toMatchObject({ returnPhase: 'implementing' });
 
     // Coordinator round (no specHash) — pause + resume applies untouched.
-    const { runId: run2 } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId: run2 } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(run2, promptOnceRunner('coordinator')).catch(() => undefined);
     expect(service.status(run2).suspension).toBe('paused_limit');
     expect(service.resume(run2).status).toBe('applied');
@@ -327,6 +329,7 @@ describe('re-entry ack — resume_reentry.completed when the re-entered round ru
       db,
       ids: new RandomIdFactory(),
       adapterFactory: makeQueueFactory([OK_TURN]).factory,
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
     });
     expect(successor.recover(runId).resumeReentryPending).toBeDefined();
 
@@ -349,7 +352,7 @@ describe('re-entry ack — resume_reentry.completed when the re-entered round ru
 
   it('a normal (non-resume) dispatch never appends an ack', async () => {
     const { service, db } = await setup([OK_TURN]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(runId, promptOnceRunner('coordinator'));
     expect(db.events.listByRun(runId).some((e) => e.type === 'resume_reentry.completed')).toBe(false);
   });
@@ -375,7 +378,7 @@ describe('W2-0 echo-mismatch pins (regression)', () => {
         },
       },
     ]);
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const error: unknown = await service
       .runCoordination(runId, promptOnceRunner('coordinator'))
       .then(() => undefined)

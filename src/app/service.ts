@@ -98,6 +98,7 @@ import {
 import {
   isLiveChild,
   OPERATION_IDLE,
+  stopIntentConfirmation,
   type ActiveChild,
   type CheckpointReason,
   type ClassifiedErrorKind,
@@ -582,6 +583,53 @@ export class NoDeliverableError extends Error {
   }
 }
 
+/**
+ * Shutdown could not prove the child absent. This is intentionally fail-closed:
+ * supervision/admission ownership remains held rather than treating a failed
+ * opaque disposal as process exit.
+ */
+export class ProcessExitUnconfirmedError extends Error {
+  readonly generationId: ProcessGenerationId;
+  readonly disposalError: unknown;
+
+  constructor(generationId: ProcessGenerationId, disposalError: unknown) {
+    super(`process exit is unconfirmed for generation ${generationId}; shutdown ownership retained`);
+    this.name = 'ProcessExitUnconfirmedError';
+    this.generationId = generationId;
+    this.disposalError = disposalError;
+  }
+}
+
+export type WorkspaceDriftKind = 'workspace_unresolvable' | 'workspace_dirty' | 'base_drift';
+
+/** Structured refusal for every source-sensitive primary-checkout boundary. */
+export class WorkspaceDriftError extends Error {
+  override readonly name: string = 'WorkspaceDriftError';
+  readonly kind: WorkspaceDriftKind;
+  readonly pinnedSha?: GitSha;
+  readonly currentSha?: GitSha;
+  readonly dirtyPaths?: readonly string[];
+  constructor(input: {
+    readonly kind: WorkspaceDriftKind;
+    readonly detail: string;
+    readonly pinnedSha?: GitSha;
+    readonly currentSha?: GitSha;
+    readonly dirtyPaths?: readonly string[];
+  }) {
+    super(input.detail);
+    this.kind = input.kind;
+    if (input.pinnedSha !== undefined) this.pinnedSha = input.pinnedSha;
+    if (input.currentSha !== undefined) this.currentSha = input.currentSha;
+    if (input.dirtyPaths !== undefined) this.dirtyPaths = input.dirtyPaths;
+  }
+}
+
+export interface PinnedWorkspaceState {
+  readonly repoRoot: string;
+  readonly pinnedSha: GitSha;
+  readonly currentSha: GitSha;
+}
+
 // ---------------------------------------------------------------------------
 // Adapter factory seam (production spawns real adapters; tests inject fakes)
 // ---------------------------------------------------------------------------
@@ -714,7 +762,7 @@ export function defaultRoleAdapterFactory(): RoleAdapterFactory {
 // ---------------------------------------------------------------------------
 // Public shapes
 // ---------------------------------------------------------------------------
-export interface CreateRunInput {
+interface CreateRunCommonInput {
   readonly goal: string;
   readonly workspacePath: string;
   /** The coordinator's resolved harness/model/effort (PLAN §7 proposes the
@@ -724,12 +772,18 @@ export interface CreateRunInput {
   readonly planningChatEnabled?: boolean;
   /** Default `{mode:'headless'}` (deny-all, §10.2). */
   readonly mediation?: PermissionMediation;
+}
+
+/**
+ * A newly-created run. Fresh runs are engine-bound to an exact source commit;
+ * callers cannot opt out of the pin by bypassing the CLI.
+ */
+export interface CreateRunInput extends CreateRunCommonInput {
   /**
    * F5: the implementation base commit, resolved from the workspace HEAD at
-   * `start` and pinned immutably into `RunMeta`. Production `start` always
-   * supplies it; omit only for a legacy/test run that pins later (or never).
+   * `start` and pinned immutably into `RunMeta`.
    */
-  readonly baseCommit?: GitSha;
+  readonly baseCommit: GitSha;
 }
 
 export interface CreateRunResult {
@@ -955,6 +1009,11 @@ export interface OrchestrationServiceOptions {
   readonly supervision?: SupervisionOptions;
   /** P4b-1 alert delivery seams; omit for production defaults. */
   readonly alerts?: AlertOptions;
+  /** Source-snapshot seam for deterministic drift/TOCTOU tests. */
+  readonly workspaceGit?: Pick<
+    typeof git,
+    'resolveTopLevel' | 'readStableHeadAndStatus' | 'porcelainPaths'
+  >;
 }
 
 const DEFAULT_HEADLESS_MEDIATION: PermissionMediation = { mode: 'headless' };
@@ -1002,6 +1061,54 @@ interface ResourceExhaustionCause {
   readonly role: RoleName;
   readonly rssBytes: number;
   readonly budgetBytes: number;
+}
+
+/**
+ * One generation owns one shutdown barrier for its entire lifetime. The
+ * barrier is installed before supervision starts, memoizes checkpoint/cancel
+ * and disposal, and is released only after process exit is confirmed and the
+ * matching durable terminal outcome commits.
+ */
+interface GenerationShutdown {
+  readonly ctx: SpawnContext;
+  readonly exitSettled: Promise<
+    | { readonly confirmed: true }
+    | { readonly confirmed: false; readonly error: unknown }
+  >;
+  readonly settleExit: (
+    resolution:
+      | { readonly confirmed: true }
+      | { readonly confirmed: false; readonly error: unknown },
+  ) => void;
+  gracefulStop?: Promise<void>;
+  dispose?: Promise<boolean>;
+  /** The role result used when the durable child-stop outcome is folded. */
+  completedNormally?: boolean;
+  /** The original waiter has returned/failed, so a later exit observation
+   * must drive the retained shutdown through its recovery path. */
+  waitAbandoned: boolean;
+  /** A durable `resource.exhausted` / `child.stopped` outcome committed. */
+  outcomeCommitted: boolean;
+  outcomeCommitInFlight?: Promise<void>;
+  /** Provider-limit transport quality retained until the barrier emits the
+   * non-RSS child-stop confirmation. */
+  confirmationReason?: 'graceful' | 'terminated';
+  disposeSucceeded?: boolean;
+  /** Bounded exit-confirmation failure for a hung/failed identity-backed
+   * disposal. The watchdog remains armed after this fires. */
+  exitConfirmationTimer?: ReturnType<typeof setTimeout>;
+  /** The original waiter was failed closed before a later whole-tree absence
+   * was observed. If the generation still has no durable stop outcome, that
+   * late observation must use the recovery-interrupt path before ownership is
+   * released. */
+  exitWasUnconfirmed?: boolean;
+  /** A confirmed exit whose durable fold failed must remain live even when
+   * there is no OS identity/watchdog capable of producing another callback. */
+  outcomeRetryTimer?: ReturnType<typeof setTimeout>;
+  ownershipReleased: boolean;
+  settled: boolean;
+  confirmed: boolean;
+  cleaned: boolean;
 }
 
 /** Map the enforced §11.2 pins onto the `child.spawned` wire records
@@ -1142,6 +1249,10 @@ export class OrchestrationService {
   readonly #bounds: EngineBounds;
   readonly #engineReducer: (state: EngineState, event: DomainEvent) => EngineState;
   readonly #adapterFactory: RoleAdapterFactory;
+  readonly #workspaceGit: Pick<
+    typeof git,
+    'resolveTopLevel' | 'readStableHeadAndStatus' | 'porcelainPaths'
+  >;
   readonly #mediation = new Map<string, PermissionMediation>();
 
   // ---- W2-6 supervision (§14) ---------------------------------------------
@@ -1186,21 +1297,8 @@ export class OrchestrationService {
   /** Live spawn contexts by generation — the watchdog's graceful-stop path
    * resolves its target through this. */
   readonly #liveSpawns = new Map<ProcessGenerationId, SpawnContext>();
-  /** F1/F3: generation-scoped RSS-exhaustion cause, set when the watchdog
-   * reports an `rss.hard_limit` for a generation (BEFORE it cancels/kills the
-   * turn) and consulted at the prompt / provider-failure seam to classify the
-   * termination as `resource_exhausted` rather than a completed turn or a T13
-   * crash. Cleared when the generation's supervision is released. */
-  readonly #resourceExhaustion = new Map<ProcessGenerationId, ResourceExhaustionCause>();
-  /** F6/must-fix 5: the ONE shared graceful-stop promise per generation. The
-   * watchdog callback stores it; runRole's `finally` AWAITS it before releasing
-   * supervision, so the checkpoint+cancel+shared-dispose runs at most once and
-   * supervision is held until it completes (never a concurrent second stop). */
-  readonly #gracefulStops = new Map<ProcessGenerationId, Promise<void>>();
-  /** must-fix 5: the ONE shared child-dispose promise per generation, so the
-   * graceful-stop callback and runRole's `finally` never call `handle.dispose()`
-   * concurrently — both await the same disposal, which resolves once. */
-  readonly #disposals = new Map<ProcessGenerationId, Promise<boolean>>();
+  /** F1/F6: all shutdown ownership is generation-scoped and unified here. */
+  readonly #shutdowns = new Map<ProcessGenerationId, GenerationShutdown>();
   /** Runs with a role spawn in flight (heartbeat refcount, §14). */
   readonly #activeSpawnRuns = new Map<RunId, number>();
   /** W2-4: probe claims THIS process is currently executing (in-memory leg of
@@ -1230,6 +1328,7 @@ export class OrchestrationService {
     // decision is consistent with the durable counters.
     this.#breaker = new RestartBreaker(this.#ids, DEFAULT_BREAKER_BOUNDS, this.#bounds);
     this.#adapterFactory = options.adapterFactory ?? defaultRoleAdapterFactory();
+    this.#workspaceGit = options.workspaceGit ?? git;
     // P4b-1: alert delivery sinks. `notifiers` REPLACES the set; otherwise the
     // default `stderr` + `status_json` sinks (with an optional stderr redirect).
     this.#notifiers =
@@ -1282,32 +1381,26 @@ export class OrchestrationService {
           this.#worktreeSupervision?.markTainted(assignmentId, taint),
       },
       requestGracefulStop: (target) => this.#onWatchdogGracefulStop(target.generationId),
-      // T21/T22 ingest through the service — the SAME single transition path
-      // every other event takes; a throw must never escape into a timer. F1/F3:
-      // an `rss.hard_limit` (graceful OR emergency) BINDS a generation-scoped
-      // exhaustion cause BEFORE the watchdog cancels/kills the turn — this runs
-      // synchronously before `requestGracefulStop`, so the cause is present when
-      // the cancelled prompt resolves (or the SIGKILL'd transport throws) at the
-      // prompt / provider-failure seam. Set before the ingest so a folding
-      // failure can never leave the cause unbound.
-      onEvent: (event) => {
-        if (event.type === 'rss.hard_limit') {
-          this.#bindResourceExhaustionCause(event);
-          // F1: an EMERGENCY kill (SIGKILL) DEFINITIVELY terminates the
-          // generation — suspend `resource_exhausted` DURABLY right here (fold
-          // the T22 effects first, then the suspend), so the classification
-          // survives a restart AND the subsequent crash/exit can never fold
-          // T13/auto-respawn (the generation is already marked stopped +
-          // suspended). This closes the pin-retry, idle/no-call, and restart
-          // gaps. A GRACEFUL stop stays LAZY at the prompt seam — a natural
-          // end_turn may still race the cancel — so it only folds T22 here.
-          if (event.payload.escalation === 'emergency_kill') {
-            this.#suspendResourceExhaustedFromEvent(event);
-            return;
-          }
-        }
-        this.#ingestFromSupervisor(event);
+      // Emergency signaling invokes this synchronously as its verified
+      // pre-signal hook. A persistence failure MUST reject the signal path, so
+      // do not swallow here; the watchdog's timer boundary records the failure.
+      onEvent: (event) => this.#persistWatchdogEvent(event),
+      // Only a watchdog sample proving the whole process group absent confirms
+      // an identity-backed child exit. Transport disposal may return after the
+      // leader exits while descendants remain in the PGID, so it is never
+      // confirmation for these handles.
+      onExitConfirmed: (target) => {
+        this.#confirmObservedTreeAbsence(target.generationId);
+        // This service, not the watchdog, owns registry/watchdog cleanup.
+        // Retire the entry only after #commitGenerationShutdown has committed
+        // the durable terminal outcome and explicitly unwatches it.
+        return false;
       },
+      // An identity mismatch/gone verdict with a still-present process tree
+      // cannot be killed safely. The watchdog keeps sampling it, but this
+      // bounded callback releases the role waiter with an explicit
+      // unconfirmed outcome rather than allowing `exitSettled` to hang.
+      onExitUnconfirmed: (target, error) => this.#failShutdownExit(target.generationId, error),
       // §12.1: raw RSS ticks land in the telemetry repository (aggregated
       // per-minute there; raw samples pruned by its own retention).
       onSample: (target, sample) => {
@@ -1385,6 +1478,13 @@ export class OrchestrationService {
    * cost projection, immutable meta, and the resolved engine config the run
    * binds to (W1-F5 durability) — all in one transaction. */
   createRun(input: CreateRunInput): CreateRunResult {
+    // The brand is compile-time only; reject JavaScript/cast callers that try
+    // to bypass the fresh-run pin invariant with an absent/symbolic/short SHA.
+    if (typeof input.baseCommit !== 'string' || !/^[0-9a-f]{40}$/.test(input.baseCommit)) {
+      throw new TypeError(
+        `createRun requires baseCommit to be an exact 40-character lowercase commit SHA; got ${JSON.stringify(input.baseCommit)}`,
+      );
+    }
     const runId = newRunId(this.#ids);
     const initial = initialEngineState({ bounds: this.#bounds });
     const meta: RunMeta = {
@@ -1394,7 +1494,7 @@ export class OrchestrationService {
       ...(input.planningChatEnabled === true ? { planningChatEnabled: true } : {}),
       // F5: pin the base commit at create/start — the earliest reproducible
       // snapshot. Immutable (RunMeta is never re-saved).
-      ...(input.baseCommit !== undefined ? { baseCommit: input.baseCommit } : {}),
+      baseCommit: input.baseCommit,
     };
     this.#db.transaction(() => {
       registerRun(this.#db.driver, this.#clock, runId);
@@ -1670,11 +1770,15 @@ export class OrchestrationService {
 
   // ---- CLI command wrappers (each normalizes into `ingest`) ----------------
   /** T1 — spec approved (human). */
-  approve(
+  async approve(
     runId: RunId,
     input: { readonly specVersionId: SpecVersionId; readonly specHash: SpecHash },
     opts?: CommandOptions,
-  ): IngestResult {
+  ): Promise<IngestResult> {
+    // Approval is source-sensitive: enforce the immutable pin at the service
+    // boundary so JavaScript/direct callers cannot bypass the CLI guard. Old
+    // persisted runs take the same one-time audited pin path first.
+    await this.assertOrPinLegacyCleanWorkspace(runId);
     return this.ingest(
       this.#trigger(
         runId,
@@ -1686,7 +1790,10 @@ export class OrchestrationService {
   }
 
   /** T2 — `spec revise --feedback`. */
-  reviseSpec(runId: RunId, feedback: string, opts?: CommandOptions): IngestResult {
+  async reviseSpec(runId: RunId, feedback: string, opts?: CommandOptions): Promise<IngestResult> {
+    // T2 starts another source-reading coordinator round. Refuse before the
+    // transition mutates state, including for direct service callers.
+    await this.assertOrPinLegacyCleanWorkspace(runId);
     return this.ingest(this.#trigger(runId, 'spec.revise.requested', { feedback }, opts) as DomainEvent);
   }
 
@@ -2437,6 +2544,10 @@ export class OrchestrationService {
     toDraft?: (outcome: T) => SpecDraftState,
   ): Promise<T> {
     const meta = this.#requireMeta(runId);
+    // This public coordinator boundary is source-sensitive even for legacy
+    // histories. Establish the one-time audited pin before any role admission,
+    // then every lower-level coordinator run validates against it as well.
+    await this.assertOrPinLegacyCleanWorkspace(runId);
     // W4-2 S4 / review-6 F2: a coordinator round DRIVES the run just like the
     // implement/verify loop, so it must hold the same EXCLUSIVE run-ownership
     // lease — acquired BEFORE any role work. Without this the lease was FALSE
@@ -2456,8 +2567,11 @@ export class OrchestrationService {
         inputs: JSON.stringify({ goal: meta.goal }),
       });
       if (toDraft !== undefined) {
-        this.completeCoordinationRound(runId, toDraft(result));
+        await this.completeCoordinationRound(runId, toDraft(result));
       } else {
+        // The pure runner seam has no draft completion call to perform the
+        // final check, so validate once more immediately before its advance.
+        await this.assertPinnedCleanWorkspace(runId);
         this.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
       }
       return result;
@@ -2479,7 +2593,11 @@ export class OrchestrationService {
    * `SpecDraftRef` replay can check the projection against — never an
    * approval-ready run whose draft is silently gone.
    */
-  completeCoordinationRound(runId: RunId, draft: SpecDraftState): EngineState {
+  async completeCoordinationRound(runId: RunId, draft: SpecDraftState): Promise<EngineState> {
+    // Keep the completion API public for recovery/tests, but make it a real
+    // engine boundary: fabricated/direct callers cannot persist a coordinator
+    // result after the primary checkout became dirty or drifted.
+    await this.assertOrPinLegacyCleanWorkspace(runId);
     // F1: `BEGIN IMMEDIATE` so the draft persist + the final advance are one
     // write-locked unit and the inner `advanceWorkflowPhase`
     // `transactionImmediate` nests as a shared no-op (IMMEDIATE outermost).
@@ -2552,6 +2670,11 @@ export class OrchestrationService {
     dispatch?: RoleDispatch,
   ): Promise<T> {
     const meta = this.#requireMeta(runId);
+    if (runner.role === 'implementor' && typeof runner.adjudicateRoundOutcome !== 'function') {
+      throw new WorkflowAdvanceError(
+        'runRole: implementor runners require adjudicateRoundOutcome before admission',
+      );
+    }
     // F2 (§review dogfood): the deliverable gate as an ENGINE invariant at the
     // verifier-dispatch choke point — REFUSE a dispatch that advances
     // `implementing → verifying` (the verifier round, including a direct
@@ -2559,7 +2682,7 @@ export class OrchestrationService {
     // adjudicated `no_deliverable`. Checked BEFORE anything is allocated/admitted
     // and BEFORE the pending save overwrites the projection, so it cannot be
     // bypassed by calling the lower-level dispatch APIs directly.
-    if (dispatch?.advance?.from === 'implementing' && dispatch.advance.to === 'verifying') {
+    if (runner.role === 'verifier') {
       const prev = this.getRoleRound(runId);
       if (prev?.role === 'implementor' && prev.stage === 'no_deliverable') {
         throw new NoDeliverableError(
@@ -2568,6 +2691,12 @@ export class OrchestrationService {
           'implementor round produced no deliverable — refusing to dispatch the verifier',
         );
       }
+    }
+    if (runner.role === 'coordinator') {
+      // `runRole` is public and is also the coordinator re-entry seam. Do not
+      // rely on `runCoordination`/CLI callers to have checked the workspace;
+      // legacy histories are pinned audibly here before any admission/spawn.
+      await this.assertOrPinLegacyCleanWorkspace(runId);
     }
     const resolved = resolveRoleModel(spec);
     const mediation = this.#mediation.get(runId) ?? DEFAULT_HEADLESS_MEDIATION;
@@ -2640,6 +2769,9 @@ export class OrchestrationService {
       mediation,
       ...(dispatch !== undefined ? { dispatch } : {}),
     };
+    // Install shutdown ownership before initialize can create an OS process
+    // and before supervision can publish a stop intent for this generation.
+    this.#ensureGenerationShutdown(ctx);
 
     let completedNormally = false;
     // §14 self-supervision: heartbeat for this run while any spawn is in
@@ -2745,50 +2877,48 @@ export class OrchestrationService {
       let result: T;
       try {
         result = await runner.run(roleSession);
-      } catch (flowError) {
-        // F3 (§5ff/§5hh review-7): an error thrown by the ACTIVE role flow
-        // itself — a non-limit/non-crash TYPED failure (auth/protocol after the
-        // prompt closure's `#routeProviderFailure`, a budget refusal, or a local
-        // git/worktree flow error) while the child is still alive and this round
-        // is durably ACTIVE — would otherwise skip the `completed` write below
-        // and STRAND the run: the round stays `active`, suspension `none`, so
-        // BOTH `resume` (paused/interrupted-only) and `run` (approved-only)
-        // refuse, with no operator path forward. Route it through the SAME
-        // interrupt discipline the crash/orchestrator-restart paths use so a
-        // RECOVERABLE typed failure records a durable INTERRUPTED outcome (T17)
-        // and the run stays reclaimable; a genuinely-terminal error is left
-        // untouched (terminal). The error still unwinds (the CLI renders it).
-        this.#interruptActiveRoundOnFlowError(ctx, flowError);
-        throw flowError;
-      }
+        if (runner.role === 'coordinator') {
+          // Kept inside the protected flow boundary: drift during coordinator
+          // execution leaves the same round re-enterable and commits no draft.
+          await this.assertPinnedCleanWorkspace(runId);
+        }
       // F1: an EMERGENCY kill can suspend the run `resource_exhausted` DURABLY at
       // kill time even when the runner then finishes locally with no further
       // adapter call (the no-in-flight-call edge). Never mark such a round
       // `completed` — abort so it stays re-drivable and gated on an audited
       // budget raise (the durable suspension already holds). The seam-thrown path
       // never reaches here (it threw); this catches only the return-normally edge.
-      if (this.#loadEngineRecord(runId).state.suspension.kind === 'resource_exhausted') {
-        const cause = this.#latestResourceExhaustion(runId);
-        throw new ResourceExhaustedError(
-          runId,
-          runner.role,
-          cause?.rssBytes ?? 0,
-          cause?.budgetBytes ?? 0,
-        );
+      const returnedExhaustion = this.#resourceExhaustionForGeneration(runId, ctx.generationId, {
+        fallbackRole: runner.role,
+      });
+      if (
+        returnedExhaustion !== undefined &&
+        !this.#completedTurnAfterResourceIntent(runId, ctx.generationId)
+      ) {
+        throw this.#resourceExhaustedError(ctx, returnedExhaustion);
       }
-      if (baseRound !== undefined) {
-        // F2: adjudicate the round's deliverable AT completion — persist the
-        // verdict in the SAME write that would have marked it `completed`, so the
-        // decision is ATOMIC (no `completed`-then-overwrite crash window that a
-        // resume could read as "verify next"). Absent adjudicator (coordinator /
-        // verifier) → always `completed`.
+        // F2: adjudication is an engine-wide implementor invariant, not a
+        // dispatched-round feature. A bare/standalone run must still evaluate
+        // and reject `no_deliverable`; dispatched runs additionally persist the
+        // verdict atomically in their RoleRoundProjection.
         const stage: RoleRoundStage =
-          runner.adjudicateRoundOutcome !== undefined
+          runner.role === 'implementor'
             ? await runner.adjudicateRoundOutcome(result)
             : 'completed';
+        if (baseRound !== undefined) {
         // Preserve a checkpoint ref a mid-round pause recorded on THIS round
         // (a resumed round completing keeps its §12.2 lineage visible).
         const current = this.getRoleRound(runId);
+        // A cancelled/resource-exhausted turn may have atomically gated the
+        // round while the runner was still unwinding. Never overwrite that
+        // durable no-deliverable outcome with a late normal return.
+        if (current?.round === baseRound.round && current.stage === 'no_deliverable') {
+          throw new NoDeliverableError(
+            runId,
+            baseRound.round,
+            'round was already closed no_deliverable by its turn outcome',
+          );
+        }
         this.#saveRoleRound(runId, {
           ...baseRound,
           stage,
@@ -2812,44 +2942,27 @@ export class OrchestrationService {
         // false-trip the breaker on its next unrelated crash). The durable window
         // deque is deliberately NOT cleared (real restarts still count).
         this.#breaker.recordProgress(this.#breakerAssignmentKey(ctx));
-      }
-      completedNormally = true;
-      return result;
-    } finally {
-      // must-fix 5: if a watchdog graceful stop is in flight for this
-      // generation, AWAIT it (checkpoint + cancel + SHARED dispose) before
-      // releasing supervision — never dispose concurrently, and hold supervision
-      // until the stop's confirmed exit. Its dispose IS the shared disposal
-      // below, so `#disposeChildOnce` then returns the same resolved result.
-      const gracefulStop = this.#gracefulStops.get(ctx.generationId);
-      if (gracefulStop !== undefined) {
-        try {
-          await gracefulStop;
-        } catch {
-          // The stop's own failures are handled inside it (counted, never thrown).
+        } else if (stage === 'no_deliverable') {
+          throw new NoDeliverableError(
+            runId,
+            dispatch?.round ?? 1,
+            'standalone implementor produced no deliverable',
+          );
         }
+        completedNormally = true;
+        return result;
+      } catch (flowError) {
+        // Includes adjudication and its host-side HEAD read. Recoverable flow
+        // failures therefore take T17 and resume the same active round.
+        this.#interruptActiveRoundOnFlowError(ctx, flowError);
+        throw flowError;
       }
-      // The ONE shared disposal (never concurrent with the graceful stop's).
-      const disposedCleanly = await this.#disposeChildOnce(ctx);
-      // W2-6: every dispose path deregisters its watchers. The registry
-      // record is removed only on a CLEAN dispose (the transport ladder
-      // awaited the group's exit); a failed dispose leaves it durable for
-      // §14 startup reaping — never silently dropped.
-      this.#releaseSpawnSupervision(ctx, disposedCleanly);
-      // Confirm the stop for any path that did not already do so (normal
-      // completion, ModelPinError, typed auth/protocol failures, flow
-      // errors, and a pending T11 user pause — whose `paused_user` folds
-      // exactly here, on the generation-matched confirmation). The pause
-      // spine (`pauseForLimit`) and T13 already marked the generation
-      // stopped, so this is a no-op for them.
-      this.#confirmChildStopped(runId, ctx, completedNormally ? 'graceful' : 'terminated');
-      this.#endHeartbeat(runId);
-      // W3-5: free the admitted concurrency slot on EVERY exit path (normal
-      // completion, pin failure, flow error, pause/cancel) — both the durable
-      // reservation (cross-process cap) and the in-process mirror. The durable
-      // registry record's own lifecycle is owned by #releaseSpawnSupervision.
-      this.#releaseSpawnReservation(ctx.generationId);
-      this.#concurrency.release(ctx.generationId);
+    } finally {
+      try {
+        await this.#awaitGenerationShutdown(ctx, completedNormally);
+      } finally {
+        this.#endHeartbeat(runId);
+      }
     }
   }
 
@@ -2884,6 +2997,125 @@ export class OrchestrationService {
       }
     }
     return pinned;
+  }
+
+  /**
+   * Resolve and validate the primary checkout against the run's immutable
+   * source pin. Ignored files remain outside porcelain status by Git policy;
+   * staged, tracked, modified, and untracked paths all refuse the boundary.
+   */
+  async assertPinnedCleanWorkspace(runId: RunId): Promise<PinnedWorkspaceState> {
+    const meta = this.#requireMeta(runId);
+    const pinnedSha = this.getRunBaseCommit(runId);
+    if (pinnedSha === undefined) {
+      throw new WorkspaceDriftError({
+        kind: 'workspace_unresolvable',
+        detail: `run ${runId} has no immutable base commit`,
+      });
+    }
+    let repoRoot: string;
+    let currentSha: GitSha;
+    let status: string;
+    try {
+      repoRoot = await this.#workspaceGit.resolveTopLevel(meta.workspacePath);
+      const snapshot = await this.#workspaceGit.readStableHeadAndStatus(repoRoot);
+      currentSha = gitSha(snapshot.headAfter);
+      status = snapshot.statusPorcelain;
+      if (!snapshot.stable) {
+        throw new WorkspaceDriftError({
+          kind: 'base_drift',
+          pinnedSha,
+          currentSha,
+          detail:
+            `workspace HEAD changed while source drift was being checked ` +
+            `(${snapshot.headBefore} -> ${snapshot.headAfter}); retry from a stable checkout`,
+        });
+      }
+    } catch (error) {
+      if (error instanceof WorkspaceDriftError) throw error;
+      throw new WorkspaceDriftError({
+        kind: 'workspace_unresolvable',
+        pinnedSha,
+        detail:
+          `workspace '${meta.workspacePath}' cannot resolve a Git root, HEAD^{commit}, or status: ` +
+          redactText(error instanceof Error ? error.message : String(error)),
+      });
+    }
+    if (String(currentSha) !== String(pinnedSha)) {
+      throw new WorkspaceDriftError({
+        kind: 'base_drift',
+        pinnedSha,
+        currentSha,
+        detail: `workspace HEAD ${currentSha} differs from pinned base ${pinnedSha}`,
+      });
+    }
+    const dirtyPaths = this.#workspaceGit.porcelainPaths(status);
+    if (dirtyPaths.length > 0) {
+      throw new WorkspaceDriftError({
+        kind: 'workspace_dirty',
+        pinnedSha,
+        currentSha,
+        dirtyPaths,
+        detail: `workspace has ${dirtyPaths.length} tracked/staged/modified/untracked path(s)`,
+      });
+    }
+    return { repoRoot, pinnedSha, currentSha };
+  }
+
+  /**
+   * Source-sensitive compatibility boundary. A run from an old database may
+   * have no immutable base; take one stable, clean snapshot, append the
+   * audited one-time pin, then re-check against that durable pin. Fresh runs
+   * never need this path because `createRun` requires `baseCommit`.
+   */
+  async assertOrPinLegacyCleanWorkspace(runId: RunId): Promise<PinnedWorkspaceState> {
+    const existing = this.getRunBaseCommit(runId);
+    if (existing !== undefined) return this.assertPinnedCleanWorkspace(runId);
+
+    const meta = this.#requireMeta(runId);
+    let repoRoot: string;
+    let currentSha: GitSha;
+    let status: string;
+    try {
+      repoRoot = await this.#workspaceGit.resolveTopLevel(meta.workspacePath);
+      const snapshot = await this.#workspaceGit.readStableHeadAndStatus(repoRoot);
+      currentSha = gitSha(snapshot.headAfter);
+      status = snapshot.statusPorcelain;
+      if (!snapshot.stable) {
+        throw new WorkspaceDriftError({
+          kind: 'base_drift',
+          pinnedSha: gitSha(snapshot.headBefore),
+          currentSha,
+          detail:
+            `workspace HEAD changed while the legacy source pin was being established ` +
+            `(${snapshot.headBefore} -> ${snapshot.headAfter}); retry from a stable checkout`,
+        });
+      }
+    } catch (error) {
+      if (error instanceof WorkspaceDriftError) throw error;
+      throw new WorkspaceDriftError({
+        kind: 'workspace_unresolvable',
+        detail:
+          `legacy workspace '${meta.workspacePath}' cannot resolve a stable Git root, HEAD^{commit}, or status: ` +
+          redactText(error instanceof Error ? error.message : String(error)),
+      });
+    }
+
+    const dirtyPaths = this.#workspaceGit.porcelainPaths(status);
+    if (dirtyPaths.length > 0) {
+      throw new WorkspaceDriftError({
+        kind: 'workspace_dirty',
+        pinnedSha: currentSha,
+        currentSha,
+        dirtyPaths,
+        detail:
+          `legacy workspace must be clean before its one-time source pin; found ` +
+          `${dirtyPaths.length} tracked/staged/modified/untracked path(s)`,
+      });
+    }
+
+    this.pinRunBaseCommit(runId, currentSha);
+    return this.assertPinnedCleanWorkspace(runId);
   }
 
   /**
@@ -3126,9 +3358,11 @@ export class OrchestrationService {
     // `crash` → T13 → bounded auto-respawn at the SAME budget. (The emergency
     // path already suspended durably at kill time, so this also covers the
     // graceful pin-window case.)
-    const exhaustion = this.#resourceExhaustion.get(ctx.generationId);
+    const exhaustion = this.#resourceExhaustionForGeneration(ctx.runId, ctx.generationId, {
+      fallbackRole: ctx.role,
+    });
     if (exhaustion !== undefined) {
-      throw this.#enterResourceExhaustion(ctx, exhaustion, 'initial_config_pin');
+      throw this.#resourceExhaustedError(ctx, exhaustion);
     }
     const classification = ctx.adapter.classifyError(raw);
     switch (classification.kind) {
@@ -3155,88 +3389,133 @@ export class OrchestrationService {
     }
   }
 
-  /**
-   * F1/F3: enter the distinct `resource_exhausted` state for a generation the
-   * RSS watchdog terminated. Drives the supporting `resource.exhausted` fold
-   * (marks the generation stopped, suspends the run — return phase preserved),
-   * then closes an in-flight turn `resource_exhausted` (a pin-window exhaustion
-   * has no `turn.started` to close). Returns the typed error the caller throws
-   * so the role flow aborts WITHOUT counting cadence or completing the round.
-   */
-  #enterResourceExhaustion(
+  #resourceExhaustedError(
     ctx: SpawnContext,
     cause: ResourceExhaustionCause,
-    operation: PausedOperation,
   ): ResourceExhaustedError {
-    // F1: suspend + close the turn in ONE transaction — a crash can never land
-    // between `resource.exhausted` and its `turn.completed`. Idempotent: if an
-    // emergency kill already suspended this run durably (at kill time), only the
-    // in-flight turn is closed here (foldResourceExhausted is a no-op anyway).
-    let firstEntry = false;
-    this.#db.transactionImmediate(() => {
-      if (this.#loadEngineRecord(ctx.runId).state.suspension.kind !== 'resource_exhausted') {
-        firstEntry = true;
-        this.ingest(
-          this.#trigger(ctx.runId, 'resource.exhausted', {
-            generationId: ctx.generationId,
-            segmentId: ctx.segmentId,
-            role: cause.role,
-            rssBytes: cause.rssBytes,
-            budgetBytes: cause.budgetBytes,
-          }) as DomainEvent,
-        );
-      }
-      if (operation === 'prompt_turn') {
-        this.ingest(
-          this.#trigger(ctx.runId, 'turn.completed', {
-            segmentId: ctx.segmentId,
-            generationId: ctx.generationId,
-            outcome: 'resource_exhausted',
-          }) as DomainEvent,
-        );
-      }
-    });
-    // F3: raise the operator notify + alert exactly once — on the FIRST entry
-    // into the state (an emergency kill may already have suspended durably).
-    if (firstEntry) {
-      this.#raiseResourceExhaustedAlert(ctx.runId, cause.role, cause.rssBytes, cause.budgetBytes);
-    }
     return new ResourceExhaustedError(ctx.runId, ctx.role, cause.rssBytes, cause.budgetBytes);
   }
 
-  /** F3: durable operator notify + alert for a run entering `resource_exhausted`
-   * (distinct from `paused_limit`). Idempotency keyed on the incident so a
-   * double-emit (emergency onEvent + a later seam) dedupes. Timer-safe. */
-  #raiseResourceExhaustedAlert(
-    runId: RunId,
-    role: RoleName,
-    rssBytes: number,
-    budgetBytes: number,
+  /** Non-RSS cancellation closes the turn and gates the matching round atomically. */
+  #closeCancelledTurn(ctx: SpawnContext): void {
+    this.#db.transactionImmediate(() => {
+      this.ingest(
+        this.#trigger(ctx.runId, 'turn.completed', {
+          segmentId: ctx.segmentId,
+          generationId: ctx.generationId,
+          outcome: 'cancelled',
+        }) as DomainEvent,
+      );
+      const round = this.getRoleRound(ctx.runId);
+      if (
+        round !== undefined &&
+        round.role === ctx.role &&
+        round.stage !== 'completed' &&
+        round.stage !== 'no_deliverable' &&
+        (round.generationId === undefined || round.generationId === ctx.generationId)
+      ) {
+        this.#saveRoleRound(ctx.runId, {
+          ...round,
+          stage: 'no_deliverable',
+          generationId: ctx.generationId,
+          segmentId: ctx.segmentId,
+        });
+      }
+    });
+  }
+
+  /**
+   * Exit-confirmation fold for T22 v2. The incident, active turn closure,
+   * no-deliverable round, notification, and alert commit in one immediate
+   * transaction and are generation-idempotent.
+   */
+  #finalizeResourceExhaustion(
+    ctx: Pick<SpawnContext, 'runId' | 'role' | 'generationId' | 'segmentId'>,
+    cause: ResourceExhaustionCause,
+  ): void {
+    const incidentKey = `${String(ctx.runId)}:${String(ctx.generationId)}`;
+    this.#db.transactionImmediate(() => {
+      const before = this.#loadEngineRecord(ctx.runId).state;
+      const firstEntry = before.suspension.kind !== 'resource_exhausted';
+      if (firstEntry) {
+        this.ingest(
+          this.#trigger(
+            ctx.runId,
+            'resource.exhausted',
+            {
+              generationId: ctx.generationId,
+              segmentId: ctx.segmentId,
+              role: cause.role,
+              rssBytes: cause.rssBytes,
+              budgetBytes: cause.budgetBytes,
+            },
+            { idempotencyKey: idempotencyKey(`resource.exhausted:${incidentKey}`) },
+          ) as DomainEvent,
+        );
+      }
+      if (before.operation.kind === 'prompt_turn') {
+        this.ingest(
+          this.#trigger(
+            ctx.runId,
+            'turn.completed',
+            {
+              segmentId: ctx.segmentId,
+              generationId: ctx.generationId,
+              outcome: 'resource_exhausted',
+            },
+            { idempotencyKey: idempotencyKey(`turn.resource_exhausted:${incidentKey}`) },
+          ) as DomainEvent,
+        );
+      }
+      const round = this.getRoleRound(ctx.runId);
+      if (
+        round !== undefined &&
+        round.role === ctx.role &&
+        round.stage !== 'completed' &&
+        round.stage !== 'no_deliverable' &&
+        (round.generationId === undefined || round.generationId === ctx.generationId)
+      ) {
+        this.#saveRoleRound(ctx.runId, {
+          ...round,
+          stage: 'no_deliverable',
+          generationId: ctx.generationId,
+          segmentId: ctx.segmentId,
+        });
+      }
+      if (firstEntry) this.#recordResourceExhaustedAlert(ctx, cause, incidentKey);
+    });
+  }
+
+  #recordResourceExhaustedAlert(
+    ctx: Pick<SpawnContext, 'runId' | 'generationId'>,
+    cause: ResourceExhaustionCause,
+    incidentKey: string,
   ): void {
     const detail =
-      `RSS memory budget exhausted (${role}): ${rssBytes} bytes over the ${budgetBytes}-byte budget — ` +
-      `the generation was terminated. Raise the role's memory budget (audited), then resume.`;
-    const suffix = `${String(runId)}:${role}:${rssBytes}:${budgetBytes}`;
-    this.#ingestFromSupervisor(
+      `RSS memory budget exhausted (${cause.role}): ${cause.rssBytes} bytes over the ` +
+      `${cause.budgetBytes}-byte budget — the generation was terminated. ` +
+      `Raise the role's memory budget (audited), then resume.`;
+    this.ingest(
       draftEvent({
         type: 'notify.requested',
-        runId,
-        idempotencyKey: idempotencyKey(`notify:resource_exhausted:${suffix}`),
+        runId: ctx.runId,
+        idempotencyKey: idempotencyKey(`notify:resource_exhausted:${incidentKey}`),
         occurredAt: this.#clock.nowIso(),
         payload: { topic: 'resource_exhausted', message: detail },
       }) as DomainEvent,
     );
-    const alertKey = idempotencyKey(`alert.raised:resource_exhausted:${suffix}`);
-    this.#ingestFromSupervisor(
+    const alertKey = idempotencyKey(`alert.raised:resource_exhausted:${incidentKey}`);
+    this.ingest(
       draftEvent({
         type: 'alert.raised',
-        runId,
+        runId: ctx.runId,
         idempotencyKey: alertKey,
         occurredAt: this.#clock.nowIso(),
         payload: {
           alertId: alertId(String(alertKey)),
           kind: 'resource_exhausted',
-          role,
+          role: cause.role,
+          generationId: ctx.generationId,
           topic: 'resource_exhausted',
           detail: redactText(detail),
         },
@@ -3262,9 +3541,11 @@ export class OrchestrationService {
     // would fold restart counters and auto-respawn at the SAME budget). Close an
     // in-flight turn `resource_exhausted` and suspend the run BEFORE the
     // classifier ever runs. Covers both a mid-turn SIGKILL and a pin-window one.
-    const exhaustion = this.#resourceExhaustion.get(ctx.generationId);
+    const exhaustion = this.#resourceExhaustionForGeneration(ctx.runId, ctx.generationId, {
+      fallbackRole: ctx.role,
+    });
     if (exhaustion !== undefined) {
-      throw this.#enterResourceExhaustion(ctx, exhaustion, operation);
+      throw this.#resourceExhaustedError(ctx, exhaustion);
     }
     const classification = ctx.adapter.classifyError(raw);
     switch (classification.kind) {
@@ -3645,33 +3926,13 @@ export class OrchestrationService {
       }
     }
 
-    // (3) Cancel/dispose the child — transport ladder; never unwinds the
-    // pause. W2-6: the watchdog stands down first (this IS a dispose path);
-    // registry/heartbeat release follows in runRole's finally as the throw
-    // unwinds through it.
-    this.#watchdog.unwatch(ctx.generationId);
-    let stoppedCleanly = true;
-    if (operation === 'prompt_turn' && ctx.acpSessionId !== undefined) {
-      try {
-        await ctx.adapter.cancelTurn({ sessionId: ctx.acpSessionId });
-      } catch {
-        stoppedCleanly = false;
-      }
-    }
-    try {
-      await ctx.handle.dispose();
-    } catch {
-      stoppedCleanly = false;
-    }
-
-    // (4) Generation-matched confirmation.
-    this.ingest(
-      this.#trigger(ctx.runId, 'child.stopped', {
-        generationId: ctx.generationId,
-        segmentId: ctx.segmentId,
-        reason: stoppedCleanly ? 'graceful' : 'terminated',
-      }) as DomainEvent,
-    );
+    // (3/4) The generation barrier owns cancellation, the one memoized
+    // disposal, observed exit, durable `child.stopped`, and only then cleanup.
+    // This call intentionally does not await transport shutdown: runRole's
+    // `finally` waits on the independent exit barrier, while a failed/hung
+    // identity-backed disposal remains watched and reaches a bounded
+    // unconfirmed decision without inventing a stop confirmation.
+    this.#startGenerationGracefulStop(this.#ensureGenerationShutdown(ctx), false);
 
     return new LimitPausedError({
       runId: ctx.runId,
@@ -3798,6 +4059,27 @@ export class OrchestrationService {
   confirmStopIntentAfterCleanup(runId: RunId, opts?: CommandOptions): IngestResult | undefined {
     const child = this.#loadEngineRecord(runId).state.activeChild;
     if (child === undefined || child.status !== 'stopping') return undefined;
+    if (
+      child.stopCause !== undefined &&
+      stopIntentConfirmation(child.stopCause) === 'resource_exhaustion'
+    ) {
+      const round = this.getRoleRound(runId);
+      const cause = this.#resourceExhaustionForGeneration(runId, child.generationId, {
+        includeLegacy: true,
+        ...(round?.role !== undefined ? { fallbackRole: round.role } : {}),
+      });
+      if (cause === undefined) return undefined;
+      this.#finalizeResourceExhaustion(
+        {
+          runId,
+          role: cause.role,
+          generationId: child.generationId,
+          segmentId: child.segmentId,
+        },
+        cause,
+      );
+      return undefined;
+    }
     return this.ingest(
       this.#trigger(
         runId,
@@ -4092,6 +4374,7 @@ export class OrchestrationService {
       cwd: meta.workspacePath,
       mediation: DEFAULT_HEADLESS_MEDIATION,
     };
+    this.#ensureGenerationShutdown(ctx);
     this.#beginHeartbeat(runId);
     try {
       try {
@@ -4144,21 +4427,11 @@ export class OrchestrationService {
         };
       }
     } finally {
-      let disposedCleanly = true;
       try {
-        await handle.dispose();
-      } catch {
-        disposedCleanly = false;
+        await this.#awaitGenerationShutdown(ctx, false);
+      } finally {
+        this.#endHeartbeat(runId);
       }
-      this.#releaseSpawnSupervision(ctx, disposedCleanly);
-      this.#endHeartbeat(runId);
-      // W4-8/F8: free the admitted concurrency slot on EVERY exit path (probe
-      // OK, still-limited, inconclusive, budget refusal, dispose failure) —
-      // both the durable reservation (cross-process cap) and the in-process
-      // mirror. The durable registry record's lifecycle is owned by
-      // `#releaseSpawnSupervision` above.
-      this.#releaseSpawnReservation(ctx.generationId);
-      this.#concurrency.release(ctx.generationId);
     }
   }
 
@@ -4168,11 +4441,10 @@ export class OrchestrationService {
    * identity-VERIFIED orphans (ps identity AND — where readable — the
    * `HARNESS_SPAWN_ID` nonce; anything less withholds the signal and
    * surfaces the alert). Then reconcile the pause spine's crash window: a
-   * generation that is provably ABSENT (`gone`) or was just reaped
-   * (`killed`) satisfies the "§14 identity-verified cleanup" a committed
-   * stop-intent waits for, so its run's `child.stopped` confirmation is
-   * appended (idempotent). Ambiguous verdicts (mismatch / nonce trouble)
-   * confirm NOTHING — the process wearing that pid may still be live.
+   * generation is reconciled only after a later identity sample proves it
+   * ABSENT (`confirmed_gone`). A successfully sent SIGKILL is reported as
+   * `signal_sent`, retains registry ownership, and confirms NOTHING. Ambiguous
+   * verdicts (mismatch / nonce trouble) likewise confirm nothing.
    * Call at CLI startup (`resume` does) before re-entering any run.
    */
   /**
@@ -4255,24 +4527,59 @@ export class OrchestrationService {
 
   reapOrphanProcesses(): ReapSummary {
     const store = this.#registry.store;
-    // Snapshot before reaping: killed entries are removed from the store by
-    // the registry itself, but their run attribution is needed below.
+    // Snapshot before reaping so run attribution remains stable while each
+    // confirmed-gone record is reconciled before its explicit acknowledgement.
     const recordsByGeneration = new Map(store.list().map((r) => [r.generationId, r] as const));
     const summary = this.#registry.reapOrphans('SIGKILL');
     for (const entry of summary.entries) {
       const record = recordsByGeneration.get(entry.generationId);
       if (record === undefined) continue;
-      const provablyStopped = entry.action === 'killed' || entry.verification.verdict === 'gone';
-      if (!provablyStopped) continue;
-      // A gone process's record is spent bookkeeping — drop it so later
-      // reaps stay quiet about it (killed records were already removed).
-      if (entry.verification.verdict === 'gone') store.remove(entry.generationId);
-      if (record.runId === undefined) continue;
+      // Signal acceptance is not exit confirmation. Reconcile only after a
+      // fresh identity sample observes the process absent.
+      if (entry.action !== 'confirmed_gone') continue;
+      if (record.runId === undefined) {
+        store.remove(entry.generationId);
+        continue;
+      }
       const child = this.#db.projections.get<EngineState>(record.runId, ENGINE_STATE_PROJECTION)?.state
         .activeChild;
       // Only the run's OWN active generation is reconciled (a late/superseded
       // generation clears nothing).
       if (child === undefined || child.generationId !== entry.generationId || !isLiveChild(child)) {
+        store.remove(entry.generationId);
+        continue;
+      }
+      // F1 back-compat: v2 intent is explicit in the projection. Legacy T22
+      // did not set stopCause, so forward-reconcile it only here, where the
+      // matching generation's process is independently proven stopped. The
+      // old event is never reinterpreted during replay; new confirmation facts
+      // are appended idempotently.
+      const recoveryRound = this.getRoleRound(record.runId);
+      const rssCause = this.#resourceExhaustionForGeneration(record.runId, child.generationId, {
+        includeLegacy: true,
+        ...(recoveryRound?.role !== undefined ? { fallbackRole: recoveryRound.role } : {}),
+      });
+      if (
+        rssCause !== undefined &&
+        ((child.stopCause !== undefined &&
+          stopIntentConfirmation(child.stopCause) === 'resource_exhaustion') ||
+          recoveryRound?.stage !== 'completed')
+      ) {
+        this.#finalizeResourceExhaustion(
+          {
+            runId: record.runId,
+            role: rssCause.role,
+            generationId: child.generationId,
+            segmentId: child.segmentId,
+          },
+          rssCause,
+        );
+        // R1/Round 7: finalizers can reject without throwing when durable
+        // state raced after the snapshot above. Reload before acknowledging
+        // the sole retry record; a still-live matching generation retains it.
+        if (this.#startupGenerationDurablyReconciled(record.runId, entry.generationId)) {
+          store.remove(entry.generationId);
+        }
         continue;
       }
       if (child.status === 'stopping') {
@@ -4280,6 +4587,9 @@ export class OrchestrationService {
         // matching child.stopped — confirm the stop (idempotent). NO
         // interrupt: the pause is intentional, the suspension already holds.
         this.confirmStopIntentAfterCleanup(record.runId);
+        if (this.#startupGenerationDurablyReconciled(record.runId, entry.generationId)) {
+          store.remove(entry.generationId);
+        }
         continue;
       }
       // W4-4: an `active`/`spawning` generation whose OWNER was DEAD (only
@@ -4291,9 +4601,10 @@ export class OrchestrationService {
       //  - pending/active (or no round) → T17 `recovery.running_segment_found`
       //    (interrupted; manual resume). T17 (NOT T13) keeps orchestrator
       //    restarts out of the child-crash breaker/respawn counters.
-      // A T17 rejected by its preconditions (e.g. a run that is actually
-      // paused/terminal) is a benign no-op — ingest records a
-      // `transition.rejected` and never throws in this loop.
+      // A T17 rejected by its preconditions (including a T4 racing the stale
+      // snapshot above) records `transition.rejected` without throwing. The
+      // post-ingest durable reload below must therefore retain ownership when
+      // that matching generation remains live.
       const round = this.getRoleRound(record.runId);
       if (round?.stage === 'completed') {
         this.ingest(
@@ -4311,8 +4622,29 @@ export class OrchestrationService {
           }) as DomainEvent,
         );
       }
+      if (this.#startupGenerationDurablyReconciled(record.runId, entry.generationId)) {
+        store.remove(entry.generationId);
+      }
     }
     return summary;
+  }
+
+  /**
+   * Round 7 startup mirror of the live barrier's R1 commit-before-release
+   * rule. A startup stop/recovery ingest may reject as a durable no-op rather
+   * than throw, so its return is not exit-outcome proof. Reload the engine
+   * projection and acknowledge the registry record only when the recorded
+   * generation is stopped or no longer the run's active generation. A
+   * matching live generation keeps the sole retry record fail-closed.
+   */
+  #startupGenerationDurablyReconciled(
+    runId: RunId,
+    generationId: ProcessGenerationId,
+  ): boolean {
+    const child = this.#loadEngineRecord(runId).state.activeChild;
+    return (
+      child === undefined || child.generationId !== generationId || child.status === 'stopped'
+    );
   }
 
   /**
@@ -4329,8 +4661,9 @@ export class OrchestrationService {
    * double counting.
    *
    * Crashed peers never hold capacity hostage (§14): a reservation whose owner
-   * pid is gone/recycled — or a registry record whose child pid is not
-   * identity-alive — is not counted and is reclaimed, so no deadlock.
+   * pid is gone/recycled is reclaimed. A durable child registry record keeps
+   * occupying its slot while ANY member of its recorded process group remains
+   * alive; a gone leader alone is not exit confirmation.
    *
    * Called BEFORE any spawn; the slot is released in `runRole`'s `finally`.
    * Throwing here leaves nothing durable to unwind (the reservation is rolled
@@ -4352,7 +4685,9 @@ export class OrchestrationService {
       for (const record of this.#registry.store.list()) {
         if (String(record.generationId) === String(generationId)) continue;
         if (occupied.has(String(record.generationId))) continue;
-        if (this.#ps.isAlive(record.pid)) occupied.add(String(record.generationId));
+        if (this.#ps.sampleProcessTree(record.pgid) !== undefined) {
+          occupied.add(String(record.generationId));
+        }
       }
       const live = occupied.size;
       if (live >= max) {
@@ -4378,6 +4713,13 @@ export class OrchestrationService {
     } catch {
       // swallow — see doc comment
     }
+  }
+
+  /** Barrier-owned release is durability-critical: callers must know whether
+   * the live-owner reservation was actually deleted so they can retain and
+   * retry shutdown ownership on database failure. */
+  #releaseSpawnReservationStrict(generationId: ProcessGenerationId): void {
+    this.#reservations.release(generationId);
   }
 
   /** This process's reservation record for `generationId` (§14 owner identity). */
@@ -4448,20 +4790,156 @@ export class OrchestrationService {
     });
   }
 
-  /** W2-6: stop watchers on EVERY dispose path. The durable identity record
-   * is removed only when the dispose ladder confirmed the group's exit —
-   * otherwise it stays for §14 startup reaping. */
-  #releaseSpawnSupervision(ctx: SpawnContext, disposedCleanly: boolean): void {
+  #ensureGenerationShutdown(ctx: SpawnContext): GenerationShutdown {
+    const existing = this.#shutdowns.get(ctx.generationId);
+    if (existing !== undefined) return existing;
+    let settleExit!: GenerationShutdown['settleExit'];
+    const exitSettled = new Promise<
+      | { readonly confirmed: true }
+      | { readonly confirmed: false; readonly error: unknown }
+    >((resolve) => {
+      settleExit = resolve;
+    });
+    const shutdown: GenerationShutdown = {
+      ctx,
+      exitSettled,
+      settleExit,
+      waitAbandoned: false,
+      outcomeCommitted: false,
+      ownershipReleased: false,
+      settled: false,
+      confirmed: false,
+      cleaned: false,
+    };
+    this.#shutdowns.set(ctx.generationId, shutdown);
+    return shutdown;
+  }
+
+  /** Whole-PGID absence observed by the watchdog confirms an identity-backed
+   * generation. This is deliberately the only confirmation entry point for a
+   * handle with captured process identity. */
+  #confirmObservedTreeAbsence(generationId: ProcessGenerationId): void {
+    const shutdown = this.#shutdowns.get(generationId);
+    if (shutdown === undefined) return;
+    this.#markShutdownConfirmed(shutdown);
+  }
+
+  /** An opaque handle has no PGID to sample. Its owned disposal contract is
+   * therefore the only available positive exit evidence; never use this path
+   * for an identity-backed handle. */
+  #confirmOpaqueDisposal(generationId: ProcessGenerationId): void {
+    const shutdown = this.#shutdowns.get(generationId);
+    if (shutdown === undefined || shutdown.ctx.identity !== undefined) return;
+    this.#markShutdownConfirmed(shutdown);
+  }
+
+  #markShutdownConfirmed(shutdown: GenerationShutdown): void {
+    // A provider-limit stop is graceful only when its owned disposal itself
+    // confirmed success. Watchdog-observed absence after a failed/pending
+    // disposal is a terminated confirmation, even though it is safe to fold.
+    if (
+      shutdown.confirmationReason !== undefined &&
+      shutdown.disposeSucceeded !== true
+    ) {
+      shutdown.confirmationReason = 'terminated';
+    }
+    if (shutdown.exitConfirmationTimer !== undefined) {
+      clearTimeout(shutdown.exitConfirmationTimer);
+      delete shutdown.exitConfirmationTimer;
+    }
+    if (!shutdown.confirmed) {
+      shutdown.confirmed = true;
+      if (!shutdown.settled) {
+        shutdown.settled = true;
+        shutdown.settleExit({ confirmed: true });
+      }
+    }
+    // A bounded ambiguity decision or a failed durable finalization may have
+    // already returned the original runRole waiter. A later tree-absence
+    // sample is the retained in-process retry path: commit the durable outcome
+    // before releasing any ownership. Failure deliberately leaves the
+    // shutdown/registry/watchdog/reservation intact for startup retry.
+    if (
+      (this.#generationHasDurableStopIntent(shutdown) ||
+        shutdown.completedNormally === true ||
+        shutdown.waitAbandoned) &&
+      !shutdown.outcomeCommitted
+    ) {
+      void this.#commitGenerationShutdown(shutdown)
+        .then(() => {
+          if (shutdown.waitAbandoned) this.#retireGenerationShutdown(shutdown);
+        })
+        .catch(() => {
+          this.#supervisionIngestErrors += 1;
+          this.#scheduleGenerationOutcomeRetry(shutdown);
+        });
+    }
+  }
+
+  /** Before the runRole waiter settles, only a durable generation-matched
+   * stop intent licenses background finalization from observed absence. An
+   * unexpected disappearance first unwinds through the provider seam; if that
+   * waiter is later abandoned without an outcome, R2 uses T17 recovery. */
+  #generationHasDurableStopIntent(shutdown: GenerationShutdown): boolean {
+    const { ctx } = shutdown;
+    if (
+      this.#resourceExhaustionForGeneration(ctx.runId, ctx.generationId, {
+        fallbackRole: ctx.role,
+      }) !== undefined
+    ) {
+      return true;
+    }
+    const child = this.#loadEngineRecord(ctx.runId).state.activeChild;
+    return (
+      child !== undefined &&
+      child.generationId === ctx.generationId &&
+      child.status === 'stopping'
+    );
+  }
+
+  /** An opaque handle whose disposal failed has no evidence of exit. */
+  #failShutdownExit(generationId: ProcessGenerationId, error: unknown): void {
+    const shutdown = this.#shutdowns.get(generationId);
+    if (shutdown === undefined) return;
+    if (shutdown.exitConfirmationTimer !== undefined) {
+      clearTimeout(shutdown.exitConfirmationTimer);
+      delete shutdown.exitConfirmationTimer;
+    }
+    if (shutdown.settled) return;
+    shutdown.exitWasUnconfirmed = true;
+    shutdown.settled = true;
+    shutdown.settleExit({ confirmed: false, error });
+  }
+
+  /** Release supervision only after the process exit AND its durable outcome
+   * have both been confirmed. Registry removal comes last among durable
+   * lifecycle facts, so a failed fold leaves a startup-reap retry record. */
+  #cleanupGenerationShutdown(shutdown: GenerationShutdown): void {
+    if (shutdown.cleaned) return;
+    const { ctx } = shutdown;
+    if (!shutdown.confirmed || !shutdown.outcomeCommitted) return;
+    if (ctx.identity !== undefined) {
+      this.#registry.store.remove(ctx.generationId);
+    }
     this.#watchdog.unwatch(ctx.generationId);
     this.#liveSpawns.delete(ctx.generationId);
-    // F1/F3/F6/must-fix 5: the generation is gone — drop its exhaustion cause and
-    // the shared graceful-stop / disposal promises so the maps never leak across
-    // generations.
-    this.#resourceExhaustion.delete(ctx.generationId);
-    this.#gracefulStops.delete(ctx.generationId);
-    this.#disposals.delete(ctx.generationId);
-    if (ctx.identity !== undefined && disposedCleanly) {
-      this.#registry.store.remove(ctx.generationId);
+    shutdown.cleaned = true;
+  }
+
+  /** Delete the barrier object only after runRole's waiter has reused it, or
+   * after a waiter-abandoned background recovery has completed. */
+  #retireGenerationShutdown(shutdown: GenerationShutdown): void {
+    if (!shutdown.cleaned || !shutdown.outcomeCommitted || !shutdown.ownershipReleased) return;
+    if (shutdown.exitConfirmationTimer !== undefined) {
+      clearTimeout(shutdown.exitConfirmationTimer);
+      delete shutdown.exitConfirmationTimer;
+    }
+    if (shutdown.outcomeRetryTimer !== undefined) {
+      clearTimeout(shutdown.outcomeRetryTimer);
+      delete shutdown.outcomeRetryTimer;
+    }
+    if (this.#shutdowns.get(shutdown.ctx.generationId) === shutdown) {
+      this.#shutdowns.delete(shutdown.ctx.generationId);
     }
   }
 
@@ -4490,48 +4968,41 @@ export class OrchestrationService {
     return latest;
   }
 
-  /** F1/F3: bind (or refresh) the generation-scoped RSS-exhaustion cause from an
-   * `rss.hard_limit` incident so the prompt / provider-failure seam can classify
-   * the impending termination. A late incident for the same generation just
-   * refreshes the observed RSS. No-op if the event omitted its generation
-   * (defensive — the watchdog always stamps it). */
-  #bindResourceExhaustionCause(event: EventOfType<'rss.hard_limit'>): void {
-    const { generationId, role, rssBytes, budgetBytes } = event.payload;
-    if (generationId === undefined) return;
-    const resolvedRole = role ?? this.#liveSpawns.get(generationId)?.role;
-    if (resolvedRole === undefined) return;
-    this.#resourceExhaustion.set(generationId, { role: resolvedRole, rssBytes, budgetBytes });
+  /** Resolve RSS classification from the durable event log, never RAM maps. */
+  #resourceExhaustionForGeneration(
+    runId: RunId,
+    generationId: ProcessGenerationId,
+    options?: { readonly includeLegacy?: boolean; readonly fallbackRole?: RoleName },
+  ): ResourceExhaustionCause | undefined {
+    let latest: ResourceExhaustionCause | undefined;
+    for (const event of this.#db.events.listByRun(runId)) {
+      if (event.type !== 'rss.hard_limit') continue;
+      const payload = event.payload as EventPayloads['rss.hard_limit'];
+      if (payload.generationId !== generationId) continue;
+      if (payload.semanticsVersion !== 2 && options?.includeLegacy !== true) continue;
+      const role = payload.role ?? options?.fallbackRole;
+      if (role === undefined) continue;
+      latest = { role, rssBytes: payload.rssBytes, budgetBytes: payload.budgetBytes };
+    }
+    return latest;
   }
 
-  /**
-   * F1: durably suspend `resource_exhausted` for an EMERGENCY-killed generation.
-   * Folds the `rss.hard_limit` T22 effects FIRST (they require `child_active`),
-   * then the `resource.exhausted` supporting event (marks the generation stopped
-   * + suspends). Called from the watchdog `onEvent` at kill time so the
-   * classification is durable and the later crash/exit can never fold T13. Never
-   * throws (timer context — wrapped through `#ingestFromSupervisor`).
-   */
-  #suspendResourceExhaustedFromEvent(event: EventOfType<'rss.hard_limit'>): void {
-    this.#ingestFromSupervisor(event); // T22 effects (needs child_active) FIRST
-    const { generationId, role, rssBytes, budgetBytes, segmentId } = event.payload;
-    if (generationId === undefined) return;
-    const resolvedRole = role ?? this.#liveSpawns.get(generationId)?.role;
-    if (resolvedRole === undefined) return;
-    const alreadySuspended =
-      this.#loadEngineRecord(event.runId).state.suspension.kind === 'resource_exhausted';
-    this.#ingestFromSupervisor(
-      this.#trigger(event.runId, 'resource.exhausted', {
-        generationId,
-        role: resolvedRole,
-        rssBytes,
-        budgetBytes,
-        ...(segmentId !== undefined ? { segmentId } : {}),
-      }) as DomainEvent,
-    );
-    // F3: notify + alert on the FIRST entry into the state (not a redelivery).
-    if (!alreadySuspended) {
-      this.#raiseResourceExhaustedAlert(event.runId, resolvedRole, rssBytes, budgetBytes);
+  /** Preserve a natural end_turn that committed after the RSS stop intent. */
+  #completedTurnAfterResourceIntent(runId: RunId, generationId: ProcessGenerationId): boolean {
+    let sawIntent = false;
+    for (const event of this.#db.events.listByRun(runId)) {
+      if (event.type === 'rss.hard_limit') {
+        const payload = event.payload as EventPayloads['rss.hard_limit'];
+        if (payload.generationId === generationId && payload.semanticsVersion === 2) {
+          sawIntent = true;
+        }
+        continue;
+      }
+      if (!sawIntent || event.type !== 'turn.completed') continue;
+      const payload = event.payload as EventPayloads['turn.completed'];
+      if (payload.generationId === generationId && payload.outcome === 'completed') return true;
     }
+    return false;
   }
 
   /**
@@ -4545,70 +5016,349 @@ export class OrchestrationService {
    * (cancel the in-flight turn, dispose the child). If the tree is still
    * alive at the watchdog's deadline, the watchdog escalates to the
    * emergency kill (identity-verified SIGKILL → worktree TAINT via the
-   * attached manager). The child's death then reaches T13 through the SAME
-   * provider-failure classification path every child death takes — the
-   * watchdog never ingests T13 itself (one producer, no double-fold races).
+   * attached manager). Confirmed process absence finalizes the durable RSS
+   * outcome directly; it never routes through T13.
    */
   #onWatchdogGracefulStop(generationId: ProcessGenerationId): Promise<void> {
-    const ctx = this.#liveSpawns.get(generationId);
-    if (ctx === undefined) return Promise.resolve();
-    // F6/must-fix 5: return the ONE shared graceful-stop promise — the watchdog
-    // callback, the deadline escalation, a re-sample, and runRole's `finally`
-    // all await the SAME work (checkpoint + cancel + shared dispose); it runs
-    // once. Kept alive here so runRole's finally can await it before releasing
-    // supervision (never a concurrent second dispose).
-    const existing = this.#gracefulStops.get(generationId);
-    if (existing !== undefined) return existing;
-    const promise = this.#runGracefulStop(ctx);
-    this.#gracefulStops.set(generationId, promise);
-    return promise;
+    const shutdown = this.#shutdowns.get(generationId);
+    if (shutdown === undefined) return Promise.resolve();
+    return this.#startGenerationGracefulStop(shutdown, true);
   }
 
-  async #runGracefulStop(ctx: SpawnContext): Promise<void> {
+  /** Share the checkpoint/cancel/dispose path between RSS and provider-limit
+   * shutdown. The pause spine has already persisted its checkpoint, while
+   * T22 needs this path to write one before transport shutdown. */
+  #startGenerationGracefulStop(
+    shutdown: GenerationShutdown,
+    writeCheckpoint: boolean,
+  ): Promise<void> {
+    if (shutdown.gracefulStop !== undefined) return shutdown.gracefulStop;
+    if (!writeCheckpoint && shutdown.confirmationReason === undefined) {
+      shutdown.confirmationReason = 'graceful';
+    }
+    // Store the promise before any asynchronous work starts, so every caller
+    // observes the same checkpoint/cancel path even when callbacks race.
+    shutdown.gracefulStop = Promise.resolve()
+      .then(() => this.#runGracefulStop(shutdown, writeCheckpoint))
+      .catch((error: unknown) => {
+        // Provider-limit callers intentionally launch this promise without
+        // awaiting it. Convert every setup/disposal-launch failure into the
+        // barrier's fail-closed result so there is neither an unhandled
+        // rejection nor an exit waiter that can remain unresolved forever.
+        if (shutdown.confirmationReason !== undefined) {
+          shutdown.confirmationReason = 'terminated';
+        }
+        this.#supervisionIngestErrors += 1;
+        this.#failShutdownExit(shutdown.ctx.generationId, error);
+      });
+    return shutdown.gracefulStop;
+  }
+
+  async #runGracefulStop(
+    shutdown: GenerationShutdown,
+    writeCheckpoint: boolean,
+  ): Promise<void> {
+    const { ctx } = shutdown;
     try {
-      const state = this.#loadEngineRecord(ctx.runId).state;
-      const checkpoint = await this.#writeStopCheckpoint(ctx, 'pre_graceful_stop', state.operation);
-      if (checkpoint.event !== undefined) this.ingest(checkpoint.event as DomainEvent);
-    } catch {
-      // A failed checkpoint never blocks the stop — RSS pressure is the
-      // emergency here; resume revalidates everything (§16.3) regardless.
-      this.#supervisionIngestErrors += 1;
-    }
-    // F6: do NOT unregister the generation here. The watchdog owns dereg once the
-    // tree is confirmed gone or the deadline (armed BEFORE this callback,
-    // watchdog.ts) escalates to the emergency kill; runRole's `finally` releases
-    // supervision on the flow's own exit. Stop ladder (bounded): cancel the
-    // in-flight turn — the cancelled prompt resolves `stopReason:'cancelled'`,
-    // which the prompt seam classifies `resource_exhausted` (F1) — then dispose
-    // through the SHARED disposal (never concurrent with runRole's finally).
-    if (ctx.acpSessionId !== undefined) {
-      try {
-        await ctx.adapter.cancelTurn({ sessionId: ctx.acpSessionId });
-      } catch {
-        // Cancel failing is fine — dispose escalates.
+      if (writeCheckpoint) {
+        try {
+          const state = this.#loadEngineRecord(ctx.runId).state;
+          const checkpoint = await this.#writeStopCheckpoint(ctx, 'pre_graceful_stop', state.operation);
+          if (checkpoint.event !== undefined) this.ingest(checkpoint.event as DomainEvent);
+        } catch {
+          // A failed checkpoint never blocks the stop — RSS pressure is the
+          // emergency here; resume revalidates everything (§16.3) regardless.
+          this.#supervisionIngestErrors += 1;
+        }
       }
+      // F6: do NOT unregister the generation here. The watchdog owns dereg once the
+      // tree is confirmed gone or the deadline (armed BEFORE this callback,
+      // watchdog.ts) escalates to the emergency kill; runRole's `finally` releases
+      // supervision on the flow's own exit. Stop ladder (bounded): cancel the
+      // in-flight turn — the cancelled prompt resolves `stopReason:'cancelled'`,
+      // which the prompt seam classifies `resource_exhausted` (F1) — then dispose
+      // through the SHARED disposal (never concurrent with runRole's finally).
+      if (ctx.acpSessionId !== undefined) {
+        const pinned = loadRunConfig(this.#db, ctx.runId) ?? this.#config;
+        const cancelledCleanly = await new Promise<boolean>((resolve) => {
+          let finished = false;
+          const complete = (clean: boolean): void => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            resolve(clean);
+          };
+          const timer = setTimeout(() => complete(false), pinned.memory.gracefulStopDeadlineMs);
+          // An identity-less/opaque child has no process-tree observer that can
+          // keep the host alive while cancellation is pending. Keep this bound
+          // referenced so disposal and durable shutdown confirmation cannot be
+          // skipped by normal Node process exit.
+          if (ctx.identity !== undefined) timer.unref?.();
+          void Promise.resolve()
+            .then(() => ctx.adapter.cancelTurn({ sessionId: ctx.acpSessionId! }))
+            .then(() => complete(true))
+            .catch(() => complete(false));
+        });
+        if (!cancelledCleanly && shutdown.confirmationReason !== undefined) {
+          shutdown.confirmationReason = 'terminated';
+        }
+      }
+    } catch (error) {
+      // Downgrade before `finally` launches disposal. Opaque disposal may
+      // confirm directly; identity-backed disposal still requires a later
+      // whole-PGID absence observation.
+      if (shutdown.confirmationReason !== undefined) {
+        shutdown.confirmationReason = 'terminated';
+      }
+      throw error;
+    } finally {
+      // Even a config/checkpoint/cancel setup throw must reach the one shared
+      // disposal. A synchronous failure while arming that disposal propagates
+      // to #startGenerationGracefulStop's catch, which fails the barrier closed.
+      void this.#disposeChildOnce(shutdown);
     }
-    await this.#disposeChildOnce(ctx);
   }
 
-  /** must-fix 5: the ONE shared child disposal per generation — resolves to
-   * `disposedCleanly`. Both the graceful-stop callback and runRole's `finally`
-   * call this, so `handle.dispose()` is never invoked concurrently and its
-   * completion (confirmed process exit) is observed by both. */
-  #disposeChildOnce(ctx: SpawnContext): Promise<boolean> {
-    const existing = this.#disposals.get(ctx.generationId);
-    if (existing !== undefined) return existing;
+  /** Memoized disposal. For an identity-backed handle, success only triggers
+   * an immediate watchdog resample; it is never itself proof that descendants
+   * sharing the PGID are gone. */
+  #disposeChildOnce(shutdown: GenerationShutdown): Promise<boolean> {
+    if (shutdown.dispose !== undefined) return shutdown.dispose;
+    const { ctx } = shutdown;
+    // Opaque handles need the same fail-closed bound: they have no watchdog
+    // capable of producing a later callback if disposal never settles.
+    this.#armExitConfirmationDeadline(shutdown);
     const promise = (async (): Promise<boolean> => {
       try {
         await ctx.handle.dispose();
+        shutdown.disposeSucceeded = true;
+        if (ctx.identity === undefined) {
+          this.#confirmOpaqueDisposal(ctx.generationId);
+        } else {
+          // Avoid waiting for the ordinary watchdog cadence after a clean
+          // transport close, but keep the evidence boundary inside Watchdog:
+          // only sampleProcessTree(pgid) === undefined calls confirmation.
+          void this.#watchdog.sampleOnce(ctx.generationId).catch(() => {
+            this.#supervisionIngestErrors += 1;
+          });
+        }
         return true;
-      } catch {
-        // The registry record stays; §14 reaping owns any survivor.
+      } catch (error) {
+        if (shutdown.confirmationReason !== undefined) {
+          shutdown.confirmationReason = 'terminated';
+        }
+        // Failed disposal is not evidence of exit. Identity-backed children
+        // remain supervised for observed absence; an opaque handle fails the
+        // barrier closed and retains its reservation/concurrency ownership.
+        if (ctx.identity === undefined) this.#failShutdownExit(ctx.generationId, error);
         return false;
       }
     })();
-    this.#disposals.set(ctx.generationId, promise);
+    shutdown.dispose = promise;
     return promise;
+  }
+
+  /** A transport disposal is not allowed to hold runRole forever. Failure of
+   * this timer is not exit confirmation: the identity registry and watchdog
+   * remain owned and a later whole-tree absence can still complete recovery. */
+  #armExitConfirmationDeadline(shutdown: GenerationShutdown): void {
+    if (shutdown.exitConfirmationTimer !== undefined || shutdown.confirmed) return;
+    const pinned = loadRunConfig(this.#db, shutdown.ctx.runId) ?? this.#config;
+    const timer = setTimeout(() => {
+      delete shutdown.exitConfirmationTimer;
+      if (shutdown.confirmed) return;
+      if (shutdown.confirmationReason !== undefined) {
+        shutdown.confirmationReason = 'terminated';
+      }
+      this.#failShutdownExit(
+        shutdown.ctx.generationId,
+        new Error(
+          `process exit remains unconfirmed for generation ${shutdown.ctx.generationId} ` +
+            'after the disposal deadline; shutdown ownership retained',
+        ),
+      );
+    }, pinned.memory.gracefulStopDeadlineMs);
+    // An identity-backed generation has a durable registry/startup recovery
+    // path if this process exits. An opaque generation does not, so its
+    // fail-closed deadline must keep the CLI alive long enough to settle the
+    // waiter instead of disappearing with an unresolved Promise.
+    if (shutdown.ctx.identity !== undefined) timer.unref?.();
+    shutdown.exitConfirmationTimer = timer;
+  }
+
+  /**
+   * Start disposal without blocking the watchdog. Await only the independent
+   * exit-confirmation barrier, then fold the durable stop outcome and clean up.
+   */
+  async #awaitGenerationShutdown(
+    ctx: SpawnContext,
+    completedNormally: boolean,
+  ): Promise<void> {
+    const shutdown = this.#ensureGenerationShutdown(ctx);
+    shutdown.completedNormally = completedNormally;
+    const causeBeforeDispose = this.#resourceExhaustionForGeneration(ctx.runId, ctx.generationId, {
+      fallbackRole: ctx.role,
+    });
+    if (causeBeforeDispose !== undefined) {
+      void this.#onWatchdogGracefulStop(ctx.generationId);
+      // Let the owned checkpoint/cancel path reach the shared disposal first.
+      // If it hangs, the still-armed watchdog deadline independently kills and
+      // confirms absence. Opaque (identity-less) test handles have no watchdog,
+      // so they retain the direct disposal fallback.
+      if (ctx.identity === undefined) void this.#disposeChildOnce(shutdown);
+    } else if (shutdown.gracefulStop !== undefined) {
+      // Provider-limit pause already launched the barrier-owned cancel/dispose
+      // path. Do not race it with a second transport path; disposal itself is
+      // memoized, and its confirmation deadline is armed when it begins.
+      void shutdown.gracefulStop;
+    } else {
+      void this.#disposeChildOnce(shutdown);
+    }
+    const exit = await shutdown.exitSettled;
+    if (!exit.confirmed) {
+      shutdown.waitAbandoned = true;
+      // Tree absence/disposal success may have raced the bounded ambiguity
+      // decision. If confirmation arrived in that gap, finish the retained
+      // shutdown now rather than reporting a stale unconfirmed result.
+      if (shutdown.confirmed) {
+        try {
+          await this.#commitGenerationShutdown(shutdown);
+          this.#retireGenerationShutdown(shutdown);
+        } catch (error) {
+          this.#scheduleGenerationOutcomeRetry(shutdown);
+          throw error;
+        }
+        return;
+      }
+      throw new ProcessExitUnconfirmedError(ctx.generationId, exit.error);
+    }
+    try {
+      await this.#commitGenerationShutdown(shutdown);
+      this.#retireGenerationShutdown(shutdown);
+    } catch (error) {
+      // Keep the confirmed-but-uncommitted shutdown recoverable. The watchdog
+      // and registry remain owned; a subsequent observed-absence callback or
+      // startup reap retries the durable fold.
+      shutdown.waitAbandoned = true;
+      this.#scheduleGenerationOutcomeRetry(shutdown);
+      throw error;
+    }
+  }
+
+  /** Retry a confirmed-but-uncommitted terminal fold independently of process
+   * callbacks. This is essential for identity-less handles: after successful
+   * disposal there is no registry/watchdog entry capable of observing absence
+   * a second time. Ownership remains held until one retry commits. */
+  #scheduleGenerationOutcomeRetry(shutdown: GenerationShutdown): void {
+    if (
+      !shutdown.confirmed ||
+      (shutdown.outcomeCommitted && shutdown.cleaned && shutdown.ownershipReleased) ||
+      shutdown.outcomeRetryTimer !== undefined
+    ) {
+      return;
+    }
+    const delayMs = Math.max(1, Math.min(this.#terminateGraceMs, 1_000));
+    const timer = setTimeout(() => {
+      delete shutdown.outcomeRetryTimer;
+      void this.#commitGenerationShutdown(shutdown)
+        .then(() => {
+          if (shutdown.waitAbandoned) this.#retireGenerationShutdown(shutdown);
+        })
+        .catch(() => {
+          this.#supervisionIngestErrors += 1;
+          this.#scheduleGenerationOutcomeRetry(shutdown);
+        });
+    }, delayMs);
+    // Identity-backed generations retain a durable registry/startup recovery
+    // route if this process exits. Opaque generations have no such route, so
+    // their retry timer must keep this process alive until the durable fold
+    // and reservation release succeed.
+    if (shutdown.ctx.identity !== undefined) timer.unref?.();
+    shutdown.outcomeRetryTimer = timer;
+  }
+
+  /** Fold the generation's terminal outcome, then and only then clean up and
+   * release its durable/in-process admission ownership. The memoized in-flight
+   * attempt prevents the waiter and a late watchdog callback from double
+   * committing; a failed attempt is deliberately retryable. */
+  #commitGenerationShutdown(shutdown: GenerationShutdown): Promise<void> {
+    if (shutdown.outcomeCommitted && shutdown.cleaned && shutdown.ownershipReleased) {
+      return Promise.resolve();
+    }
+    if (shutdown.outcomeCommitInFlight !== undefined) return shutdown.outcomeCommitInFlight;
+    const attempt = Promise.resolve().then(() => {
+      const { ctx } = shutdown;
+      if (!shutdown.confirmed) {
+        throw new ProcessExitUnconfirmedError(ctx.generationId, new Error('exit is not confirmed'));
+      }
+      if (!shutdown.outcomeCommitted) {
+        const cause = this.#resourceExhaustionForGeneration(ctx.runId, ctx.generationId, {
+          fallbackRole: ctx.role,
+        });
+        const completedAfterIntent =
+          cause !== undefined &&
+          this.#completedTurnAfterResourceIntent(ctx.runId, ctx.generationId);
+        if (cause !== undefined && !completedAfterIntent) {
+          this.#finalizeResourceExhaustion(ctx, cause);
+        } else if (
+          cause === undefined &&
+          shutdown.exitWasUnconfirmed === true &&
+          shutdown.completedNormally !== true &&
+          !this.#generationHasDurableStopIntent(shutdown)
+        ) {
+          // R2: the waiter already failed closed while the process tree was
+          // ambiguous, then a later sample proved the PGID absent. If no
+          // provider/RSS/user stop path recorded an outcome, mirror startup
+          // recovery and interrupt the still-live generation via T17. This is
+          // breaker-exempt and makes the round resumable before ownership is
+          // released. A generation already stopped by T13/T17 is a benign
+          // rejected/no-op here.
+          this.ingest(
+            this.#trigger(ctx.runId, 'recovery.running_segment_found', {
+              generationId: ctx.generationId,
+              segmentId: ctx.segmentId,
+            }) as DomainEvent,
+          );
+          const afterRecovery = this.#loadEngineRecord(ctx.runId).state.activeChild;
+          if (
+            afterRecovery !== undefined &&
+            afterRecovery.generationId === ctx.generationId &&
+            afterRecovery.status !== 'stopped'
+          ) {
+            throw new Error(
+              `late whole-tree absence did not durably interrupt generation ${ctx.generationId}`,
+            );
+          }
+        } else {
+          const completedNormally = shutdown.completedNormally ?? false;
+          this.#confirmChildStopped(
+            ctx.runId,
+            ctx,
+            cause !== undefined && completedAfterIntent
+              ? 'rss_race_completed'
+              : shutdown.confirmationReason !== undefined
+                ? shutdown.confirmationReason
+              : completedNormally
+                ? 'graceful'
+                : 'terminated',
+          );
+        }
+        shutdown.outcomeCommitted = true;
+      }
+      this.#cleanupGenerationShutdown(shutdown);
+      if (!shutdown.ownershipReleased) {
+        this.#releaseSpawnReservationStrict(ctx.generationId);
+        this.#concurrency.release(ctx.generationId);
+        shutdown.ownershipReleased = true;
+      }
+    });
+    shutdown.outcomeCommitInFlight = attempt;
+    void attempt.finally(() => {
+      if (!shutdown.outcomeCommitted || !shutdown.cleaned || !shutdown.ownershipReleased) {
+        delete shutdown.outcomeCommitInFlight;
+      }
+    }).catch(() => undefined);
+    return attempt;
   }
 
   /** §14 "ambiguity → never kill, surface an alert": persist the alert as a
@@ -4649,6 +5399,42 @@ export class OrchestrationService {
     } catch {
       this.#supervisionIngestErrors += 1;
     }
+  }
+
+  /**
+   * The watchdog treats persistence as the authorization boundary for every
+   * T22 side effect. `ingest` reports transition rejection as data rather than
+   * throwing, so the constructor callback cannot simply ignore its result:
+   * doing so would arm graceful cancellation or permit an emergency signal
+   * after the durable stop intent was refused. A replay of the exact same
+   * idempotency key is the only non-applied success.
+   */
+  #persistWatchdogEvent(event: DomainEvent): void {
+    const result = this.ingest(event);
+    if (event.type !== 'rss.hard_limit') return;
+    if (result.status === 'applied') return;
+    const attempted = event.payload;
+    const persisted = result.status === 'deduped' && result.event.type === 'rss.hard_limit'
+      ? result.event.payload
+      : undefined;
+    if (
+      result.status === 'deduped' &&
+      result.event.type === 'rss.hard_limit' &&
+      result.event.runId === event.runId &&
+      result.event.idempotencyKey === event.idempotencyKey &&
+      persisted?.semanticsVersion === 2 &&
+      persisted.semanticsVersion === attempted.semanticsVersion &&
+      persisted.generationId === attempted.generationId &&
+      persisted.segmentId === attempted.segmentId &&
+      persisted.role === attempted.role &&
+      persisted.escalation === attempted.escalation &&
+      persisted.rssBytes === attempted.rssBytes &&
+      persisted.budgetBytes === attempted.budgetBytes
+    ) {
+      return;
+    }
+    const detail = result.status === 'rejected' ? `: ${result.detail}` : '';
+    throw new Error(`watchdog T22 stop intent was not durably applied${detail}`);
   }
 
   #beginHeartbeat(runId: RunId): void {
@@ -4763,9 +5549,11 @@ export class OrchestrationService {
         // effect carries stopReason 'end_turn' and stays a completed turn (no
         // cadence lost, round completes) — the codex-flagged race. Abort here so
         // the turn is never stamped `completed` and the round never completes.
-        const exhaustion = this.#resourceExhaustion.get(ctx.generationId);
+        const exhaustion = this.#resourceExhaustionForGeneration(ctx.runId, ctx.generationId, {
+          fallbackRole: ctx.role,
+        });
         if (exhaustion !== undefined && result.stopReason === 'cancelled') {
-          throw this.#enterResourceExhaustion(ctx, exhaustion, 'prompt_turn');
+          throw this.#resourceExhaustedError(ctx, exhaustion);
         }
         if (result.stopReason === 'cancelled') {
           // A NON-RSS cancel (user/cross-process) resolved the prompt
@@ -4773,13 +5561,7 @@ export class OrchestrationService {
           // `completed` one: it counts NO cadence and lets the round complete no
           // deliverable (the F2 gate blocks it downstream). `foldTurnCompleted`
           // still folds the operation back to idle.
-          this.ingest(
-            this.#trigger(runId, 'turn.completed', {
-              segmentId: ctx.segmentId,
-              generationId: ctx.generationId,
-              outcome: 'cancelled',
-            }) as DomainEvent,
-          );
+          this.#closeCancelledTurn(ctx);
           if (result.usage !== undefined) this.#foldTurnUsage(runId, role, sessionKey, result.usage);
           return result;
         }

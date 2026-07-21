@@ -35,6 +35,7 @@
  *  D. a LoopCompositionError stays terminal (NOT falsely resumable);
  *  E. the crash path (autoRespawn=off) is unchanged — no spurious T17.
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -218,6 +219,7 @@ interface LoopRig {
   readonly runId: RunId;
   readonly assignmentId: ReturnType<typeof toAssignmentId>;
   readonly created: CreatedCount;
+  readonly baseCommit: ReturnType<typeof gitSha>;
 }
 
 async function openLoopRig(
@@ -257,13 +259,27 @@ async function openLoopRig(
     adapterFactory: factory,
     ...(opts.config !== undefined ? { config: opts.config } : {}),
   });
-  const { runId } = service.createRun({ goal: 'g', workspacePath: repo.dir, coordinator: COORDINATOR });
+  const baseCommit = gitSha(await repo.headSha());
+  const { runId } = createRunFixture(service, {
+    goal: 'g',
+    workspacePath: repo.dir,
+    coordinator: COORDINATOR,
+    baseCommit,
+  });
   service.advanceWorkflowPhase(runId, 'created', 'specifying');
   service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
-  expect(service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH }).status).toBe(
+  expect((await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH })).status).toBe(
     'applied',
   );
-  return { service, db: handle.db, worktrees, runId, assignmentId: toAssignmentId(`asg_${runId}`), created };
+  return {
+    service,
+    db: handle.db,
+    worktrees,
+    runId,
+    assignmentId: toAssignmentId(`asg_${runId}`),
+    created,
+    baseCommit,
+  };
 }
 
 function loopInput(rig: LoopRig) {
@@ -279,7 +295,7 @@ function loopInput(rig: LoopRig) {
     criteria: CRITERIA,
     evidence: fakeEvidence(),
     runVerificationCommands: PASS_VERIFY,
-    baseRef: 'HEAD', // F5: pin the fresh test repo HEAD explicitly
+    baseCommit: rig.baseCommit,
   };
 }
 
@@ -313,6 +329,7 @@ async function openServiceRig(
   });
   const created: CreatedCount = { implementor: 0, verifier: 0, coordinator: 0 };
   const service = new OrchestrationService({
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
     db: handle.db,
     ids: new DeterministicIdFactory(),
     // A default fake for every role — the spawn/pin window succeeds, then the
@@ -320,10 +337,10 @@ async function openServiceRig(
     adapterFactory: makeFactory({ implementor: [{ turns: [] }] }, created),
     ...(opts.config !== undefined ? { config: opts.config } : {}),
   });
-  const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: COORDINATOR });
+  const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: COORDINATOR });
   service.advanceWorkflowPhase(runId, 'created', 'specifying');
   service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
-  expect(service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH }).status).toBe(
+  expect((await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: SPEC_HASH })).status).toBe(
     'applied',
   );
   return { service, db: handle.db, runId, assignmentId: toAssignmentId(`asg_${runId}`) };
@@ -332,12 +349,12 @@ async function openServiceRig(
 /** A RoleRunner that throws `error` from `run()` (no prompt) — models a local
  * flow error (git/artifact) or a composition breach reaching the F3 catch. */
 function throwingRunner(role: 'implementor' | 'verifier', error: unknown): RoleRunner {
-  return {
-    role,
-    run: async () => {
-      throw error;
-    },
+  const run = async (): Promise<never> => {
+    throw error;
   };
+  return role === 'implementor'
+    ? { role, run, adjudicateRoundOutcome: () => 'completed' }
+    : { role, run };
 }
 
 /** Dispatch an ACTIVE implementor round via a DIRECT `runRole` and return the
@@ -474,6 +491,7 @@ describe.each(DRIVER_KINDS)('F3 non-limit active-round strand (%s)', (kind) => {
     const rig = await openServiceRig(kind, { config: cfg({ budget: { maxBudgetUsd: 0.01 } }) });
     const promptOnce: RoleRunner = {
       role: 'implementor',
+      adjudicateRoundOutcome: () => 'completed',
       run: async (session) => {
         await session.prompt({ prompt: 'go' });
         return {};
@@ -500,6 +518,40 @@ describe.each(DRIVER_KINDS)('F3 non-limit active-round strand (%s)', (kind) => {
     expect(st.counters.lifetimeRestarts).toBe(0);
     expect(countType(rig.db, rig.runId, 'recovery.running_segment_found')).toBe(1);
     expect(rig.service.getRoleRound(rig.runId)).toMatchObject({ role: 'implementor', stage: 'active' });
+  });
+
+  it('a host-HEAD adjudication failure takes T17 and the same implementor round resumes successfully', async () => {
+    const rig = await openServiceRig(kind);
+    const failed: RoleRunner<{}> = {
+      role: 'implementor',
+      run: async () => ({}),
+      adjudicateRoundOutcome: () => {
+        throw new WorktreeError('git_command_failed', 'unable to read worktree HEAD');
+      },
+    };
+    const unwound = await dispatchActiveImplementorRound(rig, failed);
+    expect(unwound).toBeInstanceOf(WorktreeError);
+    expect(rig.service.status(rig.runId).suspension).toBe('interrupted');
+    expect(rig.service.getRoleRound(rig.runId)).toMatchObject({ round: 1, stage: 'active' });
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    await rig.service.runRole(
+      rig.runId,
+      { role: 'implementor', run: async () => ({}), adjudicateRoundOutcome: () => 'completed' },
+      IMPLEMENTOR,
+      '/ws',
+      {
+        round: 1,
+        completionAdvance: { from: 'implementing', to: 'verifying' },
+        inputs: JSON.stringify({ taskScope: 'implement it' }),
+        specHash: SPEC_HASH,
+        baseCommit: gitSha('a'.repeat(40)),
+        criterionIds: [AC1],
+        assignmentId: rig.assignmentId,
+      },
+    );
+    expect(rig.service.status(rig.runId).suspension).toBe('none');
+    expect(rig.service.getRoleRound(rig.runId)).toMatchObject({ round: 1, stage: 'completed' });
   });
 
   // =========================================================================

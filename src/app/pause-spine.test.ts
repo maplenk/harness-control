@@ -24,6 +24,7 @@
  *    and the `child.spawn.initiated` pin window license T4 on live ingest
  *    and on replay identically.
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   idempotencyKey,
@@ -138,6 +139,7 @@ async function setup(opts?: FakeFactoryOptions, quotas?: { perRunBytes: number; 
     db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
   });
   return { service, db, created };
 }
@@ -184,7 +186,7 @@ describe('pauseForLimit — limit envelope on a prompt turn (T4)', () => {
         },
       ],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // W2-7 R-A ordering probe: snapshot the adapter op log at the exact
     // moment the atomic pause append executes — §12.2 step (2) precedes
@@ -291,7 +293,7 @@ describe('pauseForLimit — limit envelope on a prompt turn (T4)', () => {
     const { service, db } = await setup({
       turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(runId, promptOnceRunner()).catch(() => undefined);
 
     const before = engineProjection(db, runId);
@@ -325,7 +327,7 @@ describe('pauseForLimit — limit envelope during initial pinning (T4, initial_c
         return { effectiveValue: input.value, echoed: true };
       },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const error: unknown = await service
       .runCoordination(runId, promptOnceRunner())
@@ -374,7 +376,7 @@ describe('pauseForLimit — unknown_provider_error (T16, never the breaker)', ()
     const { service, db } = await setup({
       turns: [{ errorEnvelope: unknownProviderErrorEnvelope() }],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const error: unknown = await service
       .runCoordination(runId, promptOnceRunner())
@@ -417,7 +419,7 @@ describe('classification precedes retry — pin failures (W2-3)', () => {
         return { effectiveValue: input.value, echoed: true };
       },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const error: unknown = await service
       .runCoordination(runId, promptOnceRunner())
@@ -454,7 +456,7 @@ describe('classification precedes retry — pin failures (W2-3)', () => {
         return { effectiveValue: input.value, echoed: true };
       },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const error: unknown = await service
       .runCoordination(runId, promptOnceRunner())
@@ -478,7 +480,7 @@ describe('classification precedes retry — pin failures (W2-3)', () => {
         return { effectiveValue: input.value, echoed: true };
       },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const error: unknown = await service
       .runCoordination(runId, promptOnceRunner())
@@ -500,7 +502,7 @@ describe('classification precedes retry — pin failures (W2-3)', () => {
     const { service } = await setup({
       onSetConfigOption: (input) => ({ effectiveValue: input.value, echoed: false }),
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(runId, promptOnceRunner());
     expect(service.status(runId).phase).toBe('awaiting_approval');
   });
@@ -525,7 +527,7 @@ describe('child death during a turn — T13 (interrupted, manual resume)', () =>
         return undefined;
       },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const error: unknown = await service
       .runCoordination(runId, promptOnceRunner())
@@ -559,7 +561,7 @@ describe('pauseForLimit crash windows', () => {
     const { service, db, created } = await setup({
       turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // Inject the crash exactly between step (1) artifact fsync and step (2)
     // the atomic append: the batch carrying the T4 trigger throws.
@@ -604,7 +606,7 @@ describe('pauseForLimit crash windows', () => {
 
   it('crash between the committed append and the stop confirmation: restart reclaims the stop-intent idempotently', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const now = db.clock.nowIso();
     const generation = processGenerationId('pgen_crash_1');
     const segment = segmentId('seg_crash_1');
@@ -708,7 +710,7 @@ describe('pending/active dispatch split', () => {
       },
     });
     serviceRef = service;
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     runRef = runId;
 
     const phasesInRun: string[] = [];
@@ -764,18 +766,19 @@ describe('pending/active dispatch split', () => {
       },
     });
     serviceRef = service;
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     runRef = runId;
     service.advanceWorkflowPhase(runId, 'created', 'specifying');
     service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
     expect(
-      service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: specHash('hash_1') }).status,
+      (await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: specHash('hash_1') })).status,
     ).toBe('applied');
 
     const result = await service.runRole(
       runId,
       {
         role: 'implementor',
+        adjudicateRoundOutcome: () => 'completed',
         run: async (session) => {
           phases.push(`run:${service.status(session.runId).phase}`);
           await session.prompt({ prompt: 'implement' });
@@ -810,7 +813,7 @@ describe('turn operation axis (durable prompt_turn window)', () => {
     const { service, db } = await setup({
       turns: [{ updates: [{ kind: 'agent_message_chunk', text: 'working' }] }],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const operationsSeen: string[] = [];
     await service.runCoordination(runId, {
@@ -841,7 +844,7 @@ describe('turn operation axis (durable prompt_turn window)', () => {
         { errorEnvelope: { code: -32603, message: 'auth', data: { errorKind: 'auth' } } },
       ],
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const error: unknown = await service
       .runCoordination(runId, promptOnceRunner())
@@ -867,7 +870,7 @@ describe('pauseForLimit under artifact-quota exhaustion', () => {
       { turns: [{ errorEnvelope: rateLimitErrorEnvelope() }] },
       { perRunBytes: 1, globalBytes: 1024 * 1024 },
     );
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const error: unknown = await service
       .runCoordination(runId, promptOnceRunner())
@@ -913,7 +916,7 @@ describe('W4-1 §12.2 completed-turn cadence checkpoint', () => {
     // cadence checkpoints were ever written — this expectation is the
     // regression guard (0 !== 1 without the fix).
     const { service, db } = await setup({ turns: [{}, {}, {}] });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(runId, promptNRunner(3));
 
     const cadence = cadenceCheckpoints(db, runId);
@@ -928,14 +931,14 @@ describe('W4-1 §12.2 completed-turn cadence checkpoint', () => {
 
   it('does NOT checkpoint before the window elapses (2 of 3 turns → no cadence checkpoint)', async () => {
     const { service, db } = await setup({ turns: [{}, {}] });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(runId, promptNRunner(2));
     expect(cadenceCheckpoints(db, runId)).toHaveLength(0);
   });
 
   it('resets the window after each checkpoint (6 turns → exactly 2 cadence checkpoints)', async () => {
     const { service, db } = await setup({ turns: [{}, {}, {}, {}, {}, {}] });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service.runCoordination(runId, promptNRunner(6));
     expect(cadenceCheckpoints(db, runId)).toHaveLength(2);
   });

@@ -27,6 +27,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { DeterministicIdFactory, RandomIdFactory } from '../lib/id-factory.js';
 import {
   criterionId,
+  gitSha,
   runId as toRunId,
   specHash as toSpecHash,
   specVersionId as toSpecVersionId,
@@ -39,17 +40,21 @@ import { loadProfileFile, type Profile } from '../config/profile.js';
 import { InProcessFakeAdapter, type ConfigOptionDescriptor, type InProcessTurnScript } from '../adapters/index.js';
 import {
   OrchestrationService,
+  ROLE_ROUND_PROJECTION,
   SPEC_DRAFT_PROJECTION,
   WorkflowAdvanceError,
   type RoleAdapterFactory,
   type RoleModelSpec,
+  type RoleRoundProjection,
   type SpecDraftState,
 } from '../app/index.js';
 import { CoordinatorRunner, type CoordinatorReviseContext } from '../app/flows/coordinator.js';
 import { DurableRunOwnershipStore } from '../app/run-ownership-store.js';
 import type { EvidenceRecorder } from '../app/flows/verifier.js';
+import { createLegacyRunFixture, createRunFixture } from '../app/test-support.js';
 import { artifactHash } from '../domain/ids.js';
 import { executeCommand, type CliFlowDeps } from './commands.js';
+import { makeTempGitRepo, type TempGitRepo } from '../worktree/test-support.js';
 
 const GOAL = 'Add a --verbose flag to the CLI so debug lines print to stderr.';
 const COORDINATOR: RoleModelSpec = { harness: 'claude', model: 'opus', effort: 'low' };
@@ -126,11 +131,14 @@ const NO_EVIDENCE: EvidenceRecorder = {
 };
 
 let handle: TestDatabaseHandle | undefined;
+let repo: TempGitRepo | undefined;
 
-afterEach(() => {
+afterEach(async () => {
   handle?.close();
   handle?.cleanup();
   handle = undefined;
+  await repo?.cleanup();
+  repo = undefined;
 });
 
 interface Wired {
@@ -139,11 +147,14 @@ interface Wired {
   readonly deps: { readonly ids: DeterministicIdFactory; readonly flows: CliFlowDeps };
   /** Every revision context the flow factory was handed (W3-4 rebuild proof). */
   readonly reviseCalls: (CoordinatorReviseContext | undefined)[];
+  /** Every immutable source base passed into a coordinator construction. */
+  readonly coordinatorBaseCommits: (string | undefined)[];
   /** A restarted-process stand-in over the SAME store with its own adapters. */
   successor(scripts: readonly (readonly InProcessTurnScript[])[]): OrchestrationService;
 }
 
 async function setup(scripts: readonly (readonly InProcessTurnScript[])[]): Promise<Wired> {
+  repo = await makeTempGitRepo('harness-draft-atomicity-');
   handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
   const db = handle.db;
   const ids = new DeterministicIdFactory();
@@ -161,17 +172,20 @@ async function setup(scripts: readonly (readonly InProcessTurnScript[])[]): Prom
   if (!profileResult.ok) throw new Error('coordinator profile failed to load');
   const profile: Profile = profileResult.value;
   const reviseCalls: (CoordinatorReviseContext | undefined)[] = [];
+  const coordinatorBaseCommits: (string | undefined)[] = [];
   const flows: CliFlowDeps = {
     ids,
     clock: db.clock,
-    buildCoordinatorRunner: ({ goal, revise }) => {
+    buildCoordinatorRunner: ({ goal, revise, baseCommit }) => {
       reviseCalls.push(revise);
+      coordinatorBaseCommits.push(baseCommit !== undefined ? String(baseCommit) : undefined);
       return new CoordinatorRunner({
         goal,
         profile,
         artifactStore: store,
         ids: flowIds,
         clock: db.clock,
+        baseCommit,
         ...(revise !== undefined ? { revise } : {}),
       });
     },
@@ -185,6 +199,7 @@ async function setup(scripts: readonly (readonly InProcessTurnScript[])[]): Prom
     db,
     deps: { ids, flows },
     reviseCalls,
+    coordinatorBaseCommits,
     successor: (successorScripts) =>
       new OrchestrationService({
         db,
@@ -194,7 +209,10 @@ async function setup(scripts: readonly (readonly InProcessTurnScript[])[]): Prom
   };
 }
 
-const START_CMD = { kind: 'start' as const, json: true, workspace: '/ws', goal: GOAL, coordinator: COORDINATOR };
+function startCommand() {
+  if (repo === undefined) throw new Error('test repository is not initialized');
+  return { kind: 'start' as const, json: true, workspace: repo.dir, goal: GOAL, coordinator: COORDINATOR };
+}
 
 /** Inject a process death into the durable write path: the append carrying
  * the coordinator COMPLETION advance (to === 'awaiting_approval') throws.
@@ -259,7 +277,7 @@ function completionAdvances(db: TestDatabaseHandle['db'], runId: RunId): DomainE
 describe('W3-4: the coordinator completion advance carries the draft ref', () => {
   it('start commits draft + advance together; the advance event carries artifact hash + version and getCoordinatorCompletion reads it back', async () => {
     const w = await setup([[coordinatorTurn(validSpec())]]);
-    const start = await executeCommand(w.service, w.db, START_CMD, {}, w.deps);
+    const start = await executeCommand(w.service, w.db, startCommand(), {}, w.deps);
     expect(start.exitCode).toBe(0);
     const runId = start.json['runId'] as RunId;
     const spec = start.json['spec'] as { specVersionId: string; specHash: string };
@@ -294,13 +312,45 @@ describe('W3-4: the coordinator completion advance carries the draft ref', () =>
 // 2 — crash-injection exactly in the old window
 // ---------------------------------------------------------------------------
 describe('W3-4: crash exactly in the old draft-save window', () => {
+  it('C2/C4: legacy coordinator re-entry pins once and constructs the runner with that base', async () => {
+    const w = await setup([[coordinatorTurn(validSpec())]]);
+    const { runId } = createLegacyRunFixture(w.service, w.db, {
+      goal: GOAL,
+      workspacePath: repo!.dir,
+      coordinator: COORDINATOR,
+    });
+    w.service.advanceWorkflowPhase(runId, 'created', 'specifying');
+    w.db.projections.save<RoleRoundProjection>(runId, ROLE_ROUND_PROJECTION, {
+      round: 1,
+      role: 'coordinator',
+      stage: 'completed',
+      modelSpec: COORDINATOR,
+      inputs: JSON.stringify({ goal: GOAL }),
+      intendedCompletionAdvance: { from: 'specifying', to: 'awaiting_approval' },
+    });
+
+    const resume = await executeCommand(
+      w.service,
+      w.db,
+      { kind: 'resume', json: true, runId },
+      {},
+      w.deps,
+    );
+    expect(resume.exitCode).toBe(0);
+    expect(resume.json).toMatchObject({ reentry: 'coordinator', phase: 'awaiting_approval' });
+    const pinned = w.service.getRunBaseCommit(runId);
+    expect(pinned).toBeTruthy();
+    expect(w.coordinatorBaseCommits).toEqual([String(pinned)]);
+    expect(w.db.events.listByRun(runId).filter((event) => event.type === 'run.base_commit.pinned')).toHaveLength(1);
+  });
+
   it('completion-append death: the draft ROLLS BACK with the advance (still specifying, no draft), and `resume` re-drives the round to awaiting_approval WITH the draft', async () => {
     const w = await setup([
       [coordinatorTurn(validSpec())], // the crashed round
       [coordinatorTurn(validSpec())], // the re-driven round after "restart"
     ]);
     const crash = crashOnCompletionAdvance(w.db);
-    const start = await executeCommand(w.service, w.db, START_CMD, {}, w.deps);
+    const start = await executeCommand(w.service, w.db, startCommand(), {}, w.deps);
     crash.restore();
     expect(start.exitCode).toBe(1);
     expect(JSON.stringify(start.json)).toContain('injected crash');
@@ -324,6 +374,9 @@ describe('W3-4: crash exactly in the old draft-save window', () => {
     const resume = await executeCommand(successor, w.db, { kind: 'resume', json: true, runId: RUN1 }, {}, w.deps);
     expect(resume.exitCode).toBe(0);
     expect(resume.json).toMatchObject({ outcome: 'resumed', reentry: 'coordinator', phase: 'awaiting_approval' });
+    expect(w.coordinatorBaseCommits).toHaveLength(2);
+    expect(w.coordinatorBaseCommits[0]).toBeTruthy();
+    expect(w.coordinatorBaseCommits[1]).toBe(w.coordinatorBaseCommits[0]);
 
     // The dichotomy's SECOND arm: awaiting_approval WITH the draft, and the
     // durable completion ref matches it.
@@ -338,7 +391,7 @@ describe('W3-4: crash exactly in the old draft-save window', () => {
   it('draft-projection-write death: nothing advances (still specifying, no half-committed completion), and `resume` completes the round', async () => {
     const w = await setup([[coordinatorTurn(validSpec())], [coordinatorTurn(validSpec())]]);
     const crash = crashOnDraftSave(w.db);
-    const start = await executeCommand(w.service, w.db, START_CMD, {}, w.deps);
+    const start = await executeCommand(w.service, w.db, startCommand(), {}, w.deps);
     crash.restore();
     expect(start.exitCode).toBe(1);
     expect(JSON.stringify(start.json)).toContain('injected crash');
@@ -356,7 +409,12 @@ describe('W3-4: crash exactly in the old draft-save window', () => {
 
   it('completeCoordinationRound is all-or-nothing: an illegal phase throws and persists NEITHER the draft NOR an advance', async () => {
     const w = await setup([[]]);
-    const { runId } = w.service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: COORDINATOR });
+    const { runId } = createRunFixture(w.service, {
+      goal: 'g',
+      workspacePath: repo!.dir,
+      coordinator: COORDINATOR,
+      baseCommit: gitSha(await repo!.headSha()),
+    });
     const draft: SpecDraftState = {
       specVersionId: toSpecVersionId('spec_x'),
       specHash: toSpecHash('hash_x'),
@@ -371,7 +429,7 @@ describe('W3-4: crash exactly in the old draft-save window', () => {
     };
     // The run is at `created`, not `specifying` — the advance validation
     // aborts the WHOLE transaction, so the draft written first rolls back.
-    expect(() => w.service.completeCoordinationRound(runId, draft)).toThrow(WorkflowAdvanceError);
+    await expect(w.service.completeCoordinationRound(runId, draft)).rejects.toThrow(WorkflowAdvanceError);
     expect(w.service.getSpecDraft(runId)).toBeUndefined();
     expect(completionAdvances(w.db, runId)).toHaveLength(0);
   });
@@ -382,7 +440,7 @@ describe('W3-4: crash exactly in the old draft-save window', () => {
 // ---------------------------------------------------------------------------
 describe('W3-4: a draftless awaiting_approval run is detected and refused', () => {
   async function startedRun(w: Wired): Promise<{ runId: RunId; specVersionId: string; specHash: string }> {
-    const start = await executeCommand(w.service, w.db, START_CMD, {}, w.deps);
+    const start = await executeCommand(w.service, w.db, startCommand(), {}, w.deps);
     expect(start.exitCode).toBe(0);
     const spec = start.json['spec'] as { specVersionId: string; specHash: string };
     return { runId: start.json['runId'] as RunId, specVersionId: spec.specVersionId, specHash: spec.specHash };
@@ -528,7 +586,7 @@ describe('W4-4: the coordinator re-drive carve-out is owner-liveness gated', () 
   it('a LIVE owner holds the run lease → the carve-out WITHHOLDS (stays specifying, no draft) — fails without the gate: the ungated carve-out re-drove to awaiting_approval', async () => {
     const w = await setup([[coordinatorTurn(validSpec())]]);
     const crash = crashOnCompletionAdvance(w.db);
-    const start = await executeCommand(w.service, w.db, START_CMD, {}, w.deps);
+    const start = await executeCommand(w.service, w.db, startCommand(), {}, w.deps);
     crash.restore();
     expect(start.exitCode).toBe(1);
     // Stranded at the coordinator round, still specifying (the W3-4 dichotomy).
@@ -562,7 +620,7 @@ describe('W4-4: the coordinator re-drive carve-out is owner-liveness gated', () 
   it('a DEAD owner lease → the carve-out PROCEEDS (re-drives to awaiting_approval) — the intended crash reclaim', async () => {
     const w = await setup([[coordinatorTurn(validSpec())]]);
     const crash = crashOnCompletionAdvance(w.db);
-    const start = await executeCommand(w.service, w.db, START_CMD, {}, w.deps);
+    const start = await executeCommand(w.service, w.db, startCommand(), {}, w.deps);
     crash.restore();
     expect(start.exitCode).toBe(1);
     expect(w.service.status(RUN1).phase).toBe('specifying');

@@ -20,10 +20,11 @@
  * seams — except the LAST describe, which captures a REAL child process
  * (the fake ACP child) through the real transport + real `ps`.
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ManualClock, isoTimestamp } from '../lib/clock.js';
 import { DeterministicIdFactory } from '../lib/id-factory.js';
 import {
@@ -31,6 +32,7 @@ import {
   idempotencyKey,
   processGenerationId,
   segmentId,
+  type EventSequence,
   type ProcessGenerationId,
   type RunId,
 } from '../domain/ids.js';
@@ -64,16 +66,26 @@ import { unwrap } from '../lib/result.js';
 import {
   LimitPausedError,
   OrchestrationService,
+  ProcessExitUnconfirmedError,
   ResourceExhaustedError,
   captureAcpProcessIdentity,
   type RoleAdapterFactory,
   type SupervisionOptions,
 } from './service.js';
-import { ENGINE_STATE_PROJECTION, ROLE_ROUND_PROJECTION } from './projections.js';
+import {
+  ENGINE_STATE_PROJECTION,
+  ROLE_ROUND_PROJECTION,
+  RUN_CONFIG_PROJECTION,
+} from './projections.js';
 import { DurableProcessRegistryStore } from './process-registry-store.js';
+import {
+  SPAWN_RESERVATION_PROJECTION,
+  SPAWN_RESERVATION_SCOPE,
+} from './spawn-reservation-store.js';
 import type { RoleRunner } from './role-runner.js';
 
 const CLAUDE_LOW = { harness: 'claude', model: 'opus', effort: 'low' } as const;
+const TEST_MB = 1024 * 1024;
 
 function fakeConfigOptions(): ConfigOptionDescriptor[] {
   return [
@@ -143,6 +155,14 @@ function identityFor(pid: number, generationId: ProcessGenerationId): ProcessIde
 interface SupervisedFactoryOptions {
   readonly turns?: readonly InProcessTurnScript[];
   readonly onSetConfigOption?: (input: SetConfigOptionInput) => SetConfigOptionResult;
+  readonly captureIdentity?: boolean;
+  readonly disposeError?: Error;
+  readonly hangDispose?: boolean;
+  readonly hangCancel?: boolean;
+  /** Defaults to true: a successful fake disposal is accompanied by the
+   * independent fake-ps observation that its whole group disappeared. Set
+   * false to model a dead leader with surviving descendants. */
+  readonly treeGoneOnDispose?: boolean;
 }
 
 function makeSupervisedFactory(
@@ -163,16 +183,34 @@ function makeSupervisedFactory(
           : {}),
       });
       adapters.push(adapter);
+      if (opts.hangCancel === true) {
+        Object.defineProperty(adapter, 'cancelTurn', {
+          configurable: true,
+          value: (): Promise<void> => new Promise<void>(() => undefined),
+        });
+      }
       const pid = nextPid;
       nextPid += 1;
-      ps.identities.set(pid, sampleFor(pid));
+      if (opts.captureIdentity !== false) {
+        ps.treeGone = false;
+        ps.identities.set(pid, sampleFor(pid));
+      }
       return {
         adapter,
-        captureProcessIdentity: (generationId: ProcessGenerationId) =>
-          identityFor(pid, generationId),
-        dispose: (): Promise<void> => {
+        ...(opts.captureIdentity !== false
+          ? {
+              captureProcessIdentity: (generationId: ProcessGenerationId) =>
+                identityFor(pid, generationId),
+            }
+          : {}),
+        dispose: async (): Promise<void> => {
           disposeCalls += 1;
-          return adapter.close();
+          if (opts.hangDispose === true) await new Promise<void>(() => undefined);
+          if (opts.disposeError !== undefined) throw opts.disposeError;
+          await adapter.close();
+          if (opts.captureIdentity !== false && opts.treeGoneOnDispose !== false) {
+            ps.treeGone = true;
+          }
         },
       };
     },
@@ -222,6 +260,7 @@ async function setup(opts: {
     db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
     ...(config !== undefined ? { config } : {}),
     supervision: {
       ps: ps.client,
@@ -243,6 +282,14 @@ function engineState(db: TestDatabaseHandle['db'], runId: RunId): EngineState {
   const record = db.projections.get<EngineState>(runId, ENGINE_STATE_PROJECTION);
   if (record === undefined) throw new Error('engine projection missing');
   return record.state;
+}
+
+function spawnReservationCount(db: TestDatabaseHandle['db']): number {
+  const state = db.projections.get<{ readonly reservations: Record<string, unknown> }>(
+    SPAWN_RESERVATION_SCOPE,
+    SPAWN_RESERVATION_PROJECTION,
+  )?.state;
+  return Object.keys(state?.reservations ?? {}).length;
 }
 
 /** A coordinator runner delegating its body to the test. */
@@ -288,6 +335,719 @@ describe('DurableProcessRegistryStore — §14 identity survives the process', (
 // Registry identity persisted BEFORE child.spawned; deregistered on dispose
 // ---------------------------------------------------------------------------
 describe('runRole §14 identity registration (W2-6)', () => {
+  it('rejects a graceful T22 before launching cancel/dispose side effects when the generation is no longer active', async () => {
+    const { service, db, ps, adapters, disposeCalls } = await setup({ budgetMb: 64 });
+    const { runId } = createRunFixture(service, {
+      goal: 'reject stale graceful T22',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    let sampleError: unknown;
+    let disposeCallsAtRejection = -1;
+    let cancelCallsAtRejection = -1;
+
+    await service.runCoordination(
+      runId,
+      runnerWith(async () => {
+        const generation = service.supervision.registry.store.list()[0]!.generationId;
+        const state = engineState(db, runId);
+        db.projections.save(runId, ENGINE_STATE_PROJECTION, { ...state, activeChild: undefined });
+        ps.rssBytes = 70 * TEST_MB;
+        sampleError = await service.supervision.watchdog
+          .sampleOnce(generation)
+          .then(() => undefined)
+          .catch((error: unknown) => error);
+        // The only later dispose is runRole's ordinary finally cleanup. The
+        // rejected watchdog decision itself launched no transport callback.
+        disposeCallsAtRejection = disposeCalls();
+        cancelCallsAtRejection = adapters[0]!.log.filter((entry) => entry.op === 'cancelTurn').length;
+      }),
+    );
+
+    expect(String(sampleError)).toContain('T22 stop intent was not durably applied');
+    expect(disposeCallsAtRejection).toBe(0);
+    expect(cancelCallsAtRejection).toBe(0);
+    expect(disposeCalls()).toBe(1);
+    expect(eventTypes(db, runId)).not.toContain('rss.hard_limit');
+  });
+
+  it('rejects an emergency T22 before SIGKILL or taint when the generation is no longer active', async () => {
+    const { service, db, ps, signals, disposeCalls } = await setup({ budgetMb: 64 });
+    const { runId } = createRunFixture(service, {
+      goal: 'reject stale emergency T22',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const asg = assignmentId('asg_rejected_emergency');
+    const taints: string[] = [];
+    service.attachWorktreeSupervision({
+      markTainted: (_assignment, taint) => taints.push(taint),
+      awaitGitOpIdle: async () => 'idle' as const,
+    });
+    let sampleError: unknown;
+
+    await service.runRole(
+      runId,
+      runnerWith(async () => {
+        const generation = service.supervision.registry.store.list()[0]!.generationId;
+        const state = engineState(db, runId);
+        db.projections.save(runId, ENGINE_STATE_PROJECTION, { ...state, activeChild: undefined });
+        ps.rssBytes = 100 * TEST_MB;
+        sampleError = await service.supervision.watchdog
+          .sampleOnce(generation)
+          .then(() => undefined)
+          .catch((error: unknown) => error);
+        expect(disposeCalls()).toBe(0);
+      }),
+      CLAUDE_LOW,
+      '/ws',
+      { round: 1, assignmentId: asg },
+    );
+    service.detachWorktreeSupervision();
+
+    expect(String(sampleError)).toContain('T22 stop intent was not durably applied');
+    expect(signals).toEqual([]);
+    expect(taints).toEqual([]);
+    expect(eventTypes(db, runId)).not.toContain('rss.hard_limit');
+  });
+
+  it('fails closed when opaque disposal fails and retains the concurrency reservation', async () => {
+    const config = unwrap(parseEngineConfig({ maxLiveChildren: 1 }));
+    const { service } = await setup({
+      config,
+      factory: {
+        captureIdentity: false,
+        disposeError: new Error('synthetic opaque disposal failure'),
+      },
+    });
+    const first = createRunFixture(service, { goal: 'first', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const error = await service
+      .runCoordination(first.runId, runnerWith(async () => undefined))
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(ProcessExitUnconfirmedError);
+    expect(String(error)).toContain('shutdown ownership retained');
+    expect(service.supervision.registry.store.list()).toEqual([]);
+
+    // No identity existed and disposal failed, so neither permitted exit
+    // confirmation source fired. A later spawn is refused at capacity: the
+    // slot/reservation was not released merely because cleanup threw.
+    const second = createRunFixture(service, { goal: 'second', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const capacity = await service
+      .runCoordination(second.runId, runnerWith(async () => undefined))
+      .catch((caught: unknown) => caught);
+    expect(String(capacity)).toMatch(/max-live-children guard: at capacity/i);
+  });
+
+  it('bounds an identity-less hung disposal without confirming exit or releasing capacity', async () => {
+    const config = unwrap(
+      parseEngineConfig({
+        maxLiveChildren: 1,
+        memory: { gracefulStopDeadlineMs: 25 },
+      }),
+    );
+    const { service, disposeCalls } = await setup({
+      config,
+      factory: { captureIdentity: false, hangDispose: true },
+    });
+    const first = createRunFixture(service, {
+      goal: 'identityless hung disposal',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+
+    const error = await Promise.race([
+      service
+        .runCoordination(first.runId, runnerWith(async () => undefined))
+        .catch((caught: unknown) => caught),
+      sleep(1_000).then(() => new Error('identityless disposal remained unbounded')),
+    ]);
+    expect(error).toBeInstanceOf(ProcessExitUnconfirmedError);
+    expect(String(error)).not.toContain('remained unbounded');
+    expect(disposeCalls()).toBe(1);
+    expect(service.status(first.runId).activeChild?.status).toBe('active');
+
+    const second = createRunFixture(service, {
+      goal: 'capacity remains owned',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const capacity = await service
+      .runCoordination(second.runId, runnerWith(async () => undefined))
+      .catch((caught: unknown) => caught);
+    expect(String(capacity)).toMatch(/max-live-children guard: at capacity/i);
+  });
+
+  it('A1 does not treat identity-backed disposal as exit while descendants remain in the PGID', async () => {
+    const config = unwrap(
+      parseEngineConfig({
+        maxLiveChildren: 1,
+        memory: { gracefulStopDeadlineMs: 25 },
+      }),
+    );
+    const { service, db, ps, disposeCalls } = await setup({
+      config,
+      factory: { treeGoneOnDispose: false },
+    });
+    const { runId } = createRunFixture(service, {
+      goal: 'leader exits but descendant survives',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+
+    const error = await Promise.race([
+      service
+        .runCoordination(runId, runnerWith(async () => undefined))
+        .catch((caught: unknown) => caught),
+      sleep(1_000).then(() => new Error('live whole-PGID confirmation remained unbounded')),
+    ]);
+
+    expect(error).toBeInstanceOf(ProcessExitUnconfirmedError);
+    expect(String(error)).not.toContain('remained unbounded');
+    expect(disposeCalls()).toBe(1);
+    const generation = service.supervision.registry.store.list()[0]!.generationId;
+    // The transport/leader closed, but fake ps still observes a descendant in
+    // the recorded group. No durable stop or ownership release is permitted.
+    expect(engineState(db, runId).activeChild).toMatchObject({
+      generationId: generation,
+      status: 'active',
+    });
+    expect(eventTypes(db, runId)).not.toContain('child.stopped');
+    expect(service.supervision.watchdog.isWatching(generation)).toBe(true);
+    expect(spawnReservationCount(db)).toBe(1);
+
+    ps.treeGone = true;
+    await service.supervision.watchdog.sampleOnce(generation);
+    for (let attempt = 0; attempt < 50 && service.supervision.registry.store.list().length > 0; attempt += 1) {
+      await sleep(5);
+    }
+    expect(engineState(db, runId).activeChild?.status).toBe('stopped');
+    expect(service.supervision.registry.store.list()).toEqual([]);
+    expect(service.supervision.watchdog.isWatching(generation)).toBe(false);
+    expect(spawnReservationCount(db)).toBe(0);
+  });
+
+  it('R1 retains all ownership when durable RSS finalization fails, then retries after a later absence sample', async () => {
+    const { service, db, ps } = await setup({ budgetMb: 64 });
+    const { runId } = createRunFixture(service, {
+      goal: 'durable ordering',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const realTransactionImmediate = db.transactionImmediate.bind(db);
+    let failFinalization = false;
+    Object.defineProperty(db, 'transactionImmediate', {
+      configurable: true,
+      value: <T>(fn: () => T): T => {
+        if (failFinalization) {
+          failFinalization = false;
+          throw new Error('synthetic durable finalization failure');
+        }
+        return realTransactionImmediate(fn);
+      },
+    });
+
+    const error = await service
+      .runCoordination(
+        runId,
+        runnerWith(async () => {
+          const record = service.supervision.registry.store.list()[0]!;
+          service.ingest(
+            draftEvent({
+              type: 'rss.hard_limit',
+              runId,
+              idempotencyKey: idempotencyKey('r1-finalization-intent'),
+              occurredAt: db.clock.nowIso(),
+              payload: {
+                semanticsVersion: 2,
+                generationId: record.generationId,
+                role: 'coordinator',
+                rssBytes: 70 * 1024 * 1024,
+                budgetBytes: 64 * 1024 * 1024,
+                escalation: 'graceful',
+              },
+            }),
+          );
+          // The next immediate transaction is the terminal RSS fold. Its
+          // failure must precede every cleanup/release side effect.
+          failFinalization = true;
+        }),
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(String(error)).toContain('synthetic durable finalization failure');
+    const retained = service.supervision.registry.store.list()[0]!;
+    expect(retained).toBeDefined();
+    expect(service.supervision.watchdog.isWatching(retained.generationId)).toBe(true);
+    expect(eventTypes(db, runId)).not.toContain('resource.exhausted');
+    expect(engineState(db, runId).activeChild).toMatchObject({
+      generationId: retained.generationId,
+      status: 'stopping',
+    });
+
+    // The retained watchdog/registry record is a real retry path. A later
+    // tree-absence observation re-runs the idempotent durable fold, then (and
+    // only then) removes supervision and admission ownership.
+    ps.treeGone = true;
+    await service.supervision.watchdog.sampleOnce(retained.generationId);
+    for (let attempt = 0; attempt < 50 && service.supervision.registry.store.list().length > 0; attempt += 1) {
+      await sleep(5);
+    }
+    expect(eventTypes(db, runId)).toContain('resource.exhausted');
+    expect(service.supervision.registry.store.list()).toEqual([]);
+    expect(service.supervision.watchdog.isWatching(retained.generationId)).toBe(false);
+  });
+
+  it('R2 bounds an ambiguous emergency wait without orphaning supervision, then accepts later absence', async () => {
+    const config = unwrap(
+      parseEngineConfig({
+        maxLiveChildren: 1,
+        memory: { budgetMb: 64, gracefulStopDeadlineMs: 25 },
+      }),
+    );
+    const { service, db, ps, signals } = await setup({
+      config,
+      factory: { disposeError: new Error('synthetic identity-backed disposal failure') },
+    });
+    const { runId } = createRunFixture(service, {
+      goal: 'ambiguous supervision',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    let generation: ProcessGenerationId | undefined;
+
+    const error = await Promise.race([
+      service
+        .runCoordination(
+          runId,
+          runnerWith(async () => {
+            const record = service.supervision.registry.store.list()[0]!;
+            generation = record.generationId;
+            // Recycle the leader identity while the PGID tree remains alive.
+            // Emergency signaling must be withheld, but supervision retained.
+            ps.identities.set(record.pid, {
+              ...sampleFor(record.pid),
+              startedAt: 'recycled-leader',
+            });
+            ps.rssBytes = 100 * 1024 * 1024;
+            await service.supervision.watchdog.sampleOnce(record.generationId);
+          }),
+        )
+        .catch((caught: unknown) => caught),
+      sleep(1_000).then(() => new Error('ambiguous exit barrier timed out')),
+    ]);
+
+    expect(error).toBeInstanceOf(ProcessExitUnconfirmedError);
+    expect(String(error)).not.toContain('ambiguous exit barrier timed out');
+    expect(generation).toBeDefined();
+    expect(signals).toEqual([]);
+    expect(eventTypes(db, runId)).not.toContain('rss.hard_limit');
+    expect(service.supervision.watchdog.phaseOf(generation!)).toBe('ambiguous');
+    expect(service.supervision.watchdog.isWatching(generation!)).toBe(true);
+    expect(service.supervision.registry.store.get(generation!)).toBeDefined();
+
+    // The timeout failed the waiter closed; it did not permanently latch the
+    // barrier. Whole-tree absence still confirms, folds child.stopped, and
+    // releases retained ownership through the late-recovery path.
+    ps.treeGone = true;
+    await service.supervision.watchdog.sampleOnce(generation!);
+    for (let attempt = 0; attempt < 50 && service.supervision.registry.store.list().length > 0; attempt += 1) {
+      await sleep(5);
+    }
+    expect(service.supervision.registry.store.list()).toEqual([]);
+    expect(service.supervision.watchdog.isWatching(generation!)).toBe(false);
+    expect(engineState(db, runId).activeChild?.status).toBe('stopped');
+  });
+
+  it('R2 late absence interrupts an abnormal no-T22 generation and releases all ownership', async () => {
+    const config = unwrap(
+      parseEngineConfig({
+        maxLiveChildren: 1,
+        memory: { budgetMb: 64, gracefulStopDeadlineMs: 25 },
+      }),
+    );
+    const { service, db, ps, signals } = await setup({
+      config,
+      factory: { disposeError: new Error('synthetic abnormal disposal failure') },
+    });
+    const { runId } = createRunFixture(service, {
+      goal: 'abnormal no-T22 late absence',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const countersBefore = engineState(db, runId).counters;
+    let generation: ProcessGenerationId | undefined;
+
+    const error = await Promise.race([
+      service
+        .runCoordination(
+          runId,
+          runnerWith(async () => {
+            const record = service.supervision.registry.store.list()[0]!;
+            generation = record.generationId;
+            ps.identities.set(record.pid, {
+              ...sampleFor(record.pid),
+              startedAt: 'recycled-abnormal-leader',
+            });
+            ps.rssBytes = 100 * TEST_MB;
+            await service.supervision.watchdog.sampleOnce(record.generationId);
+            throw new Error('synthetic abnormal runner exit');
+          }),
+        )
+        .catch((caught: unknown) => caught),
+      sleep(1_000).then(() => new Error('abnormal ambiguity waiter remained unbounded')),
+    ]);
+
+    expect(error).toBeInstanceOf(ProcessExitUnconfirmedError);
+    expect(String(error)).not.toContain('remained unbounded');
+    expect(generation).toBeDefined();
+    expect(signals).toEqual([]);
+    expect(eventTypes(db, runId)).not.toContain('rss.hard_limit');
+    expect(service.supervision.watchdog.isWatching(generation!)).toBe(true);
+    expect(spawnReservationCount(db)).toBe(1);
+
+    ps.treeGone = true;
+    await service.supervision.watchdog.sampleOnce(generation!);
+    for (let attempt = 0; attempt < 50 && service.supervision.registry.store.list().length > 0; attempt += 1) {
+      await sleep(5);
+    }
+
+    const state = engineState(db, runId);
+    expect(state.suspension.kind).toBe('interrupted');
+    expect(state.activeChild?.status).toBe('stopped');
+    expect(state.counters).toEqual(countersBefore);
+    expect(eventTypes(db, runId)).toContain('recovery.initiated');
+    expect(eventTypes(db, runId)).not.toContain('child.exited.unexpectedly');
+    expect(service.supervision.registry.store.list()).toEqual([]);
+    expect(service.supervision.watchdog.isWatching(generation!)).toBe(false);
+    expect(spawnReservationCount(db)).toBe(0);
+  });
+
+  it('keeps a provider-limit stop watched and unconfirmed after identity-backed disposal fails', async () => {
+    const config = unwrap(
+      parseEngineConfig({
+        maxLiveChildren: 1,
+        memory: { gracefulStopDeadlineMs: 25 },
+      }),
+    );
+    const { service, db, ps, disposeCalls } = await setup({
+      config,
+      factory: {
+        turns: [{ errorEnvelope: rateLimitErrorEnvelope({}) }],
+        disposeError: new Error('synthetic provider-pause disposal failure'),
+      },
+    });
+    const { runId } = createRunFixture(service, {
+      goal: 'provider limit barrier',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+
+    const error = await Promise.race([
+      service
+        .runCoordination(
+          runId,
+          runnerWith(async (session) => {
+            await session.prompt({ prompt: 'limit' });
+          }),
+        )
+        .catch((caught: unknown) => caught),
+      sleep(1_000).then(() => new Error('provider-limit barrier timed out')),
+    ]);
+
+    expect(error).toBeInstanceOf(ProcessExitUnconfirmedError);
+    expect(String(error)).not.toContain('provider-limit barrier timed out');
+    expect(disposeCalls()).toBe(1);
+    const generation = service.supervision.registry.store.list()[0]!.generationId;
+    expect(service.supervision.watchdog.isWatching(generation)).toBe(true);
+    expect(engineState(db, runId).activeChild).toMatchObject({
+      generationId: generation,
+      status: 'stopping',
+    });
+    expect(eventTypes(db, runId)).not.toContain('child.stopped');
+
+    ps.treeGone = true;
+    await service.supervision.watchdog.sampleOnce(generation);
+    for (let attempt = 0; attempt < 50 && service.supervision.registry.store.list().length > 0; attempt += 1) {
+      await sleep(5);
+    }
+    expect(eventTypes(db, runId)).toContain('child.stopped');
+    expect(
+      db.events.listByRun(runId).find((event) => event.type === 'child.stopped')?.payload,
+    ).toMatchObject({ reason: 'terminated' });
+    expect(service.supervision.registry.store.list()).toEqual([]);
+    expect(service.supervision.watchdog.isWatching(generation)).toBe(false);
+  });
+
+  it('bounds a hung provider-limit cancel and still reaches the one shared identity-less disposal', async () => {
+    const config = unwrap(
+      parseEngineConfig({ memory: { gracefulStopDeadlineMs: 25 } }),
+    );
+    const { service, db, disposeCalls } = await setup({
+      config,
+      factory: {
+        captureIdentity: false,
+        hangCancel: true,
+        turns: [{ errorEnvelope: rateLimitErrorEnvelope({}) }],
+      },
+    });
+    const { runId } = createRunFixture(service, {
+      goal: 'hung provider cancel',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+
+    const result = await Promise.race([
+      service
+        .runCoordination(
+          runId,
+          runnerWith(async (session) => {
+            await session.prompt({ prompt: 'limit' });
+          }),
+        )
+        .catch((caught: unknown) => caught),
+      sleep(1_000).then(() => new Error('hung cancel was not bounded')),
+    ]);
+
+    expect(result).toBeInstanceOf(LimitPausedError);
+    expect(String(result)).not.toContain('hung cancel was not bounded');
+    expect(disposeCalls()).toBe(1);
+    expect(service.status(runId).activeChild).toMatchObject({ status: 'stopped' });
+    const stopped = db.events.listByRun(runId).find((event) => event.type === 'child.stopped');
+    expect(stopped?.payload).toMatchObject({ reason: 'terminated' });
+  });
+
+  it('fails a provider-limit barrier closed without an unhandled rejection when stop setup throws', async () => {
+    const config = unwrap(
+      parseEngineConfig({ memory: { gracefulStopDeadlineMs: 25 } }),
+    );
+    const { service, db, disposeCalls } = await setup({
+      config,
+      factory: { turns: [{ errorEnvelope: rateLimitErrorEnvelope({}) }] },
+    });
+    const { runId } = createRunFixture(service, {
+      goal: 'provider stop setup failure',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const realGet = db.projections.get.bind(db.projections);
+    let setupFailures = 0;
+    Object.defineProperty(db.projections, 'get', {
+      configurable: true,
+      value: (scope: RunId, name: string): unknown => {
+        if (
+          setupFailures === 0 &&
+          scope === runId &&
+          name === RUN_CONFIG_PROJECTION &&
+          eventTypes(db, runId).includes('limit.classified.prompt_turn')
+        ) {
+          setupFailures += 1;
+          throw new Error('synthetic provider-stop config failure');
+        }
+        return realGet(scope, name);
+      },
+    });
+
+    const result = await Promise.race([
+      service
+        .runCoordination(
+          runId,
+          runnerWith(async (session) => {
+            await session.prompt({ prompt: 'limit' });
+          }),
+        )
+        .catch((caught: unknown) => caught),
+      sleep(1_000).then(() => new Error('provider stop setup failure hung the barrier')),
+    ]);
+
+    expect(String(result)).not.toContain('hung the barrier');
+    expect(setupFailures).toBe(1);
+    // The throw occurred before cancel setup completed, but `finally` still
+    // reached the shared disposal exactly once.
+    expect(disposeCalls()).toBe(1);
+    for (let attempt = 0; attempt < 50 && !eventTypes(db, runId).includes('child.stopped'); attempt += 1) {
+      await sleep(5);
+    }
+    const stopped = db.events.listByRun(runId).find((event) => event.type === 'child.stopped');
+    expect(stopped?.payload).toMatchObject({ reason: 'terminated' });
+  });
+
+  it('commits a durable T22 outcome on observed absence while the role runner is still hung', async () => {
+    const { service, db, ps } = await setup({ budgetMb: 64 });
+    const { runId } = createRunFixture(service, {
+      goal: 'hung runner exit confirmation',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    let releaseRunner!: () => void;
+    const holdRunner = new Promise<void>((resolve) => {
+      releaseRunner = resolve;
+    });
+    let thresholdSampled!: () => void;
+    const thresholdReached = new Promise<void>((resolve) => {
+      thresholdSampled = resolve;
+    });
+
+    const running = service
+      .runCoordination(
+        runId,
+        runnerWith(async () => {
+          const generation = service.supervision.registry.store.list()[0]!.generationId;
+          ps.rssBytes = 70 * TEST_MB;
+          await service.supervision.watchdog.sampleOnce(generation);
+          ps.treeGone = true;
+          await service.supervision.watchdog.sampleOnce(generation);
+          thresholdSampled();
+          await holdRunner;
+        }),
+      )
+      .catch((caught: unknown) => caught);
+
+    await thresholdReached;
+    for (let attempt = 0; attempt < 50 && !eventTypes(db, runId).includes('resource.exhausted'); attempt += 1) {
+      await sleep(5);
+    }
+    expect(eventTypes(db, runId)).toContain('resource.exhausted');
+    expect(service.status(runId).suspension).toBe('resource_exhausted');
+
+    releaseRunner();
+    expect(await running).toBeInstanceOf(ResourceExhaustedError);
+  });
+
+  it('retries an identity-less confirmed RSS outcome after a transient durable commit failure', async () => {
+    const config = unwrap(parseEngineConfig({ maxLiveChildren: 1, memory: { budgetMb: 64 } }));
+    const { service, db } = await setup({
+      config,
+      factory: { captureIdentity: false },
+      supervision: { terminateGraceMs: 250 },
+    });
+    const first = createRunFixture(service, {
+      goal: 'identityless durable retry',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const realTransactionImmediate = db.transactionImmediate.bind(db);
+    let failFinalization = false;
+    let injectedFailures = 0;
+    Object.defineProperty(db, 'transactionImmediate', {
+      configurable: true,
+      value: <T>(fn: () => T): T => {
+        if (failFinalization) {
+          failFinalization = false;
+          injectedFailures += 1;
+          throw new Error('synthetic identityless finalization failure');
+        }
+        return realTransactionImmediate(fn);
+      },
+    });
+
+    const firstError = await service
+      .runCoordination(
+        first.runId,
+        runnerWith(async () => {
+          const state = engineState(db, first.runId);
+          const generation = state.activeChild!.generationId;
+          service.ingest(
+            draftEvent({
+              type: 'rss.hard_limit',
+              runId: first.runId,
+              idempotencyKey: idempotencyKey('identityless-retry-t22'),
+              occurredAt: db.clock.nowIso(),
+              payload: {
+                semanticsVersion: 2,
+                generationId: generation,
+                role: 'coordinator',
+                rssBytes: 70 * TEST_MB,
+                budgetBytes: 64 * TEST_MB,
+                escalation: 'graceful',
+              },
+            }),
+          );
+          failFinalization = true;
+        }),
+      )
+      .catch((caught: unknown) => caught);
+    expect(String(firstError)).toContain('synthetic identityless finalization failure');
+    expect(injectedFailures).toBe(1);
+
+    // The failed commit did not release the sole capacity slot.
+    const second = createRunFixture(service, {
+      goal: 'capacity probe',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const beforeRetry = await service
+      .runCoordination(second.runId, runnerWith(async () => undefined))
+      .catch((caught: unknown) => caught);
+    expect(String(beforeRetry)).toMatch(/max-live-children guard: at capacity/i);
+
+    for (let attempt = 0; attempt < 100 && !eventTypes(db, first.runId).includes('resource.exhausted'); attempt += 1) {
+      await sleep(5);
+    }
+    expect(eventTypes(db, first.runId)).toContain('resource.exhausted');
+    // Retry success released ownership; the previously refused run can now
+    // acquire the slot normally.
+    await expect(
+      service.runCoordination(second.runId, runnerWith(async () => undefined)),
+    ).resolves.toBeDefined();
+  });
+
+  it('does not mark ownership released when durable reservation deletion fails, then retries it', async () => {
+    const config = unwrap(parseEngineConfig({ maxLiveChildren: 1 }));
+    const { service, db } = await setup({
+      config,
+      factory: { captureIdentity: false },
+      supervision: { terminateGraceMs: 250 },
+    });
+    const realSave = db.projections.save.bind(db.projections);
+    let failRelease = false;
+    let releaseFailures = 0;
+    Object.defineProperty(db.projections, 'save', {
+      configurable: true,
+      value: <S>(scope: RunId, name: string, state: S, eventCursor?: EventSequence): void => {
+        if (
+          failRelease &&
+          scope === SPAWN_RESERVATION_SCOPE &&
+          name === SPAWN_RESERVATION_PROJECTION
+        ) {
+          failRelease = false;
+          releaseFailures += 1;
+          throw new Error('synthetic reservation deletion failure');
+        }
+        realSave(scope, name, state, eventCursor);
+      },
+    });
+    const first = createRunFixture(service, {
+      goal: 'reservation release retry',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const releaseError = await service
+      .runCoordination(
+        first.runId,
+        runnerWith(async () => {
+          failRelease = true;
+        }),
+      )
+      .catch((caught: unknown) => caught);
+    expect(String(releaseError)).toContain('synthetic reservation deletion failure');
+    expect(releaseFailures).toBe(1);
+
+    const second = createRunFixture(service, {
+      goal: 'reservation capacity check',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const retained = await service
+      .runCoordination(second.runId, runnerWith(async () => undefined))
+      .catch((caught: unknown) => caught);
+    expect(String(retained)).toMatch(/max-live-children guard: at capacity/i);
+
+    await sleep(300);
+    await expect(
+      service.runCoordination(second.runId, runnerWith(async () => undefined)),
+    ).resolves.toBeDefined();
+  });
+
   it('persists the identity in the DURABLE store before child.spawned commits, and removes it on clean dispose', async () => {
     let storeAtPinTime: readonly ProcessIdentityRecord[] | undefined;
     let spawnedAtPinTime: boolean | undefined;
@@ -311,7 +1071,7 @@ describe('runRole §14 identity registration (W2-6)', () => {
     });
     serviceRef = service;
     dbRef = db;
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     runRef = runId;
 
     await service.runCoordination(runId, runnerWith(async () => undefined));
@@ -332,10 +1092,10 @@ describe('runRole §14 identity registration (W2-6)', () => {
   });
 
   it('a limit pause (T4) also stops the watchdog and deregisters the durable record on its dispose path', async () => {
-    const { service } = await setup({
+    const { service, db } = await setup({
       factory: { turns: [{ errorEnvelope: rateLimitErrorEnvelope({}) }] },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const error: unknown = await service
       .runCoordination(
@@ -350,6 +1110,8 @@ describe('runRole §14 identity registration (W2-6)', () => {
     expect(error).toBeInstanceOf(LimitPausedError);
     expect(service.status(runId).suspension).toBe('paused_limit');
     expect(service.supervision.registry.store.list()).toEqual([]);
+    const stopped = db.events.listByRun(runId).find((event) => event.type === 'child.stopped');
+    expect(stopped?.payload).toMatchObject({ reason: 'graceful' });
   });
 });
 
@@ -384,7 +1146,7 @@ describe('reapOrphanProcesses — §14 startup reaping over the durable registry
         },
       },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // Verified orphan: live, identity matches, nonce matches → killed.
     ps.identities.set(42_001, sampleFor(42_001));
@@ -401,13 +1163,15 @@ describe('reapOrphanProcesses — §14 startup reaping over the durable registry
 
     const summary = service.reapOrphanProcesses();
 
-    expect(summary.killedCount).toBe(1);
+    expect(summary.signalSentCount).toBe(1);
+    expect(summary.confirmedGoneCount).toBe(0);
     expect(summary.skippedCount).toBe(3);
     expect(signals).toEqual([{ pgid: 42_001, signal: 'SIGKILL' }]);
 
-    // Killed record removed; every withheld record retained (never silently dropped).
+    // Signal-sent is not exit-confirmed: all records remain owned until a
+    // later sample observes absence; withheld records are also retained.
     const remaining = service.supervision.registry.store.list().map((r) => r.pid);
-    expect(remaining.sort()).toEqual([42_002, 42_003, 42_004]);
+    expect(remaining.sort()).toEqual([42_001, 42_002, 42_003, 42_004]);
 
     // §14 alerts are durable events on the owning run, naming the verdicts.
     const alerts = db.events
@@ -419,8 +1183,8 @@ describe('reapOrphanProcesses — §14 startup reaping over the durable registry
   });
 
   it('a provably-GONE generation reconciles the pause spine: stop-intent confirmed, record dropped, nothing signaled', async () => {
-    const { service, db, signals } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { service, db, ps, signals } = await setup();
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     // Build the crash window the spine documents: committed T4 (generation
     // STOPPING with a durable stop-intent) and NO child.stopped confirmation.
@@ -477,9 +1241,12 @@ describe('reapOrphanProcesses — §14 startup reaping over the durable registry
     // GONE (fake ps knows no pid 43001).
     seedRecord(service, 43_001, 'pgen_reap_gone', runId);
 
+    ps.treeGone = true;
     const summary = service.reapOrphanProcesses();
-    expect(summary.killedCount).toBe(0);
-    expect(summary.skippedCount).toBe(1);
+    expect(summary.signalSentCount).toBe(0);
+    expect(summary.confirmedGoneCount).toBe(1);
+    expect(summary.skippedCount).toBe(0);
+    expect(summary.entries[0]!.action).toBe('confirmed_gone');
     expect(summary.entries[0]!.verification.verdict).toBe('gone');
     expect(signals).toEqual([]); // absent process: nothing to signal
 
@@ -546,6 +1313,7 @@ describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () =
     // Process A owns a live run + child, registered in the SHARED durable store.
     const serviceA = new OrchestrationService({
       db,
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       supervision: {
         ps: ps.client,
         selfPid: OWNER_A,
@@ -553,7 +1321,7 @@ describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () =
         envNonce: { verifyNonce: () => 'match' },
       },
     });
-    const { runId } = serviceA.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(serviceA, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const generation = processGenerationId('pgen_peer_live');
     const segment = segmentId('seg_peer_live');
     seedActiveChild(serviceA, db, runId, generation, segment);
@@ -567,6 +1335,7 @@ describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () =
     // Process B (a DIFFERENT live orchestrator) reaps over the SAME store.
     const serviceB = new OrchestrationService({
       db,
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       supervision: {
         ps: ps.client,
         selfPid: OWNER_B,
@@ -578,7 +1347,8 @@ describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () =
 
     // The peer's child was left entirely alone — the whole point of the gate.
     expect(summary.ownerLiveSkippedCount).toBe(1);
-    expect(summary.killedCount).toBe(0);
+    expect(summary.signalSentCount).toBe(0);
+    expect(summary.confirmedGoneCount).toBe(0);
     expect(signalsA).toEqual([]);
     expect(signalsB).toEqual([]);
     expect(serviceB.supervision.registry.store.get(generation)).toBeDefined();
@@ -589,9 +1359,9 @@ describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () =
     expect(eventTypes(db, runId)).not.toContain('child.exited.unexpectedly');
   });
 
-  it('a dead-owner ACTIVE generation is reaped AND marked interrupted via T17 (recovery.initiated), never T13', async () => {
+  it('a dead-owner ACTIVE generation is interrupted only after post-signal absence is observed, never on signal acceptance', async () => {
     const { service, db, ps, signals } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const generation = processGenerationId('pgen_deadowner_active');
     const segment = segmentId('seg_deadowner_active');
     seedActiveChild(service, db, runId, generation, segment);
@@ -608,8 +1378,17 @@ describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () =
 
     const summary = service.reapOrphanProcesses();
 
-    expect(summary.killedCount).toBe(1);
+    expect(summary.signalSentCount).toBe(1);
+    expect(summary.confirmedGoneCount).toBe(0);
     expect(signals).toEqual([{ pgid: childPid, signal: 'SIGKILL' }]);
+    expect(engineState(db, runId).suspension.kind).toBe('none');
+    expect(engineState(db, runId).activeChild?.status).toBe('active');
+    expect(service.supervision.registry.store.get(generation)).toBeDefined();
+
+    ps.identities.delete(childPid); // later observation: process tree is absent
+    ps.treeGone = true;
+    const confirmed = service.reapOrphanProcesses();
+    expect(confirmed.confirmedGoneCount).toBe(1);
     const state = engineState(db, runId);
     expect(state.suspension.kind).toBe('interrupted'); // T17
     expect(state.activeChild?.status).toBe('stopped');
@@ -620,9 +1399,138 @@ describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () =
     expect(state.counters).toEqual(before);
   });
 
-  it('a COMPLETED-but-not-yet-stopped reaped generation is confirmed stopped — NO interrupt, NO counter', async () => {
+  it('startup reconciles an identity-mismatched record when its recorded PGID is independently absent', async () => {
     const { service, db, ps, signals } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const generation = processGenerationId('pgen_startup_mismatch_absent');
+    const segment = segmentId('seg_startup_mismatch_absent');
+    const childPid = 62_101;
+    seedActiveChild(service, db, runId, generation, segment);
+    // The recorded leader pid now resolves to an unrelated identity, but an
+    // independent whole-PGID sample proves that the old group has no members.
+    ps.identities.set(childPid, { ...sampleFor(childPid), startedAt: 'recycled-start' });
+    ps.treeGone = true;
+    service.supervision.registry.store.put({
+      ...identityFor(childPid, generation),
+      runId,
+      segmentId: segment,
+      recordedAt: db.clock.nowIso(),
+      ownerPid: DEAD_OWNER,
+    });
+    const before = engineState(db, runId).counters;
+
+    const summary = service.reapOrphanProcesses();
+
+    expect(summary.signalSentCount).toBe(0);
+    expect(summary.skippedCount).toBe(0);
+    expect(summary.confirmedGoneCount).toBe(1);
+    expect(summary.entries[0]).toMatchObject({
+      generationId: generation,
+      action: 'confirmed_gone',
+      verification: { verdict: 'mismatch' },
+    });
+    expect(signals).toEqual([]);
+    expect(service.supervision.registry.store.get(generation)).toBeUndefined();
+    const state = engineState(db, runId);
+    expect(state.suspension.kind).toBe('interrupted');
+    expect(state.activeChild?.status).toBe('stopped');
+    expect(state.counters).toEqual(before);
+    expect(eventTypes(db, runId)).toContain('process.identity.alert');
+    expect(eventTypes(db, runId)).toContain('recovery.initiated');
+    expect(eventTypes(db, runId)).not.toContain('child.exited.unexpectedly');
+  });
+
+  it('retains the startup retry record when a raced T4 makes T17 reject with the generation still live', async () => {
+    const classification: LimitClassification = {
+      kind: 'usage_limit',
+      provider: 'claude',
+      source: 'structured',
+      confidence: 'high',
+      detectionTier: 'structured',
+    };
+    const { service, db, ps, signals } = await setup();
+    const { runId } = createRunFixture(service, {
+      goal: 'startup T17 commit-before-release',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+    const generation = processGenerationId('pgen_startup_t17_rejected');
+    const segment = segmentId('seg_startup_t17_rejected');
+    const childPid = 62_151;
+    seedActiveChild(service, db, runId, generation, segment);
+    ps.identities.set(childPid, { ...sampleFor(childPid), startedAt: 'recycled-start' });
+    ps.treeGone = true;
+    service.supervision.registry.store.put({
+      ...identityFor(childPid, generation),
+      runId,
+      segmentId: segment,
+      recordedAt: db.clock.nowIso(),
+      ownerPid: DEAD_OWNER,
+    });
+
+    // Race T4 after reapOrphanProcesses has loaded the ACTIVE child but before
+    // it emits T17. getRoleRound is the next service seam in that exact gap.
+    const getRoleRound = service.getRoleRound.bind(service);
+    let raced = false;
+    const roundSpy = vi.spyOn(service, 'getRoleRound').mockImplementation((queriedRunId) => {
+      if (!raced && queriedRunId === runId) {
+        raced = true;
+        const now = db.clock.nowIso();
+        service.ingest(
+          draftEvent({
+            type: 'turn.started',
+            runId,
+            payload: { segmentId: segment, generationId: generation },
+            idempotencyKey: idempotencyKey('startup-t17-race-turn'),
+            occurredAt: now,
+          }) as DomainEvent,
+        );
+        service.ingest(
+          draftEvent({
+            type: 'limit.classified.prompt_turn',
+            runId,
+            payload: { segmentId: segment, classification },
+            idempotencyKey: idempotencyKey('startup-t17-race-t4'),
+            occurredAt: now,
+          }) as DomainEvent,
+        );
+      }
+      return getRoleRound(queriedRunId);
+    });
+
+    const first = service.reapOrphanProcesses();
+    roundSpy.mockRestore();
+
+    expect(raced).toBe(true);
+    expect(first.confirmedGoneCount).toBe(1);
+    expect(signals).toEqual([]);
+    expect(engineState(db, runId).activeChild).toMatchObject({
+      generationId: generation,
+      status: 'stopping',
+    });
+    expect(engineState(db, runId).suspension.kind).toBe('paused_limit');
+    expect(
+      db.events.listByRun(runId).some(
+        (event) =>
+          event.type === 'transition.rejected' &&
+          event.payload.attemptedEventType === 'recovery.running_segment_found',
+      ),
+    ).toBe(true);
+    expect(eventTypes(db, runId)).not.toContain('recovery.initiated');
+    // The durable recovery did not commit, so startup ownership remains as
+    // the only retry path even though the PGID is already confirmed absent.
+    expect(service.supervision.registry.store.get(generation)).toBeDefined();
+
+    // A later startup pass sees the durable T4 stop intent, confirms it, and
+    // only then acknowledges the retained registry record.
+    expect(service.reapOrphanProcesses().confirmedGoneCount).toBe(1);
+    expect(engineState(db, runId).activeChild?.status).toBe('stopped');
+    expect(service.supervision.registry.store.get(generation)).toBeUndefined();
+  });
+
+  it('a completed reaped generation is confirmed stopped only after observed absence — no interrupt or counter', async () => {
+    const { service, db, ps, signals } = await setup();
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const generation = processGenerationId('pgen_completed_round');
     const segment = segmentId('seg_completed_round');
     seedActiveChild(service, db, runId, generation, segment);
@@ -645,8 +1553,15 @@ describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () =
 
     const summary = service.reapOrphanProcesses();
 
-    expect(summary.killedCount).toBe(1);
+    expect(summary.signalSentCount).toBe(1);
+    expect(summary.confirmedGoneCount).toBe(0);
     expect(signals).toEqual([{ pgid: childPid, signal: 'SIGKILL' }]);
+    expect(engineState(db, runId).activeChild?.status).toBe('active');
+    expect(service.supervision.registry.store.get(generation)).toBeDefined();
+
+    ps.identities.delete(childPid);
+    ps.treeGone = true;
+    expect(service.reapOrphanProcesses().confirmedGoneCount).toBe(1);
     const state = engineState(db, runId);
     expect(state.activeChild?.status).toBe('stopped'); // confirmed stopped
     expect(state.suspension.kind).toBe('none'); // NOT interrupted — the round succeeded
@@ -661,7 +1576,7 @@ describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () =
     const { service, db } = await setup();
 
     // (1) paused_limit: an active generation driven to T4 (child STOPPING).
-    const paused = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const paused = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const gen1 = processGenerationId('pgen_t17_paused');
     const seg1 = segmentId('seg_t17_paused');
     seedActiveChild(service, db, paused.runId, gen1, seg1);
@@ -705,7 +1620,7 @@ describe('reapOrphanProcesses — W4-0 owner-liveness + W4-4 T17 producer', () =
     expect(engineState(db, paused.runId).suspension.kind).toBe('paused_limit'); // unchanged
 
     // (2) terminal: a cancelled run.
-    const terminal = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const terminal = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const gen2 = processGenerationId('pgen_t17_terminal');
     const seg2 = segmentId('seg_t17_terminal');
     seedActiveChild(service, db, terminal.runId, gen2, seg2);
@@ -742,13 +1657,14 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
       db,
       ids: new DeterministicIdFactory(),
       config: pinned,
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       adapterFactory: {
         create: () => {
           throw new Error('creator service never spawns in this test');
         },
       },
     });
-    const { runId } = creator.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(creator, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const ps = makeFakePs();
     const { factory } = makeSupervisedFactory(ps);
@@ -756,6 +1672,7 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
       db,
       ids: new DeterministicIdFactory(),
       adapterFactory: factory, // DEFAULT config: budget would be 1024MB
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       supervision: { ps: ps.client, sendSignal: () => undefined, envNonce: { verifyNonce: () => 'match' } },
     });
 
@@ -786,10 +1703,10 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
 
   it('T22 graceful: 100% crossing checkpoints (pre_graceful_stop) and drives the stop ladder through the service', async () => {
     const { service, db, ps, adapters } = await setup({ budgetMb: 64 });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     let closedDuringRun = false;
-    await service.runRole(
+    const stopped = await service.runRole(
       runId,
       runnerWith(async () => {
         const generation = service.supervision.registry.store.list()[0]!.generationId;
@@ -799,7 +1716,8 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
       }),
       CLAUDE_LOW,
       '/ws',
-    );
+    ).catch((error: unknown) => error);
+    expect(stopped).toBeInstanceOf(ResourceExhaustedError);
 
     const events = db.events.listByRun(runId);
     const hard = events.find((e) => e.type === 'rss.hard_limit');
@@ -813,14 +1731,14 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
     const recorded = events.find((e) => e.type === 'checkpoint.recorded');
     expect((recorded?.payload as { reason: string }).reason).toBe('pre_graceful_stop');
     expect(adapters[0]!.log.some((entry) => entry.op === 'cancelTurn')).toBe(true);
-    expect(closedDuringRun).toBe(true);
+    expect(closedDuringRun).toBe(false); // callback is deliberately non-blocking
     // The stop was clean → the durable identity record is gone.
     expect(service.supervision.registry.store.list()).toEqual([]);
   });
 
   it('T22 emergency: ceiling crossing SIGKILLs identity-verified, taints via the ATTACHED manager, and folds the engine effects', async () => {
     const { service, db, ps, signals } = await setup({ budgetMb: 64 });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const asg = assignmentId('asg_wd_emergency');
     const taints: Array<{ assignmentId: string; taint: string }> = [];
     service.attachWorktreeSupervision({
@@ -885,9 +1803,10 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
       db,
       ids: new DeterministicIdFactory(),
       adapterFactory: factory,
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       supervision: { ps: ps.client, sendSignal: () => undefined, envNonce: { verifyNonce: () => 'match' } },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     ps.rssBytes = 12 * MB; // ~1% of the default 1024MB budget — no soft/hard crossing
     await service.runRole(
@@ -922,18 +1841,20 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
     const { service, db, ps } = await setup({ config: pinned });
 
     async function budgetSeenFor(role: RoleName, rssMb: number): Promise<number> {
-      const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+      const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+      const run = async (): Promise<{}> => {
+        const generation = service.supervision.registry.store.list()[0]!.generationId;
+        ps.rssBytes = rssMb * MB;
+        await service.supervision.watchdog.sampleOnce(generation);
+        return {};
+      };
+      const runner: RoleRunner =
+        role === 'implementor'
+          ? { role, run, adjudicateRoundOutcome: () => 'completed' }
+          : { role, run };
       await service.runRole(
         runId,
-        {
-          role,
-          run: async () => {
-            const generation = service.supervision.registry.store.list()[0]!.generationId;
-            ps.rssBytes = rssMb * MB;
-            await service.supervision.watchdog.sampleOnce(generation);
-            return {};
-          },
-        },
+        runner,
         CLAUDE_LOW,
         '/ws',
       );
@@ -957,7 +1878,7 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
 describe('runRole heartbeat wiring (§14: stall observability)', () => {
   it('ticks orchestrator.heartbeat for the run while a spawn is active and stops afterward', async () => {
     const { service, db } = await setup({ supervision: { heartbeatIntervalMs: 20 } });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     await service.runCoordination(
       runId,
@@ -1039,7 +1960,8 @@ describe('captureAcpProcessIdentity — real child process through the real tran
 
       // Full §14 startup reap: ps identity AND nonce verified → killed.
       const summary = registry.reapOrphans('SIGKILL');
-      expect(summary.killedCount).toBe(1);
+      expect(summary.signalSentCount).toBe(1);
+      expect(summary.confirmedGoneCount).toBe(0);
       expect(signals).toEqual([{ pgid: identity!.pid, signal: 'SIGKILL' }]);
     }
   }, 20_000);
@@ -1066,13 +1988,14 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
       // A permission-scripted turn stays IN FLIGHT until the watchdog cancels it.
       factory: { turns: [{ permission: { description: 'need approval' } }] },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const err: unknown = await service
       .runRole(
         runId,
         {
           role: 'implementor',
+          adjudicateRoundOutcome: () => 'completed',
           run: async (session) => {
             const generation = service.supervision.registry.store.list()[0]!.generationId;
             const promptPromise = session.prompt({ prompt: 'go' });
@@ -1122,13 +2045,14 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
       budgetMb: 64,
       factory: { turns: [{ permission: { description: 'need approval' } }] },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     const err: unknown = await service
       .runRole(
         runId,
         {
           role: 'implementor',
+          adjudicateRoundOutcome: () => 'completed',
           run: async (session) => {
             const generation = service.supervision.registry.store.list()[0]!.generationId;
             const promptPromise = session.prompt({ prompt: 'go' });
@@ -1158,7 +2082,7 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
 
   it('F1 (1a): after an RSS emergency kill, a LATE child-crash for that generation can never fold T13 / auto-respawn', async () => {
     const { service, db, ps } = await setup({ budgetMb: 64 });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     let generation: ProcessGenerationId | undefined;
     const err: unknown = await service
       .runRole(
@@ -1195,25 +2119,44 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
     expect(service.status(runId).counters.restartsInWindow).toBe(before);
   });
 
-  it('F1 race: a turn that completed end_turn is NOT reclassified when a GRACEFUL RSS stop then fires', async () => {
-    // A GRACEFUL stop (unlike the emergency kill) does not durably suspend — the
-    // seam classifies resource_exhausted ONLY on `stopReason:'cancelled'`. A turn
-    // that already resolved end_turn (won the race) stays completed even though
-    // RSS then crossed the graceful threshold. (The in-flight micro-race — cause
-    // bound, then end_turn AT the seam — is guarded by the same
-    // `stopReason==='cancelled'` check, verified in the seam.)
-    const { service, db, ps } = await setup({ budgetMb: 64 }); // no permission → the turn settles end_turn
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+  it('F1 race: a natural end_turn committed AFTER T22 v2 remains completed', async () => {
+    const { service, db } = await setup({
+      budgetMb: 64,
+      factory: { turns: [{ updates: [{ kind: 'agent_message_chunk', text: 'done' }] }] },
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     await service.runRole(
       runId,
       {
         role: 'implementor',
+        adjudicateRoundOutcome: () => 'completed',
         run: async (session) => {
           const generation = service.supervision.registry.store.list()[0]!.generationId;
-          await session.prompt({ prompt: 'go' }); // resolves end_turn → completed + cadence
-          ps.rssBytes = 70 * MB; // 109% → GRACEFUL (no durable suspend; the turn is already done)
-          await service.supervision.watchdog.sampleOnce(generation);
+          let emitted = false;
+          await session.prompt({
+            prompt: 'go',
+            onUpdate: () => {
+              if (emitted) return;
+              emitted = true;
+              service.ingest(
+                draftEvent({
+                  type: 'rss.hard_limit',
+                  runId,
+                  idempotencyKey: idempotencyKey('rss-race'),
+                  occurredAt: db.clock.nowIso(),
+                  payload: {
+                    semanticsVersion: 2,
+                    generationId: generation,
+                    role: 'implementor',
+                    rssBytes: 70 * MB,
+                    budgetBytes: 64 * MB,
+                    escalation: 'graceful',
+                  },
+                }),
+              );
+            },
+          });
           return {};
         },
       },
@@ -1222,9 +2165,70 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
       DISPATCH,
     );
 
-    expect(outcomes(db, runId)).toEqual(['completed']); // stayed completed
+    expect(outcomes(db, runId)).toEqual(['completed']);
     expect(service.status(runId).suspension).not.toBe('resource_exhausted');
     expect(db.events.listByRun(runId).some((e) => e.type === 'resource.exhausted')).toBe(false);
+  });
+
+  it('F1 race: a natural end_turn after T22 confirms rss_race_completed even when adjudication later throws', async () => {
+    const { service, db } = await setup({
+      budgetMb: 64,
+      factory: { turns: [{ updates: [{ kind: 'agent_message_chunk', text: 'done' }] }] },
+    });
+    const { runId } = createRunFixture(service, {
+      goal: 'natural T22 race with adjudication failure',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+    });
+
+    const failure = await service
+      .runRole(
+        runId,
+        {
+          role: 'implementor',
+          adjudicateRoundOutcome: () => {
+            throw new Error('synthetic adjudication failure after end_turn');
+          },
+          run: async (session) => {
+            const generation = service.supervision.registry.store.list()[0]!.generationId;
+            let emitted = false;
+            await session.prompt({
+              prompt: 'go',
+              onUpdate: () => {
+                if (emitted) return;
+                emitted = true;
+                service.ingest(
+                  draftEvent({
+                    type: 'rss.hard_limit',
+                    runId,
+                    idempotencyKey: idempotencyKey('rss-race-adjudication'),
+                    occurredAt: db.clock.nowIso(),
+                    payload: {
+                      semanticsVersion: 2,
+                      generationId: generation,
+                      role: 'implementor',
+                      rssBytes: 70 * MB,
+                      budgetBytes: 64 * MB,
+                      escalation: 'graceful',
+                    },
+                  }),
+                );
+              },
+            });
+            return {};
+          },
+        },
+        CLAUDE_LOW,
+        '/ws',
+        DISPATCH,
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(String(failure)).toContain('synthetic adjudication failure after end_turn');
+    expect(outcomes(db, runId)).toEqual(['completed']);
+    expect(eventTypes(db, runId)).not.toContain('resource.exhausted');
+    const stopped = db.events.listByRun(runId).find((event) => event.type === 'child.stopped');
+    expect(stopped?.payload).toMatchObject({ reason: 'rss_race_completed' });
   });
 
   it('F1 (1d): a NON-RSS cancelled turn is recorded `cancelled` (not `completed`), counts no cadence', async () => {
@@ -1232,12 +2236,13 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
       budgetMb: 64,
       factory: { turns: [{ permission: { description: 'need approval' } }] },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
-    await service.runRole(
+    const cancelled = await service.runRole(
       runId,
       {
         role: 'implementor',
+        adjudicateRoundOutcome: () => 'completed',
         run: async (session) => {
           const promptPromise = session.prompt({ prompt: 'go' });
           // A plain (non-RSS) cancel — no rss.hard_limit was ever emitted, so no
@@ -1250,11 +2255,13 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
       CLAUDE_LOW,
       '/ws',
       DISPATCH,
-    );
+    ).catch((error: unknown) => error);
+    expect(cancelled).toMatchObject({ name: 'NoDeliverableError' });
 
     // Recorded `cancelled`, NOT `completed`; never resource_exhausted (no RSS cause).
     expect(outcomes(db, runId)).toEqual(['cancelled']);
     expect(service.status(runId).suspension).toBe('none');
+    expect(service.getRoleRound(runId)?.stage).toBe('no_deliverable');
     // No cadence checkpoint counted against a cancelled turn.
     expect(
       db.events
@@ -1266,8 +2273,8 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
 
   it('F3: rss.hard_limit carries the role + generation (structured incident)', async () => {
     const { service, db, ps } = await setup({ budgetMb: 64 });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
-    await service.runRole(
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const stopped = await service.runRole(
       runId,
       runnerWith(async () => {
         const generation = service.supervision.registry.store.list()[0]!.generationId;
@@ -1276,7 +2283,8 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
       }),
       CLAUDE_LOW,
       '/ws',
-    );
+    ).catch((error: unknown) => error);
+    expect(stopped).toBeInstanceOf(ResourceExhaustedError);
     const hard = db.events.listByRun(runId).find((e) => e.type === 'rss.hard_limit');
     expect(hard?.payload).toMatchObject({ role: 'coordinator', escalation: 'graceful' });
     expect((hard?.payload as { generationId?: string }).generationId).toBeDefined();
@@ -1292,12 +2300,13 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
       budgetMb: 64,
       factory: { turns: [{ permission: { description: 'need approval' } }] },
     });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     await service
       .runRole(
         runId,
         {
           role: 'implementor',
+          adjudicateRoundOutcome: () => 'completed',
           run: async (session) => {
             const generation = service.supervision.registry.store.list()[0]!.generationId;
             const p = session.prompt({ prompt: 'go' });
@@ -1339,7 +2348,7 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
 
   it('F3: raiseRoleMemoryBudget is refused on a run that is not resource_exhausted', async () => {
     const { service } = await setup({ budgetMb: 64 });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     expect(() => service.raiseRoleMemoryBudget(runId, 'implementor', 256)).toThrow(
       /not resource_exhausted/i,
     );
@@ -1373,7 +2382,7 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
     // is only ever produced by a `resource.exhausted` event, so that state is
     // unreachable through the normal folds, but the guard no longer trusts it.)
     const { service, db } = await setup({ budgetMb: 64 });
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const generation = processGenerationId('pgen_re_orphan');
     const segment = segmentId('seg_re_orphan');
     const now = db.clock.nowIso();

@@ -16,10 +16,12 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DeterministicIdFactory } from '../lib/id-factory.js';
-import { artifactHash, specHash as toSpecHash, specVersionId as toSpecVersionId, type RunId } from '../domain/ids.js';
+import { artifactHash, gitSha, specHash as toSpecHash, specVersionId as toSpecVersionId, type RunId } from '../domain/ids.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../persistence/test-support.js';
 import { ArtifactStore } from '../artifacts/store.js';
 import { loadProfileFile, type Profile } from '../config/profile.js';
@@ -42,7 +44,8 @@ import {
 import { CoordinatorRunner } from '../app/flows/coordinator.js';
 import type { EvidenceRecorder } from '../app/flows/verifier.js';
 import type { VerificationRunner } from '../app/flows/implementor.js';
-import { EXIT_INTEGRATION_BLOCKED, executeCommand, type CliFlowDeps } from './commands.js';
+import { createLegacyRunFixture, createRunFixture } from '../app/test-support.js';
+import { executeCommand, type CliFlowDeps } from './commands.js';
 import { buildCliFlows, renderFatalError } from './index.js';
 
 const GOAL = 'Add a --verbose flag to the CLI so debug lines print to stderr.';
@@ -199,6 +202,7 @@ interface Wired {
   readonly db: TestDatabaseHandle['db'];
   readonly flows: CliFlowDeps;
   readonly deps: { readonly ids: DeterministicIdFactory; readonly flows: CliFlowDeps };
+  readonly coordinatorBaseCommits: Array<ReturnType<typeof gitSha> | undefined>;
 }
 
 async function setup(scripts: {
@@ -217,28 +221,244 @@ async function setup(scripts: {
   if (!profileResult.ok) throw new Error(`coordinator profile failed to load: ${JSON.stringify(profileResult.error)}`);
   const profile: Profile = profileResult.value;
   const mgr = worktrees;
+  const coordinatorBaseCommits: Array<ReturnType<typeof gitSha> | undefined> = [];
   const flows: CliFlowDeps = {
     ids,
     clock: dbHandle.db.clock,
     // `revise` forwarded so a `spec revise` re-drive carries the T2 revision
     // context (prior version + feedback) into the coordinator flow (W1-F7).
-    buildCoordinatorRunner: ({ goal, revise }) =>
-      new CoordinatorRunner({
+    buildCoordinatorRunner: ({ goal, revise, baseCommit }) => {
+      coordinatorBaseCommits.push(baseCommit);
+      return new CoordinatorRunner({
         goal,
         profile,
         artifactStore: store,
         ids: flowIds,
         clock: dbHandle!.db.clock,
+        baseCommit,
         ...(revise !== undefined ? { revise } : {}),
-      }),
+      });
+    },
     openWorktrees: async () => mgr,
     evidence: fakeEvidence(),
     runVerification: PASS_VERIFY,
   };
-  return { service, db: dbHandle.db, flows, deps: { ids, flows } };
+  return { service, db: dbHandle.db, flows, deps: { ids, flows }, coordinatorBaseCommits };
+}
+
+function seedLegacyApprovalDraft(
+  service: OrchestrationService,
+  db: TestDatabaseHandle['db'],
+): {
+  readonly runId: RunId;
+  readonly specVersionId: ReturnType<typeof toSpecVersionId>;
+  readonly specHash: ReturnType<typeof toSpecHash>;
+} {
+  const { runId } = createLegacyRunFixture(service, db, {
+    goal: GOAL,
+    workspacePath: repo!.dir,
+    coordinator: COORDINATOR,
+  });
+  service.advanceWorkflowPhase(runId, 'created', 'specifying');
+  service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
+  const specVersionId = toSpecVersionId('spec_legacy_1');
+  const specHash = toSpecHash('hash_legacy_1');
+  service.saveSpecDraft(runId, {
+    specVersionId,
+    specHash,
+    canonicalSpec: JSON.stringify(validSpec()),
+    goal: GOAL,
+    criteria: [],
+    proposedImplementorProfile: 'implementor',
+    proposedVerifierProfile: 'verifier',
+    revision: 1,
+  });
+  return { runId, specVersionId, specHash };
 }
 
 describe('D-1: the shipped CLI (executeCommand) drives the full P3 slice', () => {
+  it('F5: start creates no run for non-git, unborn, or dirty workspaces', async () => {
+    const { service, db, deps } = await setup({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+    });
+    const nonGit = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-nongit-'));
+    const unborn = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-unborn-'));
+    try {
+      execFileSync('git', ['init'], { cwd: unborn, stdio: 'ignore' });
+      for (const workspace of [nonGit, unborn]) {
+        const refused = await executeCommand(
+          service,
+          db,
+          { kind: 'start', json: true, workspace, goal: GOAL, coordinator: COORDINATOR },
+          {},
+          deps,
+        );
+        expect(refused.exitCode).toBe(2);
+        expect(refused.json).toMatchObject({ refused: 'workspace_unresolvable' });
+        expect(refused.json['runId']).toBeUndefined();
+      }
+      const dirty = path.join(repo!.dir, 'untracked-before-start.txt');
+      fs.writeFileSync(dirty, 'dirty\n', 'utf8');
+      const refused = await executeCommand(
+        service,
+        db,
+        { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
+        {},
+        deps,
+      );
+      expect(refused.exitCode).toBe(2);
+      expect(refused.json).toMatchObject({ refused: 'workspace_dirty' });
+      expect(refused.json['runId']).toBeUndefined();
+      fs.rmSync(dirty);
+
+      // Refusals consumed no run id and never invoked the coordinator.
+      const accepted = await executeCommand(
+        service,
+        db,
+        { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
+        {},
+        deps,
+      );
+      expect(accepted.exitCode).toBe(0);
+      expect(accepted.json['runId']).toBe('run_000001');
+    } finally {
+      fs.rmSync(nonGit, { recursive: true, force: true });
+      fs.rmSync(unborn, { recursive: true, force: true });
+    }
+  });
+
+  it('F5: coordinator dirt is refused inside the role boundary before any draft completes', async () => {
+    const { service, db, deps } = await setup({
+      coordinator: [
+        {
+          writes: [{ relPath: 'coordinator-drift.txt', content: 'changed during coordination\n' }],
+          turns: [coordinatorTurn(validSpec())],
+        },
+      ],
+    });
+    const start = await executeCommand(
+      service,
+      db,
+      { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
+      {},
+      deps,
+    );
+    expect(start.exitCode).toBe(2);
+    expect(start.json).toMatchObject({ refused: 'workspace_dirty' });
+    const runId = start.json['runId'] as RunId;
+    expect(service.status(runId).phase).toBe('specifying');
+    expect(service.getSpecDraft(runId)).toBeUndefined();
+  });
+
+  it('F5: approval refuses a dirty or HEAD-drifted primary checkout with structured fields', async () => {
+    const { service, db, deps } = await setup({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+    });
+    const start = await executeCommand(
+      service,
+      db,
+      { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
+      {},
+      deps,
+    );
+    const runId = start.json['runId'] as RunId;
+    const spec = start.json['spec'] as { specVersionId: string; specHash: string };
+    const dirty = path.join(repo!.dir, 'dirty-before-approve.txt');
+    fs.writeFileSync(dirty, 'dirty\n', 'utf8');
+    const dirtyApproval = await executeCommand(
+      service,
+      db,
+      {
+        kind: 'approve', json: true, runId,
+        specVersionId: toSpecVersionId(spec.specVersionId), specHash: toSpecHash(spec.specHash), testApprove: false,
+      },
+      {},
+      deps,
+    );
+    expect(dirtyApproval.json).toMatchObject({ refused: 'workspace_dirty' });
+    expect(dirtyApproval.json['dirtyPaths']).toContain('dirty-before-approve.txt');
+    fs.rmSync(dirty);
+    await repo!.writeFile('ADVANCED.md', 'new head\n');
+    await repo!.commitAll('advance before approval');
+    const driftApproval = await executeCommand(
+      service,
+      db,
+      {
+        kind: 'approve', json: true, runId,
+        specVersionId: toSpecVersionId(spec.specVersionId), specHash: toSpecHash(spec.specHash), testApprove: false,
+      },
+      {},
+      deps,
+    );
+    expect(driftApproval.json).toMatchObject({ refused: 'base_drift' });
+    expect(driftApproval.json['pinnedSha']).toBeTruthy();
+    expect(driftApproval.json['currentSha']).toBeTruthy();
+    expect(driftApproval.text).toContain(`pinned SHA: ${String(driftApproval.json['pinnedSha'])}`);
+    expect(driftApproval.text).toContain(`current SHA: ${String(driftApproval.json['currentSha'])}`);
+  });
+
+  it('C2/C3: legacy approval refuses dirt, then takes one audited clean pin and renders both SHAs', async () => {
+    const { service, db, deps } = await setup({});
+    const legacy = seedLegacyApprovalDraft(service, db);
+    const dirty = path.join(repo!.dir, 'legacy-dirty.txt');
+    fs.writeFileSync(dirty, 'dirty\n', 'utf8');
+
+    const refused = await executeCommand(
+      service,
+      db,
+      {
+        kind: 'approve', json: true, runId: legacy.runId,
+        specVersionId: legacy.specVersionId, specHash: legacy.specHash, testApprove: false,
+      },
+      {},
+      deps,
+    );
+    expect(refused.exitCode).toBe(2);
+    expect(refused.json).toMatchObject({ refused: 'workspace_dirty' });
+    expect(refused.json['pinnedSha']).toBeTruthy();
+    expect(refused.json['currentSha']).toBe(refused.json['pinnedSha']);
+    expect(refused.text).toContain(`pinned SHA: ${String(refused.json['pinnedSha'])}`);
+    expect(refused.text).toContain(`current SHA: ${String(refused.json['currentSha'])}`);
+    expect(service.getRunBaseCommit(legacy.runId)).toBeUndefined();
+
+    fs.rmSync(dirty);
+    const approved = await executeCommand(
+      service,
+      db,
+      {
+        kind: 'approve', json: true, runId: legacy.runId,
+        specVersionId: legacy.specVersionId, specHash: legacy.specHash, testApprove: false,
+      },
+      {},
+      deps,
+    );
+    expect(approved.exitCode).toBe(0);
+    expect(service.getRunBaseCommit(legacy.runId)).toBe(gitSha(await repo!.headSha()));
+    expect(db.events.listByRun(legacy.runId).filter((event) => event.type === 'run.base_commit.pinned')).toHaveLength(1);
+  });
+
+  it('C2: legacy spec revise pins once before T2 and forwards that base to the coordinator', async () => {
+    const revisedSpec = { ...validSpec(), constraints: ['No dependency changes'] };
+    const { service, db, deps, coordinatorBaseCommits } = await setup({
+      coordinator: [{ turns: [coordinatorTurn(revisedSpec)] }],
+    });
+    const legacy = seedLegacyApprovalDraft(service, db);
+    const expectedBase = gitSha(await repo!.headSha());
+
+    const revised = await executeCommand(
+      service,
+      db,
+      { kind: 'spec_revise', json: true, runId: legacy.runId, feedback: 'No dependency changes.' },
+      {},
+      deps,
+    );
+    expect(revised.exitCode).toBe(0);
+    expect(revised.json).toMatchObject({ outcome: 'applied', phase: 'awaiting_approval' });
+    expect(service.getRunBaseCommit(legacy.runId)).toBe(expectedBase);
+    expect(coordinatorBaseCommits).toEqual([expectedBase]);
+    expect(db.events.listByRun(legacy.runId).filter((event) => event.type === 'run.base_commit.pinned')).toHaveLength(1);
+  });
+
   it('start → approve → run → status reaches merge_ready with §16 integration commands', async () => {
     const { service, db, deps } = await setup({
       coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
@@ -541,7 +761,7 @@ describe('D-1: the shipped CLI (executeCommand) drives the full P3 slice', () =>
     expect(service.status(runId).approvedSpecHash).toBe(spec2.specHash);
   });
 
-  it('W2-2: run → integration_blocked (exit 4, no remediation round) → recheck still-blocked (exit 4) → destination cleaned → recheck → merge_ready', async () => {
+  it('F5: run refuses primary-checkout dirt before creating the first implementation worktree', async () => {
     const { service, db, deps } = await setup({
       coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
       implementor: [
@@ -589,6 +809,7 @@ describe('D-1: the shipped CLI (executeCommand) drives the full P3 slice', () =>
     // human can clear; criteria will all verify.
     const junkPath = path.join(repo!.dir, 'uncommitted-local-change.txt');
     fs.writeFileSync(junkPath, 'operator scratch\n', 'utf8');
+    const spawnsBefore = db.events.listByRun(runId).filter((event) => event.type === 'child.spawn.initiated').length;
 
     const run = await executeCommand(
       service,
@@ -597,49 +818,13 @@ describe('D-1: the shipped CLI (executeCommand) drives the full P3 slice', () =>
       {},
       deps,
     );
-    // W2-2: distinct exit code; run REMAINS in `verifying`; NO remediation
-    // round consumed; blockers + exact manual commands printed.
-    expect(run.exitCode).toBe(EXIT_INTEGRATION_BLOCKED);
-    expect(run.json).toMatchObject({ command: 'run', ok: false, outcome: 'integration_blocked', phase: 'verifying', rounds: 1 });
-    const mr = run.json['mergeReadiness'] as { ready: boolean; blockers: string[]; manualIntegrationCommands: string[] };
-    expect(mr.ready).toBe(false);
-    expect(mr.blockers.some((b) => b.includes('destination working tree is dirty'))).toBe(true);
-    expect(mr.manualIntegrationCommands.some((c) => c.includes('merge --no-ff'))).toBe(true);
-    expect(run.text).toContain('integration blocked on user-actionable §16 state');
-    expect(run.text).toContain(`harness recheck ${runId}`);
-    expect(service.status(runId).phase).toBe('verifying');
+    expect(run.exitCode).toBe(2);
+    expect(run.json).toMatchObject({ command: 'run', ok: false, refused: 'workspace_dirty' });
+    expect(run.json['dirtyPaths']).toContain('uncommitted-local-change.txt');
+    expect(service.status(runId).phase).toBe('approved');
     expect(service.status(runId).counters.remediationRounds).toBe(0);
-    let types = db.events.listByRun(runId).map((e) => e.type);
-    expect(types).toContain('merge.readiness.blocked');
-    expect(types).not.toContain('verification.completed.failed'); // no T23
-    expect(types).not.toContain('verification.completed.passed'); // no T24 yet
-
-    // recheck while STILL dirty: an UPDATED blocked event, same exit code,
-    // still no remediation round; only the git probe re-ran (no new spawn).
-    const still = await executeCommand(service, db, { kind: 'recheck', json: true, runId }, {}, deps);
-    expect(still.exitCode).toBe(EXIT_INTEGRATION_BLOCKED);
-    expect(still.json).toMatchObject({ command: 'recheck', ok: false, outcome: 'still_blocked', phase: 'verifying' });
-    expect(service.status(runId).counters.remediationRounds).toBe(0);
-    types = db.events.listByRun(runId).map((e) => e.type);
-    expect(types.filter((t) => t === 'merge.readiness.blocked')).toHaveLength(2);
-
-    // The human clears the destination → recheck ingests T24 NOW.
+    expect(db.events.listByRun(runId).filter((event) => event.type === 'child.spawn.initiated')).toHaveLength(spawnsBefore);
     fs.rmSync(junkPath);
-    const recheck = await executeCommand(service, db, { kind: 'recheck', json: true, runId }, {}, deps);
-    expect(recheck.exitCode).toBe(0);
-    expect(recheck.json).toMatchObject({ command: 'recheck', ok: true, outcome: 'ready', phase: 'merge_ready' });
-    const readyMr = recheck.json['mergeReadiness'] as { ready: boolean; manualIntegrationCommands: string[] };
-    expect(readyMr.ready).toBe(true);
-    expect(readyMr.manualIntegrationCommands.some((c) => c.includes('merge --no-ff'))).toBe(true);
-    expect(service.status(runId).phase).toBe('merge_ready');
-    types = db.events.listByRun(runId).map((e) => e.type);
-    expect(types).toContain('verification.completed.passed'); // T24 (payload-validated)
-    expect(types).toContain('merge.readiness.recorded');
-
-    // A second recheck after resolution refuses honestly.
-    const again = await executeCommand(service, db, { kind: 'recheck', json: true, runId }, {}, deps);
-    expect(again.exitCode).toBe(1);
-    expect(again.json).toMatchObject({ command: 'recheck', error: 'already_resolved' });
   });
 
   it('run before approve is rejected (not_approved, exit 1) — no CLI-only state advances it', async () => {
@@ -767,12 +952,18 @@ describe('§17.1: typed provider failures reach the CLI redacted (raw-throw bypa
     const { service, flows } = await setup({
       coordinator: [{ turns: [], promptRejection: rawProviderError() }],
     });
-    const { runId } = service.createRun({ goal: GOAL, workspacePath: repo!.dir, coordinator: COORDINATOR });
+    const { runId } = createRunFixture(service, {
+      goal: GOAL,
+      workspacePath: repo!.dir,
+      coordinator: COORDINATOR,
+      baseCommit: gitSha(await repo!.headSha()),
+    });
     const runner = flows.buildCoordinatorRunner({
       runId,
       goal: GOAL,
       coordinator: COORDINATOR,
       workspacePath: repo!.dir,
+      baseCommit: gitSha(await repo!.headSha()),
     });
     const thrown: unknown = await service.runCoordination(runId, runner).then(
       () => undefined,

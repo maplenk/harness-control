@@ -20,6 +20,7 @@
  *  - retry_after incidents resume directly (`resume_now`) once the
  *    provider's own ETA elapses — including from a fresh process (anchoring).
  */
+import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from './test-support.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock, isoTimestamp } from '../lib/clock.js';
 import { acpSessionId, runId, type RunId } from '../domain/ids.js';
@@ -144,6 +145,7 @@ async function setup(
   const db = handle.db;
   const { factory, created } = makeQueueFactory(scripts);
   const service = new OrchestrationService({
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
     db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,
@@ -166,7 +168,7 @@ function promptOnceRunner(): RoleRunner {
 async function pauseRun(
   service: OrchestrationService,
 ): Promise<RunId> {
-  const { runId: id } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+  const { runId: id } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
   const error: unknown = await service
     .runCoordination(id, promptOnceRunner())
     .then(() => undefined)
@@ -192,7 +194,7 @@ const AUTH_ENVELOPE = { code: -32603, message: 'auth', data: { errorKind: 'auth'
 describe('runScheduledProbe — schedule answers', () => {
   it('not_paused on a run without a limit pause', async () => {
     const { service } = await setup([PAUSE_SCRIPT]);
-    const { runId: id } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId: id } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     expect(await service.runScheduledProbe(id)).toEqual({ outcome: 'not_paused', suspension: 'none' });
   });
 
@@ -610,6 +612,7 @@ describe('runScheduledProbe — structured retry_after', () => {
     // "Restart": a new service over the same store, hours later.
     (db.clock as ManualClock).advanceMs(6 * 60 * 60_000);
     const successor = new OrchestrationService({
+      workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
       db,
       ids: new DeterministicIdFactory(),
       adapterFactory: {
@@ -684,6 +687,7 @@ async function setupWithPs(
   const { factory, created } = makeQueueFactory(scripts);
   const ps = makeFakePs();
   const service = new OrchestrationService({
+    workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
     db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,

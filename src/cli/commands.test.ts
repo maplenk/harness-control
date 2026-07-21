@@ -25,9 +25,12 @@ import type { RoleName } from '../domain/state.js';
 import { isoTimestamp } from '../lib/clock.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../persistence/test-support.js';
 import { OrchestrationService, type RoleAdapterFactory, type SpecDraftState } from '../app/index.js';
+import { createRunFixture } from '../app/test-support.js';
+import { ROLE_ROUND_PROJECTION, type RoleRoundProjection } from '../app/projections.js';
 import { DurableDesiredModelStore } from '../app/desired-model-store.js';
 import type { RunId } from '../domain/ids.js';
 import { executeCommand } from './commands.js';
+import { makeTempGitRepo, type TempGitRepo } from '../worktree/test-support.js';
 
 const NO_SPAWN_FACTORY: RoleAdapterFactory = {
   create() {
@@ -38,14 +41,18 @@ const NO_SPAWN_FACTORY: RoleAdapterFactory = {
 const CLAUDE_LOW = { harness: 'claude', model: 'opus', effort: 'low' } as const;
 
 let handle: TestDatabaseHandle | undefined;
+let repo: TempGitRepo | undefined;
 
-afterEach(() => {
+afterEach(async () => {
   handle?.close();
   handle?.cleanup();
   handle = undefined;
+  await repo?.cleanup();
+  repo = undefined;
 });
 
 async function setup(): Promise<{ service: OrchestrationService; db: TestDatabaseHandle['db'] }> {
+  repo = await makeTempGitRepo('harness-cli-commands-');
   handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
   const service = new OrchestrationService({
     db: handle.db,
@@ -57,7 +64,7 @@ async function setup(): Promise<{ service: OrchestrationService; db: TestDatabas
 
 /** Create a run and drive it to `awaiting_approval` via the linear dispatch advances. */
 function toAwaitingApproval(service: OrchestrationService): RunId {
-  const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+  const { runId } = createRunFixture(service, { goal: 'g', workspacePath: repo!.dir, coordinator: CLAUDE_LOW });
   service.advanceWorkflowPhase(runId, 'created', 'specifying');
   service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval');
   return runId;
@@ -155,7 +162,7 @@ describe('executeCommand — approve (explicit human only; §4.1/§18)', () => {
 
   it('reports the engine rejection when approving outside awaiting_approval (exit 1)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: repo!.dir, coordinator: CLAUDE_LOW });
     const out = await executeCommand(
       service,
       db,
@@ -246,7 +253,7 @@ describe('executeCommand — run refuses on approved-hash drift (W1-F3)', () => 
     const { service, db } = await setup();
     const runId = toAwaitingApproval(service);
     service.saveSpecDraft(runId, draftState('spec_1', 'draft_hash_1'));
-    service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: specHash('draft_hash_1') });
+    await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: specHash('draft_hash_1') });
     // A superseding draft lands AFTER approval (revision drift): run must refuse.
     service.saveSpecDraft(runId, draftState('spec_2', 'draft_hash_2', 2));
     const out = await executeCommand(
@@ -281,6 +288,116 @@ describe('executeCommand — spec revise', () => {
   });
 });
 
+describe('executeCommand — resume waits for observed orphan exit', () => {
+  it('reports signal-sent and leader-gone/live-tree states as pending without re-entry', async () => {
+    handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+    const identities = new Map<number, {
+      pid: number;
+      ppid: number;
+      pgid: number;
+      startedAt: string;
+      executablePath: string;
+    }>();
+    let treeAlive = true;
+    const pid = 77_701;
+    const observed = {
+      pid,
+      ppid: 1,
+      pgid: pid,
+      startedAt: `started-${pid}`,
+      executablePath: '/fake/agent',
+    };
+    identities.set(pid, observed);
+    const signals: Array<{ pgid: number; signal: NodeJS.Signals }> = [];
+    const service = new OrchestrationService({
+      db: handle.db,
+      ids: new DeterministicIdFactory(),
+      adapterFactory: NO_SPAWN_FACTORY,
+      supervision: {
+        selfPid: 77_700,
+        ps: {
+          sampleProcessTree: (pgid) =>
+            treeAlive
+              ? {
+                  pgid,
+                  rssBytes: 64_000,
+                  processCount: 1,
+                  pids: [pid + 1],
+                  sampledAt: handle!.db.clock.nowIso(),
+                }
+              : undefined,
+          sampleIdentity: (candidate) => identities.get(candidate),
+          isAlive: (candidate) => identities.has(candidate),
+        },
+        envNonce: { verifyNonce: () => 'match' },
+        sendSignal: (pgid, signal) => signals.push({ pgid, signal }),
+      },
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const generationId = processGenerationId('pgen_resume_signal_pending');
+    const segment = segmentId('seg_resume_signal_pending');
+    service.ingest(
+      draftEvent({
+        type: 'child.spawn.initiated',
+        runId,
+        payload: { generationId, segmentId: segment, role: 'coordinator' },
+        idempotencyKey: idempotencyKey('resume-signal-init'),
+        occurredAt: handle.db.clock.nowIso(),
+      }) as DomainEvent,
+    );
+    service.ingest(
+      draftEvent({
+        type: 'child.spawned',
+        runId,
+        payload: { generationId, segmentId: segment, role: 'coordinator', pins: [] },
+        idempotencyKey: idempotencyKey('resume-signal-spawned'),
+        occurredAt: handle.db.clock.nowIso(),
+      }) as DomainEvent,
+    );
+    service.supervision.registry.store.put({
+      generationId,
+      pid,
+      pgid: pid,
+      startedAt: observed.startedAt,
+      executablePath: observed.executablePath,
+      spawnNonce: 'nonce-resume-pending',
+      runId,
+      segmentId: segment,
+      ownerPid: 999_999,
+      recordedAt: handle.db.clock.nowIso(),
+    });
+
+    const out = await executeCommand(service, handle.db, { kind: 'resume', json: true, runId }, {});
+    expect(out.exitCode).toBe(1);
+    expect(out.json).toMatchObject({
+      outcome: 'orphan_exit_pending',
+      orphanReap: { signalSent: 1, exitPending: 0, confirmedGone: 0, withheld: 0 },
+    });
+    expect(signals).toEqual([{ pgid: pid, signal: 'SIGKILL' }]);
+    expect(service.supervision.registry.store.get(generationId)).toBeDefined();
+    expect(service.status(runId)).toMatchObject({ suspension: 'none', childActive: true });
+    expect(handle.db.events.listByRun(runId).map((event) => event.type)).not.toContain('recovery.initiated');
+
+    identities.delete(pid); // leader gone; descendant remains in the pgid
+    const descendantPending = await executeCommand(
+      service,
+      handle.db,
+      { kind: 'resume', json: true, runId },
+      {},
+    );
+    expect(descendantPending.exitCode).toBe(1);
+    expect(descendantPending.json).toMatchObject({
+      outcome: 'orphan_exit_pending',
+      orphanReap: { signalSent: 0, exitPending: 1, confirmedGone: 0, withheld: 0 },
+    });
+    // No second signal is allowed without the original leader identity.
+    expect(signals).toEqual([{ pgid: pid, signal: 'SIGKILL' }]);
+    expect(service.supervision.registry.store.get(generationId)).toBeDefined();
+    expect(service.status(runId)).toMatchObject({ suspension: 'none', childActive: true });
+    treeAlive = false;
+  });
+});
+
 // ---------------------------------------------------------------------------
 describe('executeCommand — run', () => {
   it('refuses when the run is not approved (exit 1)', async () => {
@@ -304,7 +421,7 @@ describe('executeCommand — run', () => {
     const { service, db } = await setup();
     const runId = toAwaitingApproval(service);
     service.saveSpecDraft(runId, draftState('spec_1', 'h1'));
-    service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: specHash('h1') });
+    await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: specHash('h1') });
     const out = await executeCommand(service, db, { kind: 'run', json: true, runId }, {});
     expect(out.exitCode).toBe(2);
     expect(out.json).toMatchObject({ error: 'missing_profiles' });
@@ -323,7 +440,7 @@ describe('executeCommand — run', () => {
       runId,
       draftState('spec_1', 'h1', 1, { implementor: 'codex:gpt-5.6-terra', verifier: 'claude:opus' }),
     );
-    service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: specHash('h1') });
+    await service.approve(runId, { specVersionId: specVersionId('spec_1'), specHash: specHash('h1') });
     // No --implementor/--verifier: the draft's proposed profiles are the default.
     const out = await executeCommand(service, db, { kind: 'run', json: true, runId }, {});
     expect(out.json['error']).not.toBe('missing_profiles');
@@ -335,7 +452,7 @@ describe('executeCommand — run', () => {
 describe('executeCommand — status', () => {
   it('reports phase/suspension/eta/vitals/checkpoints for a fresh run', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const out = await executeCommand(service, db, { kind: 'status', json: true, runId }, {});
     expect(out.exitCode).toBe(0);
     expect(out.json).toMatchObject({
@@ -357,7 +474,7 @@ describe('executeCommand — status', () => {
   // no aggregate must now surface as a non-null RSS.
   it('falls back to the latest RAW sample for RSS when no aggregate has been produced yet', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     db.telemetry.recordRawSample({ runId, sampledAt: isoTimestamp('2026-07-18T10:02:10.000Z'), rssBytes: 4242 });
 
     const out = await executeCommand(service, db, { kind: 'status', json: true, runId }, {});
@@ -367,7 +484,7 @@ describe('executeCommand — status', () => {
 
   it('prefers a raw sample newer than the latest closed aggregate window', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     // A closed window aggregate (10:00), then a newer in-progress raw tick (10:02).
     db.telemetry.recordRawSample({ runId, sampledAt: isoTimestamp('2026-07-18T10:00:05.000Z'), rssBytes: 1000 });
     db.telemetry.aggregateWindow({ runId, windowStart: isoTimestamp('2026-07-18T10:00:00.000Z') });
@@ -390,7 +507,7 @@ describe('executeCommand — status', () => {
 describe('executeCommand — suspension controls', () => {
   it('reports resume on a non-paused run as a clean error (exit 1)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const out = await executeCommand(service, db, { kind: 'resume', json: true, runId }, {});
     expect(out.exitCode).toBe(1);
     expect((out.json['error'] as { name: string }).name).toBe('WorkflowAdvanceError');
@@ -398,7 +515,7 @@ describe('executeCommand — suspension controls', () => {
 
   it('reports pause with no active child as an engine rejection (exit 1)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const out = await executeCommand(service, db, { kind: 'pause', json: true, runId }, {});
     expect(out.exitCode).toBe(1);
     expect(out.json).toMatchObject({ command: 'pause', outcome: 'rejected' });
@@ -406,7 +523,7 @@ describe('executeCommand — suspension controls', () => {
 
   it('reports breaker reset outside breaker_open as a rejection (exit 1)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const out = await executeCommand(service, db, { kind: 'breaker_reset', json: true, runId }, {});
     expect(out.exitCode).toBe(1);
     expect(out.json).toMatchObject({ command: 'breaker_reset', outcome: 'rejected' });
@@ -417,7 +534,7 @@ describe('executeCommand — suspension controls', () => {
 describe('executeCommand — recheck (W2-2 §16 readiness re-probe)', () => {
   it('refuses when no blocked merge-readiness is recorded (exit 1)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const out = await executeCommand(service, db, { kind: 'recheck', json: true, runId }, {});
     expect(out.exitCode).toBe(1);
     expect(out.json).toMatchObject({ command: 'recheck', ok: false, error: 'not_blocked' });
@@ -426,7 +543,7 @@ describe('executeCommand — recheck (W2-2 §16 readiness re-probe)', () => {
 
   it('refuses when the run is not in verifying (the blocked wait state no longer holds; exit 1)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     // A synthetic persisted blocked state on a run still at `created`: the
     // phase guard must refuse before any worktree/probe work.
     service.saveMergeReadinessBlocked(runId, syntheticBlockedState(runId));
@@ -540,7 +657,7 @@ function seedLiveChild(
 describe('executeCommand — switch-model (HONEST desired-model; §5t)', () => {
   it('records a durable pending desired model on a run with NO live child — not applied, not a fabricated segment', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const out = await executeCommand(
       service,
       db,
@@ -568,7 +685,7 @@ describe('executeCommand — switch-model (HONEST desired-model; §5t)', () => {
 
   it('surfaces durable child.spawned model-pin evidence instead of only a model label', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     seedLiveChild(service, db, runId, 'coordinator', 'opus');
 
     const status = await executeCommand(service, db, { kind: 'status', json: true, runId }, {});
@@ -590,7 +707,7 @@ describe('executeCommand — switch-model (HONEST desired-model; §5t)', () => {
 
   it('NEVER produces operation=model_switch via the CLI path even when a live idle child owns the run (deleted T19 false-success)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     seedLiveChild(service, db, runId, 'coordinator', 'opus');
     // Precondition the OLD path exploited: live child, idle, suspension none.
     expect(service.status(runId).childActive).toBe(true);
@@ -611,7 +728,7 @@ describe('executeCommand — switch-model (HONEST desired-model; §5t)', () => {
 
   it('on the EXACT old-exploit precondition (live idle child, suspension none) ingests ZERO new events — desired is durable, maps to NO transition (§5t S1/e)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     seedLiveChild(service, db, runId, 'coordinator', 'opus');
     // Reproduce the exact segment-less T19 guard state the old CLI path drove:
     // suspension=none & operation=idle & child_active — what T19 gates on.
@@ -643,7 +760,7 @@ describe('executeCommand — switch-model (HONEST desired-model; §5t)', () => {
 
   it('reports the real per-role EFFECTIVE model from child.spawned pins (implementor), distinct from the desired', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     seedLiveChild(service, db, runId, 'implementor', 'gpt-5.6-terra');
 
     const status = await executeCommand(service, db, { kind: 'status', json: true, runId }, {});
@@ -661,11 +778,69 @@ describe('executeCommand — switch-model (HONEST desired-model; §5t)', () => {
   });
 });
 
+describe('executeCommand — set-budget --resume (F3 one-shot re-entry)', () => {
+  it('reports the audited raise and pending re-entry honestly when flow dependencies are unavailable', async () => {
+    const { service, db } = await setup();
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    seedLiveChild(service, db, runId, 'implementor', 'gpt-5.6-terra');
+    const child = service.status(runId).activeChild;
+    expect(child).toBeDefined();
+    db.projections.save<RoleRoundProjection>(runId, ROLE_ROUND_PROJECTION, {
+      round: 1,
+      role: 'implementor',
+      stage: 'active',
+      modelSpec: { harness: 'codex', model: 'gpt-5.6-terra' },
+      generationId: child!.generationId,
+    });
+    service.ingest(
+      draftEvent({
+        type: 'resource.exhausted',
+        runId,
+        payload: {
+          generationId: child!.generationId,
+          role: 'implementor',
+          rssBytes: 1_100 * 1024 * 1024,
+          budgetBytes: 1_024 * 1024 * 1024,
+        },
+        idempotencyKey: idempotencyKey('set-budget-unavailable-rss'),
+        occurredAt: db.clock.nowIso(),
+      }) as DomainEvent,
+    );
+
+    const out = await executeCommand(
+      service,
+      db,
+      {
+        kind: 'set_budget',
+        json: true,
+        runId,
+        role: 'implementor',
+        budgetMb: 2_048,
+        resume: true,
+      },
+      {},
+    );
+
+    expect(out.exitCode).toBe(0);
+    expect(out.json).toMatchObject({
+      command: 'set_budget',
+      ok: true,
+      outcome: 'raised_resume_pending',
+      durableRaise: true,
+      reentry: 'unavailable',
+    });
+    expect(out.text).toContain('round was NOT re-entered');
+    expect(db.events.listByRun(runId).map((event) => event.type)).toContain(
+      'run.memory_budget.overridden',
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 describe('executeCommand — cancel (idempotent, one terminal result; T18)', () => {
   it('cancels, then reports a second cancel as an already-terminal no-op (exit 0)', async () => {
     const { service, db } = await setup();
-    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     const first = await executeCommand(service, db, { kind: 'cancel', json: true, runId }, {});
     expect(first.exitCode).toBe(0);
     expect(first.json).toMatchObject({ outcome: 'applied', phase: 'cancelled' });
