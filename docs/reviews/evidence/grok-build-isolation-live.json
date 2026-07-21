@@ -1,0 +1,117 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-07-21T18:41:58.961Z",
+  "harness": "grok",
+  "requestedModel": "grok-build",
+  "requestedEffort": "high",
+  "adapterVersion": "0.2.106",
+  "roles": [
+    {
+      "role": "coordinator",
+      "version": "0.2.106",
+      "childArgs": [
+        "--no-auto-update",
+        "--no-memory",
+        "--no-subagents",
+        "--disable-web-search",
+        "--sandbox",
+        "read-only",
+        "--permission-mode",
+        "dontAsk",
+        "--model",
+        "grok-build",
+        "--reasoning-effort",
+        "high",
+        "agent",
+        "--no-leader",
+        "stdio"
+      ],
+      "modelPinned": true,
+      "effortPinned": true,
+      "isolatedHome": true,
+      "isolatedHomeDisposed": true,
+      "stopReason": "end_turn+write_cancelled",
+      "permissionRequests": [
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-OhnBpX/repo/coordinator-must-not-write.txt`"
+      ],
+      "deniedOperations": [
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-OhnBpX/repo/coordinator-must-not-write.txt`"
+      ],
+      "expectedMarkerObserved": true
+    },
+    {
+      "role": "implementor",
+      "version": "0.2.106",
+      "childArgs": [
+        "--no-auto-update",
+        "--no-memory",
+        "--no-subagents",
+        "--disable-web-search",
+        "--sandbox",
+        "workspace",
+        "--permission-mode",
+        "acceptEdits",
+        "--model",
+        "grok-build",
+        "--reasoning-effort",
+        "high",
+        "agent",
+        "--no-leader",
+        "stdio"
+      ],
+      "modelPinned": true,
+      "effortPinned": true,
+      "isolatedHome": true,
+      "isolatedHomeDisposed": true,
+      "stopReason": "end_turn",
+      "permissionRequests": [
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-OhnBpX/repo/grok-model-spawn.txt`"
+      ],
+      "deniedOperations": [],
+      "expectedMarkerObserved": true
+    },
+    {
+      "role": "verifier",
+      "version": "0.2.106",
+      "childArgs": [
+        "--no-auto-update",
+        "--no-memory",
+        "--no-subagents",
+        "--disable-web-search",
+        "--sandbox",
+        "read-only",
+        "--permission-mode",
+        "dontAsk",
+        "--model",
+        "grok-build",
+        "--reasoning-effort",
+        "high",
+        "agent",
+        "--no-leader",
+        "stdio"
+      ],
+      "modelPinned": true,
+      "effortPinned": true,
+      "isolatedHome": true,
+      "isolatedHomeDisposed": true,
+      "stopReason": "end_turn+write_cancelled",
+      "permissionRequests": [
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-OhnBpX/repo/verifier-must-not-write.txt`"
+      ],
+      "deniedOperations": [
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-OhnBpX/repo/verifier-must-not-write.txt`"
+      ],
+      "expectedMarkerObserved": true
+    }
+  ],
+  "isolation": {
+    "hostileHostConfigLoaded": false,
+    "hostileProjectConfigLoaded": false,
+    "hostileProjectConfigRejectedBeforeSpawn": true,
+    "hostileHostMcpStarted": false,
+    "hostileProjectMcpStarted": false,
+    "coordinatorWriteCreated": false,
+    "verifierWriteCreated": false
+  },
+  "modelIdentityFile": "model=grok-build\neffort=high\nharness=grok\n"
+}
