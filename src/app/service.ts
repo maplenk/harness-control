@@ -233,6 +233,7 @@ import {
   type MergeReadinessBlockedState,
   type RoleRoundAdvance,
   type RoleRoundProjection,
+  type RoleRoundStage,
   type RunMeta,
   type SpecDraftState,
   type UiState,
@@ -557,6 +558,27 @@ export class ResourceExhaustedError extends Error {
     this.role = role;
     this.rssBytes = rssBytes;
     this.budgetBytes = budgetBytes;
+  }
+}
+
+/**
+ * F2 (§review dogfood) — an implementor round produced no deliverable it stands
+ * behind (abnormal turn stop, a claimed commit disagreeing with host HEAD, or a
+ * remediation round with no new commit). `runRole` persists the round
+ * `no_deliverable` ATOMICALLY (never `completed` first) and throws this so the
+ * verifier is never dispatched and a restart/resume re-drives the implementor.
+ */
+export class NoDeliverableError extends Error {
+  override readonly name: string = 'NoDeliverableError';
+  readonly runId: RunId;
+  readonly round: number;
+  constructor(runId: RunId, round: number, reason: string) {
+    super(
+      `Run ${runId} round ${round}: implementor produced no deliverable (${reason}); ` +
+        `the verifier was NOT dispatched. Re-drive the implementor (resume) or cancel.`,
+    );
+    this.runId = runId;
+    this.round = round;
   }
 }
 
@@ -1600,6 +1622,20 @@ export class OrchestrationService {
           `Run ${runId} is suspended (${state.suspension.kind}); cannot advance workflow`,
         );
       }
+      // F2 (§review dogfood): the deliverable gate is an ENGINE invariant, not
+      // just orchestrator policy — the `implementing → verifying` advance is
+      // REFUSED while the current round is an implementor round adjudicated
+      // `no_deliverable`, so a direct `advanceWorkflowPhase` call can never
+      // bypass the verifier gate (`runRole`'s dispatch guard covers the runRole/
+      // runVerification path before its pending save overwrites the projection).
+      if (from === 'implementing' && to === 'verifying') {
+        const round = this.getRoleRound(runId);
+        if (round?.role === 'implementor' && round.stage === 'no_deliverable') {
+          throw new WorkflowAdvanceError(
+            `Run ${runId}: implementor round ${round.round} produced no deliverable — refusing to advance to verifying`,
+          );
+        }
+      }
       const advance = this.#trigger(runId, 'workflow.dispatch.advanced', {
         from,
         to,
@@ -2501,6 +2537,23 @@ export class OrchestrationService {
     dispatch?: RoleDispatch,
   ): Promise<T> {
     const meta = this.#requireMeta(runId);
+    // F2 (§review dogfood): the deliverable gate as an ENGINE invariant at the
+    // verifier-dispatch choke point — REFUSE a dispatch that advances
+    // `implementing → verifying` (the verifier round, including a direct
+    // `runVerification` call) while the current round is an implementor round
+    // adjudicated `no_deliverable`. Checked BEFORE anything is allocated/admitted
+    // and BEFORE the pending save overwrites the projection, so it cannot be
+    // bypassed by calling the lower-level dispatch APIs directly.
+    if (dispatch?.advance?.from === 'implementing' && dispatch.advance.to === 'verifying') {
+      const prev = this.getRoleRound(runId);
+      if (prev?.role === 'implementor' && prev.stage === 'no_deliverable') {
+        throw new NoDeliverableError(
+          runId,
+          prev.round,
+          'implementor round produced no deliverable — refusing to dispatch the verifier',
+        );
+      }
+    }
     const resolved = resolveRoleModel(spec);
     const mediation = this.#mediation.get(runId) ?? DEFAULT_HEADLESS_MEDIATION;
     const permissions = toPermissionConfig(mediation, runner.role);
@@ -2709,18 +2762,33 @@ export class OrchestrationService {
         );
       }
       if (baseRound !== undefined) {
+        // F2: adjudicate the round's deliverable AT completion — persist the
+        // verdict in the SAME write that would have marked it `completed`, so the
+        // decision is ATOMIC (no `completed`-then-overwrite crash window that a
+        // resume could read as "verify next"). Absent adjudicator (coordinator /
+        // verifier) → always `completed`.
+        const stage: RoleRoundStage =
+          runner.adjudicateRoundOutcome !== undefined
+            ? await runner.adjudicateRoundOutcome(result)
+            : 'completed';
         // Preserve a checkpoint ref a mid-round pause recorded on THIS round
         // (a resumed round completing keeps its §12.2 lineage visible).
         const current = this.getRoleRound(runId);
         this.#saveRoleRound(runId, {
           ...baseRound,
-          stage: 'completed',
+          stage,
           generationId: ctx.generationId,
           segmentId: ctx.segmentId,
           ...(current?.checkpointRef !== undefined && current.round === baseRound.round
             ? { checkpointRef: current.checkpointRef }
             : {}),
         });
+        if (stage === 'no_deliverable') {
+          // No forward progress — do NOT reset the breaker, and abort so the
+          // verifier is never dispatched. The persisted `no_deliverable` round
+          // re-drives the implementor on resume (resolveResumeEntry).
+          throw new NoDeliverableError(runId, baseRound.round, 'no deliverable adjudicated at completion');
+        }
         // F4 (§5x): a round reaching `completed` is durable, real forward
         // progress — reset the breaker's recovery sequence so a LATER, unrelated
         // crash starts a fresh no-progress / max-elapsed-recovery clock instead
@@ -4543,22 +4611,6 @@ export class OrchestrationService {
   /** The current role round (W2-3), if a dispatch persisted one. */
   getRoleRound(runId: RunId): RoleRoundProjection | undefined {
     return this.#db.projections.get<RoleRoundProjection>(runId, ROLE_ROUND_PROJECTION)?.state;
-  }
-
-  /**
-   * F2 (§review dogfood): re-stamp `round`'s implementor projection as
-   * `no_deliverable` — the PERSISTED verifier gate. `runRole` marks a round
-   * `completed` on flow success before the orchestrator can judge the
-   * deliverable, and both resume readers (`resolveResumeEntry`, the CLI resume
-   * boundary) treat `completed` as "durably committed → verify next". Overwriting
-   * the stage here means a restart/resume re-drives the IMPLEMENTOR instead, so a
-   * no-deliverable round can never bypass the verifier. Guarded to the current
-   * implementor round so a stale caller can never clobber a later projection.
-   */
-  markRoundNoDeliverable(runId: RunId, round: number): void {
-    const current = this.getRoleRound(runId);
-    if (current === undefined || current.round !== round || current.role !== 'implementor') return;
-    this.#saveRoleRound(runId, { ...current, stage: 'no_deliverable' });
   }
 
   #buildRoleSession(args: RoleSessionArgs, ctx: SpawnContext): RoleSession {

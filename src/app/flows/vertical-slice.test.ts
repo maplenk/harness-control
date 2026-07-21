@@ -70,7 +70,12 @@ import {
 } from '../service.js';
 import type { Harness, RoleModelSpec } from '../model-resolution.js';
 import { CoordinatorRunner, type CoordinatorOutcome } from './coordinator.js';
-import { NoDeliverableError, runImplementVerifyLoop } from './orchestrate.js';
+import {
+  adjudicateImplementorDeliverable,
+  NoDeliverableError,
+  runImplementVerifyLoop,
+} from './orchestrate.js';
+import type { ImplementorResult } from './implementor.js';
 import {
   gitMergeReadinessProbe,
   runVerification,
@@ -1173,6 +1178,32 @@ describe('F2 — a round with no real deliverable never dispatches a verifier (p
     expect(result.outcome).toBe('merge_ready');
     await slice.worktrees.removeWorktree(asg);
   });
+
+  it('the gate is an ENGINE invariant — a direct advanceWorkflowPhase to verifying is refused for a no_deliverable round', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [{ turns: [{ ...implementorTurn('Refusing.'), result: { stopReason: 'refusal' } }] }],
+      verifier: [{ turns: [bothPass] }],
+    });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_f2_invariant');
+    await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      loopInput(slice, runId, outcome, recorder, asg),
+    ).catch(() => undefined);
+
+    // Persisted no_deliverable, run left at `implementing`.
+    expect(slice.service.getRoleRound(runId)?.stage).toBe('no_deliverable');
+    expect(slice.service.status(runId).phase).toBe('implementing');
+    // The engine itself refuses the implementing → verifying advance — a caller
+    // reaching past the orchestrator (public advanceWorkflowPhase / direct
+    // runVerification) cannot bypass the deliverable gate.
+    expect(() => slice.service.advanceWorkflowPhase(runId, 'implementing', 'verifying')).toThrow(
+      /no deliverable/i,
+    );
+    await slice.worktrees.removeWorktree(asg);
+  });
 });
 
 // ===========================================================================
@@ -1260,5 +1291,48 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
     expect(String(result.rounds[0]!.implementation!.baseSha)).toBe(String(pinnedBase));
     expect(String(result.rounds[0]!.implementation!.baseSha)).not.toBe(advancedHead);
     await slice.worktrees.removeWorktree(asg);
+  });
+});
+
+// ===========================================================================
+// F2 (must-fix 2) — the deliverable adjudicator: every non-end_turn stop,
+// commit-vs-host-HEAD, and the round>1 no-progress rule
+// ===========================================================================
+describe('F2 adjudicateImplementorDeliverable — every non-normal stop + host-HEAD check', () => {
+  const HEAD = gitSha('a'.repeat(40));
+  function result(overrides: Partial<ImplementorResult>): ImplementorResult {
+    return {
+      changedFiles: [],
+      diff: '',
+      committed: false,
+      stopReason: 'end_turn',
+      baseSha: gitSha('b'.repeat(40)),
+      ...overrides,
+    } as ImplementorResult;
+  }
+
+  it('every non-end_turn stop is no_deliverable (cancelled/refusal/max_tokens/max_turn_requests)', () => {
+    for (const stopReason of ['cancelled', 'refusal', 'max_tokens', 'max_turn_requests'] as const) {
+      expect(adjudicateImplementorDeliverable(result({ stopReason, committed: true, commitSha: HEAD }), 1, HEAD)).toBe(
+        'no_deliverable',
+      );
+    }
+  });
+
+  it('a claimed commit that DISAGREES with host HEAD is no_deliverable (§8: never trust the agent SHA)', () => {
+    const claimed = gitSha('c'.repeat(40));
+    expect(
+      adjudicateImplementorDeliverable(result({ committed: true, commitSha: claimed }), 1, HEAD),
+    ).toBe('no_deliverable');
+  });
+
+  it('a claimed commit that MATCHES host HEAD is a deliverable', () => {
+    expect(adjudicateImplementorDeliverable(result({ committed: true, commitSha: HEAD }), 1, HEAD)).toBe('completed');
+  });
+
+  it('a REMEDIATION round (round > 1) with no new commit is no_deliverable; round 1 zero-diff is allowed', () => {
+    expect(adjudicateImplementorDeliverable(result({ committed: false }), 2, HEAD)).toBe('no_deliverable');
+    // Fresh round-1 clean zero-diff no-op → allowed into independent verification.
+    expect(adjudicateImplementorDeliverable(result({ committed: false }), 1, HEAD)).toBe('completed');
   });
 });

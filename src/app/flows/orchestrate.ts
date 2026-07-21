@@ -54,10 +54,16 @@ import type { RunPhase } from '../../domain/state.js';
 import * as git from '../../worktree/git.js';
 import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import type { RoleModelSpec } from '../model-resolution.js';
-import { AutoRespawnSignal, LimitPausedError, type OrchestrationService } from '../service.js';
+import {
+  AutoRespawnSignal,
+  LimitPausedError,
+  NoDeliverableError,
+  type OrchestrationService,
+} from '../service.js';
 import { waitMs } from '../../supervisor/breaker.js';
 import { RunOwnershipConflictError } from '../run-ownership-store.js';
 import type { RoleRoundProjection } from '../projections.js';
+import type { RoleRunner, RoleRoundOutcome } from '../role-runner.js';
 import {
   ImplementorFlow,
   verificationRunnerViolationEvent,
@@ -91,25 +97,36 @@ export class LoopCompositionError extends Error {
   override readonly name: string = 'LoopCompositionError';
 }
 
+// F2 (§review dogfood): `NoDeliverableError` now lives in `../service.js` (thrown
+// by `runRole` when it adjudicates a round `no_deliverable` ATOMICALLY with the
+// round-completion write). Re-exported here so existing importers keep working.
+export { NoDeliverableError } from '../service.js';
+
 /**
- * F2 (§review dogfood): raised when an implementor round produced no deliverable
- * the run stands behind — an abnormal turn stop (cancelled/refusal), or a
- * remediation round with no new commit — so the verifier is NOT dispatched. The
- * round is persisted `no_deliverable` first (so restart/resume re-drives the
- * implementor, never the verifier); the loop unwinds with this typed error.
+ * F2: adjudicate an implementor round's deliverable — called by `runRole` at
+ * round completion (ATOMIC with the stage write). A round delivers nothing it
+ * stands behind when its turn ended ABNORMALLY (any non-`end_turn` stop:
+ * cancelled / refusal / max_tokens / max_turn_requests — the RSS case already
+ * aborted in `runRole`), when a claimed commit disagrees with the HOST-read
+ * worktree HEAD (§8: never trust the agent's SHA), or when a REMEDIATION round
+ * (round > 1) produced NO new commit. A FRESH round-1 clean zero-diff is a
+ * legitimate pre-existing-satisfaction no-op and IS allowed into verification.
  */
-export class NoDeliverableError extends Error {
-  override readonly name: string = 'NoDeliverableError';
-  readonly runId: RunId;
-  readonly round: number;
-  constructor(runId: RunId, round: number, reason: string) {
-    super(
-      `Run ${runId} round ${round}: implementor produced no deliverable (${reason}); ` +
-        `the verifier was NOT dispatched. Re-drive the implementor (resume) or cancel.`,
-    );
-    this.runId = runId;
-    this.round = round;
+export function adjudicateImplementorDeliverable(
+  result: ImplementorResult,
+  round: number,
+  hostHead: GitSha,
+): RoleRoundOutcome {
+  if (result.stopReason !== 'end_turn') return 'no_deliverable';
+  if (
+    result.committed &&
+    result.commitSha !== undefined &&
+    String(result.commitSha) !== String(hostHead)
+  ) {
+    return 'no_deliverable';
   }
+  if (round > 1 && !result.committed) return 'no_deliverable';
+  return 'completed';
 }
 
 export interface ImplementVerifyLoopDeps {
@@ -572,6 +589,20 @@ export async function runImplementVerifyLoop(
             ? { ...buildRoundContext(input, round, []), taskScope: persistedScope }
             : buildRoundContext(input, round, fixRequests);
         const flow = new ImplementorFlow(handle, context, buildImplementorOptions(input));
+        // F2: wrap the flow with the deliverable adjudicator — `runRole` persists
+        // the verdict ATOMICALLY at round completion (no `completed`-then-overwrite
+        // crash window a resume could read as "verify next"). The adjudicator reads
+        // the HOST worktree HEAD itself so a claimed commit is checked against it.
+        const runner: RoleRunner<ImplementorResult> = {
+          role: flow.role,
+          run: (session) => flow.run(session),
+          adjudicateRoundOutcome: async (result) =>
+            adjudicateImplementorDeliverable(
+              result,
+              round,
+              gitSha(await git.resolveSha(handle.worktreePath, 'HEAD')),
+            ),
+        };
         // P4b wave 2 FAILOVER: spawn on the EFFECTIVE spec — the ladder rung a
         // prior limit escalated to (durable desired-model record), else the run
         // default. A same-process failover re-drive AND a cross-process resume
@@ -579,7 +610,7 @@ export async function runImplementVerifyLoop(
         const implementorSpec = service.effectiveRoleSpec(input.runId, 'implementor', input.implementor);
         implementation = await service.runRole(
           input.runId,
-          flow,
+          runner,
           implementorSpec,
           handle.worktreePath,
           {
@@ -627,35 +658,11 @@ export async function runImplementVerifyLoop(
         // The verifier binds to the EXACT commit — read the worktree HEAD
         // ourselves (§8: never trust the agent's claimed SHA). After a round
         // that committed nothing new, HEAD is unchanged from the prior round.
+        // F2: the deliverable gate now runs INSIDE runRole (the adjudicator
+        // above), ATOMIC with round completion — a no_deliverable round threw
+        // `NoDeliverableError` and never reaches here, so we only get here for a
+        // round that delivered (or a legitimate fresh zero-diff no-op).
         implementationCommit = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
-
-        // F2: gate the verifier on a REAL deliverable, and PERSIST the gate so a
-        // restart/resume cannot bypass it (`runRole` already stamped the round
-        // `completed`; the resume readers treat that as "verify next"). A round
-        // delivers nothing the run stands behind when its turn ended abnormally
-        // — `cancelled`/`refusal` (the RSS-exhaustion case already aborted inside
-        // `runRole` via F1, never reaching here) — or when a REMEDIATION round
-        // (round > 1) produced NO new commit, i.e. no progress the verifier could
-        // re-judge. A FRESH round that cleanly ended with a zero diff is a
-        // legitimate pre-existing-satisfaction no-op and IS allowed into
-        // independent verification (the verifier proves the criteria against the
-        // base) — and a commit whose base→HEAD tree delta is empty is likewise
-        // allowed. We deliberately do NOT classify every zero diff as failure.
-        const abnormalStop =
-          implementation.stopReason === 'cancelled' || implementation.stopReason === 'refusal';
-        const remediationNoProgress = round > 1 && !implementation.committed;
-        if (abnormalStop || remediationNoProgress) {
-          // The single-writer lease was already released after the implementor
-          // round returned (above); no verifier round will run this iteration.
-          service.markRoundNoDeliverable(input.runId, round);
-          throw new NoDeliverableError(
-            input.runId,
-            round,
-            abnormalStop
-              ? `turn stopped '${implementation.stopReason}'`
-              : 'remediation produced no new commit',
-          );
-        }
       } else if (forcedVerifierRound !== undefined) {
         // Adoption already forced the worktree to this exact commit and
         // asserted clean; the binding below re-states it immutably.

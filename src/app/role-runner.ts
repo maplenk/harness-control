@@ -92,6 +92,17 @@ export interface RoleSession {
  * verdicts). The service owns the surrounding lifecycle (spawn → configure →
  * `run` → dispose) and the workflow phase advances around it.
  */
+/**
+ * F2 (§review dogfood): the round-completion verdict an adjudicator returns.
+ * `completed` = a real deliverable (or a legitimate pre-existing-satisfaction
+ * no-op) → the round completes and verification may proceed. `no_deliverable` =
+ * the round produced nothing it stands behind (abnormal stop, a claimed commit
+ * that disagrees with host HEAD, or a remediation round with no new commit) →
+ * `runRole` persists the round `no_deliverable` ATOMICALLY (never `completed`
+ * first) and throws, so a restart/resume can never read it as "verify next".
+ */
+export type RoleRoundOutcome = 'completed' | 'no_deliverable';
+
 export interface RoleRunner<TResult = unknown> {
   readonly role: RoleName;
   /**
@@ -101,4 +112,12 @@ export interface RoleRunner<TResult = unknown> {
    */
   readonly allowedShellCommands?: readonly string[];
   run(session: RoleSession): Promise<TResult>;
+  /**
+   * F2: adjudicate the round's deliverable AT completion time. `runRole` calls
+   * this with the flow's result and persists the returned stage in the SAME
+   * write that would have marked the round `completed` — so the decision is
+   * atomic with round completion (no `completed`-then-overwrite crash window).
+   * Absent = always `completed` (coordinator/verifier rounds).
+   */
+  adjudicateRoundOutcome?(result: TResult): Promise<RoleRoundOutcome> | RoleRoundOutcome;
 }
