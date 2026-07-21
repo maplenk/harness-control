@@ -628,7 +628,7 @@ The plan's own (now-testable) acceptance criteria become the verifier's evidence
 # drive implement → verify → (bounded remediation) → merge-readiness. --implementor /
 # --verifier are OPTIONAL packed harness:model:effort tokens; omitted, they default to
 # the approved spec's proposed profiles:
-./dist/cli/index.js run "$RUN_ID" --implementor grok:grok-build:high --verifier codex:gpt-5.6-sol:high --json
+./dist/cli/index.js run "$RUN_ID" --implementor grok:grok-build:high --verifier codex:gpt-5.6-sol:xhigh --json
 # inspect phase / suspension / vitals / cost at any point:
 ./dist/cli/index.js status "$RUN_ID" --json
 ```

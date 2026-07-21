@@ -9,7 +9,7 @@ gate** between them.
 
 Three-vendor role split (fixed): coordinator **claude:opus:xhigh** (Anthropic),
 implementor **grok:grok-build:high** (xAI/Grok Build), verifier
-**codex:gpt-5.6-sol:high** (OpenAI, read-only).
+**codex:gpt-5.6-sol:xhigh** (OpenAI, read-only).
 
 ## Run order (§6A)
 
@@ -29,6 +29,18 @@ scripts/dogfood/monitor.sh                  # newest run; --once for a snapshot
 # 3. APPROVE + RUN — bind the EXACT hash, drive implement → verify → merge_ready.
 scripts/dogfood/run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH
 ```
+
+## Memory / engine config
+
+`start-slice.sh` forwards `--config` (default `scripts/dogfood/dogfood.config.json`,
+which pins the **implementor RSS budget to 2048 MB** via the F4 per-role override).
+`--config` at `start` is persisted into the run, so the `run` stage inherits it.
+Override with `CONFIG=/path/to.json scripts/dogfood/slice-1a.sh`, or `CONFIG=` for
+engine defaults. The config path + sha256 are recorded in the run manifest.
+
+If the implementor still trips the RSS ceiling, the safe recovery is an **audited
+raise + resume** (the run stays `resource_exhausted`, spawns no verifier, until it
+succeeds): `node dist/cli/index.js set-budget RUN_ID --role implementor --memory-budget-mb <MB> --resume`.
 
 ## Merge/rebuild gate (between every run — why runs are serial)
 

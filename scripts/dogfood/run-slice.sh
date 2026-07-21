@@ -11,7 +11,7 @@
 #
 # Parameters (env-overridable):
 #   IMPLEMENTOR  default grok:grok-build:high          (xAI/Grok Build)
-#   VERIFIER     default codex:gpt-5.6-sol:high        (OpenAI/Codex, read-only)
+#   VERIFIER     default codex:gpt-5.6-sol:xhigh       (OpenAI/Codex, read-only)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -24,7 +24,7 @@ RUN_ID="${1:?usage: run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH}"
 SPEC_VERSION="${2:?spec version id required}"
 SPEC_HASH="${3:?spec hash required (binds the exact drafted spec)}"
 IMPLEMENTOR="${IMPLEMENTOR:-grok:grok-build:high}"
-VERIFIER="${VERIFIER:-codex:gpt-5.6-sol:high}"
+VERIFIER="${VERIFIER:-codex:gpt-5.6-sol:xhigh}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 APPROVE_JSON="$LOGDIR/slice-$STAMP-approve.json"

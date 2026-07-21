@@ -1,0 +1,7 @@
+{
+  "memory": {
+    "perRole": {
+      "implementor": { "budgetMb": 2048 }
+    }
+  }
+}

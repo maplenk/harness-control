@@ -29,6 +29,11 @@ SLICE="${SLICE:?set SLICE (one-line scope)}"
 PATHS="${PATHS:?set PATHS (files the implementor may touch)}"
 PLAN_SHA="${PLAN_SHA:-$(git rev-parse HEAD)}"
 COORDINATOR="${COORDINATOR:-claude:opus:xhigh}"
+# Per-run engine config (F4 per-role memory budget, etc.). Default: the committed
+# dogfood config (implementor RSS budget pinned to 2048 MB). Set CONFIG="" to run
+# on engine defaults. --config at `start` pins it into the run's persisted config,
+# so the `run` stage inherits it (no need to pass it to run-slice.sh).
+CONFIG="${CONFIG-$ROOT/scripts/dogfood/dogfood.config.json}"
 
 [ -f "$ROOT/dist/cli/index.js" ] || { echo "!! dist not built — run: npm run build" >&2; exit 1; }
 
@@ -37,6 +42,16 @@ JSON="$LOGDIR/slice-$STAMP-start.json"
 ERRLOG="$LOGDIR/slice-$STAMP-start.err.log"
 MANIFEST="$LOGDIR/slice-$STAMP.manifest.json"
 
+# --config forwarding: forward the config file if set + present; record its hash.
+CONFIG_ARGS=()
+CONFIG_SHA=""
+if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]; then
+  CONFIG_ARGS=(--config "$CONFIG")
+  CONFIG_SHA="$(shasum -a 256 "$CONFIG" | awk '{print $1}')"
+elif [ -n "$CONFIG" ]; then
+  echo "!! CONFIG is set but not a readable file: $CONFIG" >&2; exit 1
+fi
+
 GOAL="Read docs/UI-IMPLEMENTATION-PLAN.md ${SECTION} at plan SHA ${PLAN_SHA}. \
 Produce a testable spec whose acceptance criteria are exactly that section's \
 acceptance bullets. Scope: only ${SLICE}; touch no files outside ${PATHS}."
@@ -44,6 +59,7 @@ acceptance bullets. Scope: only ${SLICE}; touch no files outside ${PATHS}."
 echo "── dogfood START ──────────────────────────────────────────────"
 echo " section     : ${SECTION} @ ${PLAN_SHA}"
 echo " coordinator : ${COORDINATOR}"
+echo " config      : ${CONFIG:-<engine defaults>}${CONFIG_SHA:+  (sha256 ${CONFIG_SHA:0:12}…)}"
 echo " scope       : ${SLICE}"
 echo " paths       : ${PATHS}"
 echo " store       : ${HARNESS_HOME}"
@@ -52,7 +68,8 @@ echo " (spawns the real coordinator; blocks until awaiting_approval)"
 echo "───────────────────────────────────────────────────────────────"
 
 set +e
-"${CLI[@]}" start --workspace . --coordinator "$COORDINATOR" --goal "$GOAL" --json \
+"${CLI[@]}" start --workspace . --coordinator "$COORDINATOR" \
+  ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} --goal "$GOAL" --json \
   >"$JSON" 2>"$ERRLOG"
 RC=$?
 set -e
@@ -66,14 +83,15 @@ if [ "$RC" -ne 0 ]; then
 fi
 
 # Extract the fields the approve/run stage needs and record the manifest.
-node - "$JSON" "$MANIFEST" "$SECTION" "$PLAN_SHA" "$COORDINATOR" "$GOAL" <<'NODE'
+node - "$JSON" "$MANIFEST" "$SECTION" "$PLAN_SHA" "$COORDINATOR" "$GOAL" "$CONFIG" "$CONFIG_SHA" <<'NODE'
 const fs = require('fs');
-const [json, manifestPath, section, planSha, coordinator, goal] = process.argv.slice(2);
+const [json, manifestPath, section, planSha, coordinator, goal, config, configSha] = process.argv.slice(2);
 const o = JSON.parse(fs.readFileSync(json, 'utf8'));
 const b = o.json ?? o;                    // --json prints the command body
 const spec = b.spec ?? {};
 const manifest = {
   section, planSha, coordinator, goal,
+  ...(config ? { config, configSha } : {}),
   baseSha: require('child_process').execSync('git rev-parse HEAD').toString().trim(),
   runId: b.runId, phase: b.phase,
   specVersionId: spec.specVersionId, specHash: spec.specHash, revision: spec.revision,
@@ -86,6 +104,8 @@ line('');
 line('✔ run ' + manifest.runId + ' → phase ' + manifest.phase);
 line('  spec ' + manifest.specVersionId + ' (rev ' + manifest.revision + ')');
 line('  hash ' + manifest.specHash);
+line('  base sha: ' + manifest.baseSha + '   (F5: must equal current HEAD)');
+line('  config: ' + (config || '(engine defaults)') + (configSha ? '  sha256=' + configSha.slice(0, 12) + '…' : ''));
 line('  criteria: ' + (manifest.criteria.map((c) => c.id).join(', ') || '(none parsed)'));
 line('  proposed implementor: ' + (manifest.proposedImplementor ?? '—'));
 line('  proposed verifier   : ' + (manifest.proposedVerifier ?? '—'));
