@@ -290,6 +290,7 @@ const SUPPORTING_EVENT_TYPES = [
   'alert.delivered', // P4b-1: at-least-once delivery ack (dedup by alertId/sink)
   'resource.exhausted', // F1/F3: engine-folded RSS-exhaustion suspension (not a §6.3 row)
   'run.memory_budget.overridden', // F3: audited per-run budget raise (plain durable fact)
+  'run.base_commit.pinned', // F5: audited one-time legacy base pin (plain durable fact)
 ] as const satisfies readonly DomainEventType[];
 
 type SupportingEventType = (typeof SUPPORTING_EVENT_TYPES)[number];
@@ -601,10 +602,10 @@ function assertInvariant(
 // Meta: guards the generator's own inputs against drift.
 // ---------------------------------------------------------------------------
 describe('conformance-suite event vocabulary bookkeeping', () => {
-  it('has exactly 25 trigger rows and 43 supporting types partitioning the full vocabulary', () => {
+  it('has exactly 25 trigger rows and 44 supporting types partitioning the full vocabulary', () => {
     expect(TRANSITION_TABLE).toHaveLength(25);
     expect(TRIGGER_EVENT_TYPES).toHaveLength(25);
-    expect(SUPPORTING_EVENT_TYPES).toHaveLength(43); // +resource.exhausted, +run.memory_budget.overridden (F1/F3)
+    expect(SUPPORTING_EVENT_TYPES).toHaveLength(44); // +resource.exhausted, +run.memory_budget.overridden (F1/F3), +run.base_commit.pinned (F5)
 
     const triggerSet = new Set<string>(TRIGGER_EVENT_TYPES);
     const supportingSet = new Set<string>(SUPPORTING_EVENT_TYPES);

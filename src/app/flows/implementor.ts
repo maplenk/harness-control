@@ -999,7 +999,11 @@ export interface RunImplementorInput {
   /** The implementor's resolved harness/model/effort (§7 spec proposal → run default). */
   readonly implementor: RoleModelSpec;
   readonly context: ImplementorContext;
-  /** Ref to branch the worktree from; defaults to `'HEAD'` → immutable base SHA (§16 item 1). */
+  /** F5: the run's PINNED base commit (start-time HEAD) — takes precedence over
+   * `baseRef` so the standalone entry never branches from a drifted live HEAD. */
+  readonly baseCommit?: GitSha;
+  /** Ref to branch the worktree from; defaults to `'HEAD'` → immutable base SHA
+   * (§16 item 1). Legacy/test fallback ONLY — a pinned `baseCommit` wins. */
   readonly baseRef?: string;
   readonly options?: ImplementorFlowOptions;
 }
@@ -1021,9 +1025,11 @@ export async function runImplementor(
   deps: ImplementorFlowDeps,
   input: RunImplementorInput,
 ): Promise<ImplementorResult> {
+  // F5: the pinned base commit wins over `baseRef` (never a drifted live HEAD).
+  const pinnedBase = input.baseCommit !== undefined ? String(input.baseCommit) : input.baseRef;
   const handle = await deps.worktrees.createWorktree({
     assignmentId: input.assignmentId,
-    ...(input.baseRef !== undefined ? { baseRef: input.baseRef } : {}),
+    ...(pinnedBase !== undefined ? { baseRef: pinnedBase } : {}),
   });
   const flow = new ImplementorFlow(handle, input.context, input.options ?? {});
   try {

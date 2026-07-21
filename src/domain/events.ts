@@ -333,6 +333,18 @@ export interface EventPayloads {
     /** The budget (bytes) that was exhausted — the raise must exceed it. */
     readonly exhaustedBudgetBytes?: number;
   };
+  /**
+   * F5 (§review dogfood) — a run's implementation base commit was pinned at
+   * RUNTIME rather than at `start` (a LEGACY run created before base-at-start
+   * pinning). A plain, AUDITED durable fact so the one-time live-HEAD resolution
+   * is explicit and visible — never a silent fallback. New runs pin their base
+   * in `RunMeta` at `createRun`; `getRunBaseCommit` reads `RunMeta` first, then
+   * the latest of these.
+   */
+  'run.base_commit.pinned': {
+    readonly baseCommit: GitSha;
+    readonly reason: 'legacy_runtime_pin';
+  };
   /** T23 — verification finished blocked: any criterion failed/unproven, OR
    * (W2-2, narrowing W1-F1) every criterion verified but AGENT-actionable §16
    * readiness blockers remain (implementation worktree dirty

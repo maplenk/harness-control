@@ -149,7 +149,15 @@ export interface ImplementVerifyLoopInput {
   readonly evidence: EvidenceRecorder;
   /** §12.2 successor resume for the FIRST verification round (kill/restart). */
   readonly resumeFrom?: VerifierResumeState;
-  /** Ref to branch the worktree from; defaults to `'HEAD'` → immutable base (§16 item 1). */
+  /**
+   * F5: the run's PINNED implementation base commit (from `RunMeta`, resolved at
+   * `start`). When present it is the authoritative base every fresh worktree
+   * branches from — a commit landing between `start` and `run` can never drift
+   * it. Takes precedence over `baseRef`. The production CLI always supplies it.
+   */
+  readonly baseCommit?: GitSha;
+  /** Ref to branch the worktree from; defaults to `'HEAD'` → immutable base (§16
+   * item 1). Legacy/test fallback ONLY — a pinned `baseCommit` always wins. */
   readonly baseRef?: string;
   /** Runs the implementor's declared verification commands; injected in tests. */
   readonly runVerificationCommands?: VerificationRunner;
@@ -453,9 +461,13 @@ export async function runImplementVerifyLoop(
   try {
     let destinationLabel: string;
     if (resume === undefined) {
+      // F5: branch from the PINNED base commit (start-time HEAD) when present —
+      // never live HEAD, which may have advanced since `start`. `baseRef` is the
+      // legacy/test fallback only.
+      const pinnedBase = input.baseCommit !== undefined ? String(input.baseCommit) : input.baseRef;
       handle = await worktrees.createWorktree({
         assignmentId: input.assignmentId,
-        ...(input.baseRef !== undefined ? { baseRef: input.baseRef } : {}),
+        ...(pinnedBase !== undefined ? { baseRef: pinnedBase } : {}),
       });
       // §16: the manual `git switch <dest>` hint targets the primary checkout's
       // ACTUAL branch (read from the repo, never trusting a hardcoded 'main'); an

@@ -143,6 +143,15 @@ export interface RunMeta {
   /** Opt-in Agent Room discussion remains bound to coordinator re-entry and
    * later spec-revision rounds for this run. */
   readonly planningChatEnabled?: boolean;
+  /**
+   * F5 (§review dogfood): the implementation base commit, pinned at `start`
+   * (the earliest reproducible snapshot — the coordinator reads the repo
+   * immediately after). Immutable: every fresh implement→verify worktree
+   * branches from THIS SHA, so a commit landing between `start` and `run` can
+   * never drift the base. Optional only for legacy runs created before F5 (which
+   * get a one-time audited `run.base_commit.pinned` instead).
+   */
+  readonly baseCommit?: GitSha;
 }
 
 /**

@@ -30,9 +30,12 @@ import {
   artifactHash,
   assignmentId,
   criterionId,
+  gitSha,
   specHash as toSpecHash,
+  type GitSha,
   type RunId,
 } from '../domain/ids.js';
+import * as git from '../worktree/git.js';
 import type { AcceptanceCriterion, MergeReadiness, SpecVersion } from '../domain/entities.js';
 import type { RoleName } from '../domain/state.js';
 import type { Clock } from '../lib/clock.js';
@@ -366,6 +369,34 @@ function draftLossRecoveryHint(runId: RunId): string {
 // ---------------------------------------------------------------------------
 // start
 // ---------------------------------------------------------------------------
+/**
+ * F5: resolve the base commit to pin at `start` from the workspace HEAD, and
+ * flag a dirty tree. A non-git / unborn-HEAD workspace yields no base (the run
+ * still starts; the loop pins it at run-time via the legacy path) — never a
+ * hard failure of `start`.
+ */
+async function resolveStartBase(
+  workspace: string,
+): Promise<{ baseCommit?: GitSha; warning?: string }> {
+  let baseCommit: GitSha;
+  try {
+    baseCommit = gitSha(await git.resolveSha(workspace, 'HEAD'));
+  } catch {
+    return {}; // not a git repo / no commit yet — pinned later (legacy path)
+  }
+  let warning: string | undefined;
+  try {
+    if ((await git.statusPorcelain(workspace)).trim().length > 0) {
+      warning =
+        `workspace has uncommitted changes — they are EXCLUDED from the pinned base ${baseCommit}. ` +
+        `Commit them before \`start\` to include them in the implementation base (F5).`;
+    }
+  } catch {
+    // status is best-effort — a resolvable HEAD is enough to pin.
+  }
+  return { baseCommit, ...(warning !== undefined ? { warning } : {}) };
+}
+
 async function handleStart(
   service: OrchestrationService,
   cmd: Extract<RunCommand, { kind: 'start' }>,
@@ -381,10 +412,16 @@ async function handleStart(
     return finish('start', { error: 'flows_unavailable', detail: text }, text, 2);
   }
 
+  // F5: pin the implementation base commit at START — the earliest reproducible
+  // snapshot (the coordinator reads the repo immediately below). Every fresh
+  // implement→verify worktree branches from THIS SHA, so a commit landing
+  // between `start` and `run` can never drift the base (the exact dogfood bug).
+  const startBase = await resolveStartBase(cmd.workspace);
   const { runId } = service.createRun({
     goal: cmd.goal,
     workspacePath: cmd.workspace,
     coordinator: cmd.coordinator,
+    ...(startBase.baseCommit !== undefined ? { baseCommit: startBase.baseCommit } : {}),
     ...(cmd.enableChat === true ? { planningChatEnabled: true } : {}),
   });
 
@@ -413,6 +450,10 @@ async function handleStart(
     uiState: st.uiState,
     goal: cmd.goal,
     workspacePath: cmd.workspace,
+    // F5: the pinned base commit (and any dirty-tree warning) is surfaced so the
+    // operator sees exactly which snapshot the run implements against.
+    ...(startBase.baseCommit !== undefined ? { baseCommit: String(startBase.baseCommit) } : {}),
+    ...(startBase.warning !== undefined ? { warnings: [startBase.warning] } : {}),
     coordinator: resolvedView(resolveRoleModel(cmd.coordinator)),
     ...(cmd.enableChat === true ? { planningChat: outcome.planningChat ?? { enabled: true } } : {}),
     spec: {
@@ -815,11 +856,24 @@ async function handleRun(
   // merge_ready | failed. One assignment/worktree per run, derived from runId.
   const asg = assignmentId(`asg_${cmd.runId}`);
   const worktrees = await flows.openWorktrees(st.workspacePath);
+  // F5: branch from the run's PINNED base commit (start-time HEAD). A LEGACY run
+  // (created before base-at-start pinning) is pinned ONCE here from current HEAD
+  // with an audited `run.base_commit.pinned` — never a silent live-HEAD fallback.
+  let baseCommit = service.getRunBaseCommit(cmd.runId);
+  if (baseCommit === undefined) {
+    try {
+      baseCommit = gitSha(await git.resolveSha(st.workspacePath, 'HEAD'));
+      service.pinRunBaseCommit(cmd.runId, baseCommit);
+    } catch {
+      baseCommit = undefined; // non-git workspace — the loop falls back to HEAD
+    }
+  }
   const result = await runImplementVerifyLoop(
     { service, worktrees, ids: flows.ids, clock: flows.clock },
     {
       runId: cmd.runId,
       assignmentId: asg,
+      ...(baseCommit !== undefined ? { baseCommit } : {}),
       implementor: implementorSpec,
       verifier: verifierSpec,
       specHash: draft.specHash,

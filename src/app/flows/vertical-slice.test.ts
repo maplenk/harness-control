@@ -34,6 +34,7 @@ import {
   assignmentId,
   criterionId,
   eventSequence,
+  gitSha,
   segmentId as mkSegmentId,
   type ArtifactHash,
   type CriterionId,
@@ -1170,6 +1171,94 @@ describe('F2 — a round with no real deliverable never dispatches a verifier (p
     expect(slice.created.filter((c) => c.role === 'implementor')).toHaveLength(2);
     expect(slice.created.some((c) => c.role === 'verifier')).toBe(true);
     expect(result.outcome).toBe('merge_ready');
+    await slice.worktrees.removeWorktree(asg);
+  });
+});
+
+// ===========================================================================
+// F5 (§review dogfood) — base commit pinned at start, threaded through the loop
+// ===========================================================================
+describe('F5 — the implementation base is pinned at start, not resolved live at run', () => {
+  it('createRun records an immutable base commit; getRunBaseCommit reads it', async () => {
+    const slice = await openSlice({ coordinator: [{ turns: [coordinatorTurn(validSpec())] }] });
+    const base = gitSha(await slice.repo.headSha());
+    const { runId } = slice.service.createRun({
+      goal: GOAL,
+      workspacePath: slice.repo.dir,
+      coordinator: COORDINATOR,
+      baseCommit: base,
+    });
+    expect(String(slice.service.getRunBaseCommit(runId))).toBe(String(base));
+  });
+
+  it('a LEGACY run (no pinned base) is pinned ONCE, audited; a re-pin to a DIFFERENT sha is refused', async () => {
+    const slice = await openSlice({ coordinator: [{ turns: [coordinatorTurn(validSpec())] }] });
+    // Legacy: created without a base.
+    const { runId } = slice.service.createRun({ goal: GOAL, workspacePath: slice.repo.dir, coordinator: COORDINATOR });
+    expect(slice.service.getRunBaseCommit(runId)).toBeUndefined();
+
+    const base = gitSha(await slice.repo.headSha());
+    slice.service.pinRunBaseCommit(runId, base); // audited one-time pin
+    expect(String(slice.service.getRunBaseCommit(runId))).toBe(String(base));
+    expect(dbHandle!.db.events.listByRun(runId).some((e) => e.type === 'run.base_commit.pinned')).toBe(true);
+
+    // Re-pinning to the SAME sha is a benign no-op; a DIFFERENT sha is refused.
+    expect(slice.service.pinRunBaseCommit(runId, base)).toBeUndefined();
+    expect(() => slice.service.pinRunBaseCommit(runId, gitSha('0'.repeat(40)))).toThrow(/already has a pinned base/i);
+  });
+
+  it('the worktree branches from the START-pinned base even when HEAD advances before run', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        { writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const v = 1;\n' }], turns: [implementorTurn('Implemented.')] },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'ok' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'ok' },
+            ]),
+          ],
+        },
+      ],
+    });
+    // The base is pinned at "start" (before any drift).
+    const pinnedBase = gitSha(await slice.repo.headSha());
+    const { runId, outcome } = await coordinateAndApprove(slice);
+
+    // A commit lands AFTER start but BEFORE run — the exact dogfood drift.
+    await slice.repo.writeFile('UNRELATED.md', 'landed between start and run\n');
+    const advancedHead = await slice.repo.commitAll('unrelated commit after start');
+    expect(advancedHead).not.toBe(String(pinnedBase));
+
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_f5_pin');
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        baseCommit: pinnedBase, // the CLI threads RunMeta.baseCommit here
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement --verbose.',
+        criteria: outcome.specVersion.criteria,
+        constraints: [],
+        explorationArtifact: 'bound to base',
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+      },
+    );
+
+    // The worktree branched from the START-pinned base, NOT the HEAD that
+    // advanced between start and run.
+    expect(String(result.rounds[0]!.implementation!.baseSha)).toBe(String(pinnedBase));
+    expect(String(result.rounds[0]!.implementation!.baseSha)).not.toBe(advancedHead);
     await slice.worktrees.removeWorktree(asg);
   });
 });

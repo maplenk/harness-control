@@ -702,6 +702,12 @@ export interface CreateRunInput {
   readonly planningChatEnabled?: boolean;
   /** Default `{mode:'headless'}` (deny-all, §10.2). */
   readonly mediation?: PermissionMediation;
+  /**
+   * F5: the implementation base commit, resolved from the workspace HEAD at
+   * `start` and pinned immutably into `RunMeta`. Production `start` always
+   * supplies it; omit only for a legacy/test run that pins later (or never).
+   */
+  readonly baseCommit?: GitSha;
 }
 
 export interface CreateRunResult {
@@ -1345,6 +1351,9 @@ export class OrchestrationService {
       workspacePath: input.workspacePath,
       coordinator: input.coordinator,
       ...(input.planningChatEnabled === true ? { planningChatEnabled: true } : {}),
+      // F5: pin the base commit at create/start — the earliest reproducible
+      // snapshot. Immutable (RunMeta is never re-saved).
+      ...(input.baseCommit !== undefined ? { baseCommit: input.baseCommit } : {}),
     };
     this.#db.transaction(() => {
       registerRun(this.#db.driver, this.#clock, runId);
@@ -2735,6 +2744,48 @@ export class OrchestrationService {
   saveSpecDraft(runId: RunId, draft: SpecDraftState): void {
     this.#requireMeta(runId); // reject an unknown run (same guard as status)
     this.#db.projections.save(runId, SPEC_DRAFT_PROJECTION, draft);
+  }
+
+  /**
+   * F5: the run's pinned implementation base commit — `RunMeta.baseCommit`
+   * (pinned at `start`) if present, else the latest audited
+   * `run.base_commit.pinned` (a legacy run's one-time runtime pin). `undefined`
+   * only for a legacy run that has never been pinned — the CLI pins it (audited)
+   * before the loop rather than silently resolving live HEAD.
+   */
+  getRunBaseCommit(runId: RunId): GitSha | undefined {
+    const meta = this.#db.projections.get<RunMeta>(runId, RUN_META_PROJECTION)?.state;
+    if (meta?.baseCommit !== undefined) return meta.baseCommit;
+    let pinned: GitSha | undefined;
+    for (const event of this.#db.events.listByRun(runId)) {
+      if (event.type === 'run.base_commit.pinned') {
+        pinned = (event.payload as EventPayloads['run.base_commit.pinned']).baseCommit;
+      }
+    }
+    return pinned;
+  }
+
+  /**
+   * F5: one-time AUDITED base pin for a LEGACY run (created before base-at-start
+   * pinning, so `RunMeta.baseCommit` is absent). Records the resolved SHA as an
+   * explicit durable fact so the runtime resolution is visible, never a silent
+   * live-HEAD fallback. Idempotent by content: refuses to re-pin a run that
+   * already has a base (RunMeta or a prior pin) to a DIFFERENT SHA.
+   */
+  pinRunBaseCommit(runId: RunId, baseCommit: GitSha, opts?: CommandOptions): IngestResult | undefined {
+    this.#requireMeta(runId);
+    const existing = this.getRunBaseCommit(runId);
+    if (existing !== undefined) {
+      if (String(existing) !== String(baseCommit)) {
+        throw new WorkflowAdvanceError(
+          `pinRunBaseCommit: run ${runId} already has a pinned base ${existing}; refusing to re-pin to ${baseCommit}`,
+        );
+      }
+      return undefined; // already pinned to this SHA — no-op
+    }
+    return this.ingest(
+      this.#trigger(runId, 'run.base_commit.pinned', { baseCommit, reason: 'legacy_runtime_pin' }, opts) as DomainEvent,
+    );
   }
 
   /** The persisted coordinator spec draft for a run, if `start` drafted one. */
