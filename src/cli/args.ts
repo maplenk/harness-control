@@ -58,6 +58,10 @@ commands:
   pause RUN_ID               T11 -> paused_user
   breaker reset RUN_ID       T15
   switch-model RUN_ID --role ROLE --model ID [--harness ID] [--effort E]   T19 (§11.2)
+  set-budget RUN_ID --role ROLE --memory-budget-mb N [--resume]
+      F3: audited per-run RSS memory-budget override to recover a
+      resource_exhausted run at a higher budget (the ONE sanctioned exception to
+      config immutability). --resume also re-enters the run after raising it.
   cancel RUN_ID              T18: idempotent, one terminal result
 
 profiles (§18): '--coordinator claude --model opus --effort low' or a packed
@@ -109,6 +113,18 @@ export type RunCommand =
       readonly runId: RunId;
       readonly role: RoleName;
       readonly target: RoleModelSpec;
+    }
+  | {
+      // F3 (§review dogfood): the audited per-run RSS memory-budget override —
+      // the ONE sanctioned exception to config immutability, to recover a
+      // `resource_exhausted` run at a higher budget.
+      readonly kind: 'set_budget';
+      readonly json: boolean;
+      readonly runId: RunId;
+      readonly role: RoleName;
+      readonly budgetMb: number;
+      /** Also resume the run after raising the budget (raise → resume). */
+      readonly resume?: boolean;
     }
   | { readonly kind: 'cancel'; readonly json: boolean; readonly runId: RunId };
 
@@ -237,6 +253,8 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
       return parseBreaker(rest);
     case 'switch-model':
       return parseSwitchModel(rest);
+    case 'set-budget':
+      return parseSetBudget(rest);
     default:
       return usage(`unknown command: ${command}`);
   }
@@ -432,6 +450,37 @@ function parseSwitchModel(rest: readonly string[]): ParsedCliCommand {
     runId: runId.value,
     role: roleArg as RoleName,
     target: target.value,
+  };
+}
+
+function parseSetBudget(rest: readonly string[]): ParsedCliCommand {
+  const collected = collectOptions(rest, {
+    booleans: ['json', 'resume'],
+    values: ['role', 'memory-budget-mb', 'config'],
+  });
+  if (isErr(collected)) return usage(collected.error);
+  const { values, bools, positionals } = collected.value;
+  if (values.has('config')) return usage(CONFIG_BINDS_AT_START);
+  const runId = requireRunId(positionals, 'set-budget');
+  if (isErr(runId)) return usage(runId.error);
+  const roleArg = values.get('role');
+  if (roleArg === undefined) return usage('set-budget requires --role ROLE');
+  if (!(ROLE_NAMES as readonly string[]).includes(roleArg)) {
+    return usage(`set-budget: unknown --role '${roleArg}' (expected one of ${ROLE_NAMES.join(', ')})`);
+  }
+  const mbArg = values.get('memory-budget-mb');
+  if (mbArg === undefined) return usage('set-budget requires --memory-budget-mb N');
+  const budgetMb = Number(mbArg);
+  if (!Number.isInteger(budgetMb) || budgetMb <= 0) {
+    return usage(`set-budget: --memory-budget-mb must be a positive integer (got '${mbArg}')`);
+  }
+  return {
+    kind: 'set_budget',
+    json: bools.has('json'),
+    runId: runId.value,
+    role: roleArg as RoleName,
+    budgetMb,
+    ...(bools.has('resume') ? { resume: true } : {}),
   };
 }
 

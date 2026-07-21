@@ -232,6 +232,8 @@ export async function executeCommand(
         });
       case 'switch_model':
         return handleSwitchModel(service, db, command);
+      case 'set_budget':
+        return handleSetBudget(service, command);
       case 'cancel':
         return await handleCancel(service, command);
     }
@@ -1782,7 +1784,8 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
           : st.suspension === 'resource_exhausted'
             ? // F3: a LOCAL RSS ceiling (not a provider limit) — the remedy is an
               // audited per-run budget raise, then resume (never at the same budget).
-              'resource_exhausted — RSS memory budget crossed; raise the role memory budget (audited), then resume'
+              `resource_exhausted — RSS memory budget crossed; recover with ` +
+              `\`harness set-budget ${runId} --role <role> --memory-budget-mb <N> --resume\``
             : null,
     ...(st.autoRecovering !== undefined ? { autoRecovering: st.autoRecovering } : {}),
     operation: st.operation,
@@ -1978,6 +1981,47 @@ function handleSwitchModel(
     },
     `desired model for ${cmd.role} set to ${describeSpec(cmd.target)} — ${boundaryText}. ` +
       `Effective (running) model: ${fromModel ?? 'none yet'}.`,
+    0,
+  );
+}
+
+/**
+ * F3 (§review dogfood) — the audited per-run RSS memory-budget override, the ONE
+ * sanctioned exception to config immutability, used to recover a
+ * `resource_exhausted` run at a higher budget. `raiseRoleMemoryBudget` refuses a
+ * run that is not resource-exhausted, and refuses anything but a genuine raise
+ * (both surface as a WorkflowAdvanceError the outer handler renders). `--resume`
+ * re-enters the run after raising it (the resume guard requires the effective
+ * budget to now exceed the exhausted one).
+ */
+function handleSetBudget(
+  service: OrchestrationService,
+  cmd: Extract<RunCommand, { kind: 'set_budget' }>,
+): CommandOutput {
+  service.raiseRoleMemoryBudget(cmd.runId, cmd.role, cmd.budgetMb);
+  if (cmd.resume === true) {
+    service.resume(cmd.runId);
+    const st = service.status(cmd.runId);
+    return finish(
+      'set_budget',
+      {
+        runId: cmd.runId,
+        outcome: 'raised_and_resumed',
+        role: cmd.role,
+        budgetMb: cmd.budgetMb,
+        suspension: st.suspension,
+        phase: st.phase,
+      },
+      `run ${cmd.runId}: raised ${cmd.role} memory budget to ${cmd.budgetMb}MB (audited) and resumed ` +
+        `(now ${st.suspension}/${st.phase}).`,
+      0,
+    );
+  }
+  return finish(
+    'set_budget',
+    { runId: cmd.runId, outcome: 'raised', role: cmd.role, budgetMb: cmd.budgetMb },
+    `run ${cmd.runId}: raised ${cmd.role} memory budget to ${cmd.budgetMb}MB (audited). ` +
+      `Resume with \`harness resume ${cmd.runId}\`.`,
     0,
   );
 }

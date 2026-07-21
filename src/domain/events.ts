@@ -93,7 +93,15 @@ export type NotifyTopic =
    * spine raises the `failover` alert DIRECTLY (this topic is only the alert's
    * audit back-reference), so it never fans out as an operator notify.
    */
-  | 'failover';
+  | 'failover'
+  /**
+   * F1/F3 (§review dogfood): a generation crossed its RSS memory budget and was
+   * terminated (graceful stop or emergency SIGKILL) → the run is
+   * `resource_exhausted` and needs a human-gated, audited budget raise before it
+   * can resume. Surfaced as an operator notify + alert (distinct from a provider
+   * `paused_limit`, which drives probe scheduling / failover).
+   */
+  | 'resource_exhausted';
 
 /**
  * P4b-1 alert taxonomy (§5cc): the kinds of durable operator alert raised as a
@@ -103,7 +111,15 @@ export type NotifyTopic =
  * P4b-2 auto-respawn wave (the successor spine emits it) — declared now so the
  * projection/sink vocabulary is stable and wave 2 is a small delta.
  */
-export type AlertKind = 'limit_paused' | 'crash' | 'respawn' | 'breaker_open' | 'failover';
+export type AlertKind =
+  | 'limit_paused'
+  | 'crash'
+  | 'respawn'
+  | 'breaker_open'
+  | 'failover'
+  // F1/F3: an RSS budget was exhausted and the generation terminated — a
+  // human-actionable alert (raise the budget, then resume).
+  | 'resource_exhausted';
 
 /**
  * A named delivery sink for a raised alert. Built-ins are process `stderr`

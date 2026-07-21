@@ -1888,7 +1888,17 @@ export class OrchestrationService {
    * effective budget was raised (audited) above the budget that was exhausted. */
   #assertResumableFromResourceExhaustion(runId: RunId): void {
     const exhausted = this.#latestResourceExhaustion(runId);
-    if (exhausted === undefined) return; // no incident recorded — nothing to gate
+    if (exhausted === undefined) {
+      // Fail CLOSED: the run is `resource_exhausted` but no incident is
+      // discoverable, so the budget-raise gate cannot be evaluated. Refuse
+      // rather than silently allowing a resume at the (unknown, un-raised)
+      // budget that would immediately re-cross the ceiling.
+      throw new WorkflowAdvanceError(
+        `resume: run ${runId} is resource_exhausted but its RSS incident is not discoverable — ` +
+          `cannot verify the budget was raised. Raise the role's memory budget (raiseRoleMemoryBudget, ` +
+          `audited) and retry, or start a fresh run.`,
+      );
+    }
     const currentBudgetBytes = this.#runMemoryBudgetBytes(runId, exhausted.role);
     if (currentBudgetBytes <= exhausted.budgetBytes) {
       throw new WorkflowAdvanceError(
@@ -3144,8 +3154,10 @@ export class OrchestrationService {
     // between `resource.exhausted` and its `turn.completed`. Idempotent: if an
     // emergency kill already suspended this run durably (at kill time), only the
     // in-flight turn is closed here (foldResourceExhausted is a no-op anyway).
+    let firstEntry = false;
     this.#db.transactionImmediate(() => {
       if (this.#loadEngineRecord(ctx.runId).state.suspension.kind !== 'resource_exhausted') {
+        firstEntry = true;
         this.ingest(
           this.#trigger(ctx.runId, 'resource.exhausted', {
             generationId: ctx.generationId,
@@ -3166,7 +3178,52 @@ export class OrchestrationService {
         );
       }
     });
+    // F3: raise the operator notify + alert exactly once — on the FIRST entry
+    // into the state (an emergency kill may already have suspended durably).
+    if (firstEntry) {
+      this.#raiseResourceExhaustedAlert(ctx.runId, cause.role, cause.rssBytes, cause.budgetBytes);
+    }
     return new ResourceExhaustedError(ctx.runId, ctx.role, cause.rssBytes, cause.budgetBytes);
+  }
+
+  /** F3: durable operator notify + alert for a run entering `resource_exhausted`
+   * (distinct from `paused_limit`). Idempotency keyed on the incident so a
+   * double-emit (emergency onEvent + a later seam) dedupes. Timer-safe. */
+  #raiseResourceExhaustedAlert(
+    runId: RunId,
+    role: RoleName,
+    rssBytes: number,
+    budgetBytes: number,
+  ): void {
+    const detail =
+      `RSS memory budget exhausted (${role}): ${rssBytes} bytes over the ${budgetBytes}-byte budget — ` +
+      `the generation was terminated. Raise the role's memory budget (audited), then resume.`;
+    const suffix = `${String(runId)}:${role}:${rssBytes}:${budgetBytes}`;
+    this.#ingestFromSupervisor(
+      draftEvent({
+        type: 'notify.requested',
+        runId,
+        idempotencyKey: idempotencyKey(`notify:resource_exhausted:${suffix}`),
+        occurredAt: this.#clock.nowIso(),
+        payload: { topic: 'resource_exhausted', message: detail },
+      }) as DomainEvent,
+    );
+    const alertKey = idempotencyKey(`alert.raised:resource_exhausted:${suffix}`);
+    this.#ingestFromSupervisor(
+      draftEvent({
+        type: 'alert.raised',
+        runId,
+        idempotencyKey: alertKey,
+        occurredAt: this.#clock.nowIso(),
+        payload: {
+          alertId: alertId(String(alertKey)),
+          kind: 'resource_exhausted',
+          role,
+          topic: 'resource_exhausted',
+          detail: redactText(detail),
+        },
+      }) as DomainEvent,
+    );
   }
 
   /**
@@ -4440,6 +4497,8 @@ export class OrchestrationService {
     if (generationId === undefined) return;
     const resolvedRole = role ?? this.#liveSpawns.get(generationId)?.role;
     if (resolvedRole === undefined) return;
+    const alreadySuspended =
+      this.#loadEngineRecord(event.runId).state.suspension.kind === 'resource_exhausted';
     this.#ingestFromSupervisor(
       this.#trigger(event.runId, 'resource.exhausted', {
         generationId,
@@ -4449,6 +4508,10 @@ export class OrchestrationService {
         ...(segmentId !== undefined ? { segmentId } : {}),
       }) as DomainEvent,
     );
+    // F3: notify + alert on the FIRST entry into the state (not a redelivery).
+    if (!alreadySuspended) {
+      this.#raiseResourceExhaustedAlert(event.runId, resolvedRole, rssBytes, budgetBytes);
+    }
   }
 
   /**

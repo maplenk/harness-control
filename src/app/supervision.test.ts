@@ -1341,4 +1341,69 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
     const replayed = new OrchestrationService({ db, ids: new DeterministicIdFactory() });
     expect(replayed.status(runId).suspension).toBe('resource_exhausted');
   });
+
+  it('F3 (3b): entering resource_exhausted raises the operator notify + alert (distinct taxonomy)', async () => {
+    const { db, runId } = await driveToResourceExhausted();
+    const events = db.events.listByRun(runId);
+    const notifies = events
+      .filter((e) => e.type === 'notify.requested')
+      .map((e) => (e.payload as { topic: string }).topic);
+    expect(notifies).toContain('resource_exhausted');
+    const alerts = events
+      .filter((e) => e.type === 'alert.raised')
+      .map((e) => (e.payload as { kind: string }).kind);
+    expect(alerts).toContain('resource_exhausted');
+  });
+
+  it('F3 (3c): a directly-folded resource_exhausted run refuses resume at the same budget', async () => {
+    // Drive resource_exhausted by folding `resource.exhausted` directly (not via
+    // the watchdog), then assert the resume guard refuses at the same budget.
+    // (The guard now also fails CLOSED if the suspension somehow existed with NO
+    // discoverable incident — a defensive branch: a resource_exhausted suspension
+    // is only ever produced by a `resource.exhausted` event, so that state is
+    // unreachable through the normal folds, but the guard no longer trusts it.)
+    const { service, db } = await setup({ budgetMb: 64 });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    const generation = processGenerationId('pgen_re_orphan');
+    const segment = segmentId('seg_re_orphan');
+    const now = db.clock.nowIso();
+    // Drive a live active generation, then fold resource.exhausted directly.
+    service.ingest(
+      draftEvent({
+        type: 'child.spawn.initiated',
+        runId,
+        payload: { generationId: generation, segmentId: segment, role: 'implementor' },
+        idempotencyKey: idempotencyKey('re-orphan-init'),
+        occurredAt: now,
+      }) as DomainEvent,
+    );
+    service.ingest(
+      draftEvent({
+        type: 'child.spawned',
+        runId,
+        payload: { generationId: generation, segmentId: segment, role: 'implementor', pins: [] },
+        idempotencyKey: idempotencyKey('re-orphan-spawned'),
+        occurredAt: now,
+      }) as DomainEvent,
+    );
+    service.ingest(
+      draftEvent({
+        type: 'resource.exhausted',
+        runId,
+        payload: {
+          generationId: generation,
+          segmentId: segment,
+          role: 'implementor',
+          rssBytes: 100 * MB,
+          budgetBytes: 64 * MB,
+        },
+        idempotencyKey: idempotencyKey('re-orphan-exhausted'),
+        occurredAt: now,
+      }) as DomainEvent,
+    );
+    expect(service.status(runId).suspension).toBe('resource_exhausted');
+    // Now a discoverable incident EXISTS (the resource.exhausted above), and the
+    // budget was NOT raised → refused as a same-budget re-entry.
+    expect(() => service.resume(runId)).toThrow(/resource_exhausted|raise the role|re-cross/i);
+  });
 });

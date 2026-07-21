@@ -206,6 +206,25 @@ describe('parseCliArgs — switch-model', () => {
   });
 });
 
+describe('parseCliArgs — set-budget (F3 audited memory override)', () => {
+  it('parses --role + --memory-budget-mb (+ optional --resume)', () => {
+    expect(
+      parseCliArgs(['set-budget', 'run_1', '--role', 'implementor', '--memory-budget-mb', '2048']),
+    ).toEqual({ kind: 'set_budget', json: false, runId: 'run_1', role: 'implementor', budgetMb: 2048 });
+    expect(
+      parseCliArgs(['set-budget', 'run_1', '--role', 'verifier', '--memory-budget-mb', '4096', '--resume']),
+    ).toMatchObject({ kind: 'set_budget', role: 'verifier', budgetMb: 4096, resume: true });
+  });
+
+  it('rejects an unknown role, a missing/non-positive/non-integer budget', () => {
+    expect(parseCliArgs(['set-budget', 'run_1', '--role', 'boss', '--memory-budget-mb', '2048'])).toMatchObject({ kind: 'usage_error' });
+    expect(parseCliArgs(['set-budget', 'run_1', '--role', 'implementor'])).toMatchObject({ kind: 'usage_error' });
+    expect(parseCliArgs(['set-budget', 'run_1', '--role', 'implementor', '--memory-budget-mb', '0'])).toMatchObject({ kind: 'usage_error' });
+    expect(parseCliArgs(['set-budget', 'run_1', '--role', 'implementor', '--memory-budget-mb', '1.5'])).toMatchObject({ kind: 'usage_error' });
+    expect(parseCliArgs(['set-budget', 'run_1', '--role', 'implementor', '--memory-budget-mb', 'lots'])).toMatchObject({ kind: 'usage_error' });
+  });
+});
+
 describe('parseCliArgs — general', () => {
   it('documents the first-party Grok Build packed profile form', () => {
     expect(CLI_USAGE).toContain('--implementor grok:grok-build:high');
