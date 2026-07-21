@@ -157,7 +157,24 @@ if ((DEFAULT_BOUNDS.restartWindowMax as number) !== DEFAULT_RESTART_WINDOW_MAX) 
 // §14 memory watchdog: budget default 1024MB; soft 75% → warn; hard emergency
 // ceiling 150% of budget → SIGKILL; graceful path deadline reuses the
 // transition engine's own constant.
+//
+// F4 (§review dogfood): the RSS budget may be overridden PER ROLE. A native
+// harness (or a memory-heavy verifier) can be pinned a higher budget than the
+// coordinator without bumping the global default (which would widen the blast
+// radius across every run and repair no pinned run). Only `budgetMb` is
+// per-role — the thresholds/deadline stay global. The `perRole` object is
+// `.strict()` so an unknown role key (a typo like `implementer`) is a LOUD
+// config error, not a silently-ignored override, and `.default({})` so a
+// legacy config with no `perRole` parses unchanged (fallback → global budget).
 // ---------------------------------------------------------------------------
+const perRoleMemorySchema = z
+  .object({
+    /** RSS budget in MB for the full process tree of a segment run by this role. */
+    budgetMb: z.number().int().positive(),
+  })
+  .strict()
+  .readonly();
+
 const memorySchema = z
   .object({
     /** RSS budget in MB for the full process tree of a segment. */
@@ -168,6 +185,20 @@ const memorySchema = z
     hardCeilingRatio: z.number().positive().default(1.5),
     /** Deadline for the graceful checkpoint+stop path before escalating. */
     gracefulStopDeadlineMs: z.number().int().positive().default(RSS_GRACEFUL_STOP_DEADLINE_MS),
+    /**
+     * F4: optional per-role `budgetMb` overrides. A role with no entry falls
+     * back to the global `budgetMb` above. Strict per role (unknown role keys
+     * are rejected at parse) and defaulted empty (legacy configs round-trip).
+     */
+    perRole: z
+      .object({
+        coordinator: perRoleMemorySchema.optional(),
+        implementor: perRoleMemorySchema.optional(),
+        verifier: perRoleMemorySchema.optional(),
+      })
+      .strict()
+      .readonly()
+      .default({}),
   })
   .strict()
   .refine((v) => v.hardCeilingRatio > v.softThresholdRatio, {

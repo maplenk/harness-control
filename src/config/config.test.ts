@@ -31,6 +31,9 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
         softThresholdRatio: 0.75,
         hardCeilingRatio: 1.5,
         gracefulStopDeadlineMs: RSS_GRACEFUL_STOP_DEADLINE_MS,
+        // F4: per-role RSS budget overrides default EMPTY — every role falls
+        // back to the global `budgetMb` until an operator pins one.
+        perRole: {},
       },
       restarts: {
         windowMax: 5,
@@ -131,6 +134,69 @@ describe('parseEngineConfig (deep partial overrides + validation)', () => {
     const result = parseEngineConfig({ memory: { softThresholdRatio: 0.9, hardCeilingRatio: 0.5 } });
     expect(isErr(result)).toBe(true);
     if (isErr(result)) expect(issuePaths(result.error)).toContain('memory.hardCeilingRatio');
+  });
+
+  // F4 (§review dogfood): per-role RSS budget overrides.
+  it('F4: accepts per-role budgets for all three roles and round-trips them', () => {
+    const result = parseEngineConfig({
+      memory: {
+        budgetMb: 1024,
+        perRole: {
+          coordinator: { budgetMb: 512 },
+          implementor: { budgetMb: 2048 },
+          verifier: { budgetMb: 768 },
+        },
+      },
+    });
+    expect(isOk(result)).toBe(true);
+    const config = unwrap(result);
+    expect(config.memory.perRole).toEqual({
+      coordinator: { budgetMb: 512 },
+      implementor: { budgetMb: 2048 },
+      verifier: { budgetMb: 768 },
+    });
+    // The global budget is untouched and remains the fallback for any role
+    // without an explicit override.
+    expect(config.memory.budgetMb).toBe(1024);
+  });
+
+  it('F4: a role with no override is simply absent (falls back to the global budget)', () => {
+    const config = unwrap(parseEngineConfig({ memory: { perRole: { implementor: { budgetMb: 4096 } } } }));
+    expect(config.memory.perRole).toEqual({ implementor: { budgetMb: 4096 } });
+    expect(config.memory.perRole?.coordinator).toBeUndefined();
+    expect(config.memory.perRole?.verifier).toBeUndefined();
+  });
+
+  it('F4: REJECTS an unknown role key (strict — a typo is a loud config error)', () => {
+    const result = parseEngineConfig({ memory: { perRole: { implementer: { budgetMb: 2048 } } } });
+    expect(isErr(result)).toBe(true);
+  });
+
+  it('F4: REJECTS a non-positive / non-integer per-role budget', () => {
+    expect(isErr(parseEngineConfig({ memory: { perRole: { coordinator: { budgetMb: 0 } } } }))).toBe(true);
+    expect(isErr(parseEngineConfig({ memory: { perRole: { coordinator: { budgetMb: -1 } } } }))).toBe(true);
+    expect(isErr(parseEngineConfig({ memory: { perRole: { coordinator: { budgetMb: 1.5 } } } }))).toBe(true);
+  });
+
+  it('F4: REJECTS an unknown key inside a per-role override (strict entry)', () => {
+    const result = parseEngineConfig({
+      memory: { perRole: { coordinator: { budgetMb: 512, softThresholdRatio: 0.9 } } },
+    });
+    expect(isErr(result)).toBe(true);
+  });
+
+  it('F4: deep-freezes per-role overrides at runtime', () => {
+    const config = unwrap(parseEngineConfig({ memory: { perRole: { verifier: { budgetMb: 2048 } } } }));
+    expect(() => {
+      // @ts-expect-error -- intentionally violating readonly to assert runtime enforcement
+      config.memory.perRole!.verifier!.budgetMb = 1;
+    }).toThrow();
+  });
+
+  it('F4: a legacy config WITHOUT perRole parses (perRole defaults empty)', () => {
+    const config = unwrap(parseEngineConfig({ memory: { budgetMb: 2048 } }));
+    expect(config.memory.perRole).toEqual({});
+    expect(config.memory.budgetMb).toBe(2048);
   });
 
   it('rejects a restart window value outside {3,5,8,off}', () => {

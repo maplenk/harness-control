@@ -4002,8 +4002,9 @@ export class OrchestrationService {
         ? { assignmentId: ctx.dispatch.assignmentId }
         : {}),
       // §14/W1-F5: the RSS budget comes from the run's PINNED config, not
-      // whatever this process happens to be configured with.
-      budgetBytes: this.#runMemoryBudgetBytes(ctx.runId),
+      // whatever this process happens to be configured with. F4: keyed by the
+      // spawning ROLE so a per-role override applies to the right generation.
+      budgetBytes: this.#runMemoryBudgetBytes(ctx.runId, ctx.role),
     });
   }
 
@@ -4018,10 +4019,14 @@ export class OrchestrationService {
     }
   }
 
-  /** The run-pinned RSS budget (§14 default 1024MB), in bytes. */
-  #runMemoryBudgetBytes(runId: RunId): number {
+  /** The run-pinned RSS budget (§14 default 1024MB) for `role`, in bytes.
+   * F4: a `memory.perRole.<role>.budgetMb` override wins over the global
+   * `memory.budgetMb`; a role with no override falls back to the global
+   * budget. Always read from the run's PINNED config, never live config. */
+  #runMemoryBudgetBytes(runId: RunId, role: RoleName): number {
     const pinned = loadRunConfig(this.#db, runId) ?? this.#config;
-    return pinned.memory.budgetMb * BYTES_PER_MB;
+    const budgetMb = pinned.memory.perRole?.[role]?.budgetMb ?? pinned.memory.budgetMb;
+    return budgetMb * BYTES_PER_MB;
   }
 
   /**

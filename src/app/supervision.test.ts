@@ -35,6 +35,7 @@ import {
   type RunId,
 } from '../domain/ids.js';
 import { draftEvent, type DomainEvent, type LimitClassification } from '../domain/events.js';
+import type { RoleName } from '../domain/state.js';
 import type { EngineState } from '../domain/transitions.js';
 import {
   AcpStdioAdapter,
@@ -58,6 +59,7 @@ import {
 } from '../supervisor/index.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../persistence/test-support.js';
 import { parseEngineConfig } from '../config/loader.js';
+import type { EngineConfig } from '../config/schema.js';
 import { unwrap } from '../lib/result.js';
 import {
   LimitPausedError,
@@ -196,6 +198,8 @@ async function setup(opts: {
   readonly factory?: SupervisedFactoryOptions;
   readonly supervision?: Partial<SupervisionOptions>;
   readonly budgetMb?: number;
+  /** A fully-parsed config to pin on the run (takes precedence over `budgetMb`). */
+  readonly config?: EngineConfig;
 } = {}): Promise<SetupResult> {
   handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
   const db = handle.db;
@@ -203,9 +207,10 @@ async function setup(opts: {
   const { factory, adapters } = makeSupervisedFactory(ps, opts.factory ?? {});
   const signals: Array<{ pgid: number; signal: NodeJS.Signals }> = [];
   const config =
-    opts.budgetMb !== undefined
+    opts.config ??
+    (opts.budgetMb !== undefined
       ? unwrap(parseEngineConfig({ memory: { budgetMb: opts.budgetMb } }))
-      : undefined;
+      : undefined);
   const service = new OrchestrationService({
     db,
     ids: new DeterministicIdFactory(),
@@ -887,6 +892,47 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
     expect(aggregates).toHaveLength(1);
     expect(aggregates[0]!.rssMaxBytes).toBe(12 * MB);
     expect(aggregates[0]!.sampleCount).toBe(1);
+  });
+
+  // F4 (§review dogfood): the watchdog budget is keyed by the SPAWNING role, so
+  // a per-role override applies to the right generation while a role without an
+  // override falls back to the global budget — proven through the budgetBytes
+  // the run-pinned config puts on `rss.soft_threshold` (as in the T21 test).
+  it('F4: the watchdog uses the spawning role\'s pinned per-role budget, else the global fallback', async () => {
+    const pinned = unwrap(
+      parseEngineConfig({
+        memory: { budgetMb: 64, perRole: { coordinator: { budgetMb: 32 }, implementor: { budgetMb: 48 } } },
+      }),
+    );
+    const { service, db, ps } = await setup({ config: pinned });
+
+    async function budgetSeenFor(role: RoleName, rssMb: number): Promise<number> {
+      const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+      await service.runRole(
+        runId,
+        {
+          role,
+          run: async () => {
+            const generation = service.supervision.registry.store.list()[0]!.generationId;
+            ps.rssBytes = rssMb * MB;
+            await service.supervision.watchdog.sampleOnce(generation);
+            return {};
+          },
+        },
+        CLAUDE_LOW,
+        '/ws',
+      );
+      const soft = db.events.listByRun(runId).find((e) => e.type === 'rss.soft_threshold');
+      return (soft?.payload as { budgetBytes: number }).budgetBytes;
+    }
+
+    // coordinator override 32MB: 26MB = 81% of 32 (only ~40% of the global 64MB
+    // — it would NOT even warn under the wrong, global budget).
+    expect(await budgetSeenFor('coordinator', 26)).toBe(32 * MB);
+    // implementor override 48MB: 40MB = 83% of 48.
+    expect(await budgetSeenFor('implementor', 40)).toBe(48 * MB);
+    // verifier has NO override → falls back to the global 64MB: 52MB = 81%.
+    expect(await budgetSeenFor('verifier', 52)).toBe(64 * MB);
   });
 });
 
