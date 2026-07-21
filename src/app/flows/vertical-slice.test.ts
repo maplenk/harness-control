@@ -72,6 +72,7 @@ import type { Harness, RoleModelSpec } from '../model-resolution.js';
 import { CoordinatorRunner, type CoordinatorOutcome } from './coordinator.js';
 import {
   adjudicateImplementorDeliverable,
+  LoopCompositionError,
   NoDeliverableError,
   runImplementVerifyLoop,
 } from './orchestrate.js';
@@ -380,6 +381,7 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
         criteria: outcome.specVersion.criteria,
         constraints: ['Touch only files under src/cli'],
         explorationArtifact: 'The arg parser lives in src/cli/index.ts (bound to base deadbeef).',
+        baseRef: 'HEAD', // F5: pin the fresh test repo HEAD explicitly
         evidence: recorder,
         runVerificationCommands: PASS_VERIFY,
       },
@@ -478,6 +480,7 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
         criteria: outcome.specVersion.criteria,
+        baseRef: 'HEAD', // F5: the fresh test repo HEAD IS the base (pin explicitly)
         evidence: recorder,
         runVerificationCommands: PASS_VERIFY,
         // NB: no destinationLabel — the loop must read the branch from the repo.
@@ -545,6 +548,7 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
         criteria: outcome.specVersion.criteria,
+        baseRef: 'HEAD', // F5: the fresh test repo HEAD IS the base (pin explicitly)
         evidence: recorder,
         runVerificationCommands: PASS_VERIFY,
       },
@@ -633,6 +637,7 @@ describe('W1-F1/W1-F4 — a mutating verification command never yields merge_rea
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
         criteria: outcome.specVersion.criteria,
+        baseRef: 'HEAD', // F5: the fresh test repo HEAD IS the base (pin explicitly)
         evidence: recorder,
         runVerificationCommands: mutatingVerify,
         maxRounds: 2,
@@ -733,6 +738,7 @@ describe('W3-1 — a verification command that writes into the PRIMARY checkout 
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
         criteria: outcome.specVersion.criteria,
+        baseRef: 'HEAD', // F5: the fresh test repo HEAD IS the base (pin explicitly)
         evidence: recorder,
         runVerificationCommands: escapingVerify,
         maxRounds: 1,
@@ -1040,6 +1046,7 @@ describe('F2 — a round with no real deliverable never dispatches a verifier (p
       criteria: outcome.specVersion.criteria,
       constraints: ['Touch only files under src/cli'],
       explorationArtifact: 'The arg parser lives in src/cli/index.ts (bound to base deadbeef).',
+      baseRef: 'HEAD', // F5: pin the fresh test repo HEAD explicitly
       evidence: recorder,
       runVerificationCommands: PASS_VERIFY,
     };
@@ -1291,6 +1298,31 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
     expect(String(result.rounds[0]!.implementation!.baseSha)).toBe(String(pinnedBase));
     expect(String(result.rounds[0]!.implementation!.baseSha)).not.toBe(advancedHead);
     await slice.worktrees.removeWorktree(asg);
+  });
+
+  it('must-fix 4: the loop REFUSES a fresh worktree with NO pinned base (never live HEAD)', async () => {
+    const slice = await openSlice({ coordinator: [{ turns: [coordinatorTurn(validSpec())] }] });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const err: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: assignmentId('asg_f5_nobase'),
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'x',
+        criteria: outcome.specVersion.criteria,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+        // NO baseCommit and NO baseRef → must refuse (never branch from live HEAD).
+      },
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(LoopCompositionError);
+    expect(String(err)).toMatch(/pinned baseCommit is REQUIRED/i);
   });
 });
 

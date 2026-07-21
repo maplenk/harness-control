@@ -114,6 +114,7 @@ import {
   resolveSha,
   runGit,
   statusPorcelain,
+  WorktreeError,
   type GitWorktreeManager,
   type WorktreeHandle,
 } from '../../worktree/index.js';
@@ -1025,11 +1026,18 @@ export async function runImplementor(
   deps: ImplementorFlowDeps,
   input: RunImplementorInput,
 ): Promise<ImplementorResult> {
-  // F5: the pinned base commit wins over `baseRef` (never a drifted live HEAD).
+  // F5: the pinned base commit wins over `baseRef`, and one of them is REQUIRED
+  // — the standalone implementor entry never branches from a drifted live HEAD.
   const pinnedBase = input.baseCommit !== undefined ? String(input.baseCommit) : input.baseRef;
+  if (pinnedBase === undefined) {
+    throw new WorktreeError(
+      'not_found',
+      `runImplementor: a pinned baseCommit (or explicit baseRef) is REQUIRED — refusing to branch from live HEAD (F5).`,
+    );
+  }
   const handle = await deps.worktrees.createWorktree({
     assignmentId: input.assignmentId,
-    ...(pinnedBase !== undefined ? { baseRef: pinnedBase } : {}),
+    baseRef: pinnedBase,
   });
   const flow = new ImplementorFlow(handle, input.context, input.options ?? {});
   try {

@@ -231,6 +231,9 @@ function loopInput(rig: Rig) {
     criteria: CRITERIA,
     evidence: fakeEvidence(),
     runVerificationCommands: PASS_VERIFY,
+    // F5: the fresh test repo's HEAD IS the intended base — pin it explicitly
+    // (the loop refuses to silently default to live HEAD).
+    baseRef: 'HEAD',
   };
 }
 

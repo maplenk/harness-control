@@ -2883,18 +2883,24 @@ export class OrchestrationService {
    */
   pinRunBaseCommit(runId: RunId, baseCommit: GitSha, opts?: CommandOptions): IngestResult | undefined {
     this.#requireMeta(runId);
-    const existing = this.getRunBaseCommit(runId);
-    if (existing !== undefined) {
-      if (String(existing) !== String(baseCommit)) {
-        throw new WorkflowAdvanceError(
-          `pinRunBaseCommit: run ${runId} already has a pinned base ${existing}; refusing to re-pin to ${baseCommit}`,
-        );
+    // F5 (must-fix 4): the existence check + the pin append are ONE write-locked
+    // unit — two concurrent legacy-pin callers can no longer BOTH read "no base"
+    // and append DIFFERENT pins (the old TOCTOU). The inner `ingest`
+    // `transactionImmediate` nests as a shared no-op.
+    return this.#db.transactionImmediate(() => {
+      const existing = this.getRunBaseCommit(runId);
+      if (existing !== undefined) {
+        if (String(existing) !== String(baseCommit)) {
+          throw new WorkflowAdvanceError(
+            `pinRunBaseCommit: run ${runId} already has a pinned base ${existing}; refusing to re-pin to ${baseCommit}`,
+          );
+        }
+        return undefined; // already pinned to this SHA — no-op
       }
-      return undefined; // already pinned to this SHA — no-op
-    }
-    return this.ingest(
-      this.#trigger(runId, 'run.base_commit.pinned', { baseCommit, reason: 'legacy_runtime_pin' }, opts) as DomainEvent,
-    );
+      return this.ingest(
+        this.#trigger(runId, 'run.base_commit.pinned', { baseCommit, reason: 'legacy_runtime_pin' }, opts) as DomainEvent,
+      );
+    });
   }
 
   /** The persisted coordinator spec draft for a run, if `start` drafted one. */

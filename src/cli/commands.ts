@@ -147,6 +147,10 @@ export interface CliFlowDeps {
     readonly goal: string;
     readonly coordinator: RoleModelSpec;
     readonly workspacePath: string;
+    /** F5 (must-fix 4): the run's PINNED base commit — the coordinator binds its
+     * exploration artifact to it, so a spec drafted against a drifted tree is
+     * detectable (and refused at coordination completion). */
+    readonly baseCommit?: GitSha;
     /** Opt-in Agent Room discussion before final spec synthesis. */
     readonly enableChat?: boolean;
     /** T2 revision context (prior version + human feedback); absent for the initial draft. */
@@ -373,9 +377,10 @@ function draftLossRecoveryHint(runId: RunId): string {
 // ---------------------------------------------------------------------------
 /**
  * F5: resolve the base commit to pin at `start` from the workspace HEAD, and
- * flag a dirty tree. A non-git / unborn-HEAD workspace yields no base (the run
- * still starts; the loop pins it at run-time via the legacy path) — never a
- * hard failure of `start`.
+ * flag a dirty tree. A non-git / unborn-HEAD workspace yields no base but a
+ * PROMINENT warning (the run is UNPINNED and `run` will refuse until the
+ * workspace is a git repository) — never a silent swallow, never a live-HEAD
+ * fallback.
  */
 async function resolveStartBase(
   workspace: string,
@@ -384,7 +389,13 @@ async function resolveStartBase(
   try {
     baseCommit = gitSha(await git.resolveSha(workspace, 'HEAD'));
   } catch {
-    return {}; // not a git repo / no commit yet — pinned later (legacy path)
+    // Not a git repo / no commit yet: the run is UNPINNED. Surface it loudly —
+    // `run` is the hard gate that refuses to branch from live HEAD (must-fix 4).
+    return {
+      warning:
+        `workspace '${workspace}' is not a git repository (or has no commit) — this run is ` +
+        `UNPINNED and \`run\` will REFUSE until it is a committed git repository (F5).`,
+    };
   }
   let warning: string | undefined;
   try {
@@ -397,6 +408,27 @@ async function resolveStartBase(
     // status is best-effort — a resolvable HEAD is enough to pin.
   }
   return { baseCommit, ...(warning !== undefined ? { warning } : {}) };
+}
+
+/**
+ * F5 (must-fix 4): detect drift of the workspace HEAD from a run's pinned base
+ * commit. Returns the pair when they disagree, else undefined (no pinned base,
+ * an unresolvable HEAD, or an exact match). Used to close coordinator drift.
+ */
+async function detectBaseDrift(
+  workspace: string,
+  pinnedBase: GitSha | undefined,
+): Promise<{ pinnedBase: string; currentHead: string } | undefined> {
+  if (pinnedBase === undefined) return undefined;
+  let head: string;
+  try {
+    head = await git.resolveSha(workspace, 'HEAD');
+  } catch {
+    return undefined; // an unresolvable HEAD is handled by the start/run refusal
+  }
+  return head === String(pinnedBase)
+    ? undefined
+    : { pinnedBase: String(pinnedBase), currentHead: head };
 }
 
 async function handleStart(
@@ -418,6 +450,11 @@ async function handleStart(
   // snapshot (the coordinator reads the repo immediately below). Every fresh
   // implement→verify worktree branches from THIS SHA, so a commit landing
   // between `start` and `run` can never drift the base (the exact dogfood bug).
+  // must-fix 4: when the base cannot be resolved (a non-git / unborn-HEAD
+  // workspace) the run is created UNPINNED with a PROMINENT warning — it is NOT
+  // silently swallowed — and `run` is the hard gate that REFUSES to proceed
+  // without an immutable base (never a live-HEAD fallback). Production
+  // workspaces are always git repositories, so this pins in practice.
   const startBase = await resolveStartBase(cmd.workspace);
   const { runId } = service.createRun({
     goal: cmd.goal,
@@ -439,11 +476,31 @@ async function handleStart(
     goal: cmd.goal,
     coordinator: cmd.coordinator,
     workspacePath: cmd.workspace,
+    ...(startBase.baseCommit !== undefined ? { baseCommit: startBase.baseCommit } : {}),
     ...(cmd.enableChat === true ? { enableChat: true } : {}),
   });
   const outcome = await service.runCoordination(runId, runner, (o) =>
     draftFromOutcome(cmd.goal, o),
   );
+
+  // F5 (must-fix 4): close coordinator drift — if the workspace HEAD moved DURING
+  // drafting, the coordinator read a tree different from the immutable base
+  // pinned at start. Refuse (the drafted spec cannot be trusted against the
+  // pinned base); the operator restarts to re-pin.
+  const drift = await detectBaseDrift(cmd.workspace, startBase.baseCommit);
+  if (drift !== undefined) {
+    const text =
+      `start: workspace HEAD (${drift.currentHead}) DRIFTED from the base pinned at start ` +
+      `(${drift.pinnedBase}) during coordination — the spec may have been drafted against a ` +
+      `different tree than the immutable implementation base. Cancel this run and start again ` +
+      `(a commit landed between the base pin and coordination completion).`;
+    return finish(
+      'start',
+      { runId, error: 'coordinator_base_drift', pinnedBase: drift.pinnedBase, currentHead: drift.currentHead, detail: text },
+      text,
+      2,
+    );
+  }
 
   const st = service.status(runId);
   const body = {
@@ -567,6 +624,8 @@ async function handleSpecRevise(
     goal,
     coordinator: meta.coordinator,
     workspacePath: meta.workspacePath,
+    // F5 (must-fix 4): the revise round binds the SAME pinned base as the run.
+    ...(meta.baseCommit !== undefined ? { baseCommit: meta.baseCommit } : {}),
     ...(meta.planningChatEnabled === true ? { enableChat: true } : {}),
     revise,
   });
@@ -860,22 +919,30 @@ async function handleRun(
   const worktrees = await flows.openWorktrees(st.workspacePath);
   // F5: branch from the run's PINNED base commit (start-time HEAD). A LEGACY run
   // (created before base-at-start pinning) is pinned ONCE here from current HEAD
-  // with an audited `run.base_commit.pinned` — never a silent live-HEAD fallback.
+  // with an audited `run.base_commit.pinned` (transactional). must-fix 4: REFUSE
+  // (never a silent live-HEAD fallback) if no base can be established — the loop
+  // requires an immutable base for every fresh worktree.
   let baseCommit = service.getRunBaseCommit(cmd.runId);
   if (baseCommit === undefined) {
+    let resolved: GitSha;
     try {
-      baseCommit = gitSha(await git.resolveSha(st.workspacePath, 'HEAD'));
-      service.pinRunBaseCommit(cmd.runId, baseCommit);
+      resolved = gitSha(await git.resolveSha(st.workspacePath, 'HEAD'));
     } catch {
-      baseCommit = undefined; // non-git workspace — the loop falls back to HEAD
+      const text =
+        `run: run ${cmd.runId} has no pinned base and workspace '${st.workspacePath}' HEAD ` +
+        `cannot be resolved (not a git repository, or no commit) — cannot run without an ` +
+        `immutable base (F5).`;
+      return finish('run', { runId: cmd.runId, error: 'base_unpinnable', detail: text }, text, 2);
     }
+    service.pinRunBaseCommit(cmd.runId, resolved); // one-time audited legacy pin (transactional)
+    baseCommit = resolved;
   }
   const result = await runImplementVerifyLoop(
     { service, worktrees, ids: flows.ids, clock: flows.clock },
     {
       runId: cmd.runId,
       assignmentId: asg,
-      ...(baseCommit !== undefined ? { baseCommit } : {}),
+      baseCommit,
       implementor: implementorSpec,
       verifier: verifierSpec,
       specHash: draft.specHash,

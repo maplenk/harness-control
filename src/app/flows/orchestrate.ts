@@ -478,13 +478,21 @@ export async function runImplementVerifyLoop(
   try {
     let destinationLabel: string;
     if (resume === undefined) {
-      // F5: branch from the PINNED base commit (start-time HEAD) when present —
-      // never live HEAD, which may have advanced since `start`. `baseRef` is the
-      // legacy/test fallback only.
+      // F5: branch from the PINNED base commit (start-time HEAD). REQUIRED for a
+      // fresh worktree — a run must NEVER branch from live HEAD, which may have
+      // advanced since `start`. (`baseRef` remains as an explicit test escape
+      // hatch.) The CLI always threads `RunMeta.baseCommit`; a run with no
+      // pinnable base is refused upstream (`handleRun`), never silently defaulted.
       const pinnedBase = input.baseCommit !== undefined ? String(input.baseCommit) : input.baseRef;
+      if (pinnedBase === undefined) {
+        throw new LoopCompositionError(
+          `runImplementVerifyLoop: a pinned baseCommit is REQUIRED for a fresh worktree ` +
+            `(run ${String(input.runId)}) — refusing to branch from live HEAD (F5).`,
+        );
+      }
       handle = await worktrees.createWorktree({
         assignmentId: input.assignmentId,
-        ...(pinnedBase !== undefined ? { baseRef: pinnedBase } : {}),
+        baseRef: pinnedBase,
       });
       // §16: the manual `git switch <dest>` hint targets the primary checkout's
       // ACTUAL branch (read from the repo, never trusting a hardcoded 'main'); an

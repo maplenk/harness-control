@@ -20,7 +20,7 @@ import { execFileSync } from 'node:child_process';
 import { assignmentId, criterionId, specHash } from '../../domain/ids.js';
 import { DeterministicIdFactory } from '../../lib/id-factory.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
-import { GitWorktreeManager, type WorktreeHandle } from '../../worktree/index.js';
+import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import {
   assertPrimaryCheckoutUntouched,
   makeTempGitRepo,
@@ -213,7 +213,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
       runId,
       assignmentId: asg,
       implementor: CODEX_IMPLEMENTOR,
-      context: baseContext(),
+      baseRef: 'HEAD', context: baseContext(),
       options: { runVerification: PASS_VERIFY },
     };
     const result = await runImplementor({ service, worktrees: wt }, input);
@@ -277,6 +277,24 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
     await wt.removeWorktree(asg);
   });
 
+  it('must-fix 4: runImplementor REFUSES a fresh worktree with NO pinned base (never live HEAD)', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({ writes: [], turns: [REPORTING_TURN] });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const err: unknown = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: assignmentId('asg_impl_nobase'),
+        implementor: CODEX_IMPLEMENTOR,
+        // NO baseCommit and NO baseRef → refuse (never branch from live HEAD).
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(WorktreeError);
+    expect(String(err)).toMatch(/pinned baseCommit .*REQUIRED/i);
+  });
+
   it('captures a FAILING verification command without hiding it, and still commits the work', async () => {
     const { service, worktrees: wt, repo: r } = await setup({
       writes: [{ relPath: 'partial.txt', content: 'work in progress\n' }],
@@ -297,6 +315,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         runId,
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
+        baseRef: 'HEAD',
         context: baseContext({ verificationCommands: ['run-the-suite'] }),
         options: { runVerification: failing },
       },
@@ -333,7 +352,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         runId,
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
-        context: baseContext(),
+        baseRef: 'HEAD', context: baseContext(),
         options: { runVerification: mutating },
       },
     );
@@ -362,7 +381,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         runId,
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
-        context: baseContext(),
+        baseRef: 'HEAD', context: baseContext(),
         options: { runVerification: PASS_VERIFY },
       },
     );
@@ -386,7 +405,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
 
     await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, context: baseContext(), options: { runVerification: PASS_VERIFY } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseRef: 'HEAD', context: baseContext(), options: { runVerification: PASS_VERIFY } },
     );
 
     const handle = wt.handleFor(asg);
@@ -576,7 +595,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
         runId,
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
-        context: baseContext(),
+        baseRef: 'HEAD', context: baseContext(),
         options: { runVerification: escaping },
       },
     );
@@ -615,7 +634,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
         runId,
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
-        context: baseContext(),
+        baseRef: 'HEAD', context: baseContext(),
         options: { runVerification: committing },
       },
     );
@@ -650,7 +669,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
 
     const result = await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, context: baseContext(), options: { runVerification: plantingHook } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseRef: 'HEAD', context: baseContext(), options: { runVerification: plantingHook } },
     );
 
     expect(result.verification[0]!.passed).toBe(true); // command exited 0…
@@ -678,7 +697,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
 
     const result = await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, context: baseContext(), options: { runVerification: mutatingConfig } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseRef: 'HEAD', context: baseContext(), options: { runVerification: mutatingConfig } },
     );
 
     expect(result.runnerViolation).toBeDefined();
@@ -706,7 +725,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
 
     const result = await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, context: baseContext(), options: { runVerification: writingIgnored } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseRef: 'HEAD', context: baseContext(), options: { runVerification: writingIgnored } },
     );
 
     expect(result.runnerViolation).toBeDefined();
@@ -738,7 +757,7 @@ describe('W3-1 — primary-checkout mutation guard', () => {
 
     const result = await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, context: baseContext(), options: { runVerification: plantingViaWorktree } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseRef: 'HEAD', context: baseContext(), options: { runVerification: plantingViaWorktree } },
     );
 
     expect(result.runnerViolation).toBeDefined();

@@ -260,6 +260,7 @@ function loopInput(rig: LoopRig) {
     criteria: CRITERIA,
     evidence: fakeEvidence(),
     runVerificationCommands: PASS_VERIFY,
+    baseRef: 'HEAD', // F5: pin the fresh test repo HEAD explicitly
   };
 }
 

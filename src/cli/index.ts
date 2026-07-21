@@ -241,7 +241,7 @@ export function buildCliFlows(db: Database, config: EngineConfig = DEFAULT_ENGIN
   return {
     ids,
     clock: db.clock,
-    buildCoordinatorRunner: ({ goal, revise, enableChat }) => {
+    buildCoordinatorRunner: ({ goal, revise, enableChat, baseCommit }) => {
       const profile = loadProfileFile(coordinatorProfilePath);
       if (isErr(profile)) {
         throw new Error(
@@ -254,6 +254,9 @@ export function buildCliFlows(db: Database, config: EngineConfig = DEFAULT_ENGIN
         artifactStore: artifacts,
         ids,
         clock: db.clock,
+        // F5 (must-fix 4): bind the coordinator's exploration to the PINNED base
+        // commit so a spec drafted against a drifted tree is detectable.
+        ...(baseCommit !== undefined ? { baseCommit } : {}),
         ...(revise !== undefined ? { revise } : {}),
         ...(enableChat === true ? { planningChat } : {}),
       });
