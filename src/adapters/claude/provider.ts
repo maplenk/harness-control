@@ -510,6 +510,11 @@ export class ClaudeProviderAdapter implements HarnessAdapter {
   #child: ChildProcessWithoutNullStreams | undefined;
   #sessionCreated = false;
   #closed = false;
+  /** must-fix 5: the ONE shared close/exit promise. A concurrent second `close()`
+   * AWAITS the first close's confirmed process exit rather than returning
+   * immediately (which would let the caller clear the watchdog deadline before
+   * the child is actually dead). */
+  #closePromise: Promise<void> | undefined;
   #stdoutBuffer = '';
   #stderrTail = '';
   #pending: PendingTurn | undefined;
@@ -724,9 +729,18 @@ export class ClaudeProviderAdapter implements HarnessAdapter {
     return classifyClaudeProviderError(raw);
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    // must-fix 5: a second `close()` returns the FIRST close's promise — it
+    // AWAITS confirmed process exit instead of returning immediately while the
+    // first close is still terminating the child (which let runRole clear the
+    // watchdog deadline prematurely).
+    if (this.#closePromise !== undefined) return this.#closePromise;
     this.#closed = true;
+    this.#closePromise = this.#doClose();
+    return this.#closePromise;
+  }
+
+  async #doClose(): Promise<void> {
     const child = this.#child;
     if (child === undefined || child.exitCode !== null) return;
     child.stdin.end();

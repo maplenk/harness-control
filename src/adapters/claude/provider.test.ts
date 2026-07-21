@@ -196,6 +196,26 @@ describe('ClaudeProviderAdapter — first-party persistent stream-json path', ()
     }
   });
 
+  it('must-fix 5: close() is memoized — a concurrent second close() awaits the SAME completion, never an early return', async () => {
+    const adapter = new ClaudeProviderAdapter({
+      role: 'implementor',
+      cwd: tmpdir(),
+      model: 'sonnet',
+      effort: 'low',
+      clock: new SystemClock(),
+      resolved,
+    });
+    // Two concurrent close() calls MUST return the one shared promise — the old
+    // `if (#closed) return` made the second resolve immediately while the first
+    // was still terminating the child, letting a caller clear the watchdog
+    // deadline before the process was actually dead.
+    const first = adapter.close();
+    const second = adapter.close();
+    expect(second).toBe(first);
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
+  });
+
   it('keeps one native session across turns and exposes provider-echoed model/usage', async () => {
     const adapter = new ClaudeProviderAdapter({
       role: 'coordinator',

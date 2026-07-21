@@ -148,8 +148,9 @@ interface SupervisedFactoryOptions {
 function makeSupervisedFactory(
   ps: FakePs,
   opts: SupervisedFactoryOptions = {},
-): { factory: RoleAdapterFactory; adapters: InProcessFakeAdapter[] } {
+): { factory: RoleAdapterFactory; adapters: InProcessFakeAdapter[]; disposeCalls: () => number } {
   const adapters: InProcessFakeAdapter[] = [];
+  let disposeCalls = 0; // must-fix 5: count RAW handle.dispose() invocations (shared-dispose proof)
   let nextPid = 41_001;
   const factory: RoleAdapterFactory = {
     create() {
@@ -169,11 +170,14 @@ function makeSupervisedFactory(
         adapter,
         captureProcessIdentity: (generationId: ProcessGenerationId) =>
           identityFor(pid, generationId),
-        dispose: (): Promise<void> => adapter.close(),
+        dispose: (): Promise<void> => {
+          disposeCalls += 1;
+          return adapter.close();
+        },
       };
     },
   };
-  return { factory, adapters };
+  return { factory, adapters, disposeCalls: () => disposeCalls };
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +197,8 @@ interface SetupResult {
   readonly ps: FakePs;
   readonly adapters: InProcessFakeAdapter[];
   readonly signals: Array<{ pgid: number; signal: NodeJS.Signals }>;
+  /** must-fix 5: raw handle.dispose() invocation count (shared-dispose proof). */
+  readonly disposeCalls: () => number;
 }
 
 async function setup(opts: {
@@ -205,7 +211,7 @@ async function setup(opts: {
   handle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
   const db = handle.db;
   const ps = makeFakePs();
-  const { factory, adapters } = makeSupervisedFactory(ps, opts.factory ?? {});
+  const { factory, adapters, disposeCalls } = makeSupervisedFactory(ps, opts.factory ?? {});
   const signals: Array<{ pgid: number; signal: NodeJS.Signals }> = [];
   const config =
     opts.config ??
@@ -226,7 +232,7 @@ async function setup(opts: {
       ...(opts.supervision ?? {}),
     },
   });
-  return { service, db, ps, adapters, signals };
+  return { service, db, ps, adapters, signals, disposeCalls };
 }
 
 function eventTypes(db: TestDatabaseHandle['db'], runId: RunId): string[] {
@@ -1055,7 +1061,7 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
   }
 
   it('F1 graceful: a watchdog cancel closes the turn resource_exhausted, suspends the run, and does NOT complete the round or count cadence', async () => {
-    const { service, db, ps } = await setup({
+    const { service, db, ps, disposeCalls } = await setup({
       budgetMb: 64,
       // A permission-scripted turn stays IN FLIGHT until the watchdog cancels it.
       factory: { turns: [{ permission: { description: 'need approval' } }] },
@@ -1105,6 +1111,10 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
     // The resource.exhausted incident is structured (role + budget).
     const incident = db.events.listByRun(runId).find((e) => e.type === 'resource.exhausted');
     expect(incident?.payload).toMatchObject({ role: 'implementor', budgetBytes: 64 * MB });
+    // must-fix 5: the watchdog graceful stop and runRole's finally SHARE ONE
+    // dispose — `handle.dispose()` was invoked exactly once (no concurrent
+    // double-dispose), and the finally awaited the graceful stop before releasing.
+    expect(disposeCalls()).toBe(1);
   });
 
   it('F1 SIGKILL: an emergency-kill during a turn is classified resource_exhausted, not a T13 crash', async () => {

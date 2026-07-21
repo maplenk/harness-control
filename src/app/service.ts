@@ -1192,10 +1192,15 @@ export class OrchestrationService {
    * termination as `resource_exhausted` rather than a completed turn or a T13
    * crash. Cleared when the generation's supervision is released. */
   readonly #resourceExhaustion = new Map<ProcessGenerationId, ResourceExhaustionCause>();
-  /** F6: generations whose graceful-stop callback is already running — the
-   * watchdog's deadline escalation, a re-sample, and runRole's dispose must not
-   * re-drive the checkpoint/cancel/dispose work; it runs at most once. */
-  readonly #gracefulStopsInFlight = new Set<ProcessGenerationId>();
+  /** F6/must-fix 5: the ONE shared graceful-stop promise per generation. The
+   * watchdog callback stores it; runRole's `finally` AWAITS it before releasing
+   * supervision, so the checkpoint+cancel+shared-dispose runs at most once and
+   * supervision is held until it completes (never a concurrent second stop). */
+  readonly #gracefulStops = new Map<ProcessGenerationId, Promise<void>>();
+  /** must-fix 5: the ONE shared child-dispose promise per generation, so the
+   * graceful-stop callback and runRole's `finally` never call `handle.dispose()`
+   * concurrently — both await the same disposal, which resolves once. */
+  readonly #disposals = new Map<ProcessGenerationId, Promise<boolean>>();
   /** Runs with a role spawn in flight (heartbeat refcount, §14). */
   readonly #activeSpawnRuns = new Map<RunId, number>();
   /** W2-4: probe claims THIS process is currently executing (in-memory leg of
@@ -2811,14 +2816,21 @@ export class OrchestrationService {
       completedNormally = true;
       return result;
     } finally {
-      let disposedCleanly = true;
-      try {
-        await handle.dispose();
-      } catch {
-        // Disposal failure never masks the flow outcome; the §14 registry /
-        // startup reaping (W2-6) owns any process left behind.
-        disposedCleanly = false;
+      // must-fix 5: if a watchdog graceful stop is in flight for this
+      // generation, AWAIT it (checkpoint + cancel + SHARED dispose) before
+      // releasing supervision — never dispose concurrently, and hold supervision
+      // until the stop's confirmed exit. Its dispose IS the shared disposal
+      // below, so `#disposeChildOnce` then returns the same resolved result.
+      const gracefulStop = this.#gracefulStops.get(ctx.generationId);
+      if (gracefulStop !== undefined) {
+        try {
+          await gracefulStop;
+        } catch {
+          // The stop's own failures are handled inside it (counted, never thrown).
+        }
       }
+      // The ONE shared disposal (never concurrent with the graceful stop's).
+      const disposedCleanly = await this.#disposeChildOnce(ctx);
       // W2-6: every dispose path deregisters its watchers. The registry
       // record is removed only on a CLEAN dispose (the transport ladder
       // awaited the group's exit); a failed dispose leaves it durable for
@@ -4442,10 +4454,12 @@ export class OrchestrationService {
   #releaseSpawnSupervision(ctx: SpawnContext, disposedCleanly: boolean): void {
     this.#watchdog.unwatch(ctx.generationId);
     this.#liveSpawns.delete(ctx.generationId);
-    // F1/F3/F6: the generation is gone — drop its exhaustion cause and any
-    // in-flight graceful-stop guard so the maps never leak across generations.
+    // F1/F3/F6/must-fix 5: the generation is gone — drop its exhaustion cause and
+    // the shared graceful-stop / disposal promises so the maps never leak across
+    // generations.
     this.#resourceExhaustion.delete(ctx.generationId);
-    this.#gracefulStopsInFlight.delete(ctx.generationId);
+    this.#gracefulStops.delete(ctx.generationId);
+    this.#disposals.delete(ctx.generationId);
     if (ctx.identity !== undefined && disposedCleanly) {
       this.#registry.store.remove(ctx.generationId);
     }
@@ -4535,47 +4549,66 @@ export class OrchestrationService {
    * provider-failure classification path every child death takes — the
    * watchdog never ingests T13 itself (one producer, no double-fold races).
    */
-  async #onWatchdogGracefulStop(generationId: ProcessGenerationId): Promise<void> {
+  #onWatchdogGracefulStop(generationId: ProcessGenerationId): Promise<void> {
     const ctx = this.#liveSpawns.get(generationId);
-    if (ctx === undefined) return;
-    // F6: idempotent — the checkpoint+cancel+dispose work runs at most once per
-    // generation (the deadline escalation, a re-sample, and runRole's own
-    // dispose must never re-drive it).
-    if (this.#gracefulStopsInFlight.has(generationId)) return;
-    this.#gracefulStopsInFlight.add(generationId);
+    if (ctx === undefined) return Promise.resolve();
+    // F6/must-fix 5: return the ONE shared graceful-stop promise — the watchdog
+    // callback, the deadline escalation, a re-sample, and runRole's `finally`
+    // all await the SAME work (checkpoint + cancel + shared dispose); it runs
+    // once. Kept alive here so runRole's finally can await it before releasing
+    // supervision (never a concurrent second dispose).
+    const existing = this.#gracefulStops.get(generationId);
+    if (existing !== undefined) return existing;
+    const promise = this.#runGracefulStop(ctx);
+    this.#gracefulStops.set(generationId, promise);
+    return promise;
+  }
+
+  async #runGracefulStop(ctx: SpawnContext): Promise<void> {
     try {
+      const state = this.#loadEngineRecord(ctx.runId).state;
+      const checkpoint = await this.#writeStopCheckpoint(ctx, 'pre_graceful_stop', state.operation);
+      if (checkpoint.event !== undefined) this.ingest(checkpoint.event as DomainEvent);
+    } catch {
+      // A failed checkpoint never blocks the stop — RSS pressure is the
+      // emergency here; resume revalidates everything (§16.3) regardless.
+      this.#supervisionIngestErrors += 1;
+    }
+    // F6: do NOT unregister the generation here. The watchdog owns dereg once the
+    // tree is confirmed gone or the deadline (armed BEFORE this callback,
+    // watchdog.ts) escalates to the emergency kill; runRole's `finally` releases
+    // supervision on the flow's own exit. Stop ladder (bounded): cancel the
+    // in-flight turn — the cancelled prompt resolves `stopReason:'cancelled'`,
+    // which the prompt seam classifies `resource_exhausted` (F1) — then dispose
+    // through the SHARED disposal (never concurrent with runRole's finally).
+    if (ctx.acpSessionId !== undefined) {
       try {
-        const state = this.#loadEngineRecord(ctx.runId).state;
-        const checkpoint = await this.#writeStopCheckpoint(ctx, 'pre_graceful_stop', state.operation);
-        if (checkpoint.event !== undefined) this.ingest(checkpoint.event as DomainEvent);
+        await ctx.adapter.cancelTurn({ sessionId: ctx.acpSessionId });
       } catch {
-        // A failed checkpoint never blocks the stop — RSS pressure is the
-        // emergency here; resume revalidates everything (§16.3) regardless.
-        this.#supervisionIngestErrors += 1;
+        // Cancel failing is fine — dispose escalates.
       }
-      // F6: do NOT unregister the generation here. The watchdog owns dereg once
-      // the tree is confirmed gone (a later sample → `#finish`) or the deadline
-      // (armed BEFORE this callback, watchdog.ts) escalates to the emergency
-      // kill. Releasing the watcher mid-flight is exactly what let a hung
-      // dispose evade the deadline; runRole's `finally` releases supervision on
-      // the flow's own exit. Stop ladder (bounded, idempotent): cancel the
-      // in-flight turn — the cancelled prompt resolves `stopReason:'cancelled'`,
-      // which the prompt seam classifies `resource_exhausted` (F1) — then dispose.
-      if (ctx.acpSessionId !== undefined) {
-        try {
-          await ctx.adapter.cancelTurn({ sessionId: ctx.acpSessionId });
-        } catch {
-          // Cancel failing is fine — dispose escalates.
-        }
-      }
+    }
+    await this.#disposeChildOnce(ctx);
+  }
+
+  /** must-fix 5: the ONE shared child disposal per generation — resolves to
+   * `disposedCleanly`. Both the graceful-stop callback and runRole's `finally`
+   * call this, so `handle.dispose()` is never invoked concurrently and its
+   * completion (confirmed process exit) is observed by both. */
+  #disposeChildOnce(ctx: SpawnContext): Promise<boolean> {
+    const existing = this.#disposals.get(ctx.generationId);
+    if (existing !== undefined) return existing;
+    const promise = (async (): Promise<boolean> => {
       try {
         await ctx.handle.dispose();
+        return true;
       } catch {
         // The registry record stays; §14 reaping owns any survivor.
+        return false;
       }
-    } finally {
-      this.#gracefulStopsInFlight.delete(generationId);
-    }
+    })();
+    this.#disposals.set(ctx.generationId, promise);
+    return promise;
   }
 
   /** §14 "ambiguity → never kill, surface an alert": persist the alert as a

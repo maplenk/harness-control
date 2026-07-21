@@ -243,7 +243,9 @@ describe('Watchdog: graceful path at 100% (§14)', () => {
     expect(harness.taints).toEqual([{ assignmentId: target.assignmentId, taint: 'deadline_termination' }]);
 
     await waitUntil(() => isAliveReal(child.pid!) === false, 2_000);
-    expect(harness.watchdog.isWatching(target.generationId)).toBe(false);
+    // must-fix 5: the watchdog keeps supervising after the SIGKILL until the tree
+    // is CONFIRMED gone — it deletes the entry on the next sample after exit.
+    await waitUntil(() => !harness.watchdog.isWatching(target.generationId), 2_000);
   }, 10_000);
 
   it('F6: a graceful-stop callback that HANGS still escalates to the emergency kill by the deadline', async () => {
@@ -290,7 +292,8 @@ describe('Watchdog: immediate hard emergency ceiling (§14 150%)', () => {
     expect(harness.taints).toEqual([{ assignmentId: target.assignmentId, taint: 'emergency_kill' }]);
 
     await waitUntil(() => isAliveReal(child.pid!) === false, 2_000);
-    expect(harness.watchdog.isWatching(target.generationId)).toBe(false);
+    // must-fix 5: supervision is held until the tree is CONFIRMED gone.
+    await waitUntil(() => !harness.watchdog.isWatching(target.generationId), 2_000);
   }, 10_000);
 });
 

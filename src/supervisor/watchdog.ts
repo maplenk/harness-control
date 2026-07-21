@@ -263,17 +263,26 @@ export class Watchdog {
     if (!entry) return undefined;
     const { target, runtime } = entry;
     if (runtime.tickInFlight) return undefined;
-    if (runtime.phase === 'killing' || runtime.phase === 'done') return undefined;
+    // must-fix 5: a `killing` entry KEEPS sampling — the watchdog holds
+    // supervision after the SIGKILL until the tree is CONFIRMED gone (below),
+    // not the instant the signal is sent. Only a `done` (finished) entry is skipped.
+    if (runtime.phase === 'done') return undefined;
     runtime.tickInFlight = true;
     try {
       const sample = this.#ps.sampleProcessTree(target.pgid);
       if (!sample) {
-        // Process tree gone: whatever phase we were in (including a
-        // successful graceful stop), there is nothing left to supervise.
+        // Process tree gone (CONFIRMED exit): whatever phase we were in
+        // (including a successful graceful stop or an issued emergency kill),
+        // there is nothing left to supervise.
         this.#finish(generationId);
         return undefined;
       }
       this.#onSample(target, sample);
+      if (runtime.phase === 'killing') {
+        // must-fix 5: the SIGKILL was already issued and the tree is still
+        // present — keep supervising (re-sample) until it exits; never re-kill.
+        return sample;
+      }
 
       const ratio = this.#ratio(target, sample);
 
@@ -372,14 +381,22 @@ export class Watchdog {
     this.#emit(this.#buildRssHardLimitEvent(target, sample, 'emergency_kill'));
 
     const verification = this.#registry.signalVerified(target.generationId, 'SIGKILL');
-    if (verification.verdict === 'match' && target.assignmentId !== undefined) {
-      this.#worktreeTaint?.markTainted(target.assignmentId, taintReason);
+    if (verification.verdict === 'match') {
+      if (target.assignmentId !== undefined) {
+        this.#worktreeTaint?.markTainted(target.assignmentId, taintReason);
+      }
+      // must-fix 5: the SIGKILL landed — do NOT `#finish` here. The entry stays
+      // in `killing` and the sample loop deletes it only once the tree is
+      // CONFIRMED gone (`#tick` above), so the watchdog keeps supervising until
+      // the process actually exits, not merely until the signal was sent. The
+      // `killing` phase prevents any re-kill in the meantime, and the service
+      // also unwatches on its own exit path once its shared dispose confirms it.
+    } else {
+      // On mismatch/gone, `registry.signalVerified` already WITHHELD the signal
+      // and raised its own alert (§14: "ambiguity -> never kill"). Nothing was
+      // killed and nothing can be confirmed — stop supervising.
+      this.#finish(generationId);
     }
-    // On mismatch/gone, `registry.signalVerified` already withheld the
-    // signal and raised its own alert (§14: "ambiguity -> never kill") —
-    // nothing further to do here.
-
-    this.#finish(generationId);
   }
 
   /** Polls `gitOpLease.awaitGitOpIdle` in short slices so RSS can be re-checked between waits; the ceiling short-circuits the wait the instant it's crossed. */
