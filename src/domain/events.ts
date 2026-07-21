@@ -649,7 +649,11 @@ export interface EventPayloads {
     // terminated (graceful cancel → `stopReason:'cancelled'`, or emergency
     // SIGKILL mid-turn) — it is NOT a `completed` turn (no cadence, no round
     // completion), and NOT a typed `failed` (which never suspends the run).
-    readonly outcome: 'completed' | 'failed' | 'resource_exhausted';
+    // `cancelled` closes a NON-RSS cancelled turn honestly (user/cross-process
+    // cancel that resolved the prompt `stopReason:'cancelled'` with no RSS
+    // cause): also NOT `completed` — it counts no cadence and never lets the
+    // round complete as a deliverable.
+    readonly outcome: 'completed' | 'failed' | 'resource_exhausted' | 'cancelled';
   };
   /**
    * W2-1 — a generation's stop was CONFIRMED (transport ladder completed,

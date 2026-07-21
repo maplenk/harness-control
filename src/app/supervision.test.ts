@@ -822,19 +822,27 @@ describe('runRole watchdog wiring — T21/T22 ingest through the service', () =>
       awaitGitOpIdle: async () => 'idle' as const,
     });
 
-    await service.runRole(
-      runId,
-      runnerWith(async () => {
-        const generation = service.supervision.registry.store.list()[0]!.generationId;
-        ps.rssBytes = 100 * MB; // 156% of budget: over the 150% emergency ceiling
-        await service.supervision.watchdog.sampleOnce(generation);
-      }),
-      CLAUDE_LOW,
-      '/ws',
-      { round: 1, assignmentId: asg },
-    );
+    const err: unknown = await service
+      .runRole(
+        runId,
+        runnerWith(async () => {
+          const generation = service.supervision.registry.store.list()[0]!.generationId;
+          ps.rssBytes = 100 * MB; // 156% of budget: over the 150% emergency ceiling
+          await service.supervision.watchdog.sampleOnce(generation);
+        }),
+        CLAUDE_LOW,
+        '/ws',
+        { round: 1, assignmentId: asg },
+      )
+      .then(() => undefined)
+      .catch((e: unknown) => e);
     service.detachWorktreeSupervision();
 
+    // F1/F3: an emergency RSS kill DEFINITIVELY terminates the generation — the
+    // run enters the distinct resource_exhausted suspension (durably, at kill
+    // time), and the role flow aborts (never a T13 crash / auto-respawn).
+    expect(err).toBeInstanceOf(ResourceExhaustedError);
+    expect(service.status(runId).suspension).toBe('resource_exhausted');
     // Identity-verified SIGKILL to the process GROUP (§14 — via the registry,
     // never a raw kill).
     expect(signals).toEqual([{ pgid: 41_001, signal: 'SIGKILL' }]);
@@ -1138,11 +1146,53 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
     expect(service.status(runId).counters.restartsInWindow).toBe(0);
   });
 
-  it('F1 race: a natural end_turn that races the threshold stays `completed` (classification requires stopReason==cancelled)', async () => {
-    const { service, db, ps, adapters } = await setup({
-      budgetMb: 64,
-      factory: { turns: [{ permission: { description: 'need approval' } }] },
-    });
+  it('F1 (1a): after an RSS emergency kill, a LATE child-crash for that generation can never fold T13 / auto-respawn', async () => {
+    const { service, db, ps } = await setup({ budgetMb: 64 });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    let generation: ProcessGenerationId | undefined;
+    const err: unknown = await service
+      .runRole(
+        runId,
+        runnerWith(async () => {
+          generation = service.supervision.registry.store.list()[0]!.generationId;
+          ps.rssBytes = 100 * MB; // emergency → resource_exhausted DURABLY at kill time
+          await service.supervision.watchdog.sampleOnce(generation);
+        }),
+        CLAUDE_LOW,
+        '/ws',
+        DISPATCH,
+      )
+      .then(() => undefined)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ResourceExhaustedError);
+    expect(service.status(runId).suspension).toBe('resource_exhausted');
+    const before = service.status(runId).counters.restartsInWindow;
+
+    // The pin-retry / late-detection crash path for the RSS-killed generation is
+    // REJECTED — the durable suspension + already-stopped generation mean a T13
+    // (crash → restart-window fold → AutoRespawnSignal) can NEVER apply.
+    const segment = service.getRoleRound(runId)?.segmentId ?? segmentId('seg_late_crash');
+    const rejected = service.ingest(
+      draftEvent({
+        type: 'child.exited.unexpectedly',
+        runId,
+        payload: { segmentId: segment, generationId: generation!, classifiedAs: 'crash' },
+        idempotencyKey: idempotencyKey('late-crash'),
+        occurredAt: db.clock.nowIso(),
+      }) as DomainEvent,
+    );
+    expect(rejected.status).toBe('rejected');
+    expect(service.status(runId).counters.restartsInWindow).toBe(before);
+  });
+
+  it('F1 race: a turn that completed end_turn is NOT reclassified when a GRACEFUL RSS stop then fires', async () => {
+    // A GRACEFUL stop (unlike the emergency kill) does not durably suspend — the
+    // seam classifies resource_exhausted ONLY on `stopReason:'cancelled'`. A turn
+    // that already resolved end_turn (won the race) stays completed even though
+    // RSS then crossed the graceful threshold. (The in-flight micro-race — cause
+    // bound, then end_turn AT the seam — is guarded by the same
+    // `stopReason==='cancelled'` check, verified in the seam.)
+    const { service, db, ps } = await setup({ budgetMb: 64 }); // no permission → the turn settles end_turn
     const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
 
     await service.runRole(
@@ -1151,13 +1201,9 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
         role: 'implementor',
         run: async (session) => {
           const generation = service.supervision.registry.store.list()[0]!.generationId;
-          const promptPromise = session.prompt({ prompt: 'go' });
-          ps.rssBytes = 100 * MB; // ceiling → emergency rss.hard_limit binds the cause (no dispose)
+          await session.prompt({ prompt: 'go' }); // resolves end_turn → completed + cadence
+          ps.rssBytes = 70 * MB; // 109% → GRACEFUL (no durable suspend; the turn is already done)
           await service.supervision.watchdog.sampleOnce(generation);
-          // The turn resolves NATURALLY end_turn (raced the threshold) — even with
-          // the exhaustion cause bound, a non-'cancelled' stop stays completed.
-          adapters[0]!.forceCompleteTurn(session.handle.acpSessionId, { stopReason: 'end_turn' });
-          await promptPromise;
           return {};
         },
       },
@@ -1169,6 +1215,43 @@ describe('runRole RSS resource-exhaustion (F1/F3)', () => {
     expect(outcomes(db, runId)).toEqual(['completed']); // stayed completed
     expect(service.status(runId).suspension).not.toBe('resource_exhausted');
     expect(db.events.listByRun(runId).some((e) => e.type === 'resource.exhausted')).toBe(false);
+  });
+
+  it('F1 (1d): a NON-RSS cancelled turn is recorded `cancelled` (not `completed`), counts no cadence', async () => {
+    const { service, db, adapters } = await setup({
+      budgetMb: 64,
+      factory: { turns: [{ permission: { description: 'need approval' } }] },
+    });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+
+    await service.runRole(
+      runId,
+      {
+        role: 'implementor',
+        run: async (session) => {
+          const promptPromise = session.prompt({ prompt: 'go' });
+          // A plain (non-RSS) cancel — no rss.hard_limit was ever emitted, so no
+          // exhaustion cause is bound; the prompt resolves `stopReason:'cancelled'`.
+          await adapters[0]!.cancelTurn({ sessionId: session.handle.acpSessionId });
+          await promptPromise;
+          return {};
+        },
+      },
+      CLAUDE_LOW,
+      '/ws',
+      DISPATCH,
+    );
+
+    // Recorded `cancelled`, NOT `completed`; never resource_exhausted (no RSS cause).
+    expect(outcomes(db, runId)).toEqual(['cancelled']);
+    expect(service.status(runId).suspension).toBe('none');
+    // No cadence checkpoint counted against a cancelled turn.
+    expect(
+      db.events
+        .listByRun(runId)
+        .filter((e) => e.type === 'checkpoint.recorded')
+        .map((e) => (e.payload as { reason: string }).reason),
+    ).not.toContain('cadence');
   });
 
   it('F3: rss.hard_limit carries the role + generation (structured incident)', async () => {

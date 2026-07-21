@@ -1264,7 +1264,21 @@ export class OrchestrationService {
       // prompt / provider-failure seam. Set before the ingest so a folding
       // failure can never leave the cause unbound.
       onEvent: (event) => {
-        if (event.type === 'rss.hard_limit') this.#bindResourceExhaustionCause(event);
+        if (event.type === 'rss.hard_limit') {
+          this.#bindResourceExhaustionCause(event);
+          // F1: an EMERGENCY kill (SIGKILL) DEFINITIVELY terminates the
+          // generation — suspend `resource_exhausted` DURABLY right here (fold
+          // the T22 effects first, then the suspend), so the classification
+          // survives a restart AND the subsequent crash/exit can never fold
+          // T13/auto-respawn (the generation is already marked stopped +
+          // suspended). This closes the pin-retry, idle/no-call, and restart
+          // gaps. A GRACEFUL stop stays LAZY at the prompt seam — a natural
+          // end_turn may still race the cancel — so it only folds T22 here.
+          if (event.payload.escalation === 'emergency_kill') {
+            this.#suspendResourceExhaustedFromEvent(event);
+            return;
+          }
+        }
         this.#ingestFromSupervisor(event);
       },
       // §12.1: raw RSS ticks land in the telemetry repository (aggregated
@@ -1820,14 +1834,16 @@ export class OrchestrationService {
     });
   }
 
-  /** F3: the latest `resource.exhausted` incident (role + exhausted budget) for
-   * a run, or undefined if none was recorded. */
-  #latestResourceExhaustion(runId: RunId): { role: RoleName; budgetBytes: number } | undefined {
-    let latest: { role: RoleName; budgetBytes: number } | undefined;
+  /** F3: the latest `resource.exhausted` incident (role, observed RSS, exhausted
+   * budget) for a run, or undefined if none was recorded. */
+  #latestResourceExhaustion(
+    runId: RunId,
+  ): { role: RoleName; rssBytes: number; budgetBytes: number } | undefined {
+    let latest: { role: RoleName; rssBytes: number; budgetBytes: number } | undefined;
     for (const event of this.#db.events.listByRun(runId)) {
       if (event.type !== 'resource.exhausted') continue;
       const payload = event.payload as EventPayloads['resource.exhausted'];
-      latest = { role: payload.role, budgetBytes: payload.budgetBytes };
+      latest = { role: payload.role, rssBytes: payload.rssBytes, budgetBytes: payload.budgetBytes };
     }
     return latest;
   }
@@ -2677,6 +2693,21 @@ export class OrchestrationService {
         this.#interruptActiveRoundOnFlowError(ctx, flowError);
         throw flowError;
       }
+      // F1: an EMERGENCY kill can suspend the run `resource_exhausted` DURABLY at
+      // kill time even when the runner then finishes locally with no further
+      // adapter call (the no-in-flight-call edge). Never mark such a round
+      // `completed` — abort so it stays re-drivable and gated on an audited
+      // budget raise (the durable suspension already holds). The seam-thrown path
+      // never reaches here (it threw); this catches only the return-normally edge.
+      if (this.#loadEngineRecord(runId).state.suspension.kind === 'resource_exhausted') {
+        const cause = this.#latestResourceExhaustion(runId);
+        throw new ResourceExhaustedError(
+          runId,
+          runner.role,
+          cause?.rssBytes ?? 0,
+          cause?.budgetBytes ?? 0,
+        );
+      }
       if (baseRound !== undefined) {
         // Preserve a checkpoint ref a mid-round pause recorded on THIS round
         // (a resumed round completing keeps its §12.2 lineage visible).
@@ -2993,6 +3024,16 @@ export class OrchestrationService {
    * `crash` → T13 interrupt; `auth`/`protocol` → the raw typed error.
    */
   async #routePinFailure(ctx: SpawnContext, raw: unknown): Promise<void> {
+    // F1: an RSS termination during the pin window (SIGKILL kills the child, or a
+    // graceful dispose tears it down) surfaces the pin call as a crash here. If
+    // THIS generation was RSS-terminated, that is `resource_exhausted` — NOT a
+    // `crash` → T13 → bounded auto-respawn at the SAME budget. (The emergency
+    // path already suspended durably at kill time, so this also covers the
+    // graceful pin-window case.)
+    const exhaustion = this.#resourceExhaustion.get(ctx.generationId);
+    if (exhaustion !== undefined) {
+      throw this.#enterResourceExhaustion(ctx, exhaustion, 'initial_config_pin');
+    }
     const classification = ctx.adapter.classifyError(raw);
     switch (classification.kind) {
       case 'usage_limit':
@@ -3031,24 +3072,32 @@ export class OrchestrationService {
     cause: ResourceExhaustionCause,
     operation: PausedOperation,
   ): ResourceExhaustedError {
-    this.ingest(
-      this.#trigger(ctx.runId, 'resource.exhausted', {
-        generationId: ctx.generationId,
-        segmentId: ctx.segmentId,
-        role: cause.role,
-        rssBytes: cause.rssBytes,
-        budgetBytes: cause.budgetBytes,
-      }) as DomainEvent,
-    );
-    if (operation === 'prompt_turn') {
-      this.ingest(
-        this.#trigger(ctx.runId, 'turn.completed', {
-          segmentId: ctx.segmentId,
-          generationId: ctx.generationId,
-          outcome: 'resource_exhausted',
-        }) as DomainEvent,
-      );
-    }
+    // F1: suspend + close the turn in ONE transaction — a crash can never land
+    // between `resource.exhausted` and its `turn.completed`. Idempotent: if an
+    // emergency kill already suspended this run durably (at kill time), only the
+    // in-flight turn is closed here (foldResourceExhausted is a no-op anyway).
+    this.#db.transactionImmediate(() => {
+      if (this.#loadEngineRecord(ctx.runId).state.suspension.kind !== 'resource_exhausted') {
+        this.ingest(
+          this.#trigger(ctx.runId, 'resource.exhausted', {
+            generationId: ctx.generationId,
+            segmentId: ctx.segmentId,
+            role: cause.role,
+            rssBytes: cause.rssBytes,
+            budgetBytes: cause.budgetBytes,
+          }) as DomainEvent,
+        );
+      }
+      if (operation === 'prompt_turn') {
+        this.ingest(
+          this.#trigger(ctx.runId, 'turn.completed', {
+            segmentId: ctx.segmentId,
+            generationId: ctx.generationId,
+            outcome: 'resource_exhausted',
+          }) as DomainEvent,
+        );
+      }
+    });
     return new ResourceExhaustedError(ctx.runId, ctx.role, cause.rssBytes, cause.budgetBytes);
   }
 
@@ -4310,6 +4359,31 @@ export class OrchestrationService {
   }
 
   /**
+   * F1: durably suspend `resource_exhausted` for an EMERGENCY-killed generation.
+   * Folds the `rss.hard_limit` T22 effects FIRST (they require `child_active`),
+   * then the `resource.exhausted` supporting event (marks the generation stopped
+   * + suspends). Called from the watchdog `onEvent` at kill time so the
+   * classification is durable and the later crash/exit can never fold T13. Never
+   * throws (timer context — wrapped through `#ingestFromSupervisor`).
+   */
+  #suspendResourceExhaustedFromEvent(event: EventOfType<'rss.hard_limit'>): void {
+    this.#ingestFromSupervisor(event); // T22 effects (needs child_active) FIRST
+    const { generationId, role, rssBytes, budgetBytes, segmentId } = event.payload;
+    if (generationId === undefined) return;
+    const resolvedRole = role ?? this.#liveSpawns.get(generationId)?.role;
+    if (resolvedRole === undefined) return;
+    this.#ingestFromSupervisor(
+      this.#trigger(event.runId, 'resource.exhausted', {
+        generationId,
+        role: resolvedRole,
+        rssBytes,
+        budgetBytes,
+        ...(segmentId !== undefined ? { segmentId } : {}),
+      }) as DomainEvent,
+    );
+  }
+
+  /**
    * T22 graceful path (§14: "graceful checkpoint+stop by deadline"): invoked
    * once by the watchdog when a generation first crosses 100% of its RSS
    * budget, right after it emitted `rss.hard_limit{escalation:'graceful'}`
@@ -4538,6 +4612,22 @@ export class OrchestrationService {
         const exhaustion = this.#resourceExhaustion.get(ctx.generationId);
         if (exhaustion !== undefined && result.stopReason === 'cancelled') {
           throw this.#enterResourceExhaustion(ctx, exhaustion, 'prompt_turn');
+        }
+        if (result.stopReason === 'cancelled') {
+          // A NON-RSS cancel (user/cross-process) resolved the prompt
+          // `stopReason:'cancelled'` — an honest CANCELLED turn, never a
+          // `completed` one: it counts NO cadence and lets the round complete no
+          // deliverable (the F2 gate blocks it downstream). `foldTurnCompleted`
+          // still folds the operation back to idle.
+          this.ingest(
+            this.#trigger(runId, 'turn.completed', {
+              segmentId: ctx.segmentId,
+              generationId: ctx.generationId,
+              outcome: 'cancelled',
+            }) as DomainEvent,
+          );
+          if (result.usage !== undefined) this.#foldTurnUsage(runId, role, sessionKey, result.usage);
+          return result;
         }
         this.ingest(
           this.#trigger(runId, 'turn.completed', {
