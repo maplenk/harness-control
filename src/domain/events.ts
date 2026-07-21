@@ -290,12 +290,48 @@ export interface EventPayloads {
     readonly rssBytes: number;
     readonly budgetBytes: number;
   };
-  /** T22 — RSS hard-limit path (§14): graceful by deadline, else emergency. */
+  /** T22 — RSS hard-limit path (§14): graceful by deadline, else emergency.
+   * F3: carries the `role` + `generationId` so the incident is structured
+   * (which role's generation crossed which budget) and the service can bind a
+   * generation-scoped resource-exhaustion cause off it. */
   'rss.hard_limit': {
     readonly segmentId?: SegmentId;
+    readonly generationId?: ProcessGenerationId;
+    readonly role?: RoleName;
     readonly rssBytes: number;
     readonly budgetBytes: number;
     readonly escalation: 'graceful' | 'emergency_kill';
+  };
+  /**
+   * F1/F3 (§review dogfood) — engine-folded supporting event: a generation was
+   * terminated because it crossed its RSS budget (graceful cancel or emergency
+   * SIGKILL). Its fold marks that generation stopped and suspends the run
+   * `resource_exhausted` (return phase preserved) — distinct from T13 (which
+   * would fold restart counters + auto-respawn at the SAME budget) and from
+   * `paused_limit` (a provider incident). Idempotent: a no-op once the run is
+   * already suspended. NOT a §6.3 transition row — `applyTransition` rejects it.
+   */
+  'resource.exhausted': {
+    readonly segmentId?: SegmentId;
+    readonly generationId: ProcessGenerationId;
+    readonly role: RoleName;
+    readonly rssBytes: number;
+    readonly budgetBytes: number;
+  };
+  /**
+   * F3 (§review dogfood) — the ONE sanctioned, AUDITED exception to run-config
+   * immutability: an operator raised a role's RSS memory budget on an EXISTING
+   * `resource_exhausted` run so it can resume with more headroom. A plain
+   * durable fact (no state transition); `#runMemoryBudgetBytes` reads the
+   * latest override per role, and `resume` refuses a resource-exhausted run
+   * until the effective budget exceeds the one that was exhausted.
+   */
+  'run.memory_budget.overridden': {
+    readonly role: RoleName;
+    readonly budgetMb: number;
+    readonly previousBudgetMb: number;
+    /** The budget (bytes) that was exhausted — the raise must exceed it. */
+    readonly exhaustedBudgetBytes?: number;
   };
   /** T23 — verification finished blocked: any criterion failed/unproven, OR
    * (W2-2, narrowing W1-F1) every criterion verified but AGENT-actionable §16
@@ -597,7 +633,11 @@ export interface EventPayloads {
   'turn.completed': {
     readonly segmentId: SegmentId;
     readonly generationId?: ProcessGenerationId;
-    readonly outcome: 'completed' | 'failed';
+    // F1: `resource_exhausted` closes an in-flight turn the RSS watchdog
+    // terminated (graceful cancel → `stopReason:'cancelled'`, or emergency
+    // SIGKILL mid-turn) — it is NOT a `completed` turn (no cadence, no round
+    // completion), and NOT a typed `failed` (which never suspends the run).
+    readonly outcome: 'completed' | 'failed' | 'resource_exhausted';
   };
   /**
    * W2-1 — a generation's stop was CONFIRMED (transport ladder completed,

@@ -531,6 +531,35 @@ export class BudgetExceededError extends Error {
   }
 }
 
+/**
+ * F1/F3 (§review dogfood) — a role generation crossed its RSS budget and was
+ * terminated by the watchdog (graceful cancel → `stopReason:'cancelled'`, or an
+ * emergency SIGKILL mid-turn). Thrown at the generic `RoleSession.prompt` /
+ * provider-failure seam so the role flow ABORTS: the turn is closed
+ * `resource_exhausted` (no cadence, no round completion) and the run enters the
+ * distinct `resource_exhausted` suspension — never counted as a completed turn,
+ * never a T13 crash (which would auto-respawn at the SAME budget). The run stays
+ * suspended until an audited per-run budget raise (F3), then a manual resume.
+ */
+export class ResourceExhaustedError extends Error {
+  override readonly name: string = 'ResourceExhaustedError';
+  readonly runId: RunId;
+  readonly role: RoleName;
+  readonly rssBytes: number;
+  readonly budgetBytes: number;
+  constructor(runId: RunId, role: RoleName, rssBytes: number, budgetBytes: number) {
+    super(
+      `Run ${runId} resource-exhausted (${role}): RSS ${rssBytes} bytes crossed the ` +
+        `${budgetBytes}-byte budget; the generation was terminated. Raise the role's memory ` +
+        `budget (audited) before resuming — the run will re-cross the same ceiling otherwise.`,
+    );
+    this.runId = runId;
+    this.role = role;
+    this.rssBytes = rssBytes;
+    this.budgetBytes = budgetBytes;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Adapter factory seam (production spawns real adapters; tests inject fakes)
 // ---------------------------------------------------------------------------
@@ -938,6 +967,15 @@ interface SpawnContext {
   identity?: ProcessIdentity;
 }
 
+/** F1/F3: the structured cause bound to a generation the RSS watchdog is
+ * terminating — read at the prompt / provider-failure seam to close the turn
+ * `resource_exhausted` and suspend the run. */
+interface ResourceExhaustionCause {
+  readonly role: RoleName;
+  readonly rssBytes: number;
+  readonly budgetBytes: number;
+}
+
 /** Map the enforced §11.2 pins onto the `child.spawned` wire records
  * (`reasoning` intents are the EFFORT pins; echo facts preserved, W1-F8). */
 function toChildPinRecords(applied: readonly AppliedConfigOption[]): ChildPinRecord[] {
@@ -1120,6 +1158,16 @@ export class OrchestrationService {
   /** Live spawn contexts by generation — the watchdog's graceful-stop path
    * resolves its target through this. */
   readonly #liveSpawns = new Map<ProcessGenerationId, SpawnContext>();
+  /** F1/F3: generation-scoped RSS-exhaustion cause, set when the watchdog
+   * reports an `rss.hard_limit` for a generation (BEFORE it cancels/kills the
+   * turn) and consulted at the prompt / provider-failure seam to classify the
+   * termination as `resource_exhausted` rather than a completed turn or a T13
+   * crash. Cleared when the generation's supervision is released. */
+  readonly #resourceExhaustion = new Map<ProcessGenerationId, ResourceExhaustionCause>();
+  /** F6: generations whose graceful-stop callback is already running — the
+   * watchdog's deadline escalation, a re-sample, and runRole's dispose must not
+   * re-drive the checkpoint/cancel/dispose work; it runs at most once. */
+  readonly #gracefulStopsInFlight = new Set<ProcessGenerationId>();
   /** Runs with a role spawn in flight (heartbeat refcount, §14). */
   readonly #activeSpawnRuns = new Map<RunId, number>();
   /** W2-4: probe claims THIS process is currently executing (in-memory leg of
@@ -1202,8 +1250,17 @@ export class OrchestrationService {
       },
       requestGracefulStop: (target) => this.#onWatchdogGracefulStop(target.generationId),
       // T21/T22 ingest through the service — the SAME single transition path
-      // every other event takes; a throw must never escape into a timer.
-      onEvent: (event) => this.#ingestFromSupervisor(event),
+      // every other event takes; a throw must never escape into a timer. F1/F3:
+      // an `rss.hard_limit` (graceful OR emergency) BINDS a generation-scoped
+      // exhaustion cause BEFORE the watchdog cancels/kills the turn — this runs
+      // synchronously before `requestGracefulStop`, so the cause is present when
+      // the cancelled prompt resolves (or the SIGKILL'd transport throws) at the
+      // prompt / provider-failure seam. Set before the ingest so a folding
+      // failure can never leave the cause unbound.
+      onEvent: (event) => {
+        if (event.type === 'rss.hard_limit') this.#bindResourceExhaustionCause(event);
+        this.#ingestFromSupervisor(event);
+      },
       // §12.1: raw RSS ticks land in the telemetry repository (aggregated
       // per-minute there; raw samples pruned by its own retention).
       onSample: (target, sample) => {
@@ -1682,6 +1739,14 @@ export class OrchestrationService {
       if (suspension === 'paused_user' || suspension === 'interrupted') {
         return this.ingest(this.#trigger(runId, 'resume.user.requested', {}, opts) as DomainEvent);
       }
+      if (suspension === 'resource_exhausted') {
+        // F3: a resource-exhausted run must NEVER resume at the same budget — it
+        // would re-cross the ceiling immediately. Require an audited per-run
+        // budget raise (recorded via `raiseRoleMemoryBudget`) that lifts the
+        // exhausted role's effective budget ABOVE the exhausted budget first.
+        this.#assertResumableFromResourceExhaustion(runId);
+        return this.ingest(this.#trigger(runId, 'resume.user.requested', {}, opts) as DomainEvent);
+      }
       return this.ingest(
         this.#trigger(
           runId,
@@ -1691,6 +1756,86 @@ export class OrchestrationService {
         ) as DomainEvent,
       );
     });
+  }
+
+  /**
+   * F3 — the ONE sanctioned, AUDITED exception to run-config immutability: raise
+   * `role`'s RSS memory budget on an EXISTING `resource_exhausted` run so it can
+   * resume with more headroom. Records a durable `run.memory_budget.overridden`
+   * fact (the audit trail) that `#runMemoryBudgetBytes` then reads with top
+   * precedence. Refuses a run that is not resource-exhausted (the exception is
+   * ONLY for recovery) and refuses anything but a genuine RAISE above the
+   * current effective budget. Default posture is human-gated — there is NO
+   * automatic escalation (that would mask a leak and weaken the hard ceiling).
+   */
+  raiseRoleMemoryBudget(
+    runId: RunId,
+    role: RoleName,
+    budgetMb: number,
+    opts?: CommandOptions,
+  ): IngestResult {
+    if (!Number.isInteger(budgetMb) || budgetMb <= 0) {
+      throw new WorkflowAdvanceError(
+        `raiseRoleMemoryBudget: budgetMb must be a positive integer (got ${budgetMb})`,
+      );
+    }
+    return this.#db.transactionImmediate(() => {
+      const suspension = this.#loadEngineRecord(runId).state.suspension.kind;
+      if (suspension !== 'resource_exhausted') {
+        throw new WorkflowAdvanceError(
+          `raiseRoleMemoryBudget: run ${runId} is not resource_exhausted (suspension=${suspension}); ` +
+            `the audited per-run budget override exists ONLY to recover a resource-exhausted run`,
+        );
+      }
+      const previousBudgetMb = Math.floor(this.#runMemoryBudgetBytes(runId, role) / BYTES_PER_MB);
+      if (budgetMb <= previousBudgetMb) {
+        throw new WorkflowAdvanceError(
+          `raiseRoleMemoryBudget: new budget ${budgetMb}MB for ${role} must EXCEED the current ` +
+            `effective ${previousBudgetMb}MB (a raise, never a lowering)`,
+        );
+      }
+      const exhausted = this.#latestResourceExhaustion(runId);
+      return this.ingest(
+        this.#trigger(
+          runId,
+          'run.memory_budget.overridden',
+          {
+            role,
+            budgetMb,
+            previousBudgetMb,
+            ...(exhausted !== undefined ? { exhaustedBudgetBytes: exhausted.budgetBytes } : {}),
+          },
+          opts,
+        ) as DomainEvent,
+      );
+    });
+  }
+
+  /** F3: the latest `resource.exhausted` incident (role + exhausted budget) for
+   * a run, or undefined if none was recorded. */
+  #latestResourceExhaustion(runId: RunId): { role: RoleName; budgetBytes: number } | undefined {
+    let latest: { role: RoleName; budgetBytes: number } | undefined;
+    for (const event of this.#db.events.listByRun(runId)) {
+      if (event.type !== 'resource.exhausted') continue;
+      const payload = event.payload as EventPayloads['resource.exhausted'];
+      latest = { role: payload.role, budgetBytes: payload.budgetBytes };
+    }
+    return latest;
+  }
+
+  /** F3: refuse a resume from `resource_exhausted` until the exhausted role's
+   * effective budget was raised (audited) above the budget that was exhausted. */
+  #assertResumableFromResourceExhaustion(runId: RunId): void {
+    const exhausted = this.#latestResourceExhaustion(runId);
+    if (exhausted === undefined) return; // no incident recorded — nothing to gate
+    const currentBudgetBytes = this.#runMemoryBudgetBytes(runId, exhausted.role);
+    if (currentBudgetBytes <= exhausted.budgetBytes) {
+      throw new WorkflowAdvanceError(
+        `resume: run ${runId} is resource_exhausted (${exhausted.role}) — raise the role's memory ` +
+          `budget above the exhausted ${Math.floor(exhausted.budgetBytes / BYTES_PER_MB)}MB ` +
+          `(raiseRoleMemoryBudget, audited) before resuming; it would re-cross the ceiling otherwise`,
+      );
+    }
   }
 
   /**
@@ -2823,6 +2968,40 @@ export class OrchestrationService {
   }
 
   /**
+   * F1/F3: enter the distinct `resource_exhausted` state for a generation the
+   * RSS watchdog terminated. Drives the supporting `resource.exhausted` fold
+   * (marks the generation stopped, suspends the run — return phase preserved),
+   * then closes an in-flight turn `resource_exhausted` (a pin-window exhaustion
+   * has no `turn.started` to close). Returns the typed error the caller throws
+   * so the role flow aborts WITHOUT counting cadence or completing the round.
+   */
+  #enterResourceExhaustion(
+    ctx: SpawnContext,
+    cause: ResourceExhaustionCause,
+    operation: PausedOperation,
+  ): ResourceExhaustedError {
+    this.ingest(
+      this.#trigger(ctx.runId, 'resource.exhausted', {
+        generationId: ctx.generationId,
+        segmentId: ctx.segmentId,
+        role: cause.role,
+        rssBytes: cause.rssBytes,
+        budgetBytes: cause.budgetBytes,
+      }) as DomainEvent,
+    );
+    if (operation === 'prompt_turn') {
+      this.ingest(
+        this.#trigger(ctx.runId, 'turn.completed', {
+          segmentId: ctx.segmentId,
+          generationId: ctx.generationId,
+          outcome: 'resource_exhausted',
+        }) as DomainEvent,
+      );
+    }
+    return new ResourceExhaustedError(ctx.runId, ctx.role, cause.rssBytes, cause.budgetBytes);
+  }
+
+  /**
    * Route a non-pin provider-call failure (spawn window before pinning, or a
    * prompt turn) through the profile classifier (W2-3). Always throws — the
    * caller's control flow ends here. Only structured + 429 + unknown
@@ -2834,6 +3013,16 @@ export class OrchestrationService {
     raw: unknown,
     operation: PausedOperation,
   ): Promise<never> {
+    // F1: an emergency SIGKILL for RSS exhaustion kills the child mid-call, so
+    // the transport surfaces a crash here. If THIS generation was terminated for
+    // RSS exhaustion, that is `resource_exhausted` — NOT a `crash` → T13 (which
+    // would fold restart counters and auto-respawn at the SAME budget). Close an
+    // in-flight turn `resource_exhausted` and suspend the run BEFORE the
+    // classifier ever runs. Covers both a mid-turn SIGKILL and a pin-window one.
+    const exhaustion = this.#resourceExhaustion.get(ctx.generationId);
+    if (exhaustion !== undefined) {
+      throw this.#enterResourceExhaustion(ctx, exhaustion, operation);
+    }
     const classification = ctx.adapter.classifyError(raw);
     switch (classification.kind) {
       case 'usage_limit':
@@ -2907,6 +3096,11 @@ export class OrchestrationService {
    */
   #interruptActiveRoundOnFlowError(ctx: SpawnContext, error: unknown): void {
     if (error instanceof LimitPausedError || error instanceof AutoRespawnSignal) return;
+    // F1/F3: a resource-exhausted flow already recorded its OWN durable outcome
+    // (the `resource.exhausted` suspension) at the seam — this must not overlay a
+    // T17 `interrupted` on top (the suspension-not-none guard below also covers
+    // it; this is the explicit, self-documenting form).
+    if (error instanceof ResourceExhaustedError) return;
     if (ctx.dispatch === undefined) return;
     if (ctx.role !== 'implementor' && ctx.role !== 'verifier') return;
     // The crash/pause spine may already hold this round suspended (an
@@ -4001,6 +4195,9 @@ export class OrchestrationService {
       ...(ctx.dispatch?.assignmentId !== undefined
         ? { assignmentId: ctx.dispatch.assignmentId }
         : {}),
+      // F3: the spawning role rides onto `rss.hard_limit` so the incident is
+      // structured and the generation-scoped exhaustion cause names it.
+      role: ctx.role,
       // §14/W1-F5: the RSS budget comes from the run's PINNED config, not
       // whatever this process happens to be configured with. F4: keyed by the
       // spawning ROLE so a per-role override applies to the right generation.
@@ -4014,19 +4211,51 @@ export class OrchestrationService {
   #releaseSpawnSupervision(ctx: SpawnContext, disposedCleanly: boolean): void {
     this.#watchdog.unwatch(ctx.generationId);
     this.#liveSpawns.delete(ctx.generationId);
+    // F1/F3/F6: the generation is gone — drop its exhaustion cause and any
+    // in-flight graceful-stop guard so the maps never leak across generations.
+    this.#resourceExhaustion.delete(ctx.generationId);
+    this.#gracefulStopsInFlight.delete(ctx.generationId);
     if (ctx.identity !== undefined && disposedCleanly) {
       this.#registry.store.remove(ctx.generationId);
     }
   }
 
-  /** The run-pinned RSS budget (§14 default 1024MB) for `role`, in bytes.
-   * F4: a `memory.perRole.<role>.budgetMb` override wins over the global
-   * `memory.budgetMb`; a role with no override falls back to the global
-   * budget. Always read from the run's PINNED config, never live config. */
+  /** The effective RSS budget (§14 default 1024MB) for `role`, in bytes.
+   * Precedence: an F3 AUDITED per-run override (`run.memory_budget.overridden`,
+   * the sanctioned exception to config immutability, set only to recover a
+   * resource-exhausted run) → the F4 pinned per-role `memory.perRole.<role>`
+   * → the pinned global `memory.budgetMb`. The pinned config is always the
+   * run's, never live config. */
   #runMemoryBudgetBytes(runId: RunId, role: RoleName): number {
     const pinned = loadRunConfig(this.#db, runId) ?? this.#config;
-    const budgetMb = pinned.memory.perRole?.[role]?.budgetMb ?? pinned.memory.budgetMb;
-    return budgetMb * BYTES_PER_MB;
+    const pinnedMb = pinned.memory.perRole?.[role]?.budgetMb ?? pinned.memory.budgetMb;
+    const overrideMb = this.#latestRoleMemoryBudgetOverrideMb(runId, role);
+    return (overrideMb ?? pinnedMb) * BYTES_PER_MB;
+  }
+
+  /** F3: the budgetMb of the LATEST audited `run.memory_budget.overridden` for
+   * `role`, or undefined if none was recorded. */
+  #latestRoleMemoryBudgetOverrideMb(runId: RunId, role: RoleName): number | undefined {
+    let latest: number | undefined;
+    for (const event of this.#db.events.listByRun(runId)) {
+      if (event.type !== 'run.memory_budget.overridden') continue;
+      const payload = event.payload as EventPayloads['run.memory_budget.overridden'];
+      if (payload.role === role) latest = payload.budgetMb;
+    }
+    return latest;
+  }
+
+  /** F1/F3: bind (or refresh) the generation-scoped RSS-exhaustion cause from an
+   * `rss.hard_limit` incident so the prompt / provider-failure seam can classify
+   * the impending termination. A late incident for the same generation just
+   * refreshes the observed RSS. No-op if the event omitted its generation
+   * (defensive — the watchdog always stamps it). */
+  #bindResourceExhaustionCause(event: EventOfType<'rss.hard_limit'>): void {
+    const { generationId, role, rssBytes, budgetBytes } = event.payload;
+    if (generationId === undefined) return;
+    const resolvedRole = role ?? this.#liveSpawns.get(generationId)?.role;
+    if (resolvedRole === undefined) return;
+    this.#resourceExhaustion.set(generationId, { role: resolvedRole, rssBytes, budgetBytes });
   }
 
   /**
@@ -4047,29 +4276,43 @@ export class OrchestrationService {
   async #onWatchdogGracefulStop(generationId: ProcessGenerationId): Promise<void> {
     const ctx = this.#liveSpawns.get(generationId);
     if (ctx === undefined) return;
+    // F6: idempotent — the checkpoint+cancel+dispose work runs at most once per
+    // generation (the deadline escalation, a re-sample, and runRole's own
+    // dispose must never re-drive it).
+    if (this.#gracefulStopsInFlight.has(generationId)) return;
+    this.#gracefulStopsInFlight.add(generationId);
     try {
-      const state = this.#loadEngineRecord(ctx.runId).state;
-      const checkpoint = await this.#writeStopCheckpoint(ctx, 'pre_graceful_stop', state.operation);
-      if (checkpoint.event !== undefined) this.ingest(checkpoint.event as DomainEvent);
-    } catch {
-      // A failed checkpoint never blocks the stop — RSS pressure is the
-      // emergency here; resume revalidates everything (§16.3) regardless.
-      this.#supervisionIngestErrors += 1;
-    }
-    // Stop ladder. Deliberately bounded (cancel grace + terminate ladder),
-    // and watchers are released before the dispose like every other path.
-    this.#watchdog.unwatch(ctx.generationId);
-    if (ctx.acpSessionId !== undefined) {
       try {
-        await ctx.adapter.cancelTurn({ sessionId: ctx.acpSessionId });
+        const state = this.#loadEngineRecord(ctx.runId).state;
+        const checkpoint = await this.#writeStopCheckpoint(ctx, 'pre_graceful_stop', state.operation);
+        if (checkpoint.event !== undefined) this.ingest(checkpoint.event as DomainEvent);
       } catch {
-        // Cancel failing is fine — dispose escalates.
+        // A failed checkpoint never blocks the stop — RSS pressure is the
+        // emergency here; resume revalidates everything (§16.3) regardless.
+        this.#supervisionIngestErrors += 1;
       }
-    }
-    try {
-      await ctx.handle.dispose();
-    } catch {
-      // The registry record stays; §14 reaping owns any survivor.
+      // F6: do NOT unregister the generation here. The watchdog owns dereg once
+      // the tree is confirmed gone (a later sample → `#finish`) or the deadline
+      // (armed BEFORE this callback, watchdog.ts) escalates to the emergency
+      // kill. Releasing the watcher mid-flight is exactly what let a hung
+      // dispose evade the deadline; runRole's `finally` releases supervision on
+      // the flow's own exit. Stop ladder (bounded, idempotent): cancel the
+      // in-flight turn — the cancelled prompt resolves `stopReason:'cancelled'`,
+      // which the prompt seam classifies `resource_exhausted` (F1) — then dispose.
+      if (ctx.acpSessionId !== undefined) {
+        try {
+          await ctx.adapter.cancelTurn({ sessionId: ctx.acpSessionId });
+        } catch {
+          // Cancel failing is fine — dispose escalates.
+        }
+      }
+      try {
+        await ctx.handle.dispose();
+      } catch {
+        // The registry record stays; §14 reaping owns any survivor.
+      }
+    } finally {
+      this.#gracefulStopsInFlight.delete(generationId);
     }
   }
 
@@ -4177,6 +4420,22 @@ export class OrchestrationService {
     return this.#db.projections.get<RoleRoundProjection>(runId, ROLE_ROUND_PROJECTION)?.state;
   }
 
+  /**
+   * F2 (§review dogfood): re-stamp `round`'s implementor projection as
+   * `no_deliverable` — the PERSISTED verifier gate. `runRole` marks a round
+   * `completed` on flow success before the orchestrator can judge the
+   * deliverable, and both resume readers (`resolveResumeEntry`, the CLI resume
+   * boundary) treat `completed` as "durably committed → verify next". Overwriting
+   * the stage here means a restart/resume re-drives the IMPLEMENTOR instead, so a
+   * no-deliverable round can never bypass the verifier. Guarded to the current
+   * implementor round so a stale caller can never clobber a later projection.
+   */
+  markRoundNoDeliverable(runId: RunId, round: number): void {
+    const current = this.getRoleRound(runId);
+    if (current === undefined || current.round !== round || current.role !== 'implementor') return;
+    this.#saveRoleRound(runId, { ...current, stage: 'no_deliverable' });
+  }
+
   #buildRoleSession(args: RoleSessionArgs, ctx: SpawnContext): RoleSession {
     const { runId, role, resolved, adapter, handle, capabilities, configApplied, cwd, workspacePath } = args;
     const sessionKey = String(handle.acpSessionId);
@@ -4216,6 +4475,18 @@ export class OrchestrationService {
           // (T4), unknown → T16, crash → T13, auth/protocol → typed. Throws.
           await this.#routeProviderFailure(ctx, error, 'prompt_turn');
           throw error; // unreachable — routeProviderFailure never returns
+        }
+        // F1: a watchdog RSS GRACEFUL stop cancels the in-flight turn — the
+        // prompt RESOLVES `stopReason:'cancelled'` (it does not throw). Classify
+        // as `resource_exhausted` ONLY on BOTH signals: this generation has an
+        // RSS-exhaustion cause AND the stop reason is 'cancelled'. A natural
+        // `end_turn` that raced in after the threshold but before the cancel took
+        // effect carries stopReason 'end_turn' and stays a completed turn (no
+        // cadence lost, round completes) — the codex-flagged race. Abort here so
+        // the turn is never stamped `completed` and the round never completes.
+        const exhaustion = this.#resourceExhaustion.get(ctx.generationId);
+        if (exhaustion !== undefined && result.stopReason === 'cancelled') {
+          throw this.#enterResourceExhaustion(ctx, exhaustion, 'prompt_turn');
         }
         this.ingest(
           this.#trigger(runId, 'turn.completed', {

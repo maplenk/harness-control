@@ -48,6 +48,7 @@ import {
   foldChildSpawnInitiated,
   foldChildSpawned,
   foldChildStopped,
+  foldResourceExhausted,
   foldResumeReentryCompleted,
   foldTurnCompleted,
   foldTurnStarted,
@@ -200,8 +201,18 @@ export interface MergeReadinessBlockedState {
   readonly recordedAt: IsoTimestamp;
 }
 
-/** The round's dispatch/completion lifecycle stage (W2-3). */
-export type RoleRoundStage = 'pending' | 'active' | 'completed';
+/**
+ * The round's dispatch/completion lifecycle stage (W2-3).
+ *
+ * F2 (§review dogfood): `no_deliverable` is a TERMINAL round outcome distinct
+ * from `completed` — an implementor round whose turn ended abnormally
+ * (cancelled/refusal) or a remediation round that produced no new commit. It
+ * must NOT be read as "durably committed → verify next": the resume readers
+ * (`resolveResumeEntry`, the CLI resume boundary) re-drive the IMPLEMENTOR from
+ * it, so a persisted no-deliverable round can never bypass the verifier gate on
+ * restart/resume.
+ */
+export type RoleRoundStage = 'pending' | 'active' | 'completed' | 'no_deliverable';
 
 /** A linear workflow advance recorded on the round (dispatch or completion). */
 export interface RoleRoundAdvance {
@@ -320,6 +331,10 @@ export const ENGINE_FOLDED_SUPPORTING_EVENTS = [
   'turn.started',
   'turn.completed',
   'resume_reentry.completed',
+  // F1/F3: folds the RSS-exhaustion suspension (mark generation stopped +
+  // suspend `resource_exhausted`) — like the child-lifecycle events above it
+  // mutates EngineState and is replayed identically, but is NOT a §6.3 row.
+  'resource.exhausted',
 ] as const satisfies readonly DomainEventType[];
 
 export type EngineFoldedSupportingEvent = (typeof ENGINE_FOLDED_SUPPORTING_EVENTS)[number];
@@ -374,6 +389,9 @@ export function makeEngineReducer(
     if (event.type === 'resume_reentry.completed') {
       return foldResumeReentryCompleted(withBounds);
     }
+    if (event.type === 'resource.exhausted') {
+      return foldResourceExhausted(withBounds, event);
+    }
     const outcome = applyTransition(withBounds, event);
     return outcome.status === 'applied' ? outcome.next : withBounds;
   };
@@ -416,6 +434,10 @@ export function uiStateOf(input: UiStateInput): UiState {
       return 'stopped';
     case 'interrupted':
       return 'starting'; // recovery in progress (§12.3)
+    case 'resource_exhausted':
+      // F3: the run stopped at its RSS ceiling and needs operator action
+      // (raise the budget, then resume) — not auto-recovering like `interrupted`.
+      return 'stopped';
     case 'none':
       break;
   }

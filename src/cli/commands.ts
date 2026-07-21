@@ -1161,6 +1161,11 @@ async function handleResume(
   //   - verifier round completed, the T23/T24 merge-readiness transition never
   //     landed (phase `verifying`, round verifier/completed) → re-enter verify
   //     on the SAME immutable binding (§16.3 discards the read-only dirt).
+  //   - F2: implementor round persisted `no_deliverable` (abnormal stop or a
+  //     remediation with no new commit) → re-enter the IMPLEMENTOR (never the
+  //     verifier — `resolveResumeEntry` maps a non-`completed` implementor round
+  //     to `first: 'implement'`), so a no-deliverable round is recoverable
+  //     without ever bypassing the deliverable gate.
   // `resolveResumeEntry` derives the right next step from the durable stage;
   // WITHOUT this gate the run has no suspension to lift → `resume` errored
   // ("not paused") and the run was unreclaimable. GATED on §14 owner-liveness:
@@ -1171,7 +1176,7 @@ async function handleResume(
   if (
     st.suspension === 'none' &&
     (boundaryRound?.role === 'implementor' || boundaryRound?.role === 'verifier') &&
-    boundaryRound.stage === 'completed' &&
+    (boundaryRound.stage === 'completed' || boundaryRound.stage === 'no_deliverable') &&
     (st.activeChild === undefined || st.activeChild.status === 'stopped') &&
     st.phase !== 'merge_ready' &&
     st.phase !== 'cancelled' &&
@@ -1720,7 +1725,11 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
         ? `interrupted — auto-recovering (attempt ${st.autoRecovering.attempt})`
         : st.suspension === 'interrupted'
           ? 'interrupted — manual resume required'
-          : null,
+          : st.suspension === 'resource_exhausted'
+            ? // F3: a LOCAL RSS ceiling (not a provider limit) — the remedy is an
+              // audited per-run budget raise, then resume (never at the same budget).
+              'resource_exhausted — RSS memory budget crossed; raise the role memory budget (audited), then resume'
+            : null,
     ...(st.autoRecovering !== undefined ? { autoRecovering: st.autoRecovering } : {}),
     operation: st.operation,
     uiState: st.uiState,

@@ -91,6 +91,27 @@ export class LoopCompositionError extends Error {
   override readonly name: string = 'LoopCompositionError';
 }
 
+/**
+ * F2 (§review dogfood): raised when an implementor round produced no deliverable
+ * the run stands behind — an abnormal turn stop (cancelled/refusal), or a
+ * remediation round with no new commit — so the verifier is NOT dispatched. The
+ * round is persisted `no_deliverable` first (so restart/resume re-drives the
+ * implementor, never the verifier); the loop unwinds with this typed error.
+ */
+export class NoDeliverableError extends Error {
+  override readonly name: string = 'NoDeliverableError';
+  readonly runId: RunId;
+  readonly round: number;
+  constructor(runId: RunId, round: number, reason: string) {
+    super(
+      `Run ${runId} round ${round}: implementor produced no deliverable (${reason}); ` +
+        `the verifier was NOT dispatched. Re-drive the implementor (resume) or cancel.`,
+    );
+    this.runId = runId;
+    this.round = round;
+  }
+}
+
 export interface ImplementVerifyLoopDeps {
   readonly service: OrchestrationService;
   readonly worktrees: GitWorktreeManager;
@@ -595,6 +616,34 @@ export async function runImplementVerifyLoop(
         // ourselves (§8: never trust the agent's claimed SHA). After a round
         // that committed nothing new, HEAD is unchanged from the prior round.
         implementationCommit = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
+
+        // F2: gate the verifier on a REAL deliverable, and PERSIST the gate so a
+        // restart/resume cannot bypass it (`runRole` already stamped the round
+        // `completed`; the resume readers treat that as "verify next"). A round
+        // delivers nothing the run stands behind when its turn ended abnormally
+        // — `cancelled`/`refusal` (the RSS-exhaustion case already aborted inside
+        // `runRole` via F1, never reaching here) — or when a REMEDIATION round
+        // (round > 1) produced NO new commit, i.e. no progress the verifier could
+        // re-judge. A FRESH round that cleanly ended with a zero diff is a
+        // legitimate pre-existing-satisfaction no-op and IS allowed into
+        // independent verification (the verifier proves the criteria against the
+        // base) — and a commit whose base→HEAD tree delta is empty is likewise
+        // allowed. We deliberately do NOT classify every zero diff as failure.
+        const abnormalStop =
+          implementation.stopReason === 'cancelled' || implementation.stopReason === 'refusal';
+        const remediationNoProgress = round > 1 && !implementation.committed;
+        if (abnormalStop || remediationNoProgress) {
+          // The single-writer lease was already released after the implementor
+          // round returned (above); no verifier round will run this iteration.
+          service.markRoundNoDeliverable(input.runId, round);
+          throw new NoDeliverableError(
+            input.runId,
+            round,
+            abnormalStop
+              ? `turn stopped '${implementation.stopReason}'`
+              : 'remediation produced no new commit',
+          );
+        }
       } else if (forcedVerifierRound !== undefined) {
         // Adoption already forced the worktree to this exact commit and
         // asserted clean; the binding below re-states it immutably.

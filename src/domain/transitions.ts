@@ -360,8 +360,10 @@ export const TRANSITION_TABLE: readonly TransitionRow[] = [
     id: 'T12',
     event: 'resume.user.requested',
     description:
-      'User resume from paused_user OR interrupted (W2-1: manual re-entry after T13/T17 — same eligibility-checked re-entry as T9, worktree validation first §16.3): as T9.',
-    preconditions: [{ kind: 'suspension_in', suspensions: ['paused_user', 'interrupted'] }],
+      'User resume from paused_user, interrupted, OR resource_exhausted (W2-1: manual re-entry after T13/T17 — same eligibility-checked re-entry as T9, worktree validation first §16.3): as T9. F3: a resource_exhausted resume is additionally gated in the service on an audited per-run budget raise (never at the same budget).',
+    preconditions: [
+      { kind: 'suspension_in', suspensions: ['paused_user', 'interrupted', 'resource_exhausted'] },
+    ],
     effects: [
       { kind: 'initiate_resume' },
       { kind: 'set_phase_to_return_phase' },
@@ -1363,6 +1365,51 @@ export function foldChildStopped(
     };
   }
   return next;
+}
+
+/**
+ * Fold `resource.exhausted` (F1/F3): a generation crossed its RSS budget and
+ * was terminated. Marks the matching generation stopped (a late/foreign
+ * generation never clears the current one), clears the operation, and suspends
+ * the run `resource_exhausted` with the phase preserved as the return phase.
+ *
+ * Deliberately NOT T13: this exit must not fold restart counters or auto-respawn
+ * at the same budget, and it is a distinct suspension from `paused_limit`
+ * (a provider incident). Idempotent and terminal-safe: a redelivery, a run a
+ * racing pause already suspended, or a cancelled/failed run is a no-op — only a
+ * running, unsuspended, non-terminal run enters the suspension.
+ */
+export function foldResourceExhausted(
+  state: EngineState,
+  event: EventOfType<'resource.exhausted'>,
+): EngineState {
+  const child = state.activeChild;
+  // Generation-matched (like `foldChildStopped`): a late/foreign generation
+  // never suspends the current run. Idempotent (a run already suspended is left
+  // alone) and terminal-safe (a cancelled/failed run never re-suspends).
+  if (child === undefined || child.generationId !== event.payload.generationId) return state;
+  if (state.suspension.kind !== 'none' || isTerminalPhase(state.phase)) return state;
+  const stoppedChild: ActiveChild =
+    child.status === 'stopped'
+      ? child
+      : ((): ActiveChild => {
+          const { stopCause: _dropped, ...rest } = child;
+          return { ...rest, status: 'stopped' };
+        })();
+  return {
+    ...state,
+    activeChild: stoppedChild,
+    operation: OPERATION_IDLE,
+    suspension: {
+      kind: 'resource_exhausted',
+      reasonDetail:
+        `RSS budget exhausted (${event.payload.role}: ${event.payload.rssBytes} bytes ` +
+        `over ${event.payload.budgetBytes} budget)`,
+      returnPhase: state.phase,
+      enteredAt: event.occurredAt,
+      ...(state.operation.kind !== 'idle' ? { inFlightOperation: state.operation.kind } : {}),
+    },
+  };
 }
 
 /**

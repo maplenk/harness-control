@@ -64,6 +64,7 @@ import { unwrap } from '../lib/result.js';
 import {
   LimitPausedError,
   OrchestrationService,
+  ResourceExhaustedError,
   captureAcpProcessIdentity,
   type RoleAdapterFactory,
   type SupervisionOptions,
@@ -1028,4 +1029,233 @@ describe('captureAcpProcessIdentity — real child process through the real tran
       expect(signals).toEqual([{ pgid: identity!.pid, signal: 'SIGKILL' }]);
     }
   }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// F1/F3 (§review dogfood) — RSS resource-exhaustion is its OWN outcome +
+// suspension (never a completed turn, a T13 crash, or a paused_limit).
+// ---------------------------------------------------------------------------
+describe('runRole RSS resource-exhaustion (F1/F3)', () => {
+  const MB = 1024 * 1024;
+  const DISPATCH = { round: 1, assignmentId: assignmentId('asg_re') } as const;
+
+  function outcomes(db: TestDatabaseHandle['db'], runId: RunId): string[] {
+    return db.events
+      .listByRun(runId)
+      .filter((e) => e.type === 'turn.completed')
+      .map((e) => (e.payload as { outcome: string }).outcome);
+  }
+
+  it('F1 graceful: a watchdog cancel closes the turn resource_exhausted, suspends the run, and does NOT complete the round or count cadence', async () => {
+    const { service, db, ps } = await setup({
+      budgetMb: 64,
+      // A permission-scripted turn stays IN FLIGHT until the watchdog cancels it.
+      factory: { turns: [{ permission: { description: 'need approval' } }] },
+    });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+
+    const err: unknown = await service
+      .runRole(
+        runId,
+        {
+          role: 'implementor',
+          run: async (session) => {
+            const generation = service.supervision.registry.store.list()[0]!.generationId;
+            const promptPromise = session.prompt({ prompt: 'go' });
+            ps.rssBytes = 70 * MB; // 109% of the 64MB budget → graceful zone
+            await service.supervision.watchdog.sampleOnce(generation);
+            await promptPromise; // rejects: the cancelled prompt is resource_exhausted
+            return {};
+          },
+        },
+        CLAUDE_LOW,
+        '/ws',
+        DISPATCH,
+      )
+      .then(() => undefined)
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResourceExhaustedError);
+    // The turn was closed resource_exhausted — never a `completed` turn, so the
+    // cadence boundary (which only runs AFTER a completed turn) is never reached.
+    // The ONLY checkpoint is the graceful stop's own `pre_graceful_stop` one —
+    // never a `cadence` checkpoint counted against this exhausted turn.
+    expect(outcomes(db, runId)).toEqual(['resource_exhausted']);
+    const checkpointReasons = db.events
+      .listByRun(runId)
+      .filter((e) => e.type === 'checkpoint.recorded')
+      .map((e) => (e.payload as { reason: string }).reason);
+    expect(checkpointReasons).not.toContain('cadence');
+    expect(checkpointReasons.every((r) => r === 'pre_graceful_stop')).toBe(true);
+    // The run entered the DISTINCT resource_exhausted suspension (not paused_limit).
+    expect(service.status(runId).suspension).toBe('resource_exhausted');
+    // The role round did NOT complete — resume will re-drive the implementor.
+    expect(service.getRoleRound(runId)?.stage).not.toBe('completed');
+    // NOT a T13 crash — no restart counter, no auto-respawn.
+    expect(eventTypes(db, runId)).not.toContain('child.exited.unexpectedly');
+    expect(service.status(runId).counters.restartsInWindow).toBe(0);
+    // The resource.exhausted incident is structured (role + budget).
+    const incident = db.events.listByRun(runId).find((e) => e.type === 'resource.exhausted');
+    expect(incident?.payload).toMatchObject({ role: 'implementor', budgetBytes: 64 * MB });
+  });
+
+  it('F1 SIGKILL: an emergency-kill during a turn is classified resource_exhausted, not a T13 crash', async () => {
+    const { service, db, ps, adapters } = await setup({
+      budgetMb: 64,
+      factory: { turns: [{ permission: { description: 'need approval' } }] },
+    });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+
+    const err: unknown = await service
+      .runRole(
+        runId,
+        {
+          role: 'implementor',
+          run: async (session) => {
+            const generation = service.supervision.registry.store.list()[0]!.generationId;
+            const promptPromise = session.prompt({ prompt: 'go' });
+            ps.rssBytes = 100 * MB; // 156% of budget → over the emergency ceiling
+            await service.supervision.watchdog.sampleOnce(generation); // rss.hard_limit{emergency_kill} → cause bound
+            // The SIGKILL'd transport dies mid-turn: the in-flight prompt rejects
+            // with a crash-shaped error, which routeProviderFailure must classify
+            // resource_exhausted (the cause is bound), never a crash → T13.
+            await adapters[0]!.close();
+            await promptPromise;
+            return {};
+          },
+        },
+        CLAUDE_LOW,
+        '/ws',
+        DISPATCH,
+      )
+      .then(() => undefined)
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ResourceExhaustedError);
+    expect(outcomes(db, runId)).toEqual(['resource_exhausted']);
+    expect(service.status(runId).suspension).toBe('resource_exhausted');
+    expect(eventTypes(db, runId)).not.toContain('child.exited.unexpectedly'); // NOT T13
+    expect(service.status(runId).counters.restartsInWindow).toBe(0);
+  });
+
+  it('F1 race: a natural end_turn that races the threshold stays `completed` (classification requires stopReason==cancelled)', async () => {
+    const { service, db, ps, adapters } = await setup({
+      budgetMb: 64,
+      factory: { turns: [{ permission: { description: 'need approval' } }] },
+    });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+
+    await service.runRole(
+      runId,
+      {
+        role: 'implementor',
+        run: async (session) => {
+          const generation = service.supervision.registry.store.list()[0]!.generationId;
+          const promptPromise = session.prompt({ prompt: 'go' });
+          ps.rssBytes = 100 * MB; // ceiling → emergency rss.hard_limit binds the cause (no dispose)
+          await service.supervision.watchdog.sampleOnce(generation);
+          // The turn resolves NATURALLY end_turn (raced the threshold) — even with
+          // the exhaustion cause bound, a non-'cancelled' stop stays completed.
+          adapters[0]!.forceCompleteTurn(session.handle.acpSessionId, { stopReason: 'end_turn' });
+          await promptPromise;
+          return {};
+        },
+      },
+      CLAUDE_LOW,
+      '/ws',
+      DISPATCH,
+    );
+
+    expect(outcomes(db, runId)).toEqual(['completed']); // stayed completed
+    expect(service.status(runId).suspension).not.toBe('resource_exhausted');
+    expect(db.events.listByRun(runId).some((e) => e.type === 'resource.exhausted')).toBe(false);
+  });
+
+  it('F3: rss.hard_limit carries the role + generation (structured incident)', async () => {
+    const { service, db, ps } = await setup({ budgetMb: 64 });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    await service.runRole(
+      runId,
+      runnerWith(async () => {
+        const generation = service.supervision.registry.store.list()[0]!.generationId;
+        ps.rssBytes = 70 * MB;
+        await service.supervision.watchdog.sampleOnce(generation);
+      }),
+      CLAUDE_LOW,
+      '/ws',
+    );
+    const hard = db.events.listByRun(runId).find((e) => e.type === 'rss.hard_limit');
+    expect(hard?.payload).toMatchObject({ role: 'coordinator', escalation: 'graceful' });
+    expect((hard?.payload as { generationId?: string }).generationId).toBeDefined();
+  });
+
+  // -- F3 resume gating: no resume at the same budget; only after an audited raise
+  async function driveToResourceExhausted(): Promise<{
+    service: OrchestrationService;
+    db: TestDatabaseHandle['db'];
+    runId: RunId;
+  }> {
+    const { service, db, ps } = await setup({
+      budgetMb: 64,
+      factory: { turns: [{ permission: { description: 'need approval' } }] },
+    });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    await service
+      .runRole(
+        runId,
+        {
+          role: 'implementor',
+          run: async (session) => {
+            const generation = service.supervision.registry.store.list()[0]!.generationId;
+            const p = session.prompt({ prompt: 'go' });
+            ps.rssBytes = 70 * MB;
+            await service.supervision.watchdog.sampleOnce(generation);
+            await p;
+            return {};
+          },
+        },
+        CLAUDE_LOW,
+        '/ws',
+        DISPATCH,
+      )
+      .catch(() => undefined);
+    expect(service.status(runId).suspension).toBe('resource_exhausted');
+    return { service, db, runId };
+  }
+
+  it('F3: resume is REFUSED until an audited budget raise; ALLOWED after raiseRoleMemoryBudget', async () => {
+    const { service, runId } = await driveToResourceExhausted();
+
+    // Same budget → resume refused (it would re-cross the ceiling immediately).
+    expect(() => service.resume(runId)).toThrow(/resource_exhausted|raise the role/i);
+
+    // A lowering / equal is refused; a non-resource-exhausted run is refused elsewhere.
+    expect(() => service.raiseRoleMemoryBudget(runId, 'implementor', 64)).toThrow(/must EXCEED/i);
+
+    // An AUDITED raise above the exhausted budget unlocks the resume.
+    const raised = service.raiseRoleMemoryBudget(runId, 'implementor', 256);
+    expect(raised.status).toBe('recorded');
+    const override = service
+      .status(runId); // sanity: still resource_exhausted until the resume lands
+    expect(override.suspension).toBe('resource_exhausted');
+
+    const resumed = service.resume(runId);
+    expect(resumed.status).toBe('applied'); // T12
+    expect(service.status(runId).suspension).not.toBe('resource_exhausted');
+  });
+
+  it('F3: raiseRoleMemoryBudget is refused on a run that is not resource_exhausted', async () => {
+    const { service } = await setup({ budgetMb: 64 });
+    const { runId } = service.createRun({ goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
+    expect(() => service.raiseRoleMemoryBudget(runId, 'implementor', 256)).toThrow(
+      /not resource_exhausted/i,
+    );
+  });
+
+  it('F3: replay reconstructs the resource_exhausted suspension identically', async () => {
+    const { db, runId } = await driveToResourceExhausted();
+    // A fresh service over the SAME durable log re-derives the identical state.
+    const replayed = new OrchestrationService({ db, ids: new DeterministicIdFactory() });
+    expect(replayed.status(runId).suspension).toBe('resource_exhausted');
+  });
 });

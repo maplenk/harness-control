@@ -42,6 +42,13 @@ export const SUSPENSION_KINDS = [
   'paused_user',
   'breaker_open',
   'interrupted',
+  // F1/F3 (§review dogfood): a generation crossed its RSS budget and was
+  // terminated (graceful checkpoint+stop, or emergency SIGKILL). Distinct from
+  // `paused_limit` (a PROVIDER usage-limit incident that drives probe
+  // scheduling + failover) — a LOCAL memory ceiling has no provider ETA, and
+  // resuming at the SAME budget would just re-cross it, so resume is gated on
+  // an audited per-run budget raise (never an automatic escalation).
+  'resource_exhausted',
 ] as const;
 export type SuspensionKind = (typeof SUSPENSION_KINDS)[number];
 export type SuspendedKind = Exclude<SuspensionKind, 'none'>;

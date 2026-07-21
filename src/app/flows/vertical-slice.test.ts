@@ -69,7 +69,7 @@ import {
 } from '../service.js';
 import type { Harness, RoleModelSpec } from '../model-resolution.js';
 import { CoordinatorRunner, type CoordinatorOutcome } from './coordinator.js';
-import { runImplementVerifyLoop } from './orchestrate.js';
+import { NoDeliverableError, runImplementVerifyLoop } from './orchestrate.js';
 import {
   gitMergeReadinessProbe,
   runVerification,
@@ -1007,6 +1007,169 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
     expect(successorResult.mergeReadiness?.ready).toBe(true);
     expect(successor.status(runId).phase).toBe('merge_ready');
 
+    await slice.worktrees.removeWorktree(asg);
+  });
+});
+
+// ===========================================================================
+// F2 (§review dogfood) — the verifier deliverable gate
+// ===========================================================================
+describe('F2 — a round with no real deliverable never dispatches a verifier (persisted)', () => {
+  function loopInput(
+    slice: Slice,
+    runId: RunId,
+    outcome: CoordinatorOutcome,
+    recorder: EvidenceRecorder,
+    asg: ReturnType<typeof assignmentId>,
+  ): Parameters<typeof runImplementVerifyLoop>[1] {
+    return {
+      runId,
+      assignmentId: asg,
+      implementor: IMPLEMENTOR,
+      verifier: VERIFIER,
+      specHash: outcome.specVersion.contentHash,
+      specDocument: outcome.canonicalSpec,
+      goal: GOAL,
+      taskScope: 'Implement the --verbose flag end to end in the CLI.',
+      criteria: outcome.specVersion.criteria,
+      constraints: ['Touch only files under src/cli'],
+      explorationArtifact: 'The arg parser lives in src/cli/index.ts (bound to base deadbeef).',
+      evidence: recorder,
+      runVerificationCommands: PASS_VERIFY,
+    };
+  }
+
+  const bothPass = verifierTurn([
+    { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+    { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+  ]);
+
+  it('abnormal stop (refusal): blocks the verifier, persists no_deliverable, throws NoDeliverableError', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        // Refusal turn — no writes, so nothing is committed either.
+        { turns: [{ ...implementorTurn('I will not do this.'), result: { stopReason: 'refusal' } }] },
+      ],
+      verifier: [{ turns: [bothPass] }], // must never be reached
+    });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_f2_refusal');
+
+    const err: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      loopInput(slice, runId, outcome, recorder, asg),
+    ).then(() => undefined).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(NoDeliverableError);
+    // No verifier was EVER spawned.
+    expect(slice.created.some((c) => c.role === 'verifier')).toBe(false);
+    // The gate is PERSISTED as no_deliverable (resume can't read it as "verify next").
+    expect(slice.service.getRoleRound(runId)?.stage).toBe('no_deliverable');
+    const types = dbHandle!.db.events.listByRun(runId).map((e) => e.type);
+    expect(types).not.toContain('verification.completed.passed');
+    expect(types).not.toContain('verification.completed.failed');
+    await slice.worktrees.removeWorktree(asg);
+  });
+
+  it('valid zero-diff no-op on a FRESH round is ALLOWED into verification (not blocked)', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      // No writes → the implementor cleanly ends `end_turn` with nothing to commit.
+      implementor: [{ turns: [implementorTurn('The spec is already satisfied; no change needed.')] }],
+      verifier: [{ turns: [bothPass] }],
+    });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_f2_zerodiff');
+
+    // Bound to a single round: whatever the merge-readiness verdict on an empty
+    // diff, the point is that the verifier RAN (F2 did not block a clean fresh
+    // no-op) — it never throws NoDeliverableError and never persists that stage.
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      { ...loopInput(slice, runId, outcome, recorder, asg), maxRounds: 1 },
+    );
+
+    // The round was a clean zero-diff no-op...
+    expect(result.rounds[0]!.implementation!.committed).toBe(false);
+    // ...and the verifier WAS dispatched to prove the criteria against the base
+    // (F2 policy: a legitimate no-op candidate is allowed, never auto-failed).
+    expect(slice.created.some((c) => c.role === 'verifier')).toBe(true);
+    expect(result.rounds[0]!.verification).toBeDefined();
+    await slice.worktrees.removeWorktree(asg);
+  });
+
+  it('remediation with no new commit is BLOCKED — round-1 verifier runs, round-2 verifier never does', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        // Round 1 commits a real change.
+        { writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const v = 1;\n' }], turns: [implementorTurn('Round 1.')] },
+        // Round 2 (remediation) writes NOTHING → no new commit → blocked.
+        { turns: [implementorTurn('Round 2: I could not make further progress.')] },
+      ],
+      verifier: [
+        // Round 1: AC-1 fails → T23 remediation.
+        { turns: [verifierTurn([
+          { id: 'AC-1', verdict: 'failed', fix: 'AC-1 still not wired' },
+          { id: 'AC-2', verdict: 'passed', evidence: 'ok' },
+        ])] },
+        { turns: [bothPass] }, // round-2 verifier — must never run
+      ],
+    });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_f2_remediation');
+
+    const err: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      loopInput(slice, runId, outcome, recorder, asg),
+    ).then(() => undefined).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(NoDeliverableError);
+    // Exactly ONE verifier ran (round 1); the no-progress round-2 verifier did not.
+    expect(slice.created.filter((c) => c.role === 'verifier')).toHaveLength(1);
+    expect(slice.service.getRoleRound(runId)?.stage).toBe('no_deliverable');
+    await slice.worktrees.removeWorktree(asg);
+  });
+
+  it('restart/resume does NOT bypass the gate — a no_deliverable round re-drives the IMPLEMENTOR, not the verifier', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        // Round-1 implementor refuses → no_deliverable.
+        { turns: [{ ...implementorTurn('Refusing.'), result: { stopReason: 'refusal' } }] },
+        // On resume, the SECOND implementor delivers a real change.
+        { writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const v = 2;\n' }], turns: [implementorTurn('Now implemented.')] },
+      ],
+      verifier: [{ turns: [bothPass] }],
+    });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_f2_resume');
+    const deps = { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock };
+
+    // First pass: the refusal is blocked and persisted no_deliverable.
+    await runImplementVerifyLoop(deps, loopInput(slice, runId, outcome, recorder, asg))
+      .catch(() => undefined);
+    expect(slice.service.getRoleRound(runId)?.stage).toBe('no_deliverable');
+    expect(slice.created.some((c) => c.role === 'verifier')).toBe(false);
+
+    // Resume from the persisted no_deliverable round: it must re-enter the
+    // IMPLEMENTOR (first: 'implement'), NOT skip to the verifier.
+    const round = slice.service.getRoleRound(runId)!;
+    const result = await runImplementVerifyLoop(deps, {
+      ...loopInput(slice, runId, outcome, recorder, asg),
+      resume: { round },
+    });
+
+    // The implementor was re-driven (a second implementor adapter) and only THEN
+    // did a verifier run — the gate held across the resume.
+    expect(slice.created.filter((c) => c.role === 'implementor')).toHaveLength(2);
+    expect(slice.created.some((c) => c.role === 'verifier')).toBe(true);
+    expect(result.outcome).toBe('merge_ready');
     await slice.worktrees.removeWorktree(asg);
   });
 });

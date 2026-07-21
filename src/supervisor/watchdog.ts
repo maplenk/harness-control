@@ -51,7 +51,7 @@ import type { Clock } from '../lib/clock.js';
 import type { IdFactory } from '../lib/id-factory.js';
 import { newIdempotencyKey, type AssignmentId, type ProcessGenerationId, type RunId, type SegmentId } from '../domain/ids.js';
 import { draftEvent, type DomainEvent, type EventOfType } from '../domain/events.js';
-import type { WorktreeTaint } from '../domain/state.js';
+import type { RoleName, WorktreeTaint } from '../domain/state.js';
 import { BYTES_PER_MB, DEFAULT_ENGINE_CONFIG, type MemoryConfig } from '../config/schema.js';
 import { createPsClient, type PsClient, type ProcessTreeSample } from './ps.js';
 import type { VerifiedSignaler } from './registry.js';
@@ -69,6 +69,9 @@ export interface WatchdogTarget {
   readonly assignmentId?: AssignmentId;
   /** Overrides `memory.budgetMb` for this one target. */
   readonly budgetBytes?: number;
+  /** F3: the spawning role — carried onto `rss.hard_limit` so the incident is
+   * structured and the host can bind a generation-scoped exhaustion cause. */
+  readonly role?: RoleName;
 }
 
 /** Structurally compatible with `GitWorktreeManager` (`../worktree/manager.ts`) — see module doc. */
@@ -283,12 +286,24 @@ export class Watchdog {
         if (runtime.phase !== 'graceful_pending') {
           runtime.phase = 'graceful_pending';
           this.#emit(this.#buildRssHardLimitEvent(target, sample, 'graceful'));
-          await this.#requestGracefulStop(target, sample);
+          // F6: arm the SIGKILL deadline BEFORE launching the graceful stop
+          // callback. Previously the callback was awaited first and the deadline
+          // armed only after it returned — but the host callback unregisters the
+          // generation and awaits child disposal, so a hung/slow checkpoint,
+          // cancel, or dispose meant the deadline was never armed (or was armed
+          // on an already-deleted entry) and the emergency escalation never
+          // fired. Arming first makes the deadline independent of the callback:
+          // a stuck stop still escalates to the identity-verified kill. The
+          // callback must not block on child exit (contract) and must NOT
+          // unregister the generation — the entry stays watched until the tree
+          // is confirmed gone (a later sample → `#finish`) or the deadline
+          // escalates.
           const deadlineTimer = setTimeout(() => {
             void this.#onGracefulDeadline(generationId);
           }, this.#memory.gracefulStopDeadlineMs);
           deadlineTimer.unref?.();
           runtime.deadlineTimer = deadlineTimer;
+          await this.#requestGracefulStop(target, sample);
         }
         return sample;
       }
@@ -438,7 +453,9 @@ export class Watchdog {
         rssBytes: sample.rssBytes,
         budgetBytes: this.#budgetBytes(target),
         escalation,
+        generationId: target.generationId,
         ...(target.segmentId !== undefined ? { segmentId: target.segmentId } : {}),
+        ...(target.role !== undefined ? { role: target.role } : {}),
       },
       idempotencyKey: newIdempotencyKey(this.#ids),
       occurredAt: this.#clock.nowIso(),

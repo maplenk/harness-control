@@ -18,6 +18,7 @@ import {
   TRANSITION_TABLE,
   TRIGGER_EVENT_TYPES,
   applyTransition,
+  foldResourceExhausted,
   initialEngineState,
   transitionForEvent,
   type AppliedTransition,
@@ -466,5 +467,62 @@ describe('T18 cancel', () => {
       'segment.stop.requested',
       'process_group.reap.requested',
     ]);
+  });
+});
+
+describe('foldResourceExhausted (F1/F3) + T12 resume from resource_exhausted', () => {
+  const exhausted = (gen = GEN, key = 'rx-1'): EventOfType<'resource.exhausted'> =>
+    ev('resource.exhausted', { generationId: gen, segmentId: SEG, role: 'implementor', rssBytes: 200, budgetBytes: 100 }, key);
+
+  it('suspends resource_exhausted, marks the matching generation stopped, idles the operation, preserves the return phase', () => {
+    const state = initialEngineState({
+      phase: 'implementing',
+      activeChild: liveChild(),
+      operation: { kind: 'prompt_turn' },
+    });
+    const next = foldResourceExhausted(state, exhausted());
+    expect(next.suspension.kind).toBe('resource_exhausted');
+    if (next.suspension.kind === 'resource_exhausted') {
+      expect(next.suspension.returnPhase).toBe('implementing');
+      expect(next.suspension.inFlightOperation).toBe('prompt_turn');
+    }
+    expect(next.activeChild?.status).toBe('stopped');
+    expect(next.operation.kind).toBe('idle');
+  });
+
+  it('is idempotent — a redelivery (or a run already suspended) is an unchanged no-op', () => {
+    const once = foldResourceExhausted(
+      initialEngineState({ phase: 'implementing', activeChild: liveChild() }),
+      exhausted(),
+    );
+    const twice = foldResourceExhausted(once, exhausted(GEN, 'rx-2'));
+    expect(twice).toBe(once); // same reference — no second suspension
+  });
+
+  it('never suspends on a late/FOREIGN generation, and is a no-op on a terminal run', () => {
+    const foreign = foldResourceExhausted(
+      initialEngineState({ phase: 'implementing', activeChild: liveChild() }),
+      exhausted(processGenerationId('pgen_other'), 'rx-foreign'),
+    );
+    expect(foreign.suspension.kind).toBe('none'); // the current generation is untouched
+    expect(foreign.activeChild?.status).toBe('active');
+
+    const terminal = foldResourceExhausted(
+      initialEngineState({ phase: 'failed', activeChild: liveChild() }),
+      exhausted(),
+    );
+    expect(terminal.suspension.kind).toBe('none');
+  });
+
+  it('T12 resumes from resource_exhausted (like paused_user/interrupted) to the return phase', () => {
+    const suspended = foldResourceExhausted(
+      initialEngineState({ phase: 'implementing', activeChild: liveChild('stopped') }),
+      exhausted(),
+    );
+    expect(suspended.suspension.kind).toBe('resource_exhausted');
+    const resumed = expectApplied(applyTransition(suspended, ev('resume.user.requested', {}, 'resume-1')));
+    expect(resumed.transitionId).toBe('T12');
+    expect(resumed.next.suspension.kind).toBe('none');
+    expect(resumed.next.phase).toBe('implementing');
   });
 });

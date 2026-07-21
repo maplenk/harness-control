@@ -245,6 +245,34 @@ describe('Watchdog: graceful path at 100% (§14)', () => {
     await waitUntil(() => isAliveReal(child.pid!) === false, 2_000);
     expect(harness.watchdog.isWatching(target.generationId)).toBe(false);
   }, 10_000);
+
+  it('F6: a graceful-stop callback that HANGS still escalates to the emergency kill by the deadline', async () => {
+    // The regression this guards: the deadline used to be armed only AFTER
+    // awaiting `requestGracefulStop`. The real host callback awaits child
+    // disposal (and unregistered the generation mid-flight), so a hung/slow stop
+    // meant the deadline was never armed and the emergency escalation NEVER
+    // fired. Arming the deadline BEFORE launching the callback makes escalation
+    // independent of it — proven here by a callback that never resolves.
+    const child = spawnWithExtraMb(340 - baselineMb);
+    await settle(300);
+    const harness = buildHarness({
+      memory: buildMemoryConfig({ gracefulStopDeadlineMs: 200 }),
+      requestGracefulStop: () => new Promise<void>(() => {}), // hangs forever
+    });
+    const target = watchTarget(harness, child);
+
+    await waitUntil(() => eventTypes(harness.events).includes('rss.hard_limit'), 3_000);
+    expect(harness.gracefulStopCalls).toHaveLength(1);
+    expect(hardLimitEvents(harness.events)).toEqual([{ escalation: 'graceful' }]);
+
+    // Despite the hung callback, the deadline escalates to the emergency kill.
+    await waitUntil(
+      () => hardLimitEvents(harness.events).some((e) => e.escalation === 'emergency_kill'),
+      3_000,
+    );
+    await waitUntil(() => isAliveReal(child.pid!) === false, 3_000);
+    expect(harness.taints).toEqual([{ assignmentId: target.assignmentId, taint: 'deadline_termination' }]);
+  }, 10_000);
 });
 
 describe('Watchdog: immediate hard emergency ceiling (§14 150%)', () => {
