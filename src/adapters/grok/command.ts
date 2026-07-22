@@ -85,6 +85,18 @@ const SAFE_SIMPLE_READ_COMMANDS = new Set([
   'tail',
   'true',
   'wc',
+  // Read-only shell builtins Grok leans on in exploration idioms (e.g.
+  // `… || echo "no dir yet"`). None can mutate state: `echo`/`printf` only
+  // print, `test`/`[`/`true`/`false` only evaluate, and `dirname`/`basename`
+  // only parse path strings. Writes-via-redirection are already blocked by
+  // `stripSafeRedirections`, and out-of-worktree paths by `hasEscapingPathArgument`.
+  'echo',
+  'printf',
+  'test',
+  '[',
+  'false',
+  'dirname',
+  'basename',
 ]);
 const SAFE_GIT_READ_SUBCOMMANDS = new Set([
   'diff',

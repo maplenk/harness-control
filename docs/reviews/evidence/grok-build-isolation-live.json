@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "recordedAt": "2026-07-22T04:17:59.346Z",
+  "recordedAt": "2026-07-22T04:50:06.445Z",
   "harness": "grok",
   "requestedModel": "grok-build",
   "requestedEffort": "high",
@@ -32,11 +32,11 @@
       "isolatedHomeDisposed": true,
       "stopReason": "end_turn+write_cancelled",
       "permissionRequests": [
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/coordinator-must-not-write.txt`"
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-2HvaW7/repo/coordinator-must-not-write.txt`"
       ],
       "allowedOperations": [],
       "deniedOperations": [
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/coordinator-must-not-write.txt`"
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-2HvaW7/repo/coordinator-must-not-write.txt`"
       ],
       "expectedMarkerObserved": true
     },
@@ -67,12 +67,12 @@
       "stopReason": "end_turn+write_cancelled",
       "permissionRequests": [
         "Execute `pwd && ls -la . 2>/dev/null || true`",
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/grok-model-spawn.txt`",
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-2HvaW7/repo/grok-model-spawn.txt`",
         "Execute `mkdir -p shell-must-not-write`"
       ],
       "allowedOperations": [
         "Execute `pwd && ls -la . 2>/dev/null || true`",
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/grok-model-spawn.txt`"
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-2HvaW7/repo/grok-model-spawn.txt`"
       ],
       "deniedOperations": [
         "Execute `mkdir -p shell-must-not-write`"
@@ -105,11 +105,11 @@
       "isolatedHomeDisposed": true,
       "stopReason": "end_turn+write_cancelled",
       "permissionRequests": [
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/verifier-must-not-write.txt`"
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-2HvaW7/repo/verifier-must-not-write.txt`"
       ],
       "allowedOperations": [],
       "deniedOperations": [
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/verifier-must-not-write.txt`"
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-2HvaW7/repo/verifier-must-not-write.txt`"
       ],
       "expectedMarkerObserved": true
     }
