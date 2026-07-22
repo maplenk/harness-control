@@ -354,10 +354,31 @@ export interface PromptInput {
   readonly onUpdate?: (update: SessionUpdate) => void;
 }
 
+/**
+ * Sink-safe diagnostics captured at an abnormal ACP turn boundary. Stderr is
+ * already redacted and bounded by the transport before it reaches this SPI
+ * surface; an absent childExit means the provider returned the stop reason
+ * while its ACP process was still alive.
+ */
+export interface PromptDiagnostics {
+  readonly stderr?: {
+    readonly head: string;
+    readonly tail: string;
+    readonly totalBytes: number;
+    readonly truncated: boolean;
+  };
+  readonly childExit?: {
+    readonly code: number | null;
+    readonly signal: NodeJS.Signals | null;
+  };
+}
+
 /** Final turn result: ACP's closed StopReason enum + honest usage (§17.2). */
 export interface PromptResult {
   readonly stopReason: AcpStopReason;
   readonly usage?: TurnUsage;
+  /** Present only when an abnormal stop had transport evidence to preserve. */
+  readonly diagnostics?: PromptDiagnostics;
 }
 
 export interface CancelTurnInput {

@@ -48,6 +48,28 @@ export function buildGrokAcpArgs(options: GrokAcpArgsOptions = {}): readonly str
   return args;
 }
 
+/**
+ * Exact ACP permission title Grok 0.2.106 emits for a shell request. The
+ * shared permission engine compares this string by equality, so an approved
+ * verification command cannot widen into a command prefix or chained suffix.
+ */
+export function grokShellPermissionTitle(command: string): string {
+  if (
+    command.length === 0 ||
+    command.includes('\n') ||
+    command.includes('\r') ||
+    command.includes('\0') ||
+    command.includes('`')
+  ) {
+    throw new AdapterError(
+      'invalid_argument',
+      'Grok shell permissions require a non-empty single-line command without NUL or backtick bytes',
+      { harnessId: GROK_HARNESS_ID },
+    );
+  }
+  return `Bash \`${command}\``;
+}
+
 export interface ResolvedGrokCommand {
   readonly command: string;
   readonly args: readonly string[];

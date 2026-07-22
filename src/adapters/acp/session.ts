@@ -73,6 +73,7 @@ import {
   type PermissionOptionKind,
   type PermissionOutcome,
   type PermissionRequest,
+  type PromptDiagnostics,
   type ProbeResult,
   type PromptInput,
   type PromptResult,
@@ -816,9 +817,12 @@ export class AcpStdioAdapter implements HarnessAdapter {
       if (stopReasonRaw !== 'cancelled' && this.#authEvidence.validatedTurnAt === undefined) {
         this.#authEvidence = { ...this.#authEvidence, validatedTurnAt: this.#clock.nowIso() };
       }
+      const diagnostics =
+        stopReasonRaw !== 'end_turn' ? this.#promptDiagnostics(transport) : undefined;
       return {
         stopReason: stopReasonRaw as AcpStopReason,
         ...(usage !== undefined ? { usage } : {}),
+        ...(diagnostics !== undefined ? { diagnostics } : {}),
       };
     } catch (error) {
       // A child that stops (EOF) after cancellation was requested is the
@@ -829,7 +833,11 @@ export class AcpStdioAdapter implements HarnessAdapter {
         isAdapterError(error) &&
         (error.kind === 'unexpected_eof' || error.kind === 'queue_overflow')
       ) {
-        return { stopReason: 'cancelled' };
+        const diagnostics = this.#promptDiagnostics(transport);
+        return {
+          stopReason: 'cancelled',
+          ...(diagnostics !== undefined ? { diagnostics } : {}),
+        };
       }
       // H-2 auth-failure evidence: a provider envelope this profile's own
       // classifier calls `auth` (codex live: -32000 authRequired / 401) is
@@ -849,6 +857,16 @@ export class AcpStdioAdapter implements HarnessAdapter {
       this.#closedTurnUpdate.set(sessionKey, turn.onUpdate);
       this.#dropPendingPermissions(sessionKey);
     }
+  }
+
+  #promptDiagnostics(transport: AcpStdioTransport): PromptDiagnostics | undefined {
+    const stderr = transport.stderrSnapshot();
+    const childExit = transport.exitInfo;
+    if (stderr.totalBytes === 0 && childExit === undefined) return undefined;
+    return {
+      ...(stderr.totalBytes > 0 ? { stderr } : {}),
+      ...(childExit !== undefined ? { childExit } : {}),
+    };
   }
 
   async cancelTurn(input: CancelTurnInput): Promise<void> {

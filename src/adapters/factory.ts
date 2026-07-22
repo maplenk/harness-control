@@ -113,6 +113,7 @@ import {
   assertSafeGrokProjectConfig,
   buildGrokCapabilityRecord,
   classifyGrokError,
+  grokShellPermissionTitle,
   prepareGrokHomeIsolation,
   probeGrokAuthReadiness,
   type PreparedGrokHome,
@@ -198,6 +199,8 @@ export interface CreateGrokBuildAcpAdapterOptions extends CreateProviderAdapterO
   readonly model: string;
   readonly reasoningEffort?: string;
   readonly role?: RoleName;
+  /** Exact approved commands the implementor may run while self-checking. */
+  readonly allowedShellCommands?: readonly string[];
   /** Production defaults to an isolated HOME/GROK_HOME containing auth only. */
   readonly grokHome?: {
     readonly mode?: 'isolated' | 'inherit_host';
@@ -571,7 +574,12 @@ export function createGrokBuildAcpAdapter(
       ? {
           ...options.permissions,
           policy: {
-            allow: options.permissions.policy?.allow ?? [],
+            allow: [
+              ...new Set([
+                ...(options.permissions.policy?.allow ?? []),
+                ...(options.allowedShellCommands ?? []).map(grokShellPermissionTitle),
+              ]),
+            ],
             workspaceWriteRoot: cwd,
           },
         }

@@ -254,6 +254,24 @@ describe('permission mediation decision core (§10.2, T20)', () => {
   });
 });
 
+describe('abnormal prompt diagnostics', () => {
+  it('returns redacted bounded stderr with a provider-originated cancelled stop', async () => {
+    const adapter = await makeAdapter({
+      stderr: { perTurn: ['provider cancelled; api_key=super-secret-value'] },
+      turns: [{ response: { stopReason: 'cancelled' } }],
+    });
+    await adapter.initialize();
+    const session = await adapter.createSession({ cwd: tmpdir() });
+    const result = await adapter.prompt({ sessionId: session.acpSessionId, prompt: 'go' });
+
+    expect(result.stopReason).toBe('cancelled');
+    expect(result.diagnostics?.stderr?.totalBytes).toBeGreaterThan(0);
+    expect(result.diagnostics?.stderr?.head).toContain('provider cancelled');
+    expect(result.diagnostics?.stderr?.head).not.toContain('super-secret-value');
+    expect(result.diagnostics?.childExit).toBeUndefined();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // PLAN §19 test 6 — permission default-deny (+allowlist allow, unknown deny)
 // ---------------------------------------------------------------------------

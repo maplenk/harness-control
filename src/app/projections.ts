@@ -247,6 +247,8 @@ export interface RoleRoundProjection {
   readonly round: number;
   readonly role: RoleName;
   readonly stage: RoleRoundStage;
+  /** Redacted, bounded abnormal-turn evidence retained across resume. */
+  readonly diagnostic?: string;
   /** The round's `{harness, model, effort}` spec, stamped at dispatch (W2-4:
    * a scheduled resume probe runs a fresh throwaway session pinned to
    * EXACTLY this — the same profile/model/effort the round would resume). */

@@ -9,6 +9,7 @@ import {
   assertGrokMinimumVersion,
   buildGrokAcpArgs,
   checkGrokMinimumVersion,
+  grokShellPermissionTitle,
   parseGrokVersion,
   resolveGrokCommand,
   tryResolveGrokCommand,
@@ -66,6 +67,18 @@ describe('buildGrokAcpArgs', () => {
     ]) {
       expect(args).toContain('read-only');
       expect(args).toContain('dontAsk');
+    }
+  });
+});
+
+describe('grokShellPermissionTitle', () => {
+  it('maps one declared command to Grok\'s exact ACP operation title', () => {
+    expect(grokShellPermissionTitle('npm run typecheck')).toBe('Bash `npm run typecheck`');
+  });
+
+  it('fails closed for ambiguous operation-title bytes', () => {
+    for (const command of ['', 'npm test\nrm -rf /', 'echo `whoami`', 'echo\0x']) {
+      expect(() => grokShellPermissionTitle(command)).toThrow(/single-line command/i);
     }
   });
 });

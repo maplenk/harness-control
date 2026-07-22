@@ -65,6 +65,7 @@ import { RunOwnershipConflictError } from '../run-ownership-store.js';
 import type { RoleRoundProjection } from '../projections.js';
 import type { RoleRunner } from '../role-runner.js';
 import {
+  describeImplementorRoundDiagnostic,
   ImplementorFlow,
   verificationRunnerViolationEvent,
   type ImplementorContext,
@@ -581,7 +582,9 @@ export async function runImplementVerifyLoop(
         // the HOST worktree HEAD itself so a claimed commit is checked against it.
         const runner: RoleRunner<ImplementorResult> = {
           role: flow.role,
+          allowedShellCommands: flow.allowedShellCommands,
           run: (session) => flow.run(session),
+          diagnoseRoundOutcome: describeImplementorRoundDiagnostic,
           adjudicateRoundOutcome: async (result) =>
             adjudicateImplementorDeliverable(
               result,
