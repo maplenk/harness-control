@@ -72,6 +72,202 @@ export function grokShellPermissionTitle(command: string): string {
   return `Execute \`${command}\``;
 }
 
+const MAX_READ_ONLY_SHELL_BYTES = 8_192;
+const MAX_READ_ONLY_SHELL_SEGMENTS = 24;
+const SAFE_NULL_REDIRECTIONS = new Set(['>/dev/null', '1>/dev/null', '2>/dev/null']);
+const SAFE_SIMPLE_READ_COMMANDS = new Set([
+  'cat',
+  'grep',
+  'head',
+  'ls',
+  'pwd',
+  'rg',
+  'tail',
+  'true',
+  'wc',
+]);
+const SAFE_GIT_READ_SUBCOMMANDS = new Set([
+  'diff',
+  'log',
+  'ls-files',
+  'rev-parse',
+  'show',
+  'status',
+]);
+
+interface ShellToken {
+  readonly value: string;
+  readonly quoted: boolean;
+}
+
+function splitShellSegments(command: string): readonly string[] | undefined {
+  if (Buffer.byteLength(command, 'utf8') > MAX_READ_ONLY_SHELL_BYTES) return undefined;
+  const segments: string[] = [];
+  let quote: "'" | '"' | undefined;
+  let start = 0;
+  const push = (end: number): boolean => {
+    const segment = command.slice(start, end).trim();
+    if (segment.length === 0) return false;
+    segments.push(segment);
+    return segments.length <= MAX_READ_ONLY_SHELL_SEGMENTS;
+  };
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (char === undefined) return undefined;
+    if (char === '\0' || char === '\n' || char === '\r' || char === '`' || char === '$' || char === '\\') {
+      return undefined;
+    }
+    if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === '<' || char === '#' || char === '(' || char === ')' || char === '{' || char === '}') {
+      return undefined;
+    }
+    if (char === '&') {
+      if (command[index + 1] !== '&' || !push(index)) return undefined;
+      index += 1;
+      start = index + 1;
+      continue;
+    }
+    if (char === '|') {
+      const width = command[index + 1] === '|' ? 2 : 1;
+      if (!push(index)) return undefined;
+      index += width - 1;
+      start = index + 1;
+      continue;
+    }
+    if (char === ';') {
+      if (!push(index)) return undefined;
+      start = index + 1;
+    }
+  }
+  if (quote !== undefined || !push(command.length)) return undefined;
+  return segments;
+}
+
+function tokenizeShellSegment(segment: string): readonly ShellToken[] | undefined {
+  const tokens: ShellToken[] = [];
+  let quote: "'" | '"' | undefined;
+  let value = '';
+  let quoted = false;
+  const push = (): void => {
+    if (value.length === 0 && !quoted) return;
+    tokens.push({ value, quoted });
+    value = '';
+    quoted = false;
+  };
+
+  for (const char of segment) {
+    if (char === '\0' || char === '\n' || char === '\r' || char === '`' || char === '$' || char === '\\') {
+      return undefined;
+    }
+    if (quote !== undefined) {
+      if (char === quote) {
+        quote = undefined;
+      } else {
+        value += char;
+      }
+      quoted = true;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      quoted = true;
+      continue;
+    }
+    if (/\s/u.test(char)) {
+      push();
+      continue;
+    }
+    value += char;
+  }
+  if (quote !== undefined) return undefined;
+  push();
+  return tokens.length > 0 ? tokens : undefined;
+}
+
+function stripSafeRedirections(tokens: readonly ShellToken[]): readonly string[] | undefined {
+  const argv: string[] = [];
+  for (const token of tokens) {
+    if (!token.quoted && SAFE_NULL_REDIRECTIONS.has(token.value)) continue;
+    if (!token.quoted && (token.value.includes('>') || token.value.includes('<'))) return undefined;
+    argv.push(token.value);
+  }
+  return argv.length > 0 ? argv : undefined;
+}
+
+function hasEscapingPathArgument(argv: readonly string[]): boolean {
+  return argv.slice(1).some((arg) =>
+    arg === '..' ||
+    arg.startsWith('../') ||
+    arg.includes('/../') ||
+    arg.startsWith('/') ||
+    arg.startsWith('~/') ||
+    arg.includes('=/')
+  );
+}
+
+function isSafeGitRead(argv: readonly string[]): boolean {
+  const subcommand = argv[1];
+  if (subcommand === undefined || !SAFE_GIT_READ_SUBCOMMANDS.has(subcommand)) return false;
+  return !argv.slice(2).some((arg) =>
+    arg === '-c' ||
+    arg === '--ext-diff' ||
+    arg === '--textconv' ||
+    arg === '--output' ||
+    arg.startsWith('--output=') ||
+    arg === '--exec-path' ||
+    arg.startsWith('--exec-path=') ||
+    arg === '--config-env' ||
+    arg.startsWith('--config-env=') ||
+    arg === '--git-dir' ||
+    arg.startsWith('--git-dir=') ||
+    arg === '--work-tree' ||
+    arg.startsWith('--work-tree=') ||
+    arg === '--namespace' ||
+    arg.startsWith('--namespace=') ||
+    arg === '--help' ||
+    arg === '-h'
+  );
+}
+
+function isSafeReadOnlyArgv(argv: readonly string[]): boolean {
+  if (hasEscapingPathArgument(argv)) return false;
+  if (argv[0] === 'git') return isSafeGitRead(argv);
+  if (argv[0] === 'rg' && argv.slice(1).some((arg) => arg === '--pre' || arg.startsWith('--pre='))) {
+    return false;
+  }
+  return argv[0] !== undefined && SAFE_SIMPLE_READ_COMMANDS.has(argv[0]);
+}
+
+/**
+ * Recognizes only shell compositions whose every segment is a conservative
+ * read-only repository inspection. This intentionally rejects shell
+ * expansions, subshells, backgrounding, arbitrary redirection, absolute or
+ * parent-traversing paths, executable ripgrep preprocessors, mutating git
+ * forms, network clients, and all unknown commands.
+ */
+export function isGrokReadOnlyShellPermissionTitle(operation: string): boolean {
+  const match = /^Execute `([^`\r\n]+)`$/.exec(operation.trim());
+  if (match === null) return false;
+  const command = match[1];
+  if (command === undefined) return false;
+  const segments = splitShellSegments(command);
+  if (segments === undefined) return false;
+  return segments.every((segment) => {
+    const tokens = tokenizeShellSegment(segment);
+    if (tokens === undefined) return false;
+    const argv = stripSafeRedirections(tokens);
+    return argv !== undefined && isSafeReadOnlyArgv(argv);
+  });
+}
+
 export interface ResolvedGrokCommand {
   readonly command: string;
   readonly args: readonly string[];

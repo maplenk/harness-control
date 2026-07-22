@@ -199,7 +199,7 @@ describe('provider adapter factory — command resolution + version pin (§3, §
     expect(spawn.args).toEqual(
       expect.arrayContaining([
         '--sandbox',
-        'workspace',
+        'strict',
         '--permission-mode',
         'acceptEdits',
         '--model',
@@ -545,7 +545,7 @@ describe('provider adapter factory — composed initialize() over the fake wire 
   );
 
   it(
-    'grok exposes immutable spawn pins and permits only an in-worktree structured implementor write',
+    'grok permits structured writes, parsed read-only shell, and exact verification commands only',
     async () => {
       const fixture = fixtureGrok();
       const target = path.join(fixture.cwd, 'implemented.txt');
@@ -554,6 +554,13 @@ describe('provider adapter factory — composed initialize() over the fake wire 
           turns: [
             {
               permission: { toolTitle: `Write \`${target}\`` },
+              response: { stopReason: 'end_turn' },
+            },
+            {
+              permission: {
+                toolTitle:
+                  'Execute `git log --oneline -5 && git rev-parse HEAD && ls -la scripts/dogfood/ 2>/dev/null; head -50 scripts/dogfood/slice-1a.sh 2>/dev/null || true`',
+              },
               response: { stopReason: 'end_turn' },
             },
             {
@@ -600,6 +607,9 @@ describe('provider adapter factory — composed initialize() over the fake wire 
         created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'implement' }),
       ).resolves.toMatchObject({ stopReason: 'end_turn' });
       await expect(
+        created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'inspect repository' }),
+      ).resolves.toMatchObject({ stopReason: 'end_turn' });
+      await expect(
         created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'scaffold through shell' }),
       ).resolves.toMatchObject({ stopReason: 'end_turn' });
       await expect(
@@ -610,6 +620,12 @@ describe('provider adapter factory — composed initialize() over the fake wire 
           operation: `Write \`${target}\``,
           action: 'allow',
           reason: 'allowlisted_workspace_write',
+        }),
+        expect.objectContaining({
+          operation:
+            'Execute `git log --oneline -5 && git rev-parse HEAD && ls -la scripts/dogfood/ 2>/dev/null; head -50 scripts/dogfood/slice-1a.sh 2>/dev/null || true`',
+          action: 'allow',
+          reason: 'allowlisted_read_only_operation',
         }),
         expect.objectContaining({
           operation: 'Execute `mkdir -p src/app/commands`',

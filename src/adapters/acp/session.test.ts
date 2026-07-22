@@ -188,6 +188,36 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     });
   });
 
+  it('admits only trusted read-only classifier matches and fails closed when it throws', () => {
+    const allowReadOnlyOperation = (operation: string): boolean => operation === 'safe inspection';
+    const policy = {
+      mode: 'headless',
+      policy: { allow: [], allowReadOnlyOperation },
+    } as const;
+    expect(decidePermission(policy, 'safe inspection')).toEqual({
+      action: 'allow',
+      reason: 'allowlisted_read_only_operation',
+    });
+    expect(decidePermission(policy, 'unsafe mutation')).toEqual({
+      action: 'deny',
+      reason: 'denied_default',
+    });
+    expect(
+      decidePermission(
+        {
+          mode: 'headless',
+          policy: {
+            allow: [],
+            allowReadOnlyOperation: () => {
+              throw new Error('classifier bug');
+            },
+          },
+        },
+        'unknown operation',
+      ),
+    ).toEqual({ action: 'deny', reason: 'denied_default' });
+  });
+
   it('coordinator/verifier WRITE requests are always denied — in every mode, over any allowlist', () => {
     expect(
       decidePermission(

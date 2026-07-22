@@ -114,6 +114,7 @@ import {
   buildGrokCapabilityRecord,
   classifyGrokError,
   grokShellPermissionTitle,
+  isGrokReadOnlyShellPermissionTitle,
   prepareGrokHomeIsolation,
   probeGrokAuthReadiness,
   type PreparedGrokHome,
@@ -580,6 +581,7 @@ export function createGrokBuildAcpAdapter(
                 ...(options.allowedShellCommands ?? []).map(grokShellPermissionTitle),
               ]),
             ],
+            allowReadOnlyOperation: isGrokReadOnlyShellPermissionTitle,
             workspaceWriteRoot: cwd,
           },
         }

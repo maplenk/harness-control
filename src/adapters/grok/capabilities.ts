@@ -21,12 +21,12 @@ export const GROK_CONFLICTING_BUILTIN_TOOLS = [
   'get_task_output',
 ] as const;
 
-export type GrokSandboxProfile = 'read-only' | 'workspace';
+export type GrokSandboxProfile = 'read-only' | 'strict';
 export type GrokPermissionMode = 'acceptEdits' | 'dontAsk';
 
 /** Undefined/unknown roles fail closed to the read-only process sandbox. */
 export function grokSandboxProfileForRole(role: RoleName | undefined): GrokSandboxProfile {
-  return role === 'implementor' ? 'workspace' : 'read-only';
+  return role === 'implementor' ? 'strict' : 'read-only';
 }
 
 /** Implementors may use structured edits; every other role fails closed. */

@@ -37,7 +37,7 @@ describe('prepareGrokHomeIsolation', () => {
     expect(statSync(prepared.authPath).mode & 0o777).toBe(0o600);
     expect(statSync(prepared.configPath).mode & 0o777).toBe(0o600);
     expect(existsSync(path.join(prepared.dir, 'host-config.toml'))).toBe(false);
-    expect(prepared.sandboxProfile).toBe('workspace');
+    expect(prepared.sandboxProfile).toBe('strict');
     prepared.dispose();
     expect(existsSync(prepared.dir)).toBe(false);
     prepared.dispose();

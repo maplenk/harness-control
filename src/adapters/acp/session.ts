@@ -96,12 +96,18 @@ import {
 // Permission mediation (PLAN §10.2, T20)
 // ---------------------------------------------------------------------------
 /**
- * Headless allowlist: EXACT operation strings (matched against the request's
- * tool title). No globs, no substrings — §10.2 "policy allowlists the exact
- * operation"; anything else is DENIED.
+ * Headless allowlist: exact operation strings (matched against the request's
+ * tool title), plus an optional trusted provider-specific read-only
+ * classifier. No globs or substring matching — anything else is DENIED.
  */
 export interface HeadlessPermissionPolicy {
   readonly allow: readonly string[];
+  /**
+   * Optional fail-closed classifier for provider operation titles that can be
+   * proven read-only after parsing. The harness supplies this only for Grok's
+   * implementor `Execute` requests; a false result or throw is a denial.
+   */
+  readonly allowReadOnlyOperation?: (operation: string) => boolean;
   /**
    * Optional canonical workspace boundary for structured path-qualified
    * `Write` / `Edit` operations. Shell-shaped or unparseable operations never
@@ -130,6 +136,7 @@ export type PermissionMediationConfig =
 
 export type PermissionDecisionReason =
   | 'allowlisted'
+  | 'allowlisted_read_only_operation'
   | 'interactive'
   | 'allowlisted_workspace_write'
   | 'denied_default'
@@ -221,6 +228,13 @@ export function decidePermission(
   }
   if ((config.policy?.allow ?? []).includes(operation)) {
     return { action: 'allow', reason: 'allowlisted' };
+  }
+  try {
+    if (config.policy?.allowReadOnlyOperation?.(operation) === true) {
+      return { action: 'allow', reason: 'allowlisted_read_only_operation' };
+    }
+  } catch {
+    // A classifier failure must never widen a headless permission decision.
   }
   if (
     role === 'implementor' &&

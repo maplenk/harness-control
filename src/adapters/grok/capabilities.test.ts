@@ -49,7 +49,7 @@ describe('Grok capability profile', () => {
   });
 
   it('maps role to an OS-enforced spawn sandbox', () => {
-    expect(grokSandboxProfileForRole('implementor')).toBe('workspace');
+    expect(grokSandboxProfileForRole('implementor')).toBe('strict');
     expect(grokSandboxProfileForRole('coordinator')).toBe('read-only');
     expect(grokSandboxProfileForRole('verifier')).toBe('read-only');
     expect(grokSandboxProfileForRole(undefined)).toBe('read-only');
