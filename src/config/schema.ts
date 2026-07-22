@@ -24,6 +24,7 @@
  */
 import { z } from 'zod';
 import type { FailoverPolicy } from '../domain/entities.js';
+import type { ProvisionStrategy } from '../worktree/provision.js';
 import { HARNESSES, REASONING_EFFORTS } from '../app/model-resolution.js';
 import { DEFAULT_BOUNDS, DEFAULT_PROBE_LADDER_MINUTES } from '../domain/state.js';
 import { RSS_GRACEFUL_STOP_DEADLINE_MS } from '../domain/transitions.js';
@@ -350,6 +351,28 @@ const budgetSchema = z
 const BUDGET_DEFAULT = budgetSchema.parse({});
 
 // ---------------------------------------------------------------------------
+// F7 (spec §3): worktree dependency provisioning. The engine provisions a REAL,
+// git-ignored `node_modules` into each child worktree at the post-commit /
+// pre-verification boundary so host self-check + verifier commands
+// (`npm run typecheck`, `npx vitest`) don't exit 127. `auto` (default) clones the
+// primary checkout's tree when the committed dependency fingerprint matches and
+// APFS copy-on-write is available, else `npm ci`; `clone`/`install` force a lane
+// (both fall back to install on a non-clonable host); `none` disables managed
+// provisioning (the operator owns node_modules). The value flows into
+// `WorktreeManagerOptions.provision` via cli/index.ts.
+// ---------------------------------------------------------------------------
+export const PROVISION_STRATEGIES = ['auto', 'clone', 'install', 'none'] as const satisfies readonly ProvisionStrategy[];
+export const DEFAULT_PROVISION_STRATEGY: ProvisionStrategy = 'auto';
+
+const worktreeSchema = z
+  .object({
+    provision: z.enum(PROVISION_STRATEGIES).default(DEFAULT_PROVISION_STRATEGY),
+  })
+  .strict()
+  .readonly();
+const WORKTREE_DEFAULT = worktreeSchema.parse({});
+
+// ---------------------------------------------------------------------------
 // Top-level EngineConfig
 // ---------------------------------------------------------------------------
 export const engineConfigSchema = z
@@ -387,6 +410,8 @@ export const engineConfigSchema = z
     budget: budgetSchema.default(BUDGET_DEFAULT),
     /** §17.1/W3-1: verification-runner confinement knobs. */
     verification: verificationSchema.default(VERIFICATION_DEFAULT),
+    /** F7 (§3): worktree dependency provisioning strategy. */
+    worktree: worktreeSchema.default(WORKTREE_DEFAULT),
   })
   .strict()
   // P4b wave 2: `switch_model`/`switch_harness` are only meaningful with a
@@ -431,6 +456,8 @@ export type RemediationConfig = EngineConfig['remediation'];
 export type CheckpointConfig = EngineConfig['checkpoint'];
 export type BudgetConfig = EngineConfig['budget'];
 export type VerificationConfig = EngineConfig['verification'];
+/** F7 (§3): worktree dependency provisioning config. */
+export type WorktreeConfig = EngineConfig['worktree'];
 /** P4b wave 2: the resolved per-assignment ordered escalation ladder. */
 export type FailoverLadderConfig = EngineConfig['failoverLadder'];
 

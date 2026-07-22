@@ -26,6 +26,15 @@ export const WORKTREE_ERROR_KINDS = [
   'requires_validation',
   /** A resolved path landed outside the manager's configured base dir / inside the primary checkout (safety guard). */
   'unsafe_path',
+  /**
+   * F7 (`./provision.ts`): `provisionForVerification` could not PROVE a real,
+   * git-ignored `node_modules` for the committed manifests — `node_modules` is
+   * not ignored / is tracked (would risk staging deps into a commit), neither
+   * clone nor `npm ci` produced a tree, or a provisioned tree held an unsafe
+   * (absolute / worktree-escaping) symlink. The caller FAILS CLOSED: no host
+   * self-check, no verifier dispatch, no `merge_ready`.
+   */
+  'provisioning_failed',
 ] as const;
 
 export type WorktreeErrorKind = (typeof WORKTREE_ERROR_KINDS)[number];

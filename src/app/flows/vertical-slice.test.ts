@@ -55,7 +55,7 @@ import {
   type PromptInput,
   type PromptResult,
 } from '../../adapters/index.js';
-import { GitWorktreeManager, WorktreeError } from '../../worktree/index.js';
+import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import * as git from '../../worktree/git.js';
 import {
   assertPrimaryCheckoutUntouched,
@@ -76,6 +76,7 @@ import {
   adjudicateImplementorDeliverable,
   NoDeliverableError,
   runImplementVerifyLoop,
+  toProvisioningFailure,
 } from './orchestrate.js';
 import type { ImplementorResult } from './implementor.js';
 import {
@@ -1485,5 +1486,256 @@ describe('F2 adjudicateImplementorDeliverable — every non-normal stop + host-H
         HEAD,
       ),
     ).toBe('no_deliverable');
+  });
+});
+
+// ===========================================================================
+// F7 — dependency-provisioning fail-closed HALTS the loop before the verifier
+// ===========================================================================
+describe('F7 — provisioning fail-closed halts the loop before verifier dispatch (§2.1/§2.4)', () => {
+  it('an implementor commit that declares deps without an ignore rule → provisioning_failed, NO verifier, NO merge_ready', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          // The implementor introduces a package.json declaring deps AND writes a
+          // node_modules file — but the repo has NO `node_modules` ignore rule. B1:
+          // the commit must EXCLUDE node_modules (addAllExceptNodeModules), and the
+          // post-commit F7 preflight then fails closed (unignored node_modules).
+          writes: [
+            {
+              relPath: 'package.json',
+              content: JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0' } }),
+            },
+            {
+              relPath: 'package-lock.json',
+              content: '{"name":"x","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{}}',
+            },
+            { relPath: 'node_modules/evil.js', content: 'module.exports = "toolchain";\n' },
+          ],
+          turns: [implementorTurn('Added a dependency.')],
+        },
+      ],
+      verifier: [{ turns: [verifierTurn([{ id: 'AC-1', verdict: 'passed', evidence: 'unreached' }])] }], // must NEVER run
+    });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_f7_loop_failclosed');
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag end to end in the CLI.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+      },
+    );
+
+    expect(result.outcome).toBe('provisioning_failed');
+    expect(result.provisioningFailure).toBeDefined();
+    expect(result.provisioningFailure?.detail).toMatch(/not git-ignored/i);
+    // M9: the failure carries the round and the ACTUAL committed HEAD (not stale).
+    expect(result.provisioningFailure?.round).toBe(1);
+    expect(result.provisioningFailure?.implementationCommit).toBeDefined();
+    // B1: node_modules never entered the committed tree (excluded from the commit),
+    // despite the missing ignore rule.
+    const tracked = (await slice.repo.run(['ls-tree', '-r', '--name-only', String(result.implementationCommit)])).split('\n');
+    expect(tracked.some((p) => p.startsWith('node_modules'))).toBe(false);
+    expect(tracked).toContain('package.json');
+    // The verifier was NEVER dispatched, and no verification verdict was recorded.
+    expect(slice.created.some((c) => c.role === 'verifier')).toBe(false);
+    const types = dbHandle!.db.events.listByRun(runId).map((e) => e.type);
+    expect(types).not.toContain('verification.completed.passed');
+    expect(types).not.toContain('verification.completed.failed');
+    expect(slice.service.status(runId).phase).not.toBe('merge_ready');
+    await slice.worktrees.removeWorktree(asg);
+  });
+
+  // Round-3 #1: a COMPLETED implementor round whose provisioning failed is persisted
+  // `completed` and re-enters at VERIFICATION on resume. The old adoption path called
+  // validate(), whose dirty-tree recovery WIP-committed the ENTIRE tree (`git add -A`)
+  // — corrupting the branch with node_modules and making unadjudicated dirt the
+  // verifier's HEAD. The fix RESETS the adopted worktree to EXACTLY the persisted
+  // implementation commit and DISCARDS the dirt. (The abnormal/no-commit → resume
+  // re-drives the implementor path is re-confirmed by the F2 "restart/resume does NOT
+  // bypass the gate" test above.)
+  it('#1 — a completed round that failed provisioning RESUMES by resetting to the persisted commit (NO dirt WIP-committed)', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          // Round 1 commits a feature AND leaves a provisioned (un-ignored)
+          // node_modules in the worktree; the repo has NO ignore rule → the post-commit
+          // preflight fails closed. The commit EXCLUDES node_modules (B1), so c1's tree
+          // is clean and node_modules is untracked worktree DIRT at resume time.
+          writes: [
+            {
+              relPath: 'package.json',
+              content: JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0' } }),
+            },
+            {
+              relPath: 'package-lock.json',
+              content: '{"name":"x","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{}}',
+            },
+            { relPath: 'src/cli/verbose.ts', content: 'export const v = 1;\n' },
+            { relPath: 'node_modules/.bin/tsc', content: '#!/bin/sh\nexit 0\n' }, // the provisioned-toolchain dirt
+          ],
+          turns: [implementorTurn('Added a dependency.')],
+        },
+      ],
+      verifier: [{ turns: [verifierTurn([{ id: 'AC-1', verdict: 'passed', evidence: 'unreached' }])] }], // must NEVER run
+    });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_f7_resume_reset');
+    const deps = { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock };
+    const loopInput: Parameters<typeof runImplementVerifyLoop>[1] = {
+      runId,
+      assignmentId: asg,
+      implementor: IMPLEMENTOR,
+      verifier: VERIFIER,
+      specHash: outcome.specVersion.contentHash,
+      specDocument: outcome.canonicalSpec,
+      goal: GOAL,
+      taskScope: 'Implement the --verbose flag end to end in the CLI.',
+      criteria: outcome.specVersion.criteria,
+      baseCommit: slice.baseCommit,
+      evidence: recorder,
+      runVerificationCommands: PASS_VERIFY,
+    };
+
+    // First pass: round 1 commits, provisioning fails closed → the loop HALTS with the
+    // round persisted `completed` and the implementation commit c1 recorded.
+    const first = await runImplementVerifyLoop(deps, loopInput);
+    expect(first.outcome).toBe('provisioning_failed');
+    expect(slice.service.getRoleRound(runId)?.role).toBe('implementor');
+    expect(slice.service.getRoleRound(runId)?.stage).toBe('completed');
+    const c1 = first.implementationCommit;
+    const worktreePath = first.worktree.worktreePath;
+    expect(await git.resolveSha(worktreePath, 'HEAD')).toBe(String(c1));
+
+    // Resume the COMPLETED implementor round (re-enters at verification).
+    const round = slice.service.getRoleRound(runId)!;
+    const resumed = await runImplementVerifyLoop(deps, { ...loopInput, resume: { round } });
+
+    // The worktree HEAD is STILL exactly c1 — no WIP commit was made on top of it.
+    expect(await git.resolveSha(worktreePath, 'HEAD')).toBe(String(c1));
+    expect(String(resumed.implementationCommit)).toBe(String(c1));
+    // The branch has exactly ONE commit past the base (round-1's) — proof the resume
+    // did NOT WIP-commit the node_modules dirt onto a new, unadjudicated HEAD.
+    const commitCount = (
+      await git.runGit(['rev-list', '--count', `${String(slice.baseCommit)}..HEAD`], worktreePath)
+    ).stdout.trim();
+    expect(commitCount).toBe('1');
+    // node_modules NEVER entered any commit (not in c1's tree, and c1 is still HEAD).
+    const tracked = (await slice.repo.run(['ls-tree', '-r', '--name-only', String(c1)])).split('\n');
+    expect(tracked.some((p) => p.startsWith('node_modules'))).toBe(false);
+    expect(tracked).toContain('package.json');
+    // The re-provision at the verifier boundary still fails closed on the un-ignored
+    // tree (#7: its detail is redacted by toProvisioningFailure), so no verifier ran.
+    expect(resumed.outcome).toBe('provisioning_failed');
+    expect(resumed.provisioningFailure?.detail).toMatch(/not git-ignored/i);
+    expect(slice.created.some((c) => c.role === 'verifier')).toBe(false);
+    await slice.worktrees.removeWorktree(asg);
+  });
+
+  // Round-4 #1: the persisted implementation commit is ROUND-SCOPED. A record left
+  // STALE by a DIFFERENT round (a later round durably completed at a new commit but
+  // crashed before updating it) must NEVER be used to reset/verify the wrong commit —
+  // resume falls back to the current HEAD (exactly the resuming round's durable commit).
+  it('#1 (round-4) — a persisted implementation commit from a DIFFERENT round is NOT used on resume (round-scoped)', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [
+            {
+              relPath: 'package.json',
+              content: JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0' } }),
+            },
+            {
+              relPath: 'package-lock.json',
+              content: '{"name":"x","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{}}',
+            },
+            { relPath: 'src/cli/verbose.ts', content: 'export const v = 1;\n' },
+            { relPath: 'node_modules/.bin/tsc', content: '#!/bin/sh\nexit 0\n' },
+          ],
+          turns: [implementorTurn('Added a dependency.')],
+        },
+      ],
+      verifier: [{ turns: [verifierTurn([{ id: 'AC-1', verdict: 'passed', evidence: 'unreached' }])] }],
+    });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_f7_roundscope');
+    const deps = { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock };
+    const loopInput: Parameters<typeof runImplementVerifyLoop>[1] = {
+      runId,
+      assignmentId: asg,
+      implementor: IMPLEMENTOR,
+      verifier: VERIFIER,
+      specHash: outcome.specVersion.contentHash,
+      specDocument: outcome.canonicalSpec,
+      goal: GOAL,
+      taskScope: 'Implement the --verbose flag end to end in the CLI.',
+      criteria: outcome.specVersion.criteria,
+      baseCommit: slice.baseCommit,
+      evidence: recorder,
+      runVerificationCommands: PASS_VERIFY,
+    };
+
+    // Round 1 commits c1, provisioning fails closed → completed round persisted at c1.
+    const first = await runImplementVerifyLoop(deps, loopInput);
+    expect(first.outcome).toBe('provisioning_failed');
+    const c1 = first.implementationCommit;
+    const worktreePath = first.worktree.worktreePath;
+    expect(await git.resolveSha(worktreePath, 'HEAD')).toBe(String(c1));
+
+    // Simulate the multi-round crash: poison the persisted record to a MISMATCHED round
+    // pointing at the WRONG commit (the base). The round-scoped guard must reject it and
+    // fall back to the current HEAD (c1) — never hard-reset/verify the base.
+    const state = slice.service.getImplementVerifyLoopState(runId)!;
+    slice.service.saveImplementVerifyLoopState(runId, {
+      ...state,
+      worktree: { ...state.worktree!, lastImplementationCommit: { round: 0, commit: slice.baseCommit } },
+    });
+
+    const round = slice.service.getRoleRound(runId)!;
+    const resumed = await runImplementVerifyLoop(deps, { ...loopInput, resume: { round } });
+    const headAfter = await git.resolveSha(worktreePath, 'HEAD');
+    expect(headAfter).toBe(String(c1)); // reset to the CORRECT round-1 commit (current HEAD)
+    expect(headAfter).not.toBe(String(slice.baseCommit)); // NEVER the stale/wrong commit
+    expect(String(resumed.implementationCommit)).toBe(String(c1));
+    await slice.worktrees.removeWorktree(asg);
+  });
+});
+
+// ===========================================================================
+// F7 round-3 #7 — a verifier-boundary provisioning error is REDACTED before it is
+// surfaced (the CLI prints ProvisioningFailure.detail; a secret-shaped install/clone
+// error must never reach that sink raw — the same redaction the implementor boundary
+// already applies).
+// ===========================================================================
+describe('F7 round-3 #7 — toProvisioningFailure redacts the surfaced detail', () => {
+  it('scrubs a secret-shaped detail from the verifier-boundary provisioning failure', () => {
+    const handle = { repoRoot: '/repo', worktreePath: '/wt' } as WorktreeHandle;
+    const secret = 'AKIAIOSFODNN7EXAMPLE'; // a canonical AWS-access-key-id-shaped token
+    const error = new WorktreeError('provisioning_failed', 'dependency install failed', {
+      detail: `npm ci failed: registry auth key ${secret} was rejected`,
+    });
+    const pf = toProvisioningFailure(error, handle);
+    expect(pf.kind).toBe('provisioning_failed');
+    expect(pf.repoRoot).toBe('/repo');
+    expect(pf.detail).not.toContain(secret); // the raw secret never reaches the CLI/sink
+    expect(pf.detail).toContain('REDACTED'); // replaced by the redaction marker
   });
 });

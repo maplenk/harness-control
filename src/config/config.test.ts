@@ -65,6 +65,10 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
       // W3-1: the verification runner's per-run env additions default EMPTY —
       // the minimal allowlist is the whole default surface.
       verification: { envAllowlist: [] },
+      // F7 (§3): worktree dependency provisioning defaults to `auto` (clone when
+      // the committed fingerprint matches the primary + APFS is available, else
+      // `npm ci`).
+      worktree: { provision: 'auto' },
     });
   });
 

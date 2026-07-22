@@ -208,6 +208,34 @@ export async function addAll(worktreePath: string): Promise<void> {
   await runGit(['add', '-A'], worktreePath);
 }
 
+/**
+ * Stage every change EXCEPT a root `node_modules/` (`git add -A -- . :(exclude)node_modules`),
+ * preserving full `-A` semantics (adds, modifications, AND deletions) for
+ * everything else. F7 (B1): the harness provisions a git-ignored `node_modules`
+ * into agent worktrees; if a target repo lacks a `node_modules/` ignore rule (or
+ * an agent removed it), a plain `git add -A` would stage the provisioned toolchain
+ * INTO the commit. Excluding it here guarantees a provisioned tree can never enter
+ * a harness commit — independent of, and complementary to, provisioning's own
+ * fail-closed refusal of an unignored/tracked `node_modules`.
+ */
+export async function addAllExceptNodeModules(worktreePath: string): Promise<void> {
+  await runGit(['add', '-A', '--', '.', ':(exclude)node_modules'], worktreePath);
+}
+
+/**
+ * Unstage any ALREADY-STAGED `node_modules` from the index (`git reset -- node_modules`),
+ * WITHOUT touching the working tree. F7 (round-4 #3): `addAllExceptNodeModules` prevents
+ * ADDING `node_modules` but does NOT remove entries a prior `git add` already placed in
+ * the index — e.g. a verification command or an interrupted implementor that ran
+ * `git add node_modules`. Called (while provisioning is active) BEFORE the implementor
+ * commit AND the §16.3 WIP reconciliation commit, so a provisioned (git-ignored)
+ * toolchain can never enter a harness commit even when it was pre-staged. Resetting a
+ * non-matching pathspec is a no-op (exit 0); the file stays on disk.
+ */
+export async function unstageNodeModules(worktreePath: string): Promise<void> {
+  await runGit(['reset', '--quiet', '--', 'node_modules'], worktreePath);
+}
+
 const NOTHING_TO_COMMIT_RE = /nothing to commit/i;
 
 /**
@@ -256,4 +284,104 @@ export async function hardReset(worktreePath: string, sha: string): Promise<void
  */
 export async function cleanUntracked(worktreePath: string): Promise<void> {
   await runGit(['clean', '-fd'], worktreePath);
+}
+
+// ---------------------------------------------------------------------------
+// F7 worktree dependency provisioning: exit-code-aware plumbing + committed-HEAD
+// / ignore queries (see `./provision.ts`).
+// ---------------------------------------------------------------------------
+export interface GitCommandStatus {
+  readonly stdout: string;
+  readonly stderr: string;
+  /** Process exit code; `-1` when the process could not be spawned at all. */
+  readonly exitCode: number;
+}
+
+/**
+ * Runs `git <args>` and returns its exit code WITHOUT throwing on a non-zero
+ * exit — for callers that must branch on a SPECIFIC code (`check-ignore` exits 1
+ * for "not ignored" but 128 for a real error; `ls-files --error-unmatch` exits 1
+ * for "not tracked"). A spawn failure (git not found) yields `exitCode: -1`.
+ */
+export async function runGitStatus(
+  args: readonly string[],
+  cwd: string,
+  extraEnv: Readonly<Record<string, string>> = {},
+): Promise<GitCommandStatus> {
+  try {
+    const { stdout, stderr } = await execFileAsync(GIT_BIN, [...args], {
+      cwd,
+      maxBuffer: MAX_BUFFER_BYTES,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...extraEnv },
+    });
+    return { stdout: toText(stdout), stderr: toText(stderr), exitCode: 0 };
+  } catch (error) {
+    const shaped = error as ExecFileErrorShape & { code?: unknown };
+    const exitCode = typeof shaped.code === 'number' ? shaped.code : -1;
+    return { stdout: toText(shaped.stdout), stderr: toText(shaped.stderr), exitCode };
+  }
+}
+
+/**
+ * True iff `pathspec` is git-ignored in the worktree (`git check-ignore -q`).
+ * Distinguishes "not ignored" (exit 1 → `false`) from a genuine git error
+ * (exit 128 / spawn failure → throw), so the F7 preflight never mistakes a
+ * broken repo for "safe to provision".
+ */
+export async function isPathIgnored(worktreePath: string, pathspec: string): Promise<boolean> {
+  const { exitCode, stderr } = await runGitStatus(['check-ignore', '-q', '--', pathspec], worktreePath);
+  if (exitCode === 0) return true;
+  if (exitCode === 1) return false;
+  throw new WorktreeError(
+    'git_command_failed',
+    `git check-ignore ${pathspec} (cwd=${worktreePath}) failed (exit ${exitCode}): ${stderr.trim()}`,
+  );
+}
+
+/**
+ * True iff at least one TRACKED file matches `pathspec` (`git ls-files
+ * --error-unmatch`). Exit 0 → tracked; exit 1 → the documented "did not match a
+ * known file" (not tracked); ANY OTHER exit (128 real error / -1 spawn failure) →
+ * throw — F7 must never mistake an operational git failure for "not tracked".
+ */
+export async function isPathTracked(worktreePath: string, pathspec: string): Promise<boolean> {
+  const { exitCode, stderr } = await runGitStatus(['ls-files', '--error-unmatch', '--', pathspec], worktreePath);
+  if (exitCode === 0) return true;
+  if (exitCode === 1) return false;
+  throw new WorktreeError(
+    'git_command_failed',
+    `git ls-files --error-unmatch ${pathspec} (cwd=${worktreePath}) failed (exit ${exitCode}): ${stderr.trim()}`,
+  );
+}
+
+/**
+ * Contents of `relpath` at the worktree's committed HEAD, or `undefined` when the
+ * path is GENUINELY absent from HEAD.
+ *
+ * B3 (round-2 #8): existence is determined STRUCTURALLY and LOCALE-INDEPENDENTLY.
+ * `git ls-tree HEAD -- <relpath>` exits 0 for any readable HEAD and prints a line
+ * IFF the path is a tracked entry, so an EMPTY stdout is genuine absence — decided
+ * on the exit code + emptiness, never by regex-matching an English `git show`
+ * fatal ("does not exist in …") a non-English git locale would translate and
+ * break. ANY nonzero `ls-tree` exit (a broken object store, an unreadable/absent
+ * HEAD, a spawn failure) is a real error → THROW (fail closed), never classified
+ * as "no such manifest" (which would wrongly reach the no-dependency success path).
+ * The follow-up `git show` reads the proven-present blob's bytes. `relpath` is
+ * repo-root-relative, posix-separated.
+ */
+export async function readFileAtHead(worktreePath: string, relpath: string): Promise<string | undefined> {
+  const probe = await runGitStatus(['ls-tree', '--name-only', 'HEAD', '--', relpath], worktreePath);
+  if (probe.exitCode !== 0) {
+    throw new WorktreeError(
+      'git_command_failed',
+      `git ls-tree HEAD -- ${relpath} (cwd=${worktreePath}) failed (exit ${probe.exitCode}): ${probe.stderr.trim()}`,
+    );
+  }
+  if (probe.stdout.trim().length === 0) return undefined; // genuinely absent at HEAD (locale-independent)
+  const { exitCode, stdout, stderr } = await runGitStatus(['show', `HEAD:${relpath}`], worktreePath);
+  if (exitCode === 0) return stdout;
+  throw new WorktreeError(
+    'git_command_failed',
+    `git show HEAD:${relpath} (cwd=${worktreePath}) failed (exit ${exitCode}): ${stderr.trim()}`,
+  );
 }

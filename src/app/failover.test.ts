@@ -23,6 +23,7 @@
 import { createRunFixture } from './test-support.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   assignmentId as toAssignmentId,
@@ -51,6 +52,7 @@ import {
   type TestDatabaseHandle,
 } from '../persistence/test-support.js';
 import { GitWorktreeManager } from '../worktree/index.js';
+import { resolveSha, runGit } from '../worktree/git.js';
 import { makeTempGitRepo, type TempGitRepo } from '../worktree/test-support.js';
 import {
   LimitPausedError,
@@ -119,6 +121,11 @@ const PASS_VERIFY: VerificationRunner = async (command) => ({
 interface AdapterScript {
   readonly writes?: ReadonlyArray<{ readonly relPath: string; readonly content: string }>;
   readonly turns: readonly InProcessTurnScript[];
+  /** round-5: runs in the worktree cwd at the START of this creation's turn (after
+   * `writes`, before the scripted turn) — lets a test CONTAMINATE the worktree
+   * (dirty files / move HEAD) on a verifier's failing attempt to prove the
+   * same-process re-entry resets to the bound commit. */
+  readonly beforeTurn?: (cwd: string) => void;
 }
 
 interface ResolvedByRole {
@@ -159,6 +166,7 @@ function makeRecordingFactory(scripts: {
           fs.mkdirSync(path.dirname(target), { recursive: true });
           fs.writeFileSync(target, write.content, 'utf8');
         }
+        script.beforeTurn?.(options.cwd);
         return orig(input);
       };
       return { adapter, dispose: (): Promise<void> => adapter.close() };
@@ -299,6 +307,40 @@ function loopDeps(rig: LoopRig) {
     clock: rig.db.clock,
     delay: NOOP_DELAY,
   };
+}
+
+const CONTAMINATION_GIT_ENV = {
+  GIT_AUTHOR_NAME: 'fo-tests',
+  GIT_AUTHOR_EMAIL: 'fo@harness.invalid',
+  GIT_COMMITTER_NAME: 'fo-tests',
+  GIT_COMMITTER_EMAIL: 'fo@harness.invalid',
+} as const;
+
+/** round-5: on a verifier's FAILING attempt, CONTAMINATE the worktree — write a
+ * tracked file AND move HEAD with a bogus commit — so the same-process re-entry must
+ * reset back to the bound implementation commit before verifying/provisioning. */
+function contaminateWorktree(cwd: string): void {
+  fs.mkdirSync(path.join(cwd, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, 'src', 'contamination.ts'), 'export const CONTAMINATION = true;\n');
+  execFileSync('git', ['add', '-A'], { cwd });
+  execFileSync('git', ['commit', '--no-verify', '-m', 'bogus verifier-attempt-1 commit'], {
+    cwd,
+    env: { ...process.env, ...CONTAMINATION_GIT_ENV },
+  });
+}
+
+/** After a same-process verifier re-entry: the worktree is at EXACTLY the bound
+ * implementation commit, attempt-1's contamination (moved HEAD + tracked dirt) is
+ * gone, and the run reached merge_ready (verified the correct, clean commit). */
+async function assertVerifierResetToBoundCommit(
+  rig: LoopRig,
+  result: Awaited<ReturnType<typeof runImplementVerifyLoop>>,
+): Promise<void> {
+  expect(result.outcome).toBe('merge_ready');
+  const worktreePath = rig.worktrees.handleFor(rig.assignmentId)!.worktreePath;
+  expect(await resolveSha(worktreePath, 'HEAD')).toBe(String(result.implementationCommit));
+  expect(fs.existsSync(path.join(worktreePath, 'src', 'contamination.ts'))).toBe(false);
+  expect((await runGit(['status', '--porcelain'], worktreePath)).stdout.trim()).toBe('');
 }
 
 describe.each(DRIVER_KINDS)('P4b wave 2 FAILOVER (%s)', (kind) => {
@@ -629,6 +671,49 @@ describe.each(DRIVER_KINDS)('P4b wave 2 FAILOVER (%s)', (kind) => {
     ]);
     expect(failoverAlertDetails(rig.db, rig.runId)).toHaveLength(0);
     expect(rig.service.status(rig.runId).suspension).toBe('none');
+  });
+
+  // -------------------------------------------------------------------------
+  // 8b. round-5 — a SAME-process verifier re-entry (limit failover OR bounded
+  //    auto-respawn) whose FAILING attempt-1 dirtied files AND moved HEAD must RESET
+  //    the worktree to EXACTLY the bound implementation commit before it provisions +
+  //    verifies. Without the fix the forced-verifier branch only restored the SHA
+  //    variable, so provisioning fingerprinted the moved HEAD while verification bound
+  //    the old commit (contaminated / wrong state).
+  // -------------------------------------------------------------------------
+  it('round-5 — a verifier LIMIT whose attempt-1 moved HEAD + dirtied files re-enters at the BOUND commit (reset, not the moved HEAD)', async () => {
+    const rig = await openLoopRig(kind, {
+      config: cfg({
+        failoverPolicy: 'switch_model',
+        failoverLadder: [{ harness: 'claude', model: 'haiku' }],
+        maxFailoversPerIncident: 2,
+      }),
+      implementor: [
+        { writes: [{ relPath: 'src/feature.ts', content: 'export const f = true;\n' }], turns: [IMPL_DONE] },
+      ],
+      // Attempt 1 CONTAMINATES (bogus commit + tracked dirt) then limits; the failover
+      // successor (attempt 2) passes — it must start from the reset, bound commit.
+      verifier: [{ beforeTurn: contaminateWorktree, turns: [CLAUDE_LIMIT] }, { turns: [VERIFY_PASS] }],
+    });
+
+    const result = await runImplementVerifyLoop(loopDeps(rig), loopInput(rig));
+    await assertVerifierResetToBoundCommit(rig, result);
+  });
+
+  it('round-5 — a verifier CRASH (bounded auto-respawn) whose attempt-1 moved HEAD + dirtied files re-enters at the BOUND commit', async () => {
+    const rig = await openLoopRig(kind, {
+      config: cfg({
+        failoverPolicy: 'wait', // a crash, not a limit
+        restarts: { windowMax: 5, autoRespawn: 'bounded' },
+      }),
+      implementor: [
+        { writes: [{ relPath: 'src/feature.ts', content: 'export const f = true;\n' }], turns: [IMPL_DONE] },
+      ],
+      verifier: [{ beforeTurn: contaminateWorktree, turns: [DIE] }, { turns: [VERIFY_PASS] }],
+    });
+
+    const result = await runImplementVerifyLoop(loopDeps(rig), loopInput(rig));
+    await assertVerifierResetToBoundCommit(rig, result);
   });
 
   // -------------------------------------------------------------------------

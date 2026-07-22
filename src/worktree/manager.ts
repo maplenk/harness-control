@@ -48,6 +48,23 @@ import {
 } from './paths.js';
 import { removeStaleIndexLock, validateWorktree, type ValidateWorktreeResult } from './validate.js';
 import { WorktreeError } from './errors.js';
+import {
+  defaultProvisionRuntime,
+  gcProvisionStages,
+  provisionWorktreeDeps,
+  type ProvisionGit,
+  type ProvisionOutcome,
+  type ProvisionRuntime,
+  type ProvisionStrategy,
+  type ProvisionWarnSink,
+} from './provision.js';
+
+/** F7: the real committed-HEAD / ignore git plumbing the provisioner uses. */
+const REAL_PROVISION_GIT: ProvisionGit = {
+  isPathIgnored: git.isPathIgnored,
+  isPathTracked: git.isPathTracked,
+  readFileAtHead: git.readFileAtHead,
+};
 
 export interface WorktreeManagerOptions {
   readonly primaryRepoRoot: string;
@@ -61,6 +78,24 @@ export interface WorktreeManagerOptions {
    * or shrink the acquire timeout.
    */
   readonly advisoryLease?: AdvisoryGitLease;
+  /**
+   * F7 dependency-provisioning strategy for `provisionForVerification`
+   * (config `worktree.provision`). `auto` (default) clones the primary's
+   * `node_modules` when the committed fingerprint matches and APFS is available,
+   * else `npm ci`; `clone`/`install` force a lane (both fall back to install on
+   * a non-clonable host); `none` disables managed provisioning.
+   */
+  readonly provision?: ProvisionStrategy;
+  /** F7 structured warning sink for non-fatal provisioning path notes. */
+  readonly provisionWarn?: ProvisionWarnSink;
+  /**
+   * F7 host runtime (APFS clone + `npm ci`) — injectable so tests exercise the
+   * REAL clone/rename/fail-closed/git logic while faking the two genuinely
+   * expensive host operations. Defaults to `defaultProvisionRuntime()`.
+   */
+  readonly provisionRuntime?: ProvisionRuntime;
+  /** F7 read-only git plumbing — injectable; defaults to the real `git.ts`. */
+  readonly provisionGit?: ProvisionGit;
 }
 
 export interface WorktreeHandle {
@@ -111,18 +146,33 @@ export class GitWorktreeManager {
   readonly #handles = new Map<AssignmentId, WorktreeHandle>();
   readonly #leasedPaths = new Set<string>();
   readonly #taints = new Map<AssignmentId, Set<WorktreeTaint>>();
+  // F7 dependency provisioning.
+  readonly #provisionStrategy: ProvisionStrategy;
+  readonly #provisionRuntime: ProvisionRuntime;
+  readonly #provisionGit: ProvisionGit;
+  readonly #provisionWarn?: ProvisionWarnSink;
 
   private constructor(
     clock: Clock,
     primaryRepoRoot: string,
     baseDirStrategy: WorktreeBaseDirStrategy,
     advisoryLease: AdvisoryGitLease,
+    provision: {
+      readonly strategy: ProvisionStrategy;
+      readonly runtime: ProvisionRuntime;
+      readonly git: ProvisionGit;
+      readonly warn?: ProvisionWarnSink;
+    },
   ) {
     this.#clock = clock;
     this.#primaryRepoRoot = primaryRepoRoot;
     this.#baseDir = resolveBaseDir(primaryRepoRoot, baseDirStrategy);
     this.#mutex = new GitOpMutex(clock);
     this.#advisoryLease = advisoryLease;
+    this.#provisionStrategy = provision.strategy;
+    this.#provisionRuntime = provision.runtime;
+    this.#provisionGit = provision.git;
+    if (provision.warn !== undefined) this.#provisionWarn = provision.warn;
   }
 
   static async open(options: WorktreeManagerOptions): Promise<GitWorktreeManager> {
@@ -140,6 +190,12 @@ export class GitWorktreeManager {
       topLevel,
       options.baseDirStrategy ?? DEFAULT_BASE_DIR_STRATEGY,
       advisoryLease,
+      {
+        strategy: options.provision ?? 'auto',
+        runtime: options.provisionRuntime ?? defaultProvisionRuntime(),
+        git: options.provisionGit ?? REAL_PROVISION_GIT,
+        ...(options.provisionWarn !== undefined ? { warn: options.provisionWarn } : {}),
+      },
     );
   }
 
@@ -149,6 +205,15 @@ export class GitWorktreeManager {
 
   get baseDir(): string {
     return this.#baseDir;
+  }
+
+  /** F7 dependency-provisioning strategy this manager runs (config
+   * `worktree.provision`). The loop driver reads it to decide whether the
+   * implementor commit must EXCLUDE `node_modules` (active — a provisioned,
+   * git-ignored toolchain must never enter HEAD) or keep normal `git add -A`
+   * semantics (`'none'` — the operator owns node_modules; round-2 #3). */
+  get provisionStrategy(): ProvisionStrategy {
+    return this.#provisionStrategy;
   }
 
   // -------------------------------------------------------------------
@@ -353,6 +418,12 @@ export class GitWorktreeManager {
           worktreePath: handle.worktreePath,
           ...(checkpointWorktreeState !== undefined ? { checkpointWorktreeState } : {}),
           wipCommitMessage: `harness-orchestration: WIP reconciliation (assignment ${String(assignmentId)}, ${this.#clock.nowIso()})`,
+          // F7 (#1): a WIP/dirty-recovery commit here must EXCLUDE node_modules whenever
+          // managed provisioning is ACTIVE — the SAME exclusion the implementor commit
+          // uses — so a provisioned, git-ignored toolchain can never enter a §16.3
+          // reconciliation commit even if the target repo's ignore rule was removed.
+          // Derived from THIS manager's real strategy; `'none'` keeps plain `git add -A`.
+          excludeNodeModulesFromWip: this.#provisionStrategy !== 'none',
         }),
       )
       .then((result) => {
@@ -406,6 +477,49 @@ export class GitWorktreeManager {
   }
 
   /**
+   * F7 (spec §2.2) — provision `<worktree>/node_modules` for the COMMITTED HEAD
+   * at the post-commit / pre-verification boundary. A single COMPOSITE operation
+   * held under BOTH the in-process mutex AND the cross-process advisory lease (the
+   * exact wrappers `createWorktree`/`removeWorktree` use — codex v2 HIGH-5: one
+   * lock around the whole reconcile→provision, never scattered across
+   * reattach/reacquire), so a concurrent worktree op on this repo (or a second OS
+   * process) can never race the tree swap.
+   *
+   * Returns a PROVEN outcome (a real git-ignored `node_modules` matching the
+   * committed dependency fingerprint, a trivially-true no-dependency skip, or the
+   * `none` opt-out) or REJECTS with `WorktreeError{kind:'provisioning_failed'}` —
+   * the caller then FAILS CLOSED (no host self-check, no verifier dispatch, no
+   * `merge_ready`). Idempotent: a second call for an unchanged fingerprint
+   * short-circuits on the marker. Does NOT require the single-writer lease (it
+   * writes only the git-ignored `node_modules`, never tracked work), so it runs
+   * for the read-only verifier after the lease is released.
+   *
+   * `async` for the same reason as `createWorktree`: `#requireHandle` throws
+   * synchronously and must surface as a rejection at the call site.
+   */
+  async provisionForVerification(assignmentId: AssignmentId): Promise<ProvisionOutcome> {
+    const handle = this.#requireHandle(assignmentId);
+    return this.#mutex.runExclusive(
+      this.#primaryRepoRoot,
+      'other',
+      { assignmentId, worktreePath: handle.worktreePath },
+      () =>
+        this.#advisoryLease.withLease(() =>
+          provisionWorktreeDeps({
+            assignmentId: String(assignmentId),
+            worktreePath: handle.worktreePath,
+            primaryRepoRoot: this.#primaryRepoRoot,
+            baseDir: this.#baseDir,
+            strategy: this.#provisionStrategy,
+            runtime: this.#provisionRuntime,
+            git: this.#provisionGit,
+            ...(this.#provisionWarn !== undefined ? { warn: this.#provisionWarn } : {}),
+          }),
+        ),
+    );
+  }
+
+  /**
    * Physically deletes the worktree + branch checkout (final cleanup —
    * post-merge-ready or run-cancelled). Bookkeeping is cleared ONLY on
    * success (including the idempotent "already gone on disk" case) — a
@@ -429,6 +543,11 @@ export class GitWorktreeManager {
             await git.worktreeRemove(this.#primaryRepoRoot, handle.worktreePath, options.force ?? true);
           }
           await git.worktreePrune(this.#primaryRepoRoot).catch(() => undefined);
+          // F7 (§2.5): GC this assignment's out-of-worktree provisioning stages.
+          // Only this manager's own `<baseDir>/.provision/<slug>/` — never the
+          // primary checkout's `node_modules` (a COW copy the worktree owned). The
+          // worktree is being deleted, so no `old-*` restore applies here.
+          gcProvisionStages(this.#baseDir, String(assignmentId), undefined, this.#provisionWarn);
           this.#handles.delete(assignmentId);
           this.#leasedPaths.delete(handle.worktreePath);
           this.#taints.delete(assignmentId);

@@ -67,6 +67,16 @@ export interface ValidateWorktreeInput {
   readonly wipCommitMessage?: string;
   /** Author/committer env for the WIP commit — never relies on ambient git config (see `git.commitAll`). */
   readonly wipCommitEnv?: Readonly<Record<string, string>>;
+  /**
+   * F7 (#1): when true, the WIP/dirty-recovery commit EXCLUDES `node_modules`
+   * (`addAllExceptNodeModules`) — the SAME exclusion the implementor commit uses, so
+   * a provisioned, git-ignored toolchain can never enter a §16.3 reconciliation
+   * commit even if the target repo's ignore rule was removed. The manager sets this
+   * to `provisionStrategy !== 'none'`; under `'none'` (the operator owns
+   * node_modules) it stays false so legitimately-tracked node_modules changes are
+   * preserved. Default false — non-F7 callers keep plain `git add -A`.
+   */
+  readonly excludeNodeModulesFromWip?: boolean;
 }
 
 export interface ValidateWorktreeResult {
@@ -148,8 +158,23 @@ async function commitWip(
   worktreePath: string,
   message: string | undefined,
   extraEnv: Readonly<Record<string, string>> | undefined,
+  excludeNodeModules: boolean,
 ): Promise<string | undefined> {
-  await git.addAll(worktreePath);
+  // F7 (#1): while managed provisioning is ACTIVE, a reconciliation WIP commit must
+  // EXCLUDE node_modules (a provisioned, git-ignored toolchain must never enter a
+  // commit even if the target repo's ignore rule was removed) — the SAME exclusion
+  // the implementor commit uses. Under provision='none' (the operator owns
+  // node_modules) keep full `git add -A` so legitimately-tracked node_modules
+  // changes are preserved (round-2 #3). For a repo with no node_modules the two are
+  // identical. round-4 #3: unstage any ALREADY-STAGED node_modules FIRST — the
+  // exclusion pathspec only prevents ADDING it, not removing an index entry an
+  // interrupted implementor / a verification command already staged.
+  if (excludeNodeModules) {
+    await git.unstageNodeModules(worktreePath);
+    await git.addAllExceptNodeModules(worktreePath);
+  } else {
+    await git.addAll(worktreePath);
+  }
   const result = await git.commitAll(worktreePath, message ?? DEFAULT_WIP_MESSAGE, extraEnv ?? DEFAULT_WIP_ENV);
   return result.sha;
 }
@@ -203,7 +228,7 @@ export async function validateWorktree(input: ValidateWorktreeInput): Promise<Va
         'No prior checkpoint to reconcile against; worktree is clean.',
       );
     }
-    const wipSha = await commitWip(worktreePath, input.wipCommitMessage, input.wipCommitEnv);
+    const wipSha = await commitWip(worktreePath, input.wipCommitMessage, input.wipCommitEnv, input.excludeNodeModulesFromWip ?? false);
     const after = await readCurrentState(worktreePath);
     return buildResult(
       'wip_committed',
@@ -250,7 +275,7 @@ export async function validateWorktree(input: ValidateWorktreeInput): Promise<Va
     );
   }
 
-  const wipSha = await commitWip(worktreePath, input.wipCommitMessage, input.wipCommitEnv);
+  const wipSha = await commitWip(worktreePath, input.wipCommitMessage, input.wipCommitEnv, input.excludeNodeModulesFromWip ?? false);
   const after = await readCurrentState(worktreePath);
   return buildResult(
     'wip_committed',

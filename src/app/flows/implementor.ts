@@ -113,11 +113,13 @@ import {
 } from '../../adapters/index.js';
 import {
   addAll,
+  addAllExceptNodeModules,
   commitAll,
   porcelainPaths,
   resolveSha,
   runGit,
   statusPorcelain,
+  unstageNodeModules,
   WorktreeError,
   type GitWorktreeManager,
   type WorktreeHandle,
@@ -542,6 +544,28 @@ async function detectPrimaryCheckoutDrift(
   };
 }
 
+/**
+ * F7 (spec §2.4): the post-commit dependency provisioning could not PROVE a real,
+ * git-ignored `node_modules` for the committed manifests, so the round FAILS
+ * CLOSED — the host self-check runner is skipped (no `tsc`/`vitest` inherited from
+ * a global PATH could green it) and the loop driver halts before verifier dispatch
+ * with the terminal `provisioning_failed` outcome. The detail is operator-actionable
+ * (which repo, which failure) and redacted (it feeds durable sinks / stderr).
+ */
+export interface ProvisioningFailure {
+  readonly kind: 'provisioning_failed';
+  /** The primary checkout root whose worktree could not be provisioned. */
+  readonly repoRoot: string;
+  readonly worktreePath: string;
+  /** Redacted, operator-actionable summary (ignore-rule / clone-vs-install / install failure). */
+  readonly detail: string;
+  /** F7 (M9): the loop round that failed (the loop driver fills this in). */
+  readonly round?: number;
+  /** F7 (M9): the actual committed HEAD at the point of failure (host-read; the
+   * loop driver fills this in so reporting is never stale). */
+  readonly implementationCommit?: GitSha;
+}
+
 export interface RunnerViolationEventInput {
   readonly runId: RunId;
   readonly assignmentId: AssignmentId;
@@ -625,6 +649,28 @@ export interface ImplementorFlowOptions {
   readonly maxDiffBytes?: number;
   /** Pass-through streaming observer (updates are collected first, then forwarded). */
   readonly onUpdate?: (update: SessionUpdate) => void;
+  /**
+   * F7 (spec §2.1): provision `node_modules` at the post-commit boundary, invoked
+   * AFTER the implementor commit and BEFORE the host self-check runner (the
+   * declared verification commands). Idempotent + composite (the manager's
+   * `provisionForVerification`, mutex + advisory-lease held). When it REJECTS the
+   * flow FAILS CLOSED: the self-check runner is skipped and the result carries
+   * `provisioningFailed` for the loop driver to halt on. Absent → legacy behavior
+   * (no provisioning), so pre-F7 callers/tests are unchanged.
+   */
+  readonly provisionForVerification?: () => Promise<unknown>;
+  /**
+   * F7 (round-2 #3): whether managed dependency provisioning is ACTIVE for this
+   * worktree (config `worktree.provision !== 'none'`). When active, the §8 commit
+   * EXCLUDES `node_modules` (`addAllExceptNodeModules`) — a provisioned,
+   * git-ignored toolchain must never enter HEAD even if the target repo's ignore
+   * rule is missing. When INACTIVE (`'none'`, the operator owns node_modules), the
+   * commit keeps normal `git add -A` semantics so a repo that legitimately tracks
+   * node_modules changes still commits them. Defaults to `true` (exclude) —
+   * matching the F7 default strategy; the loop driver / `runImplementor` pass the
+   * manager's real strategy so only `'none'` opts out.
+   */
+  readonly provisionActive?: boolean;
 }
 
 export interface VerificationCommandResult {
@@ -670,6 +716,11 @@ export interface ImplementorResult {
    * the loop driver records the durable incident event and the §16 readiness
    * gate blocks on it. */
   readonly runnerViolation?: VerificationRunnerViolation;
+  /** F7 (spec §2.4): post-commit dependency provisioning failed — the host
+   * self-check runner was SKIPPED (fail closed) and the loop driver halts before
+   * verifier dispatch with the terminal `provisioning_failed` outcome. Forces
+   * `verificationPassed:false`. */
+  readonly provisioningFailed?: ProvisioningFailure;
   /** W1-F4: the verification commands left the worktree dirty AFTER the
    * recorded commit — that content is in NO commit, so the §16 readiness
    * gate blocks merge on it. */
@@ -906,7 +957,23 @@ export class ImplementorFlow {
     const commitEnv = this.#options.commitEnv ?? IMPLEMENTOR_COMMIT_ENV;
     const commitMessage = this.#options.commitMessage ?? defaultCommitMessage(handle, this.#context);
 
-    await addAll(cwd);
+    // F7 (B1): while provisioning is ACTIVE, stage everything EXCEPT node_modules —
+    // a provisioned (git-ignored) toolchain must never enter the commit, even if the
+    // target repo's ignore rule is missing or was removed. Provisioning independently
+    // fails closed on an unignored/tracked node_modules; this keeps it out of HEAD
+    // regardless. Round-2 #3: under `worktree.provision='none'` (provisioning
+    // inactive, the operator owns node_modules) keep normal `git add -A` semantics so
+    // a repo that legitimately tracks node_modules changes still commits them.
+    const provisionActive = this.#options.provisionActive ?? true;
+    if (provisionActive) {
+      // round-4 #3: unstage any ALREADY-STAGED node_modules FIRST (the exclusion
+      // pathspec only prevents adding it, not removing an existing index entry), then
+      // stage everything else — so a pre-staged provisioned tree can never enter HEAD.
+      await unstageNodeModules(cwd);
+      await addAllExceptNodeModules(cwd);
+    } else {
+      await addAll(cwd);
+    }
     const commit = await commitAll(cwd, commitMessage, commitEnv);
 
     // Capture the base→HEAD delta from the now-clean committed tree, BEFORE
@@ -923,10 +990,37 @@ export class ImplementorFlow {
     // cutting an already-redacted marker is harmless.
     const bounded = boundText(redactText(rawDiff), this.#options.maxDiffBytes ?? DEFAULT_MAX_DIFF_BYTES);
 
+    // --- F7 (§2.1): provision node_modules at the post-commit boundary, BEFORE
+    // any host command. Idempotent + composite (manager `provisionForVerification`,
+    // mutex + advisory-lease held). A rejection FAILS CLOSED: skip the self-check
+    // runner entirely (a global `tsc`/`vitest` on PATH must never green a round
+    // whose local provisioning did not happen) and carry the typed failure so the
+    // loop driver halts before verifier dispatch. --------------------------------
+    let provisioningFailed: ProvisioningFailure | undefined;
+    if (this.#options.provisionForVerification !== undefined) {
+      try {
+        await this.#options.provisionForVerification();
+      } catch (error) {
+        provisioningFailed = {
+          kind: 'provisioning_failed',
+          repoRoot: handle.repoRoot,
+          worktreePath: cwd,
+          detail: redactText(
+            error instanceof WorktreeError
+              ? (error.detail ?? error.message)
+              : error instanceof Error
+                ? error.message
+                : String(error),
+          ),
+        };
+      }
+    }
+
     // --- Run the spec's declared verification commands (§8) -----------------
     const runVerification = this.#options.runVerification ?? defaultVerificationRunner();
     const maxOutputBytes = this.#options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
-    const commands = resolveVerificationCommands(this.#context);
+    // Fail closed: no host command runs when provisioning could not be proven.
+    const commands = provisioningFailed === undefined ? resolveVerificationCommands(this.#context) : [];
     // W3-1 layer 2: snapshot the PRIMARY checkout (HEAD + porcelain) BEFORE
     // the commands run — drift across them is a confinement violation. A
     // failing snapshot here propagates: a pre-existing broken primary is an
@@ -984,9 +1078,12 @@ export class ImplementorFlow {
       diffTruncated: bounded.truncated,
       verification,
       // W3-1: a runner violation fails verification even when every command
-      // exited 0 — a poisoned round must never read as self-check-passed.
-      verificationPassed: verification.every((v) => v.passed) && runnerViolation === undefined,
+      // exited 0 — a poisoned round must never read as self-check-passed. F7: a
+      // provisioning failure likewise never reads as passed (no command ran).
+      verificationPassed:
+        provisioningFailed === undefined && verification.every((v) => v.passed) && runnerViolation === undefined,
       ...(runnerViolation !== undefined ? { runnerViolation } : {}),
+      ...(provisioningFailed !== undefined ? { provisioningFailed } : {}),
       postVerificationDirty: postStatus.trim().length > 0,
       postVerificationDirtyFiles,
       committed: commit.committed,
@@ -1090,6 +1187,23 @@ export async function runImplementor(
       `runImplementor requires baseCommit to be an exact 40-character lowercase commit SHA; got ${JSON.stringify(input.baseCommit)}`,
     );
   }
+  // F7 (#6): the commit's node_modules exclusion MUST match the manager's ACTUAL
+  // provisioning strategy — an active-provisioning run can never commit with
+  // unrestricted `git add -A` (it would stage the provisioned, git-ignored toolchain
+  // into HEAD, even though this standalone path also installs the manager's default
+  // provisioning callback below). Derive the flag from the manager and REJECT a
+  // caller override that CONTRADICTS it (the main loop threads this correctly; this
+  // public standalone path must not let an override silently re-open the hole).
+  const managerProvisionActive = deps.worktrees.provisionStrategy !== 'none';
+  const overrideProvisionActive = input.options?.provisionActive;
+  if (overrideProvisionActive !== undefined && overrideProvisionActive !== managerProvisionActive) {
+    throw new WorktreeError(
+      'provisioning_failed',
+      `runImplementor: provisionActive override (${overrideProvisionActive}) contradicts the manager's ` +
+        `provisioning strategy '${deps.worktrees.provisionStrategy}' (active=${managerProvisionActive}); refusing — ` +
+        'an active-provisioning run must exclude node_modules from the implementor commit (never unrestricted `git add -A`).',
+    );
+  }
   const pinnedWorkspace = await deps.service.assertOrPinLegacyCleanWorkspace(input.runId);
   if (String(input.baseCommit) !== String(pinnedWorkspace.pinnedSha)) {
     throw new WorktreeError(
@@ -1101,7 +1215,20 @@ export async function runImplementor(
     assignmentId: input.assignmentId,
     baseCommit: input.baseCommit,
   });
-  const flow = new ImplementorFlow(handle, input.context, input.options ?? {});
+  // F7 (§2.1): provision deps at the post-commit boundary (fail closed on failure).
+  // An explicit caller-supplied callback wins; otherwise default to the manager's
+  // composite `provisionForVerification` for this assignment.
+  const flow = new ImplementorFlow(handle, input.context, {
+    ...(input.options ?? {}),
+    // Round-2 #3 / #6: the commit excludes node_modules exactly when the manager's
+    // provisioning is ACTIVE; `'none'` keeps normal `git add -A`. DERIVED from the
+    // manager (a contradicting caller override was already rejected above), so this
+    // standalone path can never commit a provisioned tree into HEAD.
+    provisionActive: managerProvisionActive,
+    provisionForVerification:
+      input.options?.provisionForVerification ??
+      (() => deps.worktrees.provisionForVerification(input.assignmentId)),
+  });
   const runner: RoleRunner<ImplementorResult> = {
     role: 'implementor',
     allowedShellCommands: flow.allowedShellCommands,

@@ -53,6 +53,7 @@ import type { AcceptanceCriterion, CheckpointContent, MergeReadiness } from '../
 import type { RunPhase } from '../../domain/state.js';
 import * as git from '../../worktree/git.js';
 import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
+import { redactText } from '../../redaction/index.js';
 import type { RoleModelSpec } from '../model-resolution.js';
 import {
   AutoRespawnSignal,
@@ -71,6 +72,7 @@ import {
   type ImplementorContext,
   type ImplementorFlowOptions,
   type ImplementorResult,
+  type ProvisioningFailure,
   type VerificationRunner,
 } from './implementor.js';
 import {
@@ -204,8 +206,16 @@ export interface LoopRound {
 
 /** W2-2: `integration_blocked` = criteria verified, ONLY user-actionable §16
  * blockers remain — the run REMAINS in `verifying` (no remediation round
- * consumed); `harness recheck` re-probes toward T24. */
-export type LoopOutcome = 'merge_ready' | 'needs_remediation' | 'failed' | 'integration_blocked';
+ * consumed); `harness recheck` re-probes toward T24.
+ * F7: `provisioning_failed` = the post-commit dependency provisioning could not be
+ * PROVEN, so the round HALTED before any host self-check or verifier dispatch (no
+ * `merge_ready` possible) — an operator-actionable environment failure. */
+export type LoopOutcome =
+  | 'merge_ready'
+  | 'needs_remediation'
+  | 'failed'
+  | 'integration_blocked'
+  | 'provisioning_failed';
 
 export interface ImplementVerifyLoopResult {
   readonly rounds: readonly LoopRound[];
@@ -220,6 +230,9 @@ export interface ImplementVerifyLoopResult {
    * the `integration_blocked` outcome (W2-2), the user-actionable blockers
    * the human must clear before `harness recheck`. */
   readonly mergeReadiness?: MergeReadiness;
+  /** F7: present iff `outcome === 'provisioning_failed'` — the operator-actionable
+   * detail of the dependency-provisioning failure that halted the round. */
+  readonly provisioningFailure?: ProvisioningFailure;
 }
 
 /** Phases a W2-5 resume re-entry may find the run at (`approved` covers a
@@ -374,8 +387,32 @@ async function adoptWorktree(
     });
   };
 
-  if (resume.round.role === 'verifier') {
-    const forced = resume.round.implementationCommit;
+  // #1: a COMPLETED implementor round re-enters at VERIFICATION (resolveResumeEntry
+  // → first: 'verify') exactly like a verifier round — its deliverable is already
+  // durably committed. So, like the verifier, FORCE the worktree to the EXACT
+  // implementation commit and DISCARD any post-commit dirt (verifier evidence,
+  // provisioning residue, an un-ignored node_modules) — NEVER WIP-commit it. Doing
+  // otherwise (the old `validate()` path) would WIP-commit that dirt onto a new HEAD,
+  // corrupting the branch and making unadjudicated dirt the verifier's binding. An
+  // INTERRUPTED implementor round (first: 'implement') still takes the §16.3
+  // WIP-commit-or-reset path below, so partial work is preserved.
+  const completedImplementorResume =
+    resume.round.role === 'implementor' && resume.round.stage === 'completed';
+  if (resume.round.role === 'verifier' || completedImplementorResume) {
+    const persisted = facts.lastImplementationCommit;
+    const forced =
+      resume.round.role === 'verifier'
+        ? resume.round.implementationCommit
+        : // The persisted host-verified implementation commit — used ONLY when it was
+          // recorded FOR THIS round (#1, round-4: round-scoped). Otherwise (never
+          // recorded, OR a STALE record left by an earlier round whose successor
+          // completed at a NEW commit but crashed before updating it) fall back to the
+          // current worktree HEAD, which is exactly the resuming completed round's
+          // durable commit — no WIP commit has run yet at adoption. Never reset/verify
+          // a commit from a DIFFERENT round.
+          persisted !== undefined && persisted.round === resume.round.round
+          ? persisted.commit
+          : gitSha(await git.resolveSha(facts.worktreePath, 'HEAD'));
     if (forced === undefined) {
       throw new LoopCompositionError(
         'resume re-entry of a verifier round requires its persisted implementationCommit (W2-5 immutable binding)',
@@ -384,7 +421,10 @@ async function adoptWorktree(
     await worktrees.discardToCommit(input.assignmentId, forced);
     recordValidation(
       'clean',
-      `verifier resume: worktree forced to ${String(forced)}; verifier dirt discarded, clean asserted`,
+      resume.round.role === 'verifier'
+        ? `verifier resume: worktree forced to ${String(forced)}; verifier dirt discarded, clean asserted`
+        : `completed-implementor resume: worktree forced to the persisted implementation commit ${String(forced)}; ` +
+            'post-commit dirt discarded, clean asserted (never WIP-committed)',
     );
   } else {
     const validation = await worktrees.validate(input.assignmentId, resume.checkpoint?.worktree);
@@ -454,6 +494,10 @@ export async function runImplementVerifyLoop(
   const rounds: LoopRound[] = [];
   let mergeReadiness: MergeReadiness | undefined;
   let integrationBlocked = false;
+  // F7: set when a round's post-commit dependency provisioning could not be proven
+  // — the loop HALTS before the verifier and returns the terminal
+  // `provisioning_failed` outcome (no `merge_ready` possible).
+  let provisioningFailure: ProvisioningFailure | undefined;
   let implementationCommit!: GitSha;
   try {
     let destinationLabel: string;
@@ -575,7 +619,18 @@ export async function runImplementVerifyLoop(
           persistedScope !== undefined
             ? { ...buildRoundContext(input, round, []), taskScope: persistedScope }
             : buildRoundContext(input, round, fixRequests);
-        const flow = new ImplementorFlow(handle, context, buildImplementorOptions(input));
+        // F7 (§2.1): provision deps at the post-commit / pre-self-check boundary,
+        // keyed to the manifests the implementor JUST committed. The composite,
+        // idempotent, mutex+lease-held manager op is run from inside the flow after
+        // the commit; a failure fails closed (self-check skipped, `provisioningFailed`
+        // carried out for the halt below).
+        const flow = new ImplementorFlow(handle, context, {
+          ...buildImplementorOptions(input),
+          // Round-2 #3: exclude node_modules from the commit only while provisioning
+          // is active; `worktree.provision='none'` keeps normal `git add -A`.
+          provisionActive: worktrees.provisionStrategy !== 'none',
+          provisionForVerification: () => worktrees.provisionForVerification(input.assignmentId),
+        });
         // F2: wrap the flow with the deliverable adjudicator — `runRole` persists
         // the verdict ATOMICALLY at round completion (no `completed`-then-overwrite
         // crash window a resume could read as "verify next"). The adjudicator reads
@@ -625,6 +680,32 @@ export async function runImplementVerifyLoop(
         // fresh limit later restarts the ladder from the top).
         service.resetFailoverIncident(input.runId, input.assignmentId);
 
+        // The verifier binds to the EXACT commit — read the worktree HEAD
+        // OURSELVES (§8: never trust the agent's claimed SHA). After a round that
+        // committed nothing new, HEAD is unchanged from the prior round. F2: the
+        // deliverable gate ran INSIDE runRole (the adjudicator above), ATOMIC with
+        // round completion — a no_deliverable round threw `NoDeliverableError` and
+        // never reaches here, so we only get here for a round that delivered (or a
+        // legitimate fresh zero-diff no-op).
+        implementationCommit = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
+        // F7 (#1): PERSIST this host-verified implementation commit (ROUND-SCOPED)
+        // BEFORE the fail-closed break so a completed implementor round that later
+        // RESUMES (re-entering at verification) resets the adopted worktree to EXACTLY
+        // it — never WIP-committing post-commit dirt onto a new, unadjudicated HEAD.
+        recordImplementationCommit(deps, input, round, implementationCommit);
+
+        // F7 (§2.4) FAIL CLOSED: the implementor's post-commit provisioning could
+        // not be proven, so its self-check runner was already skipped. HALT the
+        // round here — before verifier dispatch — with the terminal
+        // `provisioning_failed` outcome. No verifier, no `merge_ready`; a global
+        // `tsc`/`vitest` on PATH can never green this run. M9: `implementationCommit`
+        // is the ACTUAL committed HEAD read above, never stale (the implementor DID
+        // commit before provisioning ran).
+        if (implementation.provisioningFailed !== undefined) {
+          provisioningFailure = { ...implementation.provisioningFailed, round, implementationCommit };
+          break;
+        }
+
         // W3-1: the confinement guard's primary-checkout drift is a durable
         // INCIDENT — append it NOW (before the verifier round renders any
         // verdict), then thread the violation into the §16 readiness gate
@@ -643,19 +724,23 @@ export async function runImplementVerifyLoop(
             }),
           );
         }
-
-        // The verifier binds to the EXACT commit — read the worktree HEAD
-        // ourselves (§8: never trust the agent's claimed SHA). After a round
-        // that committed nothing new, HEAD is unchanged from the prior round.
-        // F2: the deliverable gate now runs INSIDE runRole (the adjudicator
-        // above), ATOMIC with round completion — a no_deliverable round threw
-        // `NoDeliverableError` and never reaches here, so we only get here for a
-        // round that delivered (or a legitimate fresh zero-diff no-op).
-        implementationCommit = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
       } else if (forcedVerifierRound !== undefined) {
-        // Adoption already forced the worktree to this exact commit and
-        // asserted clean; the binding below re-states it immutably.
-        implementationCommit = forcedVerifierRound.implementationCommit!;
+        const boundCommit = forcedVerifierRound.implementationCommit;
+        if (boundCommit === undefined) {
+          throw new LoopCompositionError(
+            "forced verifier re-entry requires the round's persisted implementationCommit (immutable binding)",
+          );
+        }
+        // round-5: FORCE the worktree to EXACTLY the bound implementation commit and
+        // DISCARD any dirt BEFORE provisioning/dispatch — the SAME guarantee
+        // cross-process adoption (`adoptWorktree`) gives. A SAME-process verifier
+        // failover / bounded auto-respawn whose prior attempt moved HEAD or dirtied
+        // files would otherwise be PROVISIONED + VERIFIED against a contaminated /
+        // wrong state (provisioning fingerprints the current HEAD while the binding
+        // is the old commit; the §16 readiness probe is too late). Idempotent for the
+        // cross-process path (`adoptWorktree` already discarded to this commit).
+        await worktrees.discardToCommit(input.assignmentId, boundCommit);
+        implementationCommit = boundCommit;
         if (worktrees.handleFor(input.assignmentId)?.leased === true) {
           worktrees.releaseLease(input.assignmentId); // the verifier reads, never writes
         }
@@ -667,6 +752,22 @@ export async function runImplementVerifyLoop(
         if (worktrees.handleFor(input.assignmentId)?.leased === true) {
           worktrees.releaseLease(input.assignmentId);
         }
+      }
+
+      // --- F7 (§2.1): the ONE unconditional pre-dispatch ensure covering the
+      // VERIFIER for EVERY entry — fresh, remediation, resume-after-discardToCommit,
+      // and verifier failover/auto-respawn (which skip the implementor branch). The
+      // manager op is idempotent: after a same-round implementor round already
+      // provisioned the matching fingerprint this short-circuits on the marker;
+      // otherwise (skipImplement paths, or a discardToCommit that changed HEAD) it
+      // does the real work against the forced/committed HEAD. A rejection FAILS
+      // CLOSED — no verifier dispatch, no `merge_ready`. -------------------------
+      try {
+        await worktrees.provisionForVerification(input.assignmentId);
+      } catch (error) {
+        // M9: implementationCommit is already the host-read HEAD for this round.
+        provisioningFailure = { ...toProvisioningFailure(error, handle), round, implementationCommit };
+        break;
       }
 
       // --- Independently verify (T23/T24). W2-3 split: the run stays at
@@ -832,12 +933,19 @@ export async function runImplementVerifyLoop(
   return {
     rounds,
     finalPhase,
-    // W2-2: the blocked path leaves the phase at `verifying` on purpose — the
-    // outcome carries the distinction the phase alone cannot.
-    outcome: integrationBlocked ? 'integration_blocked' : outcomeOf(finalPhase),
+    // W2-2 / F7: the blocked and provisioning-failed paths leave the phase where it
+    // was (no false advance) — the outcome carries the distinction the phase alone
+    // cannot. `provisioning_failed` takes precedence (the round never verified).
+    outcome:
+      provisioningFailure !== undefined
+        ? 'provisioning_failed'
+        : integrationBlocked
+          ? 'integration_blocked'
+          : outcomeOf(finalPhase),
     worktree: handle,
     implementationCommit,
     ...(mergeReadiness !== undefined ? { mergeReadiness } : {}),
+    ...(provisioningFailure !== undefined ? { provisioningFailure } : {}),
   };
 }
 
@@ -848,6 +956,47 @@ function outcomeOf(phase: RunPhase): LoopOutcome {
   if (phase === 'merge_ready') return 'merge_ready';
   if (phase === 'failed') return 'failed';
   return 'needs_remediation';
+}
+
+/** F7: normalize a verifier-boundary `provisionForVerification` rejection into the
+ * typed, operator-actionable `ProvisioningFailure` the loop result carries. #7: the
+ * detail is REDACTED before it crosses into the durable failure the CLI prints
+ * (commands.ts) — the SAME redaction the implementor-boundary path (implementor.ts)
+ * already applies, so a secret-shaped install/clone error at the VERIFIER boundary is
+ * never surfaced raw. Exported for a focused redaction unit test. */
+export function toProvisioningFailure(error: unknown, handle: WorktreeHandle): ProvisioningFailure {
+  const detail =
+    error instanceof WorktreeError ? (error.detail ?? error.message) : error instanceof Error ? error.message : String(error);
+  return {
+    kind: 'provisioning_failed',
+    repoRoot: handle.repoRoot,
+    worktreePath: handle.worktreePath,
+    detail: redactText(detail),
+  };
+}
+
+/**
+ * F7 (#1): persist the host-verified implementation commit onto the loop's durable
+ * worktree facts so a COMPLETED implementor round that later RESUMES (re-entering at
+ * verification) can RESET the adopted worktree to EXACTLY it — never WIP-committing
+ * post-commit dirt (provisioning residue / an un-ignored node_modules) onto a new,
+ * unadjudicated HEAD (see `adoptWorktree`). A no-op when the loop state / its worktree
+ * facts are not yet persisted (never the case once the worktree exists).
+ */
+function recordImplementationCommit(
+  deps: ImplementVerifyLoopDeps,
+  input: ImplementVerifyLoopInput,
+  round: number,
+  commit: GitSha,
+): void {
+  const loopState = deps.service.getImplementVerifyLoopState(input.runId);
+  if (loopState?.worktree === undefined) return;
+  deps.service.saveImplementVerifyLoopState(input.runId, {
+    ...loopState,
+    // ROUND-SCOPED so a resume can only trust it for the SAME round (#1, round-4):
+    // a record left stale by an earlier round never resets/verifies the wrong commit.
+    worktree: { ...loopState.worktree, lastImplementationCommit: { round, commit } },
+  });
 }
 
 function ensureLeased(worktrees: GitWorktreeManager, assignmentId: AssignmentId): void {

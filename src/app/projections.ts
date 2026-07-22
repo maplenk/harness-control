@@ -292,6 +292,23 @@ export interface WorktreeFactsState {
     readonly wipCommitSha?: GitSha;
     readonly at: IsoTimestamp;
   };
+  /**
+   * F7 (#1): the last HOST-verified implementation commit the loop read after a
+   * completed implementor round (host-read worktree HEAD, never agent-claimed),
+   * ROUND-SCOPED. A completed-round resume (which re-enters at VERIFICATION) RESETS
+   * the adopted worktree to EXACTLY this commit — never WIP-commits post-commit dirt
+   * (provisioning residue / an un-ignored node_modules) onto a new, unadjudicated
+   * HEAD. The `round` binds the commit to the round that produced it: it is used ONLY
+   * when it equals the resuming round, so a record left STALE by an EARLIER round (a
+   * later round durably completed at a NEW commit but crashed before updating this)
+   * can never reset/verify the WRONG commit — resume falls back to the current HEAD
+   * (which is exactly that later round's durable commit). Absent until the first
+   * implementor round completes.
+   */
+  readonly lastImplementationCommit?: {
+    readonly round: number;
+    readonly commit: GitSha;
+  };
 }
 
 /**

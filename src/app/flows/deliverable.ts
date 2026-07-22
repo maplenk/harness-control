@@ -8,6 +8,16 @@ export function adjudicateImplementorDeliverable(
   round: number,
   hostHead: GitSha,
 ): RoleRoundOutcome {
+  // F7 (round-2 #6): a post-commit provisioning failure is adjudicated on the
+  // DELIVERABLE alone — it must NOT override the abnormal/no-commit verdict. When
+  // the implementor DID deliver (a real committed HEAD), the round is `completed`
+  // and the loop driver still HALTS on `result.provisioningFailed` with the terminal
+  // `provisioning_failed` outcome. When the round did NOT deliver (abnormal stop, or
+  // a remediation round with no new commit), it stays `no_deliverable` so `runRole`
+  // persists that durable stage and a later resume RE-DRIVES the implementor — never
+  // skips it to VERIFY a round that required `NoDeliverableError`. (An earlier
+  // revision forced `completed` on any provisioning failure, persisting an unsafe
+  // resume state that could bypass the verifier gate — round-2 #6.)
   if (result.stopReason !== 'end_turn') return 'no_deliverable';
   if (result.committed) {
     if (result.commitSha === undefined) return 'no_deliverable';

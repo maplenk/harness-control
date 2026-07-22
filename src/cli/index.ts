@@ -261,7 +261,18 @@ export function buildCliFlows(db: Database, config: EngineConfig = DEFAULT_ENGIN
         ...(enableChat === true ? { planningChat } : {}),
       });
     },
-    openWorktrees: (workspacePath) => GitWorktreeManager.open({ primaryRepoRoot: workspacePath, clock: db.clock }),
+    openWorktrees: (workspacePath) =>
+      GitWorktreeManager.open({
+        primaryRepoRoot: workspacePath,
+        clock: db.clock,
+        // F7 (§3): the run's persisted `worktree.provision` strategy governs
+        // dependency provisioning at the verification boundary; a structured
+        // warn sink surfaces non-fatal path notes (clone→install fallback, cache
+        // purge, stage GC) to stderr.
+        provision: config.worktree.provision,
+        provisionWarn: (event) =>
+          process.stderr.write(`harness: worktree provisioning: ${JSON.stringify(event)}\n`),
+      }),
     evidence: artifactStoreEvidenceRecorder(artifacts),
     runVerification: defaultVerificationRunner({ inheritEnvKeys: config.verification.envAllowlist }),
   };

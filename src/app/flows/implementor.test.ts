@@ -20,7 +20,7 @@ import { execFileSync } from 'node:child_process';
 import { assignmentId, criterionId, gitSha, specHash } from '../../domain/ids.js';
 import { DeterministicIdFactory } from '../../lib/id-factory.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
-import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
+import { GitWorktreeManager, runGit, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import {
   assertPrimaryCheckoutUntouched,
   makeTempGitRepo,
@@ -48,9 +48,11 @@ import {
   defaultVerificationRunner,
   runImplementor,
   type ImplementorContext,
+  type ImplementorResult,
   type VerificationRunner,
   type RunImplementorInput,
 } from './implementor.js';
+import { adjudicateImplementorDeliverable } from './deliverable.js';
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -81,6 +83,10 @@ interface CreatedFake {
 function makeWritingFactory(opts: {
   readonly writes: ReadonlyArray<{ readonly relPath: string; readonly content: string }>;
   readonly turns?: readonly InProcessTurnScript[];
+  /** round-4 #3: after writing, the "agent" runs `git add -A` in its worktree —
+   * STAGING everything it wrote (incl. any node_modules), so the flow's commit path
+   * must UNSTAGE node_modules, not merely avoid re-adding it. */
+  readonly stageAfterWrite?: boolean;
 }): { factory: RoleAdapterFactory; created: CreatedFake[] } {
   const created: CreatedFake[] = [];
   const factory: RoleAdapterFactory = {
@@ -100,6 +106,9 @@ function makeWritingFactory(opts: {
           const target = path.join(options.cwd, write.relPath);
           fs.mkdirSync(path.dirname(target), { recursive: true });
           fs.writeFileSync(target, write.content, 'utf8');
+        }
+        if (opts.stageAfterWrite === true) {
+          execFileSync('git', ['add', '-A'], { cwd: options.cwd });
         }
         input.onUpdate?.({ kind: 'tool_call', toolCallId: 'tc_write', title: 'Write file', status: 'completed' });
         return origPrompt(input);
@@ -164,6 +173,12 @@ afterEach(async () => {
 async function setup(opts: {
   readonly writes: ReadonlyArray<{ readonly relPath: string; readonly content: string }>;
   readonly turns?: readonly InProcessTurnScript[];
+  /** F7 (round-2 #3): the manager's dependency-provisioning strategy. `'none'`
+   * disables managed provisioning (the operator owns node_modules), so the
+   * implementor commit keeps normal `git add -A` semantics. Default `'auto'`. */
+  readonly provision?: 'auto' | 'clone' | 'install' | 'none';
+  /** round-4 #3: the "agent" stages everything it wrote (`git add -A`) during its turn. */
+  readonly stageAfterWrite?: boolean;
 }): Promise<{
   service: OrchestrationService;
   worktrees: GitWorktreeManager;
@@ -173,10 +188,15 @@ async function setup(opts: {
   repo = await makeTempGitRepo();
   dbHandle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
   const db = dbHandle.db;
-  worktrees = await GitWorktreeManager.open({ primaryRepoRoot: repo.dir, clock: db.clock });
+  worktrees = await GitWorktreeManager.open({
+    primaryRepoRoot: repo.dir,
+    clock: db.clock,
+    ...(opts.provision !== undefined ? { provision: opts.provision } : {}),
+  });
   const { factory, created } = makeWritingFactory({
     writes: opts.writes,
     ...(opts.turns !== undefined ? { turns: opts.turns } : {}),
+    ...(opts.stageAfterWrite !== undefined ? { stageAfterWrite: opts.stageAfterWrite } : {}),
   });
   const service = new OrchestrationService({
     db,
@@ -890,5 +910,292 @@ describe('ImplementorFlow — confinement guard (§16 item 4)', () => {
     const flow = new ImplementorFlow(fakeHandle('/wt/assignment-a'), baseContext());
     const session = { role: 'coordinator', cwd: '/wt/assignment-a' } as unknown as RoleSession;
     await expect(flow.run(session)).rejects.toThrow(/expects role 'implementor'/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F7 (§2.1/§2.4): dependency provisioning at the post-commit boundary, and the
+// fail-closed gate — the host self-check runner must NEVER run (nor be greened by
+// a tool on PATH) when provisioning cannot be proven.
+// ---------------------------------------------------------------------------
+describe('ImplementorFlow — F7 dependency provisioning fail-closed (§2.1/§2.4)', () => {
+  it('skips the host self-check runner and reports provisioningFailed when provisioning fails closed', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [{ relPath: 'feature.txt', content: 'work\n' }],
+      turns: [REPORTING_TURN],
+    });
+    // A repo that DECLARES deps but has NO `node_modules` ignore rule → the F7
+    // check-ignore preflight fails closed (deps could otherwise enter a commit).
+    await r.writeFile('package.json', JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0' } }));
+    await r.writeFile('package-lock.json', '{"name":"x","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{}}');
+    await r.commitAll('deps without an ignore rule');
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+
+    // A self-check runner that WOULD pass (exit 0) if it ever ran — standing in for
+    // a global `tsc`/`vitest` on PATH that must NOT be allowed to green the round.
+    let selfCheckCalls = 0;
+    const spyVerify: VerificationRunner = async () => {
+      selfCheckCalls += 1;
+      return { exitCode: 0, stdout: '', stderr: '', launchFailed: false };
+    };
+
+    const result = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: assignmentId('asg_f7_failclosed'),
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext({
+          criteria: [{ id: criterionId('C1'), description: 'x', verificationCommands: ['echo would-pass'] }],
+        }),
+        options: { runVerification: spyVerify },
+      },
+    );
+
+    expect(result.provisioningFailed).toBeDefined();
+    expect(result.provisioningFailed?.kind).toBe('provisioning_failed');
+    expect(result.provisioningFailed?.detail).toMatch(/not git-ignored/i);
+    expect(result.verification).toEqual([]); // the self-check block was skipped
+    expect(result.verificationPassed).toBe(false); // never reads as passed
+    expect(selfCheckCalls).toBe(0); // the runner was NEVER invoked (fail closed)
+    expect(result.committed).toBe(true); // the work IS committed — only verification halts
+  });
+
+  it('a no-dependency repo provisions trivially-true and runs the self-check normally', async () => {
+    // Sanity: the default provisioning wiring never disturbs a no-deps repo (the
+    // makeTempGitRepo base has no package.json → trivially-true, no fail-closed).
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [{ relPath: 'feature.txt', content: 'work\n' }],
+      turns: [REPORTING_TURN],
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    let selfCheckCalls = 0;
+    const spyVerify: VerificationRunner = async () => {
+      selfCheckCalls += 1;
+      return { exitCode: 0, stdout: '', stderr: '', launchFailed: false };
+    };
+    const result = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: assignmentId('asg_f7_trivial'),
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext(),
+        options: { runVerification: spyVerify },
+      },
+    );
+    expect(result.provisioningFailed).toBeUndefined();
+    expect(selfCheckCalls).toBeGreaterThan(0); // the self-check DID run
+    expect(result.verification.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F7 round-2 #3: the implementor commit excludes node_modules only while managed
+// provisioning is ACTIVE; under worktree.provision='none' (the operator owns
+// node_modules) it keeps normal `git add -A` semantics so a repo that legitimately
+// tracks node_modules changes still commits them.
+// ---------------------------------------------------------------------------
+describe('ImplementorFlow — F7 round-2 #3 node_modules commit semantics follow the provision strategy', () => {
+  async function runOnceTrackingNodeModules(provision: 'none' | 'auto', asg: string) {
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [
+        { relPath: 'feature.txt', content: 'work\n' },
+        { relPath: 'node_modules/tracked.js', content: 'module.exports = 2;\n' }, // an EDIT to a tracked path
+      ],
+      turns: [REPORTING_TURN],
+      provision,
+    });
+    // The repo legitimately TRACKS a node_modules path (no ignore rule).
+    await r.writeFile('node_modules/tracked.js', 'module.exports = 1;\n');
+    await r.commitAll('track a node_modules file');
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    return runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: assignmentId(asg),
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    );
+  }
+
+  // What actually landed in the COMMIT (base..HEAD) — not `changedFiles`, which is a
+  // base→worktree diff and would still show an EXCLUDED (uncommitted) node_modules edit.
+  async function committedFiles(result: ImplementorResult): Promise<string[]> {
+    const { stdout } = await runGit(['diff', '--name-only', `${String(result.baseSha)}..HEAD`], result.worktreePath);
+    return stdout.split('\n').map((line) => line.trim()).filter((line) => line.length > 0);
+  }
+
+  it("under provision='none', a change to a TRACKED node_modules path IS committed (normal git add -A)", async () => {
+    const result = await runOnceTrackingNodeModules('none', 'asg_f7_none_addall');
+    expect(result.provisioningFailed).toBeUndefined(); // 'none' skips the preflight entirely
+    expect(result.committed).toBe(true);
+    const files = await committedFiles(result);
+    expect(files).toContain('feature.txt');
+    expect(files).toContain('node_modules/tracked.js'); // committed, not excluded
+  });
+
+  it('with provisioning ACTIVE, the same tracked node_modules edit is EXCLUDED from the commit', async () => {
+    const result = await runOnceTrackingNodeModules('auto', 'asg_f7_active_exclude');
+    expect(result.committed).toBe(true);
+    const files = await committedFiles(result);
+    expect(files).toContain('feature.txt');
+    expect(files.every((f) => !f.startsWith('node_modules'))).toBe(true); // never entered HEAD
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F7 round-3 #6: the standalone runImplementor derives the commit's node_modules
+// exclusion from the manager's ACTUAL provisioning strategy and REJECTS a caller
+// override that contradicts it — an active-provisioning run can never commit with
+// unrestricted `git add -A` (which would stage the provisioned toolchain into HEAD).
+// ---------------------------------------------------------------------------
+describe('runImplementor — F7 round-3 #6 rejects an inconsistent provisionActive override', () => {
+  it('provisionActive=false against an ACTIVE manager is REFUSED before any worktree is created', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [{ relPath: 'feature.txt', content: 'work\n' }],
+      turns: [REPORTING_TURN],
+      // provision defaults to 'auto' → managed provisioning is ACTIVE.
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const asg = assignmentId('asg_f7_override');
+
+    const err: unknown = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext(),
+        // The inconsistent override: the manager provisions (active) but the caller
+        // asks to keep normal `git add -A` — which would stage the provisioned,
+        // git-ignored toolchain into HEAD.
+        options: { provisionActive: false, runVerification: PASS_VERIFY },
+      },
+    )
+      .then(() => undefined)
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(WorktreeError);
+    expect((err as WorktreeError).kind).toBe('provisioning_failed');
+    expect(String((err as Error).message)).toMatch(/provisionActive|git add -A/i);
+    // Refused BEFORE any side effect — no worktree was created, nothing was staged.
+    expect(wt.handleFor(asg)).toBeUndefined();
+  });
+
+  it("a MATCHING override (provisionActive=false under provision='none') is accepted", async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [{ relPath: 'feature.txt', content: 'work\n' }],
+      turns: [REPORTING_TURN],
+      provision: 'none', // the operator owns node_modules → provisioning INACTIVE
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const result = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: assignmentId('asg_f7_override_ok'),
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext(),
+        options: { provisionActive: false, runVerification: PASS_VERIFY }, // matches 'none' → accepted
+      },
+    );
+    expect(result.committed).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F7 round-4 #3: the implementor commit UNSTAGES an already-staged node_modules —
+// the exclusion pathspec (`git add -A -- . :(exclude)node_modules`) prevents ADDING
+// it but does not remove an index entry a prior `git add` already placed.
+// ---------------------------------------------------------------------------
+describe('ImplementorFlow — F7 round-4 #3 a pre-staged node_modules is unstaged before the commit', () => {
+  it('an already-STAGED node_modules never enters the implementor commit', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [
+        { relPath: 'feature.txt', content: 'work\n' },
+        {
+          relPath: 'package.json',
+          content: JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0' } }),
+        },
+        { relPath: 'node_modules/.bin/tsc', content: '#!/bin/sh\nexit 0\n' }, // provisioned-toolchain dirt
+      ],
+      turns: [REPORTING_TURN],
+      stageAfterWrite: true, // the "implementor" runs `git add -A`, STAGING node_modules
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const result = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: assignmentId('asg_prestage_impl'),
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    );
+
+    // The work IS committed; provisioning then fails closed (no ignore rule) but that
+    // does not undo the commit. The pre-staged node_modules is NOT in it.
+    expect(result.committed).toBe(true);
+    const committed = (
+      await runGit(['diff', '--name-only', `${String(result.baseSha)}..HEAD`], result.worktreePath)
+    ).stdout;
+    expect(committed).toContain('feature.txt');
+    expect(committed.split('\n').some((p) => p.startsWith('node_modules'))).toBe(false); // pre-staged but excluded
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F7 round-2 #6: a provisioning failure must NOT mask the deliverable verdict.
+// A provisioning failure is adjudicated on the deliverable ALONE — an abnormal /
+// no-commit round stays `no_deliverable` (so `runRole` persists that durable stage
+// and a resume RE-DRIVES the implementor rather than skipping to verify — the
+// resume re-drive itself is proven in vertical-slice.test.ts
+// "restart/resume does NOT bypass the gate ... re-drives the IMPLEMENTOR"); a good
+// committed deliverable stays `completed` and the loop still HALTS on the returned
+// `result.provisioningFailed` with the terminal provisioning_failed outcome.
+// ---------------------------------------------------------------------------
+describe('adjudicateImplementorDeliverable — F7 round-2 #6 provisioning-failure does not mask the verdict', () => {
+  const HEAD = gitSha('a'.repeat(40));
+  function result(overrides: Partial<ImplementorResult>): ImplementorResult {
+    return {
+      stopReason: 'end_turn',
+      committed: false,
+      commitSha: undefined,
+      changedFiles: [],
+      diff: '',
+      postVerificationDirty: false,
+      // Every case here has a provisioning failure — the point is that it no longer
+      // overrides the deliverable adjudication.
+      provisioningFailed: {
+        kind: 'provisioning_failed',
+        repoRoot: '/repo',
+        worktreePath: '/wt',
+        detail: 'node_modules is NOT git-ignored',
+      },
+      ...overrides,
+    } as unknown as ImplementorResult;
+  }
+
+  it('a round>1 with NO new commit + provisioningFailed is `no_deliverable` (NOT masked as completed → resume re-drives)', () => {
+    expect(adjudicateImplementorDeliverable(result({ committed: false }), 2, HEAD)).toBe('no_deliverable');
+  });
+
+  it('an abnormal stop + provisioningFailed is `no_deliverable` (the abnormal verdict wins)', () => {
+    expect(adjudicateImplementorDeliverable(result({ stopReason: 'refusal' }), 1, HEAD)).toBe('no_deliverable');
+  });
+
+  it('a GOOD committed deliverable + provisioningFailed stays `completed` (the loop still surfaces provisioning_failed)', () => {
+    expect(adjudicateImplementorDeliverable(result({ committed: true, commitSha: HEAD }), 1, HEAD)).toBe('completed');
   });
 });

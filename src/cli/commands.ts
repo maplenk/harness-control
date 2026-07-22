@@ -1099,6 +1099,19 @@ function loopResultOutput(
       verifier: resolvedView(resolveRoleModel(verifier)),
     },
     ...(mr !== undefined ? { mergeReadiness: mergeReadinessView(mr) } : {}),
+    ...(result.provisioningFailure !== undefined
+      ? {
+          provisioningFailure: {
+            repoRoot: result.provisioningFailure.repoRoot,
+            worktreePath: result.provisioningFailure.worktreePath,
+            detail: result.provisioningFailure.detail,
+            ...(result.provisioningFailure.round !== undefined ? { round: result.provisioningFailure.round } : {}),
+            ...(result.provisioningFailure.implementationCommit !== undefined
+              ? { implementationCommit: String(result.provisioningFailure.implementationCommit) }
+              : {}),
+          },
+        }
+      : {}),
   };
   const lines = [
     `run ${runId} — ${result.outcome} (phase ${result.finalPhase}) after ${result.rounds.length} round(s).`,
@@ -1119,6 +1132,21 @@ function loopResultOutput(
     lines.push(`  integration blocked on user-actionable §16 state (no remediation round consumed):`);
     for (const blocker of mr.blockers) lines.push(`    - ${blocker}`);
     lines.push(`  next: resolve the blockers, then \`harness recheck ${runId}\` (T24 once clear).`);
+  }
+  // F7: the round HALTED because worktree dependency provisioning could not be
+  // proven — an operator-actionable ENVIRONMENT failure (no verifier ran, no
+  // merge_ready possible). Print the repo, the worktree, and the failure detail.
+  if (result.outcome === 'provisioning_failed' && result.provisioningFailure !== undefined) {
+    const pf = result.provisioningFailure;
+    lines.push(
+      `  provisioning failed — worktree dependencies could not be provisioned; verification did not run:`,
+      ...(pf.round !== undefined ? [`    round:    ${pf.round}`] : []),
+      `    repo:     ${pf.repoRoot}`,
+      `    worktree: ${pf.worktreePath}`,
+      ...(pf.implementationCommit !== undefined ? [`    commit:   ${String(pf.implementationCommit)}`] : []),
+      `    detail:   ${pf.detail}`,
+      `  next: ensure the primary checkout's node_modules is installed and node_modules is git-ignored, then re-run.`,
+    );
   }
   const exitCode =
     result.outcome === 'merge_ready'

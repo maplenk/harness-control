@@ -13,5 +13,6 @@ export * from './advisory-lease.js';
 export * from './git.js';
 export * from './mutex.js';
 export * from './paths.js';
+export * from './provision.js';
 export * from './validate.js';
 export * from './manager.js';
