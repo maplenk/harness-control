@@ -73,7 +73,7 @@ describe('buildGrokAcpArgs', () => {
 
 describe('grokShellPermissionTitle', () => {
   it('maps one declared command to Grok\'s exact ACP operation title', () => {
-    expect(grokShellPermissionTitle('npm run typecheck')).toBe('Bash `npm run typecheck`');
+    expect(grokShellPermissionTitle('npm run typecheck')).toBe('Execute `npm run typecheck`');
   });
 
   it('fails closed for ambiguous operation-title bytes', () => {

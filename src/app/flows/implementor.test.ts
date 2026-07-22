@@ -265,6 +265,9 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
     expect(prompt).toContain('src/cli.ts (bound to source commit deadbeef)'); // exploration artifact
     expect(prompt).toContain('No new runtime dependencies'); // constraint
     expect(prompt).toContain(handle!.worktreePath); // confinement path
+    expect(prompt).toMatch(/structured repository tools \(Read, Grep\/Glob, Write, and Edit\)/i);
+    expect(prompt).toMatch(/Shell access is limited to the exact declared verification commands/i);
+    expect(prompt).toMatch(/Do NOT use shell commands such as mkdir, cp, mv, rm, touch/i);
     expect(prompt).toMatch(/MUST NOT declare the task complete/i); // hard rule: cannot mark complete
     expect(prompt).toMatch(/MUST NOT add, remove, or change any acceptance criterion/i); // cannot change criteria
 

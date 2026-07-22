@@ -557,7 +557,11 @@ describe('provider adapter factory — composed initialize() over the fake wire 
               response: { stopReason: 'end_turn' },
             },
             {
-              permission: { toolTitle: 'Bash `npm run typecheck`' },
+              permission: { toolTitle: 'Execute `mkdir -p src/app/commands`' },
+              response: { stopReason: 'end_turn' },
+            },
+            {
+              permission: { toolTitle: 'Execute `npm run typecheck`' },
               response: { stopReason: 'end_turn' },
             },
           ],
@@ -596,6 +600,9 @@ describe('provider adapter factory — composed initialize() over the fake wire 
         created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'implement' }),
       ).resolves.toMatchObject({ stopReason: 'end_turn' });
       await expect(
+        created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'scaffold through shell' }),
+      ).resolves.toMatchObject({ stopReason: 'end_turn' });
+      await expect(
         created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'self-check' }),
       ).resolves.toMatchObject({ stopReason: 'end_turn' });
       expect(created.adapter.permissionDecisions).toEqual([
@@ -605,7 +612,12 @@ describe('provider adapter factory — composed initialize() over the fake wire 
           reason: 'allowlisted_workspace_write',
         }),
         expect.objectContaining({
-          operation: 'Bash `npm run typecheck`',
+          operation: 'Execute `mkdir -p src/app/commands`',
+          action: 'deny',
+          reason: 'denied_default',
+        }),
+        expect.objectContaining({
+          operation: 'Execute `npm run typecheck`',
           action: 'allow',
           reason: 'allowlisted',
         }),

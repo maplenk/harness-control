@@ -49,9 +49,11 @@ export function buildGrokAcpArgs(options: GrokAcpArgsOptions = {}): readonly str
 }
 
 /**
- * Exact ACP permission title Grok 0.2.106 emits for a shell request. The
- * shared permission engine compares this string by equality, so an approved
- * verification command cannot widen into a command prefix or chained suffix.
+ * Exact ACP permission title Grok 0.2.106 emits for a shell request. Grok's
+ * raw tool input calls the variant "Bash", but its ACP operation title is
+ * `Execute \`<command>\``. The shared permission engine compares this string
+ * by equality, so an approved verification command cannot widen into a
+ * command prefix or chained suffix.
  */
 export function grokShellPermissionTitle(command: string): string {
   if (
@@ -67,7 +69,7 @@ export function grokShellPermissionTitle(command: string): string {
       { harnessId: GROK_HARNESS_ID },
     );
   }
-  return `Bash \`${command}\``;
+  return `Execute \`${command}\``;
 }
 
 export interface ResolvedGrokCommand {
