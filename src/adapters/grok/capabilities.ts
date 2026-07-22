@@ -22,16 +22,23 @@ export const GROK_CONFLICTING_BUILTIN_TOOLS = [
 ] as const;
 
 export type GrokSandboxProfile = 'read-only' | 'strict';
-export type GrokPermissionMode = 'acceptEdits' | 'dontAsk';
+export type GrokPermissionMode = 'acceptEdits' | 'dontAsk' | 'auto';
 
 /** Undefined/unknown roles fail closed to the read-only process sandbox. */
 export function grokSandboxProfileForRole(role: RoleName | undefined): GrokSandboxProfile {
   return role === 'implementor' ? 'strict' : 'read-only';
 }
 
-/** Implementors may use structured edits; every other role fails closed. */
+/**
+ * Implementor runs in `auto` (grok auto-approves its own tool calls, contained
+ * by the `strict` FS sandbox); every other role fails closed to `dontAsk`.
+ * NOTE (macOS): `--sandbox strict` does NOT block child-process network on
+ * macOS (Seatbelt no-op — Linux-only via seccomp), so under `auto` the
+ * implementor's shell network egress is NOT sandbox-restricted here; grok's
+ * native network (web/telemetry/sharing) stays disabled by home-isolation.
+ */
 export function grokPermissionModeForRole(role: RoleName | undefined): GrokPermissionMode {
-  return role === 'implementor' ? 'acceptEdits' : 'dontAsk';
+  return role === 'implementor' ? 'auto' : 'dontAsk';
 }
 
 export interface GrokAuthProbeContext {

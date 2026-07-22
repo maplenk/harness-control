@@ -201,7 +201,7 @@ describe('provider adapter factory — command resolution + version pin (§3, §
         '--sandbox',
         'strict',
         '--permission-mode',
-        'acceptEdits',
+        'auto',
         '--model',
         'grok-build',
         '--reasoning-effort',

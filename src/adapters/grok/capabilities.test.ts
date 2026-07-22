@@ -53,7 +53,7 @@ describe('Grok capability profile', () => {
     expect(grokSandboxProfileForRole('coordinator')).toBe('read-only');
     expect(grokSandboxProfileForRole('verifier')).toBe('read-only');
     expect(grokSandboxProfileForRole(undefined)).toBe('read-only');
-    expect(grokPermissionModeForRole('implementor')).toBe('acceptEdits');
+    expect(grokPermissionModeForRole('implementor')).toBe('auto');
     expect(grokPermissionModeForRole('coordinator')).toBe('dontAsk');
     expect(grokPermissionModeForRole('verifier')).toBe('dontAsk');
     expect(grokPermissionModeForRole(undefined)).toBe('dontAsk');

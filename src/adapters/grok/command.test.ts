@@ -49,7 +49,7 @@ describe('buildGrokAcpArgs', () => {
       '--sandbox',
       'strict',
       '--permission-mode',
-      'acceptEdits',
+      'auto',
       '--model',
       'grok-build',
       '--reasoning-effort',
