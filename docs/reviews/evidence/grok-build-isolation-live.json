@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "recordedAt": "2026-07-21T18:41:58.961Z",
+  "recordedAt": "2026-07-22T04:17:59.346Z",
   "harness": "grok",
   "requestedModel": "grok-build",
   "requestedEffort": "high",
@@ -32,10 +32,11 @@
       "isolatedHomeDisposed": true,
       "stopReason": "end_turn+write_cancelled",
       "permissionRequests": [
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-OhnBpX/repo/coordinator-must-not-write.txt`"
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/coordinator-must-not-write.txt`"
       ],
+      "allowedOperations": [],
       "deniedOperations": [
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-OhnBpX/repo/coordinator-must-not-write.txt`"
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/coordinator-must-not-write.txt`"
       ],
       "expectedMarkerObserved": true
     },
@@ -48,7 +49,7 @@
         "--no-subagents",
         "--disable-web-search",
         "--sandbox",
-        "workspace",
+        "strict",
         "--permission-mode",
         "acceptEdits",
         "--model",
@@ -63,11 +64,19 @@
       "effortPinned": true,
       "isolatedHome": true,
       "isolatedHomeDisposed": true,
-      "stopReason": "end_turn",
+      "stopReason": "end_turn+write_cancelled",
       "permissionRequests": [
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-OhnBpX/repo/grok-model-spawn.txt`"
+        "Execute `pwd && ls -la . 2>/dev/null || true`",
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/grok-model-spawn.txt`",
+        "Execute `mkdir -p shell-must-not-write`"
       ],
-      "deniedOperations": [],
+      "allowedOperations": [
+        "Execute `pwd && ls -la . 2>/dev/null || true`",
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/grok-model-spawn.txt`"
+      ],
+      "deniedOperations": [
+        "Execute `mkdir -p shell-must-not-write`"
+      ],
       "expectedMarkerObserved": true
     },
     {
@@ -96,10 +105,11 @@
       "isolatedHomeDisposed": true,
       "stopReason": "end_turn+write_cancelled",
       "permissionRequests": [
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-OhnBpX/repo/verifier-must-not-write.txt`"
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/verifier-must-not-write.txt`"
       ],
+      "allowedOperations": [],
       "deniedOperations": [
-        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-OhnBpX/repo/verifier-must-not-write.txt`"
+        "Write `/var/folders/6m/cb1t1f_d46lfk7p4_r676hnr0000gn/T/harness-grok-isolation-live-zElX0J/repo/verifier-must-not-write.txt`"
       ],
       "expectedMarkerObserved": true
     }
@@ -111,7 +121,8 @@
     "hostileHostMcpStarted": false,
     "hostileProjectMcpStarted": false,
     "coordinatorWriteCreated": false,
-    "verifierWriteCreated": false
+    "verifierWriteCreated": false,
+    "implementorShellWriteCreated": false
   },
   "modelIdentityFile": "model=grok-build\neffort=high\nharness=grok\n"
 }
