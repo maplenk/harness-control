@@ -573,13 +573,16 @@ export class NoDeliverableError extends Error {
   override readonly name: string = 'NoDeliverableError';
   readonly runId: RunId;
   readonly round: number;
-  constructor(runId: RunId, round: number, reason: string) {
+  readonly diagnostic?: string;
+  constructor(runId: RunId, round: number, reason: string, diagnostic?: string) {
     super(
       `Run ${runId} round ${round}: implementor produced no deliverable (${reason}); ` +
-        `the verifier was NOT dispatched. Re-drive the implementor (resume) or cancel.`,
+        `the verifier was NOT dispatched. Re-drive the implementor (resume) or cancel.` +
+        (diagnostic !== undefined ? `\nAbnormal-turn diagnostic:\n${diagnostic}` : ''),
     );
     this.runId = runId;
     this.round = round;
+    if (diagnostic !== undefined) this.diagnostic = diagnostic;
   }
 }
 
@@ -742,6 +745,9 @@ export function defaultRoleAdapterFactory(): RoleAdapterFactory {
                 ...base,
                 role: options.role,
                 model: options.resolved.model,
+                ...(options.allowedShellCommands !== undefined
+                  ? { allowedShellCommands: options.allowedShellCommands }
+                  : {}),
                 ...(options.resolved.effort !== undefined
                   ? { reasoningEffort: options.resolved.effort }
                   : {}),
@@ -2689,6 +2695,7 @@ export class OrchestrationService {
           runId,
           prev.round,
           'implementor round produced no deliverable — refusing to dispatch the verifier',
+          prev.diagnostic,
         );
       }
     }
@@ -2905,6 +2912,8 @@ export class OrchestrationService {
           runner.role === 'implementor'
             ? await runner.adjudicateRoundOutcome(result)
             : 'completed';
+        const roundDiagnostic =
+          runner.role === 'implementor' ? runner.diagnoseRoundOutcome?.(result) : undefined;
         if (baseRound !== undefined) {
         // Preserve a checkpoint ref a mid-round pause recorded on THIS round
         // (a resumed round completing keeps its §12.2 lineage visible).
@@ -2913,10 +2922,14 @@ export class OrchestrationService {
         // round while the runner was still unwinding. Never overwrite that
         // durable no-deliverable outcome with a late normal return.
         if (current?.round === baseRound.round && current.stage === 'no_deliverable') {
+          if (roundDiagnostic !== undefined) {
+            this.#saveRoleRound(runId, { ...current, diagnostic: roundDiagnostic });
+          }
           throw new NoDeliverableError(
             runId,
             baseRound.round,
             'round was already closed no_deliverable by its turn outcome',
+            roundDiagnostic ?? current.diagnostic,
           );
         }
         this.#saveRoleRound(runId, {
@@ -2924,6 +2937,7 @@ export class OrchestrationService {
           stage,
           generationId: ctx.generationId,
           segmentId: ctx.segmentId,
+          ...(roundDiagnostic !== undefined ? { diagnostic: roundDiagnostic } : {}),
           ...(current?.checkpointRef !== undefined && current.round === baseRound.round
             ? { checkpointRef: current.checkpointRef }
             : {}),
@@ -2932,7 +2946,12 @@ export class OrchestrationService {
           // No forward progress — do NOT reset the breaker, and abort so the
           // verifier is never dispatched. The persisted `no_deliverable` round
           // re-drives the implementor on resume (resolveResumeEntry).
-          throw new NoDeliverableError(runId, baseRound.round, 'no deliverable adjudicated at completion');
+          throw new NoDeliverableError(
+            runId,
+            baseRound.round,
+            'no deliverable adjudicated at completion',
+            roundDiagnostic,
+          );
         }
         // F4 (§5x): a round reaching `completed` is durable, real forward
         // progress — reset the breaker's recovery sequence so a LATER, unrelated
@@ -2947,6 +2966,7 @@ export class OrchestrationService {
             runId,
             dispatch?.round ?? 1,
             'standalone implementor produced no deliverable',
+            roundDiagnostic,
           );
         }
         completedNormally = true;

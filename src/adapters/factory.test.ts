@@ -556,6 +556,10 @@ describe('provider adapter factory — composed initialize() over the fake wire 
               permission: { toolTitle: `Write \`${target}\`` },
               response: { stopReason: 'end_turn' },
             },
+            {
+              permission: { toolTitle: 'Bash `npm run typecheck`' },
+              response: { stopReason: 'end_turn' },
+            },
           ],
         },
         fixture.root,
@@ -572,6 +576,7 @@ describe('provider adapter factory — composed initialize() over the fake wire 
         role: 'implementor',
         model: 'grok-build',
         reasoningEffort: 'high',
+        allowedShellCommands: ['npm run typecheck'],
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });
       cleanups.push(async () => created.adapter.close());
@@ -590,11 +595,19 @@ describe('provider adapter factory — composed initialize() over the fake wire 
       await expect(
         created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'implement' }),
       ).resolves.toMatchObject({ stopReason: 'end_turn' });
+      await expect(
+        created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'self-check' }),
+      ).resolves.toMatchObject({ stopReason: 'end_turn' });
       expect(created.adapter.permissionDecisions).toEqual([
         expect.objectContaining({
           operation: `Write \`${target}\``,
           action: 'allow',
           reason: 'allowlisted_workspace_write',
+        }),
+        expect.objectContaining({
+          operation: 'Bash `npm run typecheck`',
+          action: 'allow',
+          reason: 'allowlisted',
         }),
       ]);
     },

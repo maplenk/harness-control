@@ -249,6 +249,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
     expect(impl).toBeDefined();
     expect(impl!.options.role).toBe('implementor');
     expect(path.resolve(impl!.options.cwd)).toBe(path.resolve(handle!.worktreePath));
+    expect(impl!.options.allowedShellCommands).toEqual(['echo verify-c1']);
 
     // --- §11.2 model + effort pinned on the implementor session -----------
     const setConfig = impl!.adapter.log.filter((e) => e.op === 'setConfigOption').map((e) => e.detail);
@@ -300,11 +301,14 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
     ).catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(NoDeliverableError);
+    expect(String(error)).toContain('stopReason=refusal');
+    expect(String(error)).toContain('providerStderr=(empty)');
     expect(service.getRoleRound(runId)).toMatchObject({
       role: 'implementor',
       round: 1,
       assignmentId: asg,
       stage: 'no_deliverable',
+      diagnostic: expect.stringContaining('stopReason=refusal'),
     });
     await wt.removeWorktree(asg);
   });

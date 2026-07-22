@@ -106,7 +106,8 @@ export type RoleRoundOutcome = 'completed' | 'no_deliverable';
 interface RoleRunnerBase<TResult> {
   /**
    * Exact shell commands this flow must execute as evidence. Native Claude
-   * uses these to build narrow `Bash(command)` permissions; other transports
+   * uses these for verifier `Bash(command)` permissions; Grok maps them to
+   * exact ACP operation titles for implementor self-checks. Other transports
    * may ignore the hint and keep their own permission mediation.
    */
   readonly allowedShellCommands?: readonly string[];
@@ -115,6 +116,12 @@ interface RoleRunnerBase<TResult> {
 
 export interface ImplementorRoleRunner<TResult = unknown> extends RoleRunnerBase<TResult> {
   readonly role: 'implementor';
+  /**
+   * Optional sink-safe, bounded explanation persisted with a no-deliverable
+   * verdict. This keeps provider stderr/permission evidence available after
+   * the isolated child home is disposed.
+   */
+  diagnoseRoundOutcome?(result: TResult): string | undefined;
   /**
    * F2: adjudicate the round's deliverable AT completion time. `runRole` calls
    * this with the flow's result for every implementor invocation, including a

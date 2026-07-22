@@ -106,7 +106,11 @@ import type { AcceptanceCriterion, AcpStopReason } from '../../domain/entities.j
 import { gitSha, newIdempotencyKey } from '../../domain/ids.js';
 import type { AssignmentId, GitSha, RunId, SpecHash } from '../../domain/ids.js';
 import { draftEvent, type DomainEvent } from '../../domain/events.js';
-import { CHILD_ENV_ALLOWLIST, type SessionUpdate } from '../../adapters/index.js';
+import {
+  CHILD_ENV_ALLOWLIST,
+  type PromptDiagnostics,
+  type SessionUpdate,
+} from '../../adapters/index.js';
 import {
   addAll,
   commitAll,
@@ -676,6 +680,8 @@ export interface ImplementorResult {
   readonly commitSha?: GitSha;
   /** Stop reason of the last driven turn. */
   readonly stopReason: AcpStopReason;
+  /** Redacted/bounded transport evidence captured at an abnormal turn stop. */
+  readonly promptDiagnostics?: PromptDiagnostics;
   /** §11.2 model/effort pins the engine applied to the implementor session. */
   readonly configApplied: readonly AppliedConfigOption[];
   /** The implementor agent's own narrative per turn — its stated risks/unknowns
@@ -810,6 +816,8 @@ export function buildImplementorPrompt(context: ImplementorContext, cwd: string)
  */
 export class ImplementorFlow {
   readonly role = 'implementor' as const;
+  /** Exact approved commands Grok may request through ACP while self-checking. */
+  readonly allowedShellCommands: readonly string[];
   readonly #handle: WorktreeHandle;
   readonly #context: ImplementorContext;
   readonly #options: ImplementorFlowOptions;
@@ -818,6 +826,7 @@ export class ImplementorFlow {
     this.#handle = handle;
     this.#context = context;
     this.#options = options;
+    this.allowedShellCommands = resolveVerificationCommands(context);
   }
 
   async run(session: RoleSession): Promise<ImplementorResult> {
@@ -878,11 +887,13 @@ export class ImplementorFlow {
       ...(this.#options.followUpPrompts ?? []),
     ];
     let stopReason: AcpStopReason = 'end_turn';
+    let promptDiagnostics: PromptDiagnostics | undefined;
     for (const prompt of prompts) {
       turnMessage = '';
       const result = await session.prompt({ prompt, onUpdate });
       if (turnMessage.length > 0) agentMessages.push(turnMessage);
       stopReason = result.stopReason;
+      promptDiagnostics = result.diagnostics;
       // A non-`end_turn` stop (refusal / cancelled / token or request cap) ends
       // the drive early — there is no point issuing follow-ups after it.
       if (stopReason !== 'end_turn') break;
@@ -979,12 +990,55 @@ export class ImplementorFlow {
       committed: commit.committed,
       ...(commit.sha !== undefined ? { commitSha: gitSha(commit.sha) } : {}),
       stopReason,
+      ...(promptDiagnostics !== undefined ? { promptDiagnostics } : {}),
       configApplied: session.configApplied,
       agentMessages,
       toolCalls: [...toolCalls.values()],
       permissionRequests,
     };
   }
+}
+
+/**
+ * Bounded, sink-safe abnormal-turn summary persisted with a no-deliverable
+ * round. Even when the provider wrote no stderr, the stop reason and observed
+ * permission/tool activity distinguish a policy cancellation from a crash.
+ */
+export function describeImplementorRoundDiagnostic(
+  result: ImplementorResult,
+): string | undefined {
+  if (result.stopReason === 'end_turn') return undefined;
+  const lines = [
+    `stopReason=${result.stopReason}`,
+    `agentMessageChars=${result.agentMessages.reduce((sum, message) => sum + message.length, 0)}`,
+    `toolCalls=${result.toolCalls.length}`,
+    `permissionRequests=${result.permissionRequests.length}`,
+  ];
+  if (result.permissionRequests.length > 0) {
+    lines.push(
+      `permissionTitles=${result.permissionRequests
+        .map((request) => request.toolTitle ?? '<untitled>')
+        .join(' | ')}`,
+    );
+  }
+  const diagnostics = result.promptDiagnostics;
+  if (diagnostics?.childExit !== undefined) {
+    lines.push(
+      `childExit=code:${String(diagnostics.childExit.code)},signal:${String(diagnostics.childExit.signal)}`,
+    );
+  }
+  if (diagnostics?.stderr !== undefined) {
+    const stderr = diagnostics.stderr;
+    const captured =
+      stderr.head === stderr.tail ? stderr.head : `${stderr.head}\n…[stderr tail]…\n${stderr.tail}`;
+    lines.push(
+      `providerStderrBytes=${stderr.totalBytes}${stderr.truncated ? ',truncated' : ''}`,
+      `providerStderr=${captured}`,
+    );
+  } else {
+    lines.push('providerStderr=(empty)');
+  }
+  return boundText(redactText(lines.join('\n')), DEFAULT_MAX_OUTPUT_BYTES).text;
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,7 +1102,9 @@ export async function runImplementor(
   const flow = new ImplementorFlow(handle, input.context, input.options ?? {});
   const runner: RoleRunner<ImplementorResult> = {
     role: 'implementor',
+    allowedShellCommands: flow.allowedShellCommands,
     run: (session) => flow.run(session),
+    diagnoseRoundOutcome: describeImplementorRoundDiagnostic,
     adjudicateRoundOutcome: async (result) =>
       adjudicateImplementorDeliverable(
         result,
