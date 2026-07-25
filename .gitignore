@@ -6,5 +6,7 @@ dist/
 *.db-wal
 coverage/
 .claude/
-test-results/
-playwright-report/
+/test-results/
+/web/test-results/
+/playwright-report/
+/web/playwright-report/
