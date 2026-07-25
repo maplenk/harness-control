@@ -824,10 +824,121 @@ Pre-fix runs stashed ONLY the source files and kept the tests.
 
 ---
 
+---
+
+# Round 5 — codex round-4 verdict on `6bd6693`
+
+Six findings, all narrow edges of the three survivors. Commit map:
+
+| finding | commit |
+| --- | --- |
+| HIGH-5 #1, HIGH-5 #2 | `ba39f4a` |
+| HIGH-4 #3, HIGH-6 #4/#5/#6, MED-6 | `2263c9a` |
+
+All six reproduced before being fixed. Nothing else was touched.
+
+## HIGH-5 — two reachable bypasses
+
+**#1 interactive.** Confirmed: the interactive branch returned before the veto,
+so a configured handler or `resolvePermission` could forward a `selected` option
+for an unbound payload. The veto now runs before ANY mediation branch and returns
+its denial directly.
+
+This forced a type move: `verifyOperationPayload` lived on
+`HeadlessPermissionPolicy`, and the interactive config variant has no `policy`
+field at all. It now sits on the config ROOT (exported `VerifyOperationPayload`),
+which is also the honest place for it — the binding is not an allowlist concern
+but a precondition of any approval.
+
+`PermissionRequest` now carries `rawInput`, so an interactive decider sees what
+will execute rather than the prose describing it. Asserted on both the
+divergent-payload and absent-payload requests.
+
+**#2 vacuous validity.** Confirmed: "non-shell" was inferred from untrusted title
+SYNTAX, so a malformed exact-allowlisted shell title, or a `Write` title carrying
+`{command: …}`, bound nothing. The default is inverted — an unparseable title is
+non-shell ONLY when the payload also carries no command. `operation` is
+`string | undefined` end-to-end so an absent title reaches the same judgement.
+
+Side effect asserted rather than hidden: the factory scenario's
+`Execute \`mkdir -p src/app/commands\`` turn (sent with no rawInput) is now
+refused as `denied_raw_input_mismatch` — caught by the veto before the read-only
+classifier runs, a strictly earlier denial than the previous `denied_default`.
+
+## HIGH-4 #3 — swallowed scan errors
+
+Confirmed at the `@scope` `continue`. Audited the whole scan; every "could not
+examine" path is now fail-closed, naming the path: unreadable scope directory,
+unreadable manifest (only genuine ENOENT/ENOTDIR is a skip), and malformed
+manifest (matching `parsePackageJson`'s existing B3 posture).
+
+**Honest scope note:** for an unreadable DIRECTORY the symlink containment scan
+(B6) refuses first, since it walks directories too. So the native scan's own
+enumeration guard is defence-in-depth for the race where a directory becomes
+unreadable between the two walks. The MANIFEST cases are the reachable ones, and
+those are what the tests drive.
+
+## HIGH-6 #4/#5/#6 — the quarantine was dishonest in three ways
+
+All three confirmed and fixed:
+
+- **#4** a failed marker write still emitted `stage_quarantined`. It now emits
+  `stage_quarantine_failed` with the reason and claims nothing.
+- **#5** a marker READ error was classified "ordinary stage", so the next sweep
+  deleted it — the exact opposite of the rule I had documented. Only genuine
+  ENOENT/ENOTDIR means "no marker" now.
+- **#6** post-TTL deletion ran on timestamp alone. GC now consults a §14 owner
+  probe (`QuarantineOwnerProbe`: recorded `ownerPid` + `ownerStartedAt`
+  start-time identity, built on `createPsClient` exactly as the advisory lease
+  does). A live owner EXTENDS the quarantine; only a proven-gone or recycled
+  owner releases it, and a probe that throws is not a proof of death.
+
+**MED-6** — malformed markers are no longer protected forever: with no usable
+timestamp the stage's own mtime is the fallback clock, so they expire like any
+other once the owner is gone.
+
+### Documented residual (per your instruction to say so honestly)
+
+Bounded retention is only as good as the sweeps that run. Quarantine GC runs from
+two places: `provisionWorktreeDeps`'s per-assignment preflight, and
+`gcProvisionStages` (called by `removeWorktree`, which has **no production
+callers**). So:
+
+- repeated timeouts on an assignment that KEEPS provisioning are bounded — each
+  new attempt sweeps the previous stages once their owners die;
+- an assignment that times out and then never provisions again retains its
+  quarantined stage until something calls `gcProvisionStages`.
+
+Fully closing that needs a GC entry point that does not exist yet (a startup or
+periodic sweep across `.provision`). I did not invent one — it is outside this
+round's six findings and would be untested surface. **Residual, not a blocker.**
+
+### Found while proving #3
+
+The `finally`'s stage cleanup could THROW and thereby MASK the outcome: `rmSync`
+over a tree containing an unreadable directory replaced a precise cause-coded
+refusal with a bare EACCES. That is the same swallowed/misreported-error family
+this round is about, so it is fixed here — cleanup failure is swallowed, the
+refusal is what the caller sees.
+
+## Round-5 regression proofs
+
+| suite | pre-fix | post-fix |
+| --- | --- | --- |
+| `session.test.ts` + `grok/command.test.ts` (HIGH-5) | pass 113 fail 2 | 448/448 adapters |
+| `provision.test.ts` (HIGH-4 #3, HIGH-6, MED-6) | pass 79 fail 7 | 86/86 |
+
+Pre-fix runs stashed ONLY the source files and kept the tests.
+
+**Not started, as directed:** F13 (role-independent stop-reason adjudication,
+host-attested evidence receipts).
+
+---
+
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1826 passed, 0 failed**, 105 files
+- `npx vitest run` (full, from this worktree) → **1835 passed, 0 failed**, 105 files
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
