@@ -6,7 +6,8 @@ which is NOT the tip of `main` at the time of writing (`main` is at `5669d22`, F
 numbers below are measured against `a77f3da`.
 Spec: `docs/AUTONOMOUS-BASE-PLAN.md` §1 + B2. Invariant reversal recorded in `PLAN.md` §7.1.
 
-> **READ §8 FIRST, THEN §7, THEN §6.** Sections 1–5 describe round 1 and are superseded in places.
+> **READ §9 FIRST**, then §8, §7, §6. **§9 is the round-5 record and the current state of the design.**
+> Earlier: Sections 1–5 describe round 1 and are superseded in places.
 > **§8** is the round-4 record (durable-log boundary + persisted-projection migration) and is the
 > current state of the design.
 > **§6** is the round-2 record (codex review of `c45eccf`: five findings, all reproduced). **§7** is
@@ -651,3 +652,110 @@ is untouched, and the compile-time test (a runtime no-op — same disclosure as 
 - **The brand is a compile-time guard only.** A caller who widens to `DomainEvent` before appending
   still compiles. That is the same tolerance round 3 accepted for `ingest`, and it is why the
   `applyTransition` guard — which no widening escapes — is the load-bearing one.
+
+---
+
+## 9. ROUND 5 — the zero-churn "win" was the tell
+
+Codex re-reviewed `c60ab95`. **(a) CONFIRMED**: `applyTransition` IS the universal application point — it
+traced T1 as the only writer of `approvedSpecHash`/phase `approved` and confirmed the reducer, live
+approval, auto-approval, recovery, full projection rebuild, `appendTriggerWithEffects`'s fold and
+`#pauseForLimit`'s direct call all reach it. Two findings remained.
+
+### (b) `lastDraftRef` was not reliable in every supported state
+
+Two holes, both the same error: **an absent `lastDraftRef` meant two different things** — "no
+completion exists" (legitimate; the human/imported case I correctly kept permissive) and "this
+projection never folded the event that would have established it" (UNKNOWN) — and the check took the
+permissive branch for both.
+
+1. **Recovery is incremental.** `ProjectionRepository.recover` resumes from a stored cursor and never
+   backfills, so a projection written by a build that predates `lastDraftRef` resumes past the
+   completion advance and never learns of it. A directly-appended MISMATCHING HUMAN approval then
+   folded into `approved`.
+2. **A bare `specifying → awaiting_approval` advance did not CLEAR the reference.** Round 4 only ever
+   set it, so after a revise that completed bare, an approval naming the SUPERSEDED version matched.
+
+**Fix.** `EngineState.historyComplete` is set by `initialEngineState`, so any state folded from
+sequence 1 by this build carries it and every fold preserves it; a projection persisted by an older
+build does not. `assertApprovalProvenance` now distinguishes the two and REFUSES the unknown one
+(`provenance_undeterminable`). And an advance INTO `awaiting_approval` REPLACES the reference —
+clearing it when the advance carries none — so a superseded draft cannot be matched.
+
+**A third hole I found while testing (b)2, which codex had not named:** the SERVICE had the identical
+staleness. `getCoordinatorCompletion` scanned for the latest advance *carrying* a draft, skipping bare
+ones, so it too fell back to the superseded round's ref. Fixed to return the latest advance into
+`awaiting_approval` whatever it carries — a bare completion means there is no current provenance, not
+"keep using the last one".
+
+**A test expectation I had to correct rather than the code.** My first (b)2 test asserted that a human
+approval of the superseded version is refused. It is not, and should not be: with the stale reference
+cleared, that state is honestly "no drafted provenance", which is the permissive human path codex told
+me to RETAIN. The security-relevant consequence is that the ENGINE can no longer sign there, and that
+is what the test now asserts. I changed the assertion, having convinced myself the behaviour was
+right — flagging it because "test disagreed with code" is exactly where encoding the wrong behaviour
+happens.
+
+### (c) the brand did not bind — and the zero-churn result was the evidence
+
+Round 4's `AppendableEvent<E>` tested `E['type'] extends 'spec.approved'` **non-distributively**. For a
+union — `appendBatch([approval, other])`, or any widened `DomainEvent` — the union's `type` is not
+assignable to the single literal, so the constraint passed with an unbranded approval inside. And the
+legitimate service path branded the event and then annotated the binding as `DomainEvent` one line
+later, so `#atomicEngineWrite` and `appendTriggerWithEffects` never statically received the brand.
+
+I reported "zero call-site churn" as a win. It was the tell: **a constraint that costs nothing to
+satisfy is usually not constraining anything.** Codex is right that this is the same call as the
+payload veto, which only closed once the field became non-optional at every construction site.
+
+**Fix, and what it cost.**
+- `AppendableEvent<E>` is now `E extends { readonly type: 'spec.approved' } ? ValidatedApproval : E` —
+  a naked type parameter, so it DISTRIBUTES. `AppendableEvent<DomainEvent>` is
+  `<every non-approval member> | ValidatedApproval`, and a plain `DomainEvent` is no longer assignable.
+- The brand is CARRIED to the boundary: `#atomicEngineWrite`'s callback and `appendTriggerWithEffects`
+  take `AppendableEvent`, not `DomainEvent`, so `#validateApproval`'s mint survives to the append.
+- Callers holding an erased type go through `appendableEvent()` / `appendableEvents()`, which **throw
+  `UnvalidatedApprovalAppendError` on an approval** — so the widening escape is a refusal, not a hole.
+
+**Cost paid: 64 compile errors** (0 in round 4). 6 production sites in `service.ts` plus the two
+persistence signatures; the rest were tests. Deliberate bypass tests keep bypassing via an explicit
+`forcedIntoLog()` cast that states openly what it is doing, and one persistence redaction suite that
+legitimately needs an approval row does the same.
+
+### Round-5 fails-on-parent proof (parent `c60ab95`)
+
+Behavioural, for (b):
+
+| What | Parent failure (verbatim) |
+| --- | --- |
+| projection resumed past the completion advance | `expected function to throw an error, but it didn't` — the mismatching human T1 folded into `approved` |
+| revise → bare advance → approve superseded version | `promise resolved "{ status: 'applied', …(3) }" instead of rejecting` |
+
+Compile-time, for (c) — a property vitest cannot express, so proven directly with a probe file
+compiled against both trees:
+
+```ts
+db.events.appendBatch([approval, other]);   // union carrying an unbranded approval
+db.events.append(widened);                  // widened DomainEvent
+```
+```
+parent c60ab95 : 0 errors   ← the brand bound nothing
+this branch    : 2 errors   ← both refused
+```
+The probe was a proof artifact and is not committed; the same three shapes are now pinned permanently
+by `@ts-expect-error` directives in `approval-boundary.test.ts`, which fail `npm run typecheck`
+(TS2578) if any of them becomes legal again. All three COMPILED on the round-4 parent.
+
+**Green bar after round 5:** `npm run typecheck` exit 0; `npx vitest run` → **108 files / 2042 tests,
+0 failed** (round 4: 108 / 2030).
+
+### Round-5 judgement calls
+
+- **`appendableEvent()` throws rather than silently widening.** The distributive type alone would have
+  left `as AppendableEvent` as a quiet bypass; a runtime-checked converter makes the only supported
+  widening path a refusal, and makes every deliberate bypass an explicit cast a reviewer can grep for.
+- **`historyComplete` is a positive marker set at seed time**, not a negative "legacy" flag. A missing
+  marker is the unknown case, which is the safe default for anything this build did not build.
+- **I did not try to backfill `lastDraftRef` during incremental recovery.** That would mean the reducer
+  reading events before its cursor — the DB access a reducer must not do. Refusing and telling the
+  operator to rebuild from sequence 1 is the honest option.

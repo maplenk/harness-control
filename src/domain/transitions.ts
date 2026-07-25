@@ -618,6 +618,26 @@ export interface EngineState {
    * it was written straight into the durable log and replayed by `recover()`.
    */
   readonly lastDraftRef?: SpecDraftRef;
+  /**
+   * B2 round 5 — was this state built from the run's COMPLETE history?
+   *
+   * `lastDraftRef` being absent used to mean two different things, and the
+   * provenance check treated both as the permissive one:
+   *   - "this run never completed a coordinator round" (legitimate — the
+   *     imported/legacy human-approval case), and
+   *   - "this projection never folded the event that would have established it"
+   *     (UNKNOWN — `ProjectionRepository.recover` is INCREMENTAL: it resumes
+   *     from a stored cursor and never backfills, so a projection written by a
+   *     build that predates `lastDraftRef` resumes past the completion advance
+   *     and never learns of it).
+   *
+   * `initialEngineState` sets this, so any state folded from sequence 1 by this
+   * build carries it and every later fold preserves it. A projection persisted
+   * by an older build does NOT, which is exactly the "cannot judge" case — and
+   * an undeterminable provenance now REFUSES instead of falling into the
+   * permissive branch.
+   */
+  readonly historyComplete?: true;
   /** Bound on T1. */
   readonly approvedSpecHash?: SpecHash;
   /**
@@ -641,6 +661,12 @@ export function initialEngineState(overrides: Partial<EngineState> = {}): Engine
     operation: OPERATION_IDLE,
     counters: ZERO_COUNTERS,
     bounds: DEFAULT_BOUNDS,
+    // B2 round 5: a state seeded here is folded from sequence 1, so its
+    // `lastDraftRef` (present or absent) is TRUSTWORTHY. Everything that
+    // resumes from a stored projection inherits whatever that projection
+    // recorded — and a pre-round-5 projection records nothing, which is
+    // precisely the "cannot judge provenance" case.
+    historyComplete: true,
     ...overrides,
   };
 }
@@ -789,11 +815,19 @@ interface MutableDraft {
  * the backstop for exactly that: `recover()` replaying a hand-appended T1 must
  * not produce `approved`.
  */
+export type SpecApprovalProvenanceReason =
+  /** `approvedBy:'auto'` with no completed coordinator round in the log. */
+  | 'no_completion_ref'
+  /** The approval names a version/hash the completed round did not draft. */
+  | 'binding_mismatch'
+  /** B2 round 5: this state cannot see enough history to judge provenance. */
+  | 'provenance_undeterminable';
+
 export class SpecApprovalProvenanceError extends Error {
   override readonly name: string = 'SpecApprovalProvenanceError';
   readonly runId: RunId;
-  readonly reason: 'no_completion_ref' | 'binding_mismatch';
-  constructor(runId: RunId, reason: 'no_completion_ref' | 'binding_mismatch', detail: string) {
+  readonly reason: SpecApprovalProvenanceReason;
+  constructor(runId: RunId, reason: SpecApprovalProvenanceReason, detail: string) {
     super(`Corrupt event log for run ${runId}: ${detail}`);
     this.runId = runId;
     this.reason = reason;
@@ -898,6 +932,19 @@ function assertApprovalProvenance(state: EngineState, event: DomainEvent): void 
   const payload = (event as EventOfType<'spec.approved'>).payload;
   const ref = state.lastDraftRef;
   if (ref === undefined) {
+    // B2 round 5: absent means one of TWO things, and only one of them is
+    // permissive. Refuse the one we cannot tell apart from tampering.
+    if (state.historyComplete !== true) {
+      throw new SpecApprovalProvenanceError(
+        event.runId,
+        'provenance_undeterminable',
+        `spec.approved cannot be judged: this projection was not built from the run's complete history ` +
+          `(it carries no history-complete marker, so it predates provenance tracking and resumed past ` +
+          `any completed coordinator round without folding it). Absent provenance and UNKNOWN provenance ` +
+          `are not the same thing, and an approval is never accepted on the strength of the second. ` +
+          `Rebuild this run's engine projection from sequence 1 to judge it.`,
+      );
+    }
     if (payload.approvedBy === 'auto') {
       throw new SpecApprovalProvenanceError(
         event.runId,
@@ -1395,6 +1442,7 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
       ? { resumeReentryPending: draft.resumeReentryPending }
       : {}),
     ...(draft.successorIntent !== undefined ? { successorIntent: draft.successorIntent } : {}),
+    ...(state.historyComplete === true ? { historyComplete: true as const } : {}),
     ...(draft.lastDraftRef !== undefined ? { lastDraftRef: draft.lastDraftRef } : {}),
     ...(draft.approvedSpecHash !== undefined ? { approvedSpecHash: draft.approvedSpecHash } : {}),
     ...(draft.specApprovedBy !== undefined ? { specApprovedBy: draft.specApprovedBy } : {}),

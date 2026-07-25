@@ -44,7 +44,7 @@ export interface EventRepository {
    * cannot be written into the durable log through this API without an
    * explicit, greppable cast. See `AppendableEvent`.
    */
-  append<E extends DomainEvent>(draft: AppendableEvent<E>): AppendOutcome;
+  append(draft: AppendableEvent): AppendOutcome;
   /**
    * Appends a batch of events belonging to ONE run inside a single
    * transaction (§6.3: "one idempotent event append ... in one
@@ -53,7 +53,7 @@ export interface EventRepository {
    * one call is fine (e.g. re-applying a trigger + its emitted effects
    * after a crash of unknown outcome — some may already be durable).
    */
-  appendBatch<E extends DomainEvent>(drafts: readonly AppendableEvent<E>[]): readonly AppendOutcome[];
+  appendBatch(drafts: readonly AppendableEvent[]): readonly AppendOutcome[];
   /** Ordered ascending by sequence; empty array if the run has no events. */
   listByRun(runId: RunId, options?: ListByRunOptions): readonly DomainEvent[];
   getByIdempotencyKey(runId: RunId, key: IdempotencyKey): DomainEvent | undefined;
@@ -104,13 +104,13 @@ export class SqliteEventRepository implements EventRepository {
     this.#clock = clock;
   }
 
-  append<E extends DomainEvent>(draft: AppendableEvent<E>): AppendOutcome {
-    const [outcome] = this.appendBatch([draft as DomainEvent]);
+  append(draft: AppendableEvent): AppendOutcome {
+    const [outcome] = this.appendBatch([draft]);
     // appendBatch([draft]) always returns exactly one outcome for one input.
     return outcome as AppendOutcome;
   }
 
-  appendBatch<E extends DomainEvent>(input: readonly AppendableEvent<E>[]): readonly AppendOutcome[] {
+  appendBatch(input: readonly AppendableEvent[]): readonly AppendOutcome[] {
     const drafts = input as readonly DomainEvent[];
     if (drafts.length === 0) return [];
     const owner = drafts[0]!.runId;

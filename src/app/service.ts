@@ -67,7 +67,10 @@ import {
 } from '../domain/ids.js';
 import {
   deriveIdempotencyKey,
+  appendableEvent,
+  appendableEvents,
   draftEvent,
+  type AppendableEvent,
   type ChildPinRecord,
   type ChildStopReason,
   type DomainEvent,
@@ -1662,7 +1665,9 @@ export class OrchestrationService {
         // F1: read fresh + fold in ONE transactionImmediate — a folded child
         // lifecycle / re-entry ack must never fold a stale snapshot either.
         const { written } = this.#atomicEngineWrite(event.runId, () => ({
-          trigger: event,
+          // An engine-folded SUPPORTING event, never the T1 transition —
+          // re-checked at runtime rather than asserted (B2 round 5).
+          trigger: appendableEvent(event),
           meta: undefined,
         }));
         const appended = written.appended[0];
@@ -1671,7 +1676,10 @@ export class OrchestrationService {
         }
         return { status: 'recorded', event: appended.event, deduped: appended.deduped };
       }
-      const [outcome] = this.#db.events.appendBatch([event]);
+      // Reached only when `transitionForEvent` found NO §6.3 row, so this is a
+      // supporting event and cannot be the T1 transition — `appendableEvent`
+      // re-checks that at runtime rather than asserting it (B2 round 5).
+      const [outcome] = this.#db.events.appendBatch([appendableEvent(event)]);
       if (outcome === undefined) {
         throw new Error('ingest: appendBatch returned no outcome for a supporting event');
       }
@@ -1708,21 +1716,33 @@ export class OrchestrationService {
       // and a throw rolls the whole append back. Round 4: validation MINTS the
       // `ValidatedApproval` brand the durable-log append boundary requires —
       // this is the only call site that produces one.
-      const trigger: DomainEvent =
+      // B2 round 5: the type here is `AppendableEvent`, NOT `DomainEvent`. Round
+      // 4 branded the event and then annotated this binding as `DomainEvent`,
+      // erasing the brand one line after minting it — so `#atomicEngineWrite`
+      // and `appendTriggerWithEffects` never statically received it, and the
+      // guarantee stopped short of the boundary it exists to protect.
+      const trigger: AppendableEvent =
         event.type === 'spec.approved'
-          ? (this.#validateApproval(event as EventOfType<'spec.approved'>) as DomainEvent)
-          : event;
-      const outcome = applyTransition(currentState, trigger);
+          ? this.#validateApproval(event as EventOfType<'spec.approved'>)
+          : appendableEvent(event);
+      const outcome = applyTransition(currentState, trigger as DomainEvent);
       if (outcome.status === 'rejected') {
-        return { trigger: outcome.rejectionEvent as DomainEvent, meta: outcome };
+        // A rejection appends `transition.rejected`, never the approval itself.
+        return { trigger: appendableEvent(outcome.rejectionEvent as DomainEvent), meta: outcome };
       }
       const extraEvents =
         alertCtx !== undefined
           ? this.#deriveAlertEvents(currentState, event, outcome.emitted, alertCtx)
           : [];
       // The BRANDED trigger is what reaches the log — never the caller's
-      // unvalidated original.
-      return { trigger, emitted: outcome.emitted, extraEvents, meta: outcome };
+      // unvalidated original. Emitted effects and extras are engine-produced
+      // and never approvals; `appendableEvents` re-checks that at runtime.
+      return {
+        trigger,
+        emitted: appendableEvents(outcome.emitted),
+        extraEvents: appendableEvents(extraEvents),
+        meta: outcome,
+      };
     });
 
     if (outcome.status === 'rejected') {
@@ -1808,7 +1828,7 @@ export class OrchestrationService {
         { alertId: alert.alertId, sink },
         { idempotencyKey: idempotencyKey(alertDeliveredIdempotencyKey(alert.alertId, sink)) },
       ) as DomainEvent;
-      const [outcome] = this.#db.events.appendBatch([ackEvent]);
+      const [outcome] = this.#db.events.appendBatch([appendableEvent(ackEvent)]);
       if (outcome !== undefined && !outcome.deduped) {
         delivered.push({ alertId: alert.alertId, sink });
       }
@@ -1885,7 +1905,7 @@ export class OrchestrationService {
         to,
         ...(opts?.draft !== undefined ? { draft: opts.draft } : {}),
       }) as DomainEvent;
-      return { trigger: advance, meta: undefined };
+      return { trigger: appendableEvent(advance), meta: undefined };
     });
     // Re-inject bounds (config, not state — can be Infinity, which JSON drops).
     return { ...written.projection.state, bounds: this.#bounds };
@@ -2939,7 +2959,15 @@ export class OrchestrationService {
       const event = events[i]!;
       if (event.type !== 'workflow.dispatch.advanced') continue;
       const payload = event.payload;
-      if (payload.to === 'awaiting_approval' && payload.draft !== undefined) return payload.draft;
+      if (payload.to !== 'awaiting_approval') continue;
+      // B2 round 5: the LATEST advance into `awaiting_approval` decides, even
+      // when it carries NO draft. Skipping bare advances (the previous `&&
+      // payload.draft !== undefined` filter) meant a revise that completed
+      // BARE fell back to the SUPERSEDED round's ref, and an approval naming
+      // the old version passed — the service twin of the reducer staleness
+      // codex found. A bare completion means there is no current drafted
+      // provenance, not "keep using the last one".
+      return payload.draft;
     }
     return undefined;
   }
@@ -4264,9 +4292,13 @@ export class OrchestrationService {
     // path it is simply left unreferenced and GC'd). The checkpoint extra is
     // appended ONLY on the applied path (never with the rejection).
     const { currentState, meta: outcome } = this.#atomicEngineWrite<TransitionOutcome>(ctx.runId, (state) => {
+      // B2 round 5: this is the DIRECT `applyTransition` caller codex named as
+      // proof `#ingestTransition` was not universal. It still reaches the same
+      // provenance guard inside `applyTransition`, and its appends now carry the
+      // same runtime-checked boundary type as every other one.
       const outcome = applyTransition(state, trigger);
       if (outcome.status === 'rejected') {
-        return { trigger: outcome.rejectionEvent as DomainEvent, meta: outcome };
+        return { trigger: appendableEvent(outcome.rejectionEvent as DomainEvent), meta: outcome };
       }
       // P4b-1: the T4/T16 `paused_limit` notify effect rides an `alert.raised`
       // (kind `limit_paused`) in the SAME transaction as the pause + its
@@ -4277,12 +4309,12 @@ export class OrchestrationService {
         detail: `provider=${limit.provider} tier=${limit.detectionTier} operation=${operation}`,
       });
       return {
-        trigger,
-        emitted: outcome.emitted,
-        extraEvents: [
+        trigger: appendableEvent(trigger),
+        emitted: appendableEvents(outcome.emitted),
+        extraEvents: appendableEvents([
           ...(checkpoint.event !== undefined ? [checkpoint.event as DomainEvent] : []),
           ...alerts,
-        ],
+        ]),
         meta: outcome,
       };
     });
@@ -6092,13 +6124,15 @@ export class OrchestrationService {
     const reservation = this.#config.budget.conservativeReservationUsd;
     if (!wouldExceedBudget(state, reservation, max)) return;
     this.#db.events.append(
-      this.#trigger(runId, 'budget.exceeded', {
-        spentUsd: state.totalCostUsd,
-        estimatedUsd: state.totalEstimatedCostUsd,
-        reservationUsd: reservation,
-        budgetUsd: max,
-        role,
-      }) as DomainEvent,
+      appendableEvent(
+        this.#trigger(runId, 'budget.exceeded', {
+          spentUsd: state.totalCostUsd,
+          estimatedUsd: state.totalEstimatedCostUsd,
+          reservationUsd: reservation,
+          budgetUsd: max,
+          role,
+        }) as DomainEvent,
+      ),
     );
     throw new BudgetExceededError(
       runId,
@@ -6160,10 +6194,14 @@ export class OrchestrationService {
    */
   #atomicEngineWrite<M>(
     runId: RunId,
+    // B2 round 5: the trigger is typed at the APPEND boundary, not widened back
+    // to `DomainEvent`. That is what carries `#validateApproval`'s brand all the
+    // way to `appendTriggerWithEffects` — round 4 branded the event and then
+    // immediately erased it here, so the guarantee never reached the log.
     build: (currentState: EngineState) => {
-      readonly trigger: DomainEvent;
-      readonly emitted?: readonly DomainEvent[];
-      readonly extraEvents?: readonly DomainEvent[];
+      readonly trigger: AppendableEvent;
+      readonly emitted?: readonly AppendableEvent[];
+      readonly extraEvents?: readonly AppendableEvent[];
       readonly meta: M;
     },
   ): {

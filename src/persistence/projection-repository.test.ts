@@ -32,6 +32,7 @@ import {
 import { openDatabase } from './database.js';
 import { appendTriggerWithEffects } from './write-path.js';
 import { availableDriverKinds, openTestDatabase, type TestDatabaseHandle } from './test-support.js';
+import { appendableEvent, appendableEvents } from '../domain/events.js';
 
 const DRIVER_KINDS = await availableDriverKinds();
 const PROJECTION_NAME = 'engine_state';
@@ -86,7 +87,7 @@ describe.each(DRIVER_KINDS)('ProjectionRepository.recover (%s) — §19 test 10'
     let state = SEED_STATE();
     const outcome1 = applyTransition(state, TRIGGER_1);
     if (outcome1.status !== 'applied') throw new Error('setup: TRIGGER_1 unexpectedly rejected');
-    const step1 = appendTriggerWithEffects(db1, TRIGGER_1, outcome1.emitted, {
+    const step1 = appendTriggerWithEffects(db1, appendableEvent(TRIGGER_1), appendableEvents(outcome1.emitted), {
       name: PROJECTION_NAME,
       currentState: state,
       reduceEvent: reduceEngineState,
@@ -96,7 +97,7 @@ describe.each(DRIVER_KINDS)('ProjectionRepository.recover (%s) — §19 test 10'
 
     const outcome2 = applyTransition(state, TRIGGER_2);
     if (outcome2.status !== 'applied') throw new Error('setup: TRIGGER_2 unexpectedly rejected');
-    const step2 = appendTriggerWithEffects(db1, TRIGGER_2, outcome2.emitted, {
+    const step2 = appendTriggerWithEffects(db1, appendableEvent(TRIGGER_2), appendableEvents(outcome2.emitted), {
       name: PROJECTION_NAME,
       currentState: state,
       reduceEvent: reduceEngineState,
@@ -110,7 +111,7 @@ describe.each(DRIVER_KINDS)('ProjectionRepository.recover (%s) — §19 test 10'
     // full effect batch through the RAW event repository only. ----
     const outcome3 = applyTransition(state, TRIGGER_3);
     if (outcome3.status !== 'applied') throw new Error('setup: TRIGGER_3 unexpectedly rejected');
-    db1.events.appendBatch([TRIGGER_3, ...outcome3.emitted]);
+    db1.events.appendBatch(appendableEvents([TRIGGER_3, ...outcome3.emitted]));
     // Deliberately NOT calling db1.projections.save here.
     const expected = outcome3.next; // ground truth: what full processing WOULD have produced
 
@@ -166,8 +167,8 @@ describe.each(DRIVER_KINDS)('ProjectionRepository.recover (%s) — §19 test 10'
     const expected = o2.next;
 
     // Raw append only — no projection ever saved for this run.
-    db.events.appendBatch([TRIGGER_1, ...o1.emitted]);
-    db.events.appendBatch([TRIGGER_2, ...o2.emitted]);
+    db.events.appendBatch(appendableEvents([TRIGGER_1, ...o1.emitted]));
+    db.events.appendBatch(appendableEvents([TRIGGER_2, ...o2.emitted]));
     expect(db.projections.get(RUN, PROJECTION_NAME)).toBeUndefined();
 
     const recovered = db.projections.recover<EngineState>(RUN, PROJECTION_NAME, reduceEngineState, SEED_STATE());

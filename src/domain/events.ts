@@ -932,14 +932,64 @@ export type ValidatedApproval = EventOfType<'spec.approved'> & {
 };
 
 /**
- * What the durable log accepts. Same conditional shape as `NotServiceOwned`,
- * and for the same reason: a caller holding the PRECISE `spec.approved` type
- * must supply the brand, while the many call sites that legitimately pass a
- * widened `DomainEvent` keep compiling unchanged.
+ * What the durable log accepts: every event except an UNBRANDED `spec.approved`.
+ *
+ * B2 round 5 — this is now DISTRIBUTIVE (`E extends …` over a naked type
+ * parameter), and that change is the whole point. Round 4 wrote
+ * `E['type'] extends 'spec.approved'`, which tests the union's `type` as ONE
+ * type: for `E = DomainEvent` the union `'a'|'b'|'spec.approved'` does not
+ * extend `'spec.approved'`, so a widened `DomainEvent` — and any
+ * `appendBatch([approval, other])` whose element type infers to a union —
+ * satisfied the constraint with an unbranded approval inside. I reported the
+ * resulting zero call-site churn as a win; it was the evidence the constraint
+ * bound nothing. A constraint that costs nothing to satisfy usually is not
+ * constraining anything.
+ *
+ * Distributing means `AppendableEvent<DomainEvent>` is
+ * `<every non-approval member> | ValidatedApproval`, so a plain `DomainEvent`
+ * is NOT assignable and every append site must say which it has. Callers
+ * holding a widened event that they know is not an approval go through
+ * `appendableEvent()`, which CHECKS at runtime — so the widening escape is a
+ * refusal, not a hole.
  */
-export type AppendableEvent<E extends DomainEvent> = E['type'] extends 'spec.approved'
+export type AppendableEvent<E extends DomainEvent = DomainEvent> = E extends {
+  readonly type: 'spec.approved';
+}
   ? ValidatedApproval
   : E;
+
+/**
+ * Thrown when an unvalidated `spec.approved` reaches the durable-log append
+ * boundary through a widened (`DomainEvent`) path. The compile-time constraint
+ * stops precisely typed callers; this stops the ones that erased the type.
+ */
+export class UnvalidatedApprovalAppendError extends Error {
+  override readonly name: string = 'UnvalidatedApprovalAppendError';
+  readonly runId: RunId;
+  constructor(runId: RunId) {
+    super(
+      `refusing to append an unvalidated 'spec.approved' for run ${runId}: approval events reach the ` +
+        `durable log only as a ValidatedApproval, minted by the service's binding gate. Call ` +
+        `approve(), or let completeCoordinationRound sign under approval='auto'.`,
+    );
+    this.runId = runId;
+  }
+}
+
+/**
+ * Widen a `DomainEvent` to the append boundary's type, REFUSING an approval.
+ * The one supported way for a caller holding an erased type to append, and the
+ * reason the distributive constraint has no silent bypass.
+ */
+export function appendableEvent(event: DomainEvent): AppendableEvent {
+  if (event.type === 'spec.approved') throw new UnvalidatedApprovalAppendError(event.runId);
+  return event as AppendableEvent;
+}
+
+/** Batch form of `appendableEvent` — same refusal, per element. */
+export function appendableEvents(events: readonly DomainEvent[]): readonly AppendableEvent[] {
+  return events.map(appendableEvent);
+}
 
 // ---------------------------------------------------------------------------
 // Construction helpers

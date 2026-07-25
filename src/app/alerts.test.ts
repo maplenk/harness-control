@@ -44,6 +44,7 @@ import { OrchestrationService, type RoleAdapterFactory, type AlertOptions } from
 import type { RoleRunner, RoleSession } from './role-runner.js';
 import type { Harness, RoleModelSpec } from './model-resolution.js';
 import type { RoleName } from '../domain/state.js';
+import { appendableEvents } from '../domain/events.js';
 
 // ---------------------------------------------------------------------------
 // Harness plumbing
@@ -145,7 +146,7 @@ function crashOnAppendOf(db: TestDatabaseHandle['db'], type: string): { restore:
     if (drafts.some((d) => d.type === type)) {
       throw new Error(`injected crash: process died appending ${type}`);
     }
-    return original(drafts);
+    return original(appendableEvents(drafts));
   };
   return { restore: () => void (events.appendBatch = original) };
 }

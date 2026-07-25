@@ -406,7 +406,18 @@ export function makeEngineReducer(
       // own LOG recording which SpecVersion was drafted, and it is what lets
       // `applyTransition` check a T1's provenance purely — including during
       // `recover()`, where no database read is permissible.
-      return { ...withBounds, phase: to, ...(draft !== undefined ? { lastDraftRef: draft } : {}) };
+      //
+      // B2 round 5: an advance INTO `awaiting_approval` REPLACES the reference,
+      // clearing it when the advance carries none. Round 4 only ever set it, so
+      // a revise round that completed BARE (no draft ref — the pure-runner seam)
+      // left the SUPERSEDED reference in place, and an approval matching the old
+      // version/hash satisfied the check. The latest completion is the only one
+      // that can be approved, so it is the only one the state may remember.
+      if (to === 'awaiting_approval') {
+        const { lastDraftRef: _superseded, ...rest } = withBounds;
+        return { ...rest, phase: to, ...(draft !== undefined ? { lastDraftRef: draft } : {}) };
+      }
+      return { ...withBounds, phase: to };
     }
     if (event.type === 'child.spawn.initiated') {
       return foldChildSpawnInitiated(withBounds, event);

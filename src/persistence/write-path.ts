@@ -58,21 +58,23 @@ export interface AppendTriggerOptions {
  * transition") plus the pause spine's "ONE atomic append" both land here.
  * Like `emitted`, extras are effects/facts, never further reducer inputs.
  */
-export function appendTriggerWithEffects<S, E extends DomainEvent = DomainEvent>(
+export function appendTriggerWithEffects<S>(
   db: Database,
-  // B2 round 4: the trigger reaches the durable log, so it carries the same
-  // brand requirement as `EventRepository.append` — a precisely typed
-  // `spec.approved` must be a `ValidatedApproval`. See `AppendableEvent`.
-  trigger: AppendableEvent<E>,
-  emitted: readonly DomainEvent[],
+  // B2 round 4/5: everything here reaches the durable log, so it all carries the
+  // append boundary's brand requirement — an approval must be a
+  // `ValidatedApproval`, and a caller holding an erased type must come through
+  // `appendableEvent()` (which refuses one). See `AppendableEvent`.
+  trigger: AppendableEvent,
+  emitted: readonly AppendableEvent[],
   projection: ProjectionUpdate<S>,
-  extraEvents: readonly DomainEvent[] = [],
+  extraEvents: readonly AppendableEvent[] = [],
   options: AppendTriggerOptions = {},
 ): AppendWithProjectionResult<S> {
   const body = (): AppendWithProjectionResult<S> => {
-    // The brand requirement is discharged at THIS function's boundary (above),
-    // so the batch is widened here rather than re-asserted per element.
-    const batch: readonly DomainEvent[] = [trigger as DomainEvent, ...emitted, ...extraEvents];
+    // B2 round 5: the branded trigger is carried THROUGH to the append —
+    // round 4 widened it back to `DomainEvent` here, so the guarantee never
+    // reached the boundary it exists to protect.
+    const batch: readonly AppendableEvent[] = [trigger, ...emitted, ...extraEvents];
     const appended = db.events.appendBatch(batch);
     const triggerOutcome = appended[0];
     const lastOutcome = appended[appended.length - 1];

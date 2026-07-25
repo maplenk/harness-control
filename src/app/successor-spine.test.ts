@@ -41,6 +41,7 @@ import {
 import { OrchestrationService, type RoleAdapterFactory } from './service.js';
 import type { RoleRunner } from './role-runner.js';
 import type { Harness, RoleModelSpec } from './model-resolution.js';
+import { appendableEvents } from '../domain/events.js';
 
 const DRIVER_KINDS = await availableDriverKinds();
 
@@ -165,7 +166,7 @@ function crashOnAppendOf(db: TestDatabaseHandle['db'], type: string): { restore:
     if (drafts.some((d) => d.type === type)) {
       throw new Error(`injected crash: process died appending ${type}`);
     }
-    return original(drafts);
+    return original(appendableEvents(drafts));
   };
   return {
     restore: () => {

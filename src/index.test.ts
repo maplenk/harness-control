@@ -10,6 +10,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { appendableEvent } from './domain/events.js';
 import {
   // lib
   BoundedQueue,
@@ -186,7 +187,7 @@ describe('cross-module flows through the barrel only', () => {
         occurredAt: AT,
       }) as DomainEvent;
 
-      const first = appendTriggerWithEffects(db, trigger, [], {
+      const first = appendTriggerWithEffects(db, appendableEvent(trigger), [], {
         name: 'barrel_smoke',
         currentState: { count: 0 },
         reduceEvent: (s: { count: number }) => ({ count: s.count + 1 }),
@@ -195,7 +196,7 @@ describe('cross-module flows through the barrel only', () => {
       expect(db.events.countByRun(RUN)).toBe(1);
 
       // Redelivered notification (same idempotency key) = one logical event.
-      const redelivered = db.events.append(trigger);
+      const redelivered = db.events.append(appendableEvent(trigger));
       expect(redelivered.deduped).toBe(true);
       expect(db.events.countByRun(RUN)).toBe(1);
     } finally {

@@ -53,10 +53,19 @@ import {
   type MergeReadinessBlockedState,
   type SpecDraftState,
 } from './projections.js';
-import { draftEvent, type DomainEvent, type EventOfType } from '../domain/events.js';
+import {
+  appendableEvent,
+  appendableEvents,
+  draftEvent,
+  UnvalidatedApprovalAppendError,
+  type AppendableEvent,
+  type DomainEvent,
+  type EventOfType,
+} from '../domain/events.js';
 import { SpecApprovalProvenanceError } from '../domain/transitions.js';
 import type { Verification } from '../domain/entities.js';
 import {
+  artifactHash,
   assignmentId,
   gitSha,
   idempotencyKey,
@@ -161,8 +170,13 @@ function approvalEvents(db: TestDatabaseHandle['db'], runId: RunId): readonly { 
 }
 
 /**
- * B2 round 3: codex's bypass — a hand-built T1 handed straight to public
- * `ingest`, which appends transitions and never saw round 2's per-route checks.
+ * B2 round 3/5: codex's bypass — a hand-built T1 handed straight to public
+ * `ingest` or to `db.events.append`. Round 5 made the append boundary bind, so
+ * reaching the log now needs `forcedIntoLog()` below: the explicit cast a
+ * determined attacker would have to write, since `appendableEvent()` REFUSES an
+ * approval at runtime. Everything after that point still has to hold.
+ *
+ * Original round-3 note: which appends transitions and never saw round 2's per-route checks.
  * `as DomainEvent` is exactly how a real bypass would be written (and how the
  * ~70 existing `ingest` call sites are written); the PRECISELY typed form is a
  * compile error, which `ingest-type-guard.test-d.ts` cannot express in vitest,
@@ -237,6 +251,18 @@ function staleBlockedState(runId: RunId, claimedSigner: 'human' | 'auto'): Merge
     stage: 'blocked',
     recordedAt: '2026-07-25T00:00:00.000Z' as ReturnType<Clock['nowIso']>,
   };
+}
+
+
+/**
+ * Force an unvalidated approval past the (now binding) append boundary. There
+ * is no supported way to do this — `appendableEvent()` throws on an approval
+ * and the type requires a `ValidatedApproval` — so the test states the cast
+ * openly. It is the exact shape the durable-log guard is defence against, and
+ * the point of the tests below is that the FOLD still refuses it.
+ */
+function forcedIntoLog(event: DomainEvent): AppendableEvent {
+  return event as unknown as AppendableEvent;
 }
 
 const DRIVER_KINDS = await availableDriverKinds();
@@ -648,10 +674,12 @@ describe.each(DRIVER_KINDS)('B2 round 4 — an unvalidated T1 in the durable log
 
     // Straight past every service check, into the durable log.
     db.events.append(
-      handBuiltApproval(
-        runId,
-        { specVersionId: 'spec_fabricated', specHash: 'totally-made-up-hash', approvedBy: 'auto' },
-        'log_bypass_1',
+      forcedIntoLog(
+        handBuiltApproval(
+          runId,
+          { specVersionId: 'spec_fabricated', specHash: 'totally-made-up-hash', approvedBy: 'auto' },
+          'log_bypass_1',
+        ),
       ),
     );
     // It IS in the log — the append boundary is a compile-time guard, not a
@@ -668,7 +696,9 @@ describe.each(DRIVER_KINDS)('B2 round 4 — an unvalidated T1 in the durable log
     const runId = runAtGateWithoutDraft(service); // no completion ref in the log
 
     db.events.append(
-      handBuiltApproval(runId, { specVersionId: 's', specHash: 'h', approvedBy: 'auto' }, 'log_bypass_2'),
+      forcedIntoLog(
+        handBuiltApproval(runId, { specVersionId: 's', specHash: 'h', approvedBy: 'auto' }, 'log_bypass_2'),
+      ),
     );
     expect(() => service.recover(runId)).toThrow(SpecApprovalProvenanceError);
     expect(service.status(runId).phase).toBe('awaiting_approval');
@@ -679,10 +709,12 @@ describe.each(DRIVER_KINDS)('B2 round 4 — an unvalidated T1 in the durable log
     const runId = await runWithCompletedDraft(service, draftFor(2));
 
     db.events.append(
-      handBuiltApproval(
-        runId,
-        { specVersionId: 'spec_1', specHash: 'hash_1', approvedBy: 'human' }, // superseded
-        'log_bypass_3',
+      forcedIntoLog(
+        handBuiltApproval(
+          runId,
+          { specVersionId: 'spec_1', specHash: 'hash_1', approvedBy: 'human' }, // superseded
+          'log_bypass_3',
+        ),
       ),
     );
     expect(() => service.recover(runId)).toThrow(SpecApprovalProvenanceError);
@@ -717,13 +749,34 @@ describe.each(DRIVER_KINDS)('B2 round 4 — an unvalidated T1 in the durable log
     expect(recovered.specApprovedBy).toBe('human');
   });
 
-  it('appending a PRECISELY typed spec.approved is a COMPILE error without the brand (enforced by tsc)', () => {
+  // ENFORCEMENT: these three assertions are carried by `npm run typecheck`, not
+  // by vitest (which does not typecheck) — at RUNTIME they are trivially true.
+  // Their teeth are the `@ts-expect-error` directives: tsc reports TS2578
+  // "Unused '@ts-expect-error' directive" the moment any of these calls becomes
+  // legal again, so a regression fails the typecheck gate. Measured on the
+  // round-4 parent, all three COMPILED — which is why round 5 exists.
+  it('the append boundary rejects an unbranded approval in all three shapes (enforced by tsc, not vitest)', () => {
     const event = undefined as unknown as EventOfType<'spec.approved'>;
+    const other = undefined as unknown as EventOfType<'pause.user.requested'>;
+    const widened = undefined as unknown as DomainEvent;
     const events = undefined as unknown as TestDatabaseHandle['db']['events'];
-    // @ts-expect-error -- B2 round 4: `AppendableEvent` requires the
-    // `ValidatedApproval` brand, which only the service's validated path mints.
-    const refused = (): unknown => events.append(event);
-    expect(typeof refused).toBe('function');
+
+    // 1. precisely typed, single
+    // @ts-expect-error -- `AppendableEvent` requires the `ValidatedApproval`
+    // brand, which only the service's validated path mints.
+    const single = (): unknown => events.append(event);
+
+    // 2. codex (c): a UNION batch. Round 4's non-distributive conditional
+    // tested the union's `type` as one type, so this compiled.
+    // @ts-expect-error -- the conditional now DISTRIBUTES over union members.
+    const union = (): unknown => events.appendBatch([event, other]);
+
+    // 3. codex (c): a widened `DomainEvent`. Round 4 accepted this too, which
+    // is exactly why the zero-churn result was the tell, not the win.
+    // @ts-expect-error -- `DomainEvent` includes the unbranded approval member.
+    const wide = (): unknown => events.append(widened);
+
+    expect([single, union, wide].every((f) => typeof f === 'function')).toBe(true);
   });
 });
 
@@ -763,5 +816,158 @@ describe.each(DRIVER_KINDS)('B2 round 4 — stale persisted attribution is migra
     const stored = staleBlockedState(runId, 'human');
     service.saveMergeReadinessBlocked(runId, stored);
     expect(service.getMergeReadinessBlocked(runId)?.mergeReadiness.specApprovedBy).toBe('human');
+  });
+});
+
+// ===========================================================================
+// B2 ROUND 5 — codex's three exact shapes
+//
+// (b) `lastDraftRef` was not reliable in every supported state, so the pure
+//     comparison could be satisfied by stale or missing provenance:
+//       - recovery is INCREMENTAL, so a projection whose cursor is already past
+//         the completion advance has no ref and never backfills it;
+//       - a BARE `specifying → awaiting_approval` advance did not CLEAR the
+//         previous ref, so a superseded version still matched.
+//     Both were the same error: an absent ref meant two different things and
+//     the check took the permissive one. Round 5 makes them distinguishable.
+//
+// (c) the brand did not bind: `AppendableEvent` tested `E['type']`
+//     NON-DISTRIBUTIVELY, so a union — `appendBatch([approval, other])` — and a
+//     widened `DomainEvent` both slipped through unbranded.
+// ===========================================================================
+describe.each(DRIVER_KINDS)('B2 round 5 — provenance is UNDETERMINABLE, not absent [%s]', (kind) => {
+  it('CODEX REPRO: a projection resumed PAST the completion advance refuses instead of falling permissive', async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+
+    // Exactly what a pre-round-4 build leaves behind: a projection whose cursor
+    // is past the completion advance and which never recorded `lastDraftRef`.
+    const record = db.projections.get<Record<string, unknown>>(runId, ENGINE_STATE_PROJECTION);
+    expect(record).toBeDefined();
+    const { lastDraftRef: _noRef, historyComplete: _noMarker, ...legacyState } = record!.state;
+    db.projections.save(runId, ENGINE_STATE_PROJECTION, legacyState, record!.eventCursor);
+
+    // The attack codex described is a DIRECT append plus a recovery — the
+    // service's own check reads the log and would catch an `approve()` call, so
+    // the fold is the layer under test here. A mismatching HUMAN approval used
+    // to be treated as the documented "no completion ref" case and folded
+    // straight into approved.
+    db.events.append(
+      forcedIntoLog(
+        handBuiltApproval(
+          runId,
+          { specVersionId: 'spec_anything', specHash: 'hash_anything', approvedBy: 'human' },
+          'undeterminable_1',
+        ),
+      ),
+    );
+    expect(() => service.recover(runId)).toThrow(SpecApprovalProvenanceError);
+    try {
+      service.recover(runId);
+    } catch (error) {
+      expect((error as SpecApprovalProvenanceError).reason).toBe('provenance_undeterminable');
+    }
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+  });
+
+  it('a state built from the COMPLETE history keeps the permissive human path (the retained asymmetry)', async () => {
+    const { service } = await setup(kind, HUMAN_CONFIG());
+    const runId = runAtGateWithoutDraft(service); // folded from sequence 1, no completion
+    const applied = await service.approve(runId, {
+      specVersionId: toSpecVersionId('spec_imported'),
+      specHash: toSpecHash('hash_imported'),
+    });
+    expect(applied.status).toBe('applied');
+    expect(service.status(runId).specApprovedBy).toBe('human');
+  });
+
+  it('CODEX REPRO: a revise followed by a BARE completion clears the superseded reference', async () => {
+    const { service, db } = await setup(kind, AUTO_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    expect(service.status(runId).phase).toBe('approved'); // auto-signed round 1
+
+    // Back to specifying, then complete BARE — the pure-runner seam, which
+    // advances WITHOUT a draft ref. Round 4 only ever SET the reference, so
+    // `spec_1`'s ref survived and an approval naming it still "matched".
+    service.advanceWorkflowPhase(runId, 'approved', 'implementing');
+    db.projections.save(runId, ENGINE_STATE_PROJECTION, {
+      ...service.status(runId),
+      phase: 'specifying',
+      suspension: { kind: 'none' },
+      operation: { kind: 'idle' },
+      counters: { restartsInWindow: 0, lifetimeRestarts: 0, remediationRounds: 0, probesInIncident: 0 },
+      historyComplete: true,
+      lastDraftRef: {
+        artifactHash: artifactHash('hash_1'),
+        specVersionId: toSpecVersionId('spec_1'),
+        specHash: toSpecHash('hash_1'),
+        revision: 1,
+      },
+    });
+    service.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval'); // BARE
+
+    // The security-relevant consequence: with the superseded reference cleared
+    // there is no drafted provenance, so the ENGINE may not sign at all. (A
+    // HUMAN still may — the asymmetry codex told me to retain: a person can
+    // attest an unbacked hash, the engine cannot.)
+    await expect(
+      service.approve(runId, {
+        specVersionId: toSpecVersionId('spec_1'),
+        specHash: toSpecHash('hash_1'),
+        mode: 'auto',
+      }),
+    ).rejects.toMatchObject({ reason: 'auto_approve_without_completion' });
+    expect(approvalEvents(db, runId).filter((e) => (e.payload as { approvedBy: string }).approvedBy === 'auto'))
+      .toHaveLength(1); // only round 1's, none from this attempt
+  });
+});
+
+describe.each(DRIVER_KINDS)('B2 round 5 — the append brand actually binds [%s]', (kind) => {
+  it('CODEX REPRO: appendBatch([approval, other]) — the UNION no longer slips an unbranded approval through', async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    const approval = handBuiltApproval(
+      runId,
+      { specVersionId: 'spec_1', specHash: 'hash_1', approvedBy: 'human' },
+      'union_bypass_1',
+    );
+    const other = draftEvent({
+      type: 'notify.requested',
+      runId,
+      payload: { topic: 'merge_ready', message: 'filler' },
+      idempotencyKey: idempotencyKey('union_bypass_filler'),
+      occurredAt: '2026-07-25T00:00:00.000Z' as ReturnType<Clock['nowIso']>,
+    }) as DomainEvent;
+
+    // The runtime half of the boundary: the batch helper refuses the approval,
+    // so the mixed batch cannot be laundered through a union.
+    expect(() => appendableEvents([approval, other])).toThrow(UnvalidatedApprovalAppendError);
+    // …and nothing partial was written.
+    expect(approvalEvents(db, runId)).toHaveLength(0);
+  });
+
+  it('a widened DomainEvent approval is REFUSED by appendableEvent (round 4 accepted it silently)', async () => {
+    const { service } = await setup(kind, HUMAN_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    const widened: DomainEvent = handBuiltApproval(
+      runId,
+      { specVersionId: 'spec_1', specHash: 'hash_1', approvedBy: 'human' },
+      'widened_bypass_1',
+    );
+    expect(() => appendableEvent(widened)).toThrow(UnvalidatedApprovalAppendError);
+  });
+
+  it('non-approval events pass the boundary unchanged — the guard is surgical', async () => {
+    const { service } = await setup(kind, HUMAN_CONFIG());
+    const runId = runAtGateWithoutDraft(service);
+    const fact = draftEvent({
+      type: 'notify.requested',
+      runId,
+      payload: { topic: 'merge_ready', message: 'ok' },
+      idempotencyKey: idempotencyKey('surgical_r5'),
+      occurredAt: '2026-07-25T00:00:00.000Z' as ReturnType<Clock['nowIso']>,
+    }) as DomainEvent;
+    expect(() => appendableEvent(fact)).not.toThrow();
+    expect(appendableEvents([fact, fact])).toHaveLength(2);
   });
 });
