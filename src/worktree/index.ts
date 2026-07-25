@@ -16,3 +16,5 @@ export * from './paths.js';
 export * from './provision.js';
 export * from './validate.js';
 export * from './manager.js';
+export * from './write-scope.js';
+export * from './in-place.js';

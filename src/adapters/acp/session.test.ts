@@ -10,6 +10,7 @@
  */
 import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { noPayloadToVerify } from './session.js';
+import { writeBoundary } from '../../worktree/write-scope.js';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -248,7 +249,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
       const policy = {
         mode: 'headless',
         role: 'implementor',
-        policy: { allow: [], workspaceWriteRoot: '/repo' },
+        policy: { allow: [], workspaceWriteBoundary: writeBoundary({ mode: 'worktree', executionRoot: '/repo' }) },
         verifyOperationPayload: () => false,
       } as const;
       expect(decidePermission(policy, 'Write `/repo/src/a.ts`', undefined).action).toBe('deny');
@@ -370,7 +371,12 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     const policy = {
       verifyOperationPayload: noPayloadToVerify, mode: 'headless',
       role: 'implementor',
-      policy: { allow: [], workspaceWriteRoot: root },
+      // B4: the policy field is a validated `WriteBoundary` rather than a bare
+      // root string. A boundary with the SINGLE root `root` is the same decision
+      // this test has always asserted — every containment expectation below is
+      // unchanged, including the direct `isWorkspaceWriteOperation(…, root)`
+      // calls, which still take the bare root.
+      policy: { allow: [], workspaceWriteBoundary: writeBoundary({ mode: 'worktree', executionRoot: root }) },
     } as const;
 
     // F14 (found while consolidating containment): a `..` that FOLLOWS a symlink

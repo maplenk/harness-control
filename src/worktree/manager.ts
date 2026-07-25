@@ -48,6 +48,21 @@ import {
 } from './paths.js';
 import { removeStaleIndexLock, validateWorktree, type ValidateWorktreeResult } from './validate.js';
 import { WorktreeError } from './errors.js';
+import { resolveExecutionMode, type ExecutionMode } from '../domain/execution-mode.js';
+import {
+  openInPlaceCheckpoint,
+  restoreCheckpointHead,
+  revertToCheckpoint,
+  type InPlaceCheckpoint,
+  type InPlaceRevertOutcome,
+} from './in-place.js';
+import {
+  boundariesOverlap,
+  pathsOutsideBoundary,
+  writeBoundary,
+  writeScopeConflictError,
+  type WriteBoundary,
+} from './write-scope.js';
 import {
   defaultProvisionRuntime,
   gcProvisionStages,
@@ -120,18 +135,66 @@ export interface WorktreeHandle {
   readonly assignmentId: AssignmentId;
   /** Canonicalized (`git rev-parse --show-toplevel`) primary checkout root. */
   readonly repoRoot: string;
+  /**
+   * The directory the agent runs in. In `worktree` mode this is the isolated
+   * worktree; in `in_place` mode it IS `repoRoot` — the name is kept because
+   * every downstream consumer (cwd, §16 probe, provisioning, receipts) means
+   * "the tree this assignment works in", and renaming it would have touched
+   * ~460 call sites to say the same thing.
+   */
   readonly worktreePath: string;
   readonly branch: string;
   readonly baseSha: GitSha;
   readonly createdAt: IsoTimestamp;
   /** False after `releaseLease`, true again after `reacquireLease`/`reattach`/`createWorktree`. */
   readonly leased: boolean;
+  /**
+   * B3: which execution mode produced this handle. REQUIRED, not optional — the
+   * mode decides whether `removeWorktree` may delete the directory and whether
+   * `discardToCommit` is a rollback or a destruction of the user's checkout, and
+   * an optional field would let a future construction path silently default to
+   * the destructive answer.
+   */
+  readonly executionMode: ExecutionMode;
+  /**
+   * B4: WHERE this assignment may write. REQUIRED for the same reason: this is
+   * the value the permission chokepoint and the commit gate consult, so a handle
+   * without one would be a session with no write boundary at all. In today's
+   * single-assignment shape it is the whole `worktreePath`, which is byte-for-byte
+   * the pre-B4 decision.
+   */
+  readonly writeBoundary: WriteBoundary;
 }
 
 export interface CreateWorktreeInput {
   readonly assignmentId: AssignmentId;
   /** Exact immutable commit selected when the run was created (§16 item 1). */
   readonly baseCommit: GitSha;
+  /**
+   * B4 declared write scope, repo-relative. OMITTED (the default) means the
+   * whole worktree — exactly today's behaviour. Supplied, it NARROWS what the
+   * implementor may write and what a revert may destroy.
+   */
+  readonly writeScope?: readonly string[];
+}
+
+/**
+ * B3 in-place workspace creation. No `worktreePath` and no provisioning: the
+ * work happens in the primary checkout itself, on an assignment branch, with the
+ * start checkpoint as the revert target.
+ */
+export interface CreateInPlaceInput {
+  readonly assignmentId: AssignmentId;
+  readonly baseCommit: GitSha;
+  /**
+   * B4 declared write scope, repo-relative. For a SINGLE in-place assignment an
+   * empty scope (the whole checkout) is the honest default — the agent is the
+   * only writer. For N concurrent assignments in one checkout a scope is what
+   * makes R1 enforceable, and two live overlapping scopes are REFUSED here.
+   */
+  readonly writeScope?: readonly string[];
+  /** Durable write of the start checkpoint, before the tree is touched. */
+  readonly persistCheckpoint: (checkpoint: InPlaceCheckpoint) => void;
 }
 
 export interface ReattachInput {
@@ -141,6 +204,18 @@ export interface ReattachInput {
   readonly baseSha: GitSha;
   /** Taint flags carried over from persisted state (e.g. a `Checkpoint.content.worktree.taintFlags` snapshot), so a restart doesn't lose an un-cleared taint. */
   readonly taintFlags?: readonly WorktreeTaint[];
+  /**
+   * B3: the persisted execution mode. This is UNTRUSTED persisted JSON, not a
+   * typed value — every record written before B3 has no mode at all — so it goes
+   * through `resolveExecutionMode`, which gives absence its only honest meaning
+   * (`worktree`, the status quo). Never widen this to `ExecutionMode`: that would
+   * be a compile-time claim about bytes on disk.
+   */
+  readonly executionMode?: unknown;
+  /** B3/B4: the persisted declared write scope (absent = the whole root). */
+  readonly writeScope?: readonly string[];
+  /** B3: the persisted start checkpoint, required to re-arm the in-place revert. */
+  readonly inPlaceCheckpoint?: InPlaceCheckpoint;
 }
 
 export interface RemoveWorktreeOptions {
@@ -179,6 +254,12 @@ export class GitWorktreeManager {
   readonly #handles = new Map<AssignmentId, WorktreeHandle>();
   readonly #leasedPaths = new Set<string>();
   readonly #taints = new Map<AssignmentId, Set<WorktreeTaint>>();
+  /**
+   * B3: the start checkpoint of every LIVE in-place assignment — the revert
+   * target, kept next to the handle so `revertInPlace` cannot be called with a
+   * checkpoint belonging to some other assignment.
+   */
+  readonly #inPlaceCheckpoints = new Map<AssignmentId, InPlaceCheckpoint>();
   // F7 dependency provisioning.
   readonly #provisionStrategy: ProvisionStrategy;
   readonly #provisionRuntime: ProvisionRuntime;
@@ -328,6 +409,16 @@ export class GitWorktreeManager {
     if (this.#leasedPaths.has(worktreePath)) {
       throw new WorktreeError('path_already_leased', `Worktree path already leased by another assignment: ${worktreePath}`);
     }
+    // B4: the boundary is built BEFORE the tree exists (see `write-scope.ts` on
+    // why the constructor is pure) and refused here if it collides with a live
+    // one. With no declared scope this is the whole worktree — byte-for-byte the
+    // pre-B4 containment root, and two worktrees are always disjoint directories.
+    const boundary = writeBoundary({
+      mode: 'worktree',
+      executionRoot: worktreePath,
+      ...(input.writeScope !== undefined ? { declaredScope: input.writeScope } : {}),
+    });
+    this.#assertScopeDisjoint(assignmentId, boundary);
     const branch = branchNameFor(assignmentId);
 
     // §16.2: in-process mutex (this manager) THEN the W3-5 cross-process
@@ -356,12 +447,137 @@ export class GitWorktreeManager {
           baseSha: gitSha(baseSha),
           createdAt: this.#clock.nowIso(),
           leased: true,
+          executionMode: 'worktree',
+          writeBoundary: boundary,
         };
         this.#handles.set(assignmentId, handle);
         this.#leasedPaths.add(worktreePath);
         return handle;
       }),
     );
+  }
+
+  /**
+   * B3 — open an `in_place` workspace: no `git worktree add`, no provisioning.
+   * The implementor works in THIS checkout, on `harness/assignment/<id>`, with a
+   * durable start checkpoint as the revert target (`./in-place.ts`).
+   *
+   * What this method owns that the free function does not:
+   *  - the same §16.2 in-process mutex + W3-5 cross-process advisory lease every
+   *    other tree-mutating operation holds (the branch switch mutates the SHARED
+   *    checkout, so it is strictly MORE contended than `git worktree add`, not
+   *    less);
+   *  - the single-writer lease, keyed on the repo root — which is what stops two
+   *    in-place assignments from both owning the whole checkout;
+   *  - R1: refusing a scope that overlaps a LIVE assignment's scope.
+   */
+  async createInPlaceWorkspace(input: CreateInPlaceInput): Promise<WorktreeHandle> {
+    const { assignmentId } = input;
+    const requestedBase = (input as Partial<CreateInPlaceInput>).baseCommit;
+    if (typeof requestedBase !== 'string' || !/^[0-9a-f]{40}$/.test(requestedBase)) {
+      throw new WorktreeError(
+        'invalid_base_commit',
+        `createInPlaceWorkspace requires baseCommit to be an exact 40-character lowercase commit SHA; got ${JSON.stringify(requestedBase)}`,
+      );
+    }
+    if (this.#handles.has(assignmentId)) {
+      throw new WorktreeError('already_leased', `Assignment already has a tracked worktree: ${String(assignmentId)}`);
+    }
+    const boundary = writeBoundary({
+      mode: 'in_place',
+      executionRoot: this.#primaryRepoRoot,
+      ...(input.writeScope !== undefined ? { declaredScope: input.writeScope } : {}),
+    });
+    this.#assertScopeDisjoint(assignmentId, boundary);
+    // The single-writer lease is keyed on the PATH, and in-place mode's path is
+    // the checkout itself. A whole-root in-place assignment therefore excludes
+    // every other whole-root one by the mechanism that already exists; scoped
+    // siblings pass here and are separated by `#assertScopeDisjoint` above.
+    if (boundary.declared.length === 0 && this.#leasedPaths.has(this.#primaryRepoRoot)) {
+      throw new WorktreeError(
+        'path_already_leased',
+        `the primary checkout ${this.#primaryRepoRoot} is already leased in-place by another assignment`,
+      );
+    }
+    const branch = branchNameFor(assignmentId);
+
+    return this.#mutex.runExclusive(this.#primaryRepoRoot, 'worktree_add', { assignmentId, worktreePath: this.#primaryRepoRoot }, () =>
+      this.#advisoryLease.withLease(async () => {
+        const checkpoint = await openInPlaceCheckpoint({
+          assignmentId,
+          rootPath: this.#primaryRepoRoot,
+          baseSha: requestedBase as GitSha,
+          branch,
+          clock: this.#clock,
+          persist: input.persistCheckpoint,
+        });
+        const handle: WorktreeHandle = {
+          assignmentId,
+          repoRoot: this.#primaryRepoRoot,
+          worktreePath: this.#primaryRepoRoot,
+          branch,
+          baseSha: checkpoint.baseSha,
+          createdAt: checkpoint.createdAt,
+          leased: true,
+          executionMode: 'in_place',
+          writeBoundary: boundary,
+        };
+        this.#handles.set(assignmentId, handle);
+        this.#inPlaceCheckpoints.set(assignmentId, checkpoint);
+        if (boundary.declared.length === 0) this.#leasedPaths.add(this.#primaryRepoRoot);
+        return handle;
+      }),
+    );
+  }
+
+  /** B3: the start checkpoint of a live in-place assignment (the revert target). */
+  inPlaceCheckpointFor(assignmentId: AssignmentId): InPlaceCheckpoint | undefined {
+    return this.#inPlaceCheckpoints.get(assignmentId);
+  }
+
+  /**
+   * B3 — the guarded revert. Refuses (leaving the tree untouched) when any dirty
+   * path falls outside this assignment's write scope; see `./in-place.ts` for why
+   * that refusal is unconditional. Mutex-held: it rewrites the shared checkout.
+   */
+  async revertInPlace(assignmentId: AssignmentId): Promise<InPlaceRevertOutcome> {
+    const handle = this.#requireHandle(assignmentId);
+    const checkpoint = this.#inPlaceCheckpoints.get(assignmentId);
+    if (handle.executionMode !== 'in_place' || checkpoint === undefined) {
+      throw new WorktreeError(
+        'not_found',
+        `no in-place start checkpoint for assignment ${String(assignmentId)}; a revert target is never inferred`,
+      );
+    }
+    return this.#mutex.runExclusive(
+      this.#primaryRepoRoot,
+      'other',
+      { assignmentId, worktreePath: handle.worktreePath },
+      () =>
+        this.#advisoryLease.withLease(() =>
+          revertToCheckpoint({ checkpoint, boundary: handle.writeBoundary }),
+        ),
+    );
+  }
+
+  /**
+   * R1 at the SUBSTRATE, not at a call site.
+   *
+   * Approval-time scope checking (the coordinator spec gate) is where a human
+   * sees a bad decomposition, but it is a check on a DOCUMENT. This is a check on
+   * the live set of workspaces this manager has actually handed out, so a run
+   * that reached here by any route — a hand-built input, a resumed record, a
+   * future flow nobody has written yet — still cannot obtain two overlapping
+   * write boundaries at the same time.
+   */
+  #assertScopeDisjoint(assignmentId: AssignmentId, boundary: WriteBoundary): void {
+    for (const [otherId, other] of this.#handles) {
+      if (otherId === assignmentId) continue;
+      const overlap = boundariesOverlap(other.writeBoundary, boundary);
+      if (overlap !== undefined) {
+        throw writeScopeConflictError(String(otherId), String(assignmentId), overlap);
+      }
+    }
   }
 
   /**
@@ -425,6 +641,17 @@ export class GitWorktreeManager {
     if (this.#leasedPaths.has(resolvedPath)) {
       throw new WorktreeError('path_already_leased', `Worktree path already leased: ${resolvedPath}`);
     }
+    // B3: `git worktree list --porcelain` lists the PRIMARY checkout first, so an
+    // in-place root passes the registration check above exactly as a worktree
+    // does — which is why the mode has to come from the persisted record rather
+    // than being inferred from the path.
+    const executionMode = resolveExecutionMode(input.executionMode);
+    const boundary = writeBoundary({
+      mode: executionMode,
+      executionRoot: resolvedPath,
+      ...(input.writeScope !== undefined ? { declaredScope: input.writeScope } : {}),
+    });
+    this.#assertScopeDisjoint(input.assignmentId, boundary);
     const handle: WorktreeHandle = {
       assignmentId: input.assignmentId,
       repoRoot: this.#primaryRepoRoot,
@@ -433,9 +660,14 @@ export class GitWorktreeManager {
       baseSha: input.baseSha,
       createdAt: this.#clock.nowIso(),
       leased: true,
+      executionMode,
+      writeBoundary: boundary,
     };
     this.#handles.set(input.assignmentId, handle);
     this.#leasedPaths.add(resolvedPath);
+    if (executionMode === 'in_place' && input.inPlaceCheckpoint !== undefined) {
+      this.#inPlaceCheckpoints.set(input.assignmentId, input.inPlaceCheckpoint);
+    }
     return handle;
   }
 
@@ -507,6 +739,31 @@ export class GitWorktreeManager {
       { assignmentId, worktreePath: handle.worktreePath },
       async () => {
         const lockfileCleanupPerformed = await removeStaleIndexLock(handle.worktreePath);
+        // B3 — the SAME destruction guard the explicit revert applies, at the
+        // same place, because this is the other route to `reset --hard` +
+        // `clean -fd`. In `worktree` mode the tree is the engine's own and this
+        // is a no-op (the boundary is the whole worktree, so nothing dirty can
+        // be outside it — byte-for-byte today's behaviour). In `in_place` mode
+        // the tree is the USER's, and discarding a path this assignment cannot
+        // account for is destroying work the engine did not create. The verifier
+        // resume path calls this to drop evidence dirt; evidence dirt inside the
+        // scope is still dropped, an unexplained file outside it stops the run.
+        if (handle.executionMode === 'in_place') {
+          const dirty = await git.statusPorcelainPathsExact(handle.worktreePath);
+          const unattributable = pathsOutsideBoundary(
+            handle.writeBoundary,
+            dirty.map((relative) => path.resolve(handle.worktreePath, relative)),
+          );
+          if (unattributable.length > 0) {
+            throw new WorktreeError(
+              'requires_validation',
+              `refusing to discard to ${String(commit)} in the in-place checkout ${handle.worktreePath}: ` +
+                `${unattributable.length} dirty path(s) fall outside assignment ${String(assignmentId)}'s write ` +
+                'scope, so this engine cannot prove it created them. The tree is untouched; resolve them by hand.',
+              { detail: unattributable.slice(0, 20).join('\n') },
+            );
+          }
+        }
         await git.hardReset(handle.worktreePath, String(commit));
         await git.cleanUntracked(handle.worktreePath);
         const [head, status] = await Promise.all([
@@ -548,6 +805,26 @@ export class GitWorktreeManager {
    */
   async provisionForVerification(assignmentId: AssignmentId): Promise<ProvisionOutcome> {
     const handle = this.#requireHandle(assignmentId);
+    // B3: F7/F9 are structurally moot in-place. There is no clone, no
+    // fingerprint, no marker and no install lane, because the tree the commands
+    // will run in is the checkout the operator has been using — its
+    // `node_modules` is the one they installed. This is a TRIVIALLY-TRUE skip in
+    // the F7 sense (`provisioned: true` means "the precondition holds", not "we
+    // did work"), and it is the mode's main practical win: the entire F7/F9/F10
+    // failure class does not exist on this path. It is deliberately reported as
+    // its own `strategy` so the receipt's `provisioningMarker` says in-place
+    // rather than impersonating a short-circuited clone.
+    if (handle.executionMode === 'in_place') {
+      return {
+        provisioned: true,
+        strategy: 'in_place',
+        fingerprint: '',
+        repoRoot: this.#primaryRepoRoot,
+        worktreePath: handle.worktreePath,
+        detail:
+          'in-place execution: dependencies are the checkout\'s own; no clone, fingerprint, marker or install lane applies',
+      };
+    }
     return this.#mutex.runExclusive(
       this.#primaryRepoRoot,
       'other',
@@ -581,6 +858,20 @@ export class GitWorktreeManager {
    */
   async removeWorktree(assignmentId: AssignmentId, options: RemoveWorktreeOptions = {}): Promise<void> {
     const handle = this.#requireHandle(assignmentId);
+    // B3: there is no worktree to remove in-place — `worktreePath` IS the user's
+    // checkout, and `git worktree remove --force` on it would be the single most
+    // destructive thing this engine could do. The guard reads the HANDLE's mode
+    // rather than comparing paths, because a mode is a fact the handle carries
+    // while a path comparison is an inference a future refactor can break.
+    // `releaseInPlaceWorkspace` is the in-place counterpart.
+    if (handle.executionMode === 'in_place') {
+      throw new WorktreeError(
+        'unsafe_path',
+        `assignment ${String(assignmentId)} runs in_place in ${handle.worktreePath} — the primary checkout. ` +
+          'There is no worktree to remove; use releaseInPlaceWorkspace (which restores the pre-run HEAD and ' +
+          'leaves the assignment branch for a human to merge).',
+      );
+    }
     return this.#mutex.runExclusive(
       this.#primaryRepoRoot,
       'worktree_remove',
@@ -601,6 +892,56 @@ export class GitWorktreeManager {
           this.#handles.delete(assignmentId);
           this.#leasedPaths.delete(handle.worktreePath);
           this.#taints.delete(assignmentId);
+        }),
+    );
+  }
+
+  /**
+   * B3 — the in-place counterpart of `removeWorktree`: put the operator back on
+   * the branch they were on and stop tracking the assignment. The assignment
+   * BRANCH and its commits survive, exactly as a worktree's branch does, because
+   * the human merges the result and the engine never does (§16).
+   *
+   * Restoration is best-effort by design: git refuses to switch branches away
+   * from a dirty tree, and that refusal is CORRECT — the dirt is either the
+   * verifier's evidence or a human's edit, and neither is this method's to
+   * discard. A failed restore is reported (`restored: false`) rather than
+   * escalated into a destructive cleanup.
+   */
+  async releaseInPlaceWorkspace(
+    assignmentId: AssignmentId,
+  ): Promise<{ readonly restored: boolean; readonly headRef?: string; readonly detail?: string }> {
+    const handle = this.#requireHandle(assignmentId);
+    const checkpoint = this.#inPlaceCheckpoints.get(assignmentId);
+    if (handle.executionMode !== 'in_place' || checkpoint === undefined) {
+      throw new WorktreeError(
+        'not_found',
+        `assignment ${String(assignmentId)} has no in-place start checkpoint to release`,
+      );
+    }
+    return this.#mutex.runExclusive(
+      this.#primaryRepoRoot,
+      'other',
+      { assignmentId, worktreePath: handle.worktreePath },
+      () =>
+        this.#advisoryLease.withLease(async () => {
+          let restored = true;
+          let detail: string | undefined;
+          try {
+            await restoreCheckpointHead(checkpoint);
+          } catch (error) {
+            restored = false;
+            detail = error instanceof Error ? error.message : String(error);
+          }
+          this.#handles.delete(assignmentId);
+          this.#inPlaceCheckpoints.delete(assignmentId);
+          this.#leasedPaths.delete(handle.worktreePath);
+          this.#taints.delete(assignmentId);
+          return {
+            restored,
+            headRef: checkpoint.headRef,
+            ...(detail !== undefined ? { detail } : {}),
+          };
         }),
     );
   }

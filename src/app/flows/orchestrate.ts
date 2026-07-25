@@ -66,7 +66,9 @@ import {
 } from '../service.js';
 import { waitMs } from '../../supervisor/breaker.js';
 import { RunOwnershipConflictError } from '../run-ownership-store.js';
-import type { RoleRoundProjection } from '../projections.js';
+import { resolvePersistedExecutionMode, type RoleRoundProjection } from '../projections.js';
+import type { ExecutionMode } from '../../domain/execution-mode.js';
+import type { InPlaceCheckpoint } from '../../worktree/in-place.js';
 import type { RoleRunner } from '../role-runner.js';
 import {
   describeImplementorRoundDiagnostic,
@@ -238,6 +240,21 @@ export interface ImplementVerifyLoopCommonInput {
   readonly destinationRef?: string;
   /** Caller safety cap; the engine's remediation bound is the real terminal. */
   readonly maxRounds?: number;
+  /**
+   * B3 — `worktree` (default, today's behaviour) or `in_place`.
+   *
+   * Omitted is `worktree`, so every existing caller and every existing test
+   * drives exactly the path it drove before. `in_place` swaps ONLY the workspace
+   * lifecycle: the implement->verify loop, the deliverable adjudication, the
+   * receipts, the §16 gate and the remediation bound are identical, because the
+   * handle they all read is the same shape either way.
+   */
+  readonly executionMode?: ExecutionMode;
+  /**
+   * B4 — repo-relative paths this assignment may write. Omitted means the whole
+   * execution root, which is what a single implementor has always had.
+   */
+  readonly writeScope?: readonly string[];
 }
 
 /** W2-5 resume re-entry input (see `ImplementVerifyLoopInput.resume`). */
@@ -307,6 +324,14 @@ export interface ImplementVerifyLoopResult {
   /** F7: present iff `outcome === 'provisioning_failed'` — the operator-actionable
    * detail of the dependency-provisioning failure that halted the round. */
   readonly provisioningFailure?: ProvisioningFailure;
+  /**
+   * B3: present only for an `in_place` run that reached a TERMINAL outcome —
+   * whether the operator's pre-run HEAD was successfully restored. `false` means
+   * the checkout is still on the assignment branch (git refused the switch,
+   * almost always because the tree is dirty), which the operator must be told
+   * rather than left to discover.
+   */
+  readonly inPlaceHeadRestored?: boolean;
 }
 
 /** Phases a W2-5 resume re-entry may find the run at (`approved` covers a
@@ -470,11 +495,24 @@ async function adoptWorktree(
     );
   }
   if (worktrees.handleFor(input.assignmentId) === undefined) {
+    // B3: the mode comes from the PERSISTED record, through the read-boundary
+    // migration — never from the path (`git worktree list` lists the primary
+    // checkout too, so an in-place root looks exactly like a worktree) and never
+    // from this process's input (a resume may be a different process with
+    // different arguments). An `in_place` record with no durable start
+    // checkpoint is downgraded to `worktree` by that same migration, which is
+    // what stops a revert being armed against a target nobody wrote down.
+    const persistedMode = resolvePersistedExecutionMode(facts);
     await worktrees.reattach({
       assignmentId: input.assignmentId,
       worktreePath: facts.worktreePath,
       branch: facts.branch,
       baseSha: gitSha(String(facts.baseSha)),
+      executionMode: persistedMode,
+      ...(facts.writeScope !== undefined ? { writeScope: facts.writeScope } : {}),
+      ...(persistedMode === 'in_place' && facts.inPlaceCheckpoint !== undefined
+        ? { inPlaceCheckpoint: facts.inPlaceCheckpoint }
+        : {}),
     });
   }
 
@@ -671,17 +709,50 @@ export async function runImplementVerifyLoop(
           `runImplementVerifyLoop baseCommit ${input.baseCommit} does not match run ${input.runId} pinned base ${pinnedWorkspace.pinnedSha}`,
         );
       }
-      // F5: branch only from the run's start-time immutable commit. The
-      // worktree manager revalidates the branded value at runtime.
-      handle = await worktrees.createWorktree({
-        assignmentId: input.assignmentId,
-        baseCommit: input.baseCommit,
-      });
+      const executionMode = input.executionMode ?? 'worktree';
+      // B3: the ONE place a fresh workspace is created, and the ONE place the
+      // mode decides anything about the lifecycle. Everything after this line
+      // reads `handle`, which carries the mode and the write boundary as
+      // REQUIRED fields — so no downstream step re-derives either.
+      //
+      // §16 destination geometry differs, and it has to: in-place mode CHECKS
+      // OUT the assignment branch in the very repo the §16 probe reads, so
+      // `currentBranch(repoRoot)` would answer `harness/assignment/...` — the run
+      // comparing its own work against itself, reporting no base drift and no
+      // conflicts by construction. The start checkpoint's recorded pre-run
+      // `headRef` is the honest destination, and it is read from a record made
+      // BEFORE the branch switch.
+      let inPlaceCheckpoint: InPlaceCheckpoint | undefined;
+      if (executionMode === 'in_place') {
+        handle = await worktrees.createInPlaceWorkspace({
+          assignmentId: input.assignmentId,
+          baseCommit: input.baseCommit,
+          ...(input.writeScope !== undefined ? { writeScope: input.writeScope } : {}),
+          // The durable write happens BEFORE the branch switch (`in-place.ts`),
+          // so a crash cannot leave a moved tree with no recorded revert target.
+          persistCheckpoint: (checkpoint) => {
+            inPlaceCheckpoint = checkpoint;
+            recordStartCheckpoint(deps, input, checkpoint);
+          },
+        });
+      } else {
+        // F5: branch only from the run's start-time immutable commit. The
+        // worktree manager revalidates the branded value at runtime.
+        handle = await worktrees.createWorktree({
+          assignmentId: input.assignmentId,
+          baseCommit: input.baseCommit,
+          ...(input.writeScope !== undefined ? { writeScope: input.writeScope } : {}),
+        });
+      }
       // §16: the manual `git switch <dest>` hint targets the primary checkout's
       // ACTUAL branch (read from the repo, never trusting a hardcoded 'main'); an
       // explicit caller `destinationLabel` still wins, and a detached HEAD falls
       // back to 'main'. Resolved once — the primary branch is stable across rounds.
-      destinationLabel = input.destinationLabel ?? (await git.currentBranch(handle.repoRoot)) ?? 'main';
+      destinationLabel =
+        input.destinationLabel ??
+        inPlaceCheckpoint?.headRef ??
+        (await git.currentBranch(handle.repoRoot)) ??
+        'main';
       // W2-5: persist the loop binding + worktree facts AT CREATION so a later,
       // separate process can adopt the worktree and re-enter this loop.
       service.saveImplementVerifyLoopState(input.runId, {
@@ -691,7 +762,7 @@ export async function runImplementVerifyLoop(
         specHash: input.specHash,
         taskScope: input.taskScope,
         destinationLabel,
-        destinationRef: input.destinationRef ?? 'HEAD',
+        destinationRef: input.destinationRef ?? defaultDestinationRef(inPlaceCheckpoint),
         worktree: {
           assignmentId: input.assignmentId,
           repoRoot: handle.repoRoot,
@@ -699,6 +770,9 @@ export async function runImplementVerifyLoop(
           branch: handle.branch,
           baseSha: handle.baseSha,
           createdAt: handle.createdAt,
+          executionMode: handle.executionMode,
+          ...(input.writeScope !== undefined ? { writeScope: input.writeScope } : {}),
+          ...(inPlaceCheckpoint !== undefined ? { inPlaceCheckpoint } : {}),
         },
       });
     } else {
@@ -713,7 +787,7 @@ export async function runImplementVerifyLoop(
     const destinationRef =
       input.destinationRef ??
       (resume !== undefined ? service.getImplementVerifyLoopState(input.runId)?.destinationRef : undefined) ??
-      'HEAD';
+      defaultDestinationRef(service.getImplementVerifyLoopState(input.runId)?.worktree?.inPlaceCheckpoint);
 
     const entry: ResumeEntryPlan =
       resume !== undefined ? resolveResumeEntry(resume.round, entryPhase) : { startRound: 1, first: 'implement' };
@@ -811,6 +885,10 @@ export async function runImplementVerifyLoop(
         const runner: RoleRunner<ImplementorResult> = {
           role: flow.role,
           allowedShellCommands: flow.allowedShellCommands,
+          // B4: the SAME boundary the commit gate enforces, forwarded to the
+          // provider's permission mediation so prevention and detection agree
+          // by construction rather than by two matching derivations.
+          writeBoundary: flow.writeBoundary,
           run: (session) => flow.run(session),
           diagnoseRoundOutcome: (result) => receiptMismatch ?? describeImplementorRoundDiagnostic(result),
           adjudicateRoundOutcome: async (result) => {
@@ -1236,9 +1314,30 @@ export async function runImplementVerifyLoop(
   }
 
   const finalPhase = service.status(input.runId).phase;
+  // B3 EXIT — put the operator back on the branch they were on.
+  //
+  // ONLY on a TERMINAL outcome. `merge_ready` and `failed` are the two phases
+  // from which this loop never re-enters, so the assignment branch has nothing
+  // left to do but wait for a human to merge it. Every other exit —
+  // `integration_blocked` (which `harness recheck` re-probes), a remediation cap,
+  // a provisioning halt, a pause, a crash — is RESUMABLE, and a resume reads the
+  // commit from the checked-out assignment branch. Restoring there would be
+  // helpfulness that breaks the resume.
+  //
+  // Deliberately outside the `finally`: an exception leaving this loop is by
+  // definition not a terminal outcome. And the restore is best-effort — git
+  // refuses to switch away from a dirty tree, which is the correct answer, so a
+  // failure is REPORTED rather than escalated into anything destructive.
+  let inPlaceHeadRestored: boolean | undefined;
+  if (handle?.executionMode === 'in_place' && (finalPhase === 'merge_ready' || finalPhase === 'failed')) {
+    inPlaceHeadRestored = (await worktrees.releaseInPlaceWorkspace(input.assignmentId).catch(() => ({
+      restored: false,
+    }))).restored;
+  }
   return {
     rounds,
     finalPhase,
+    ...(inPlaceHeadRestored !== undefined ? { inPlaceHeadRestored } : {}),
     // W2-2 / F7: the blocked and provisioning-failed paths leave the phase where it
     // was (no false advance) — the outcome carries the distinction the phase alone
     // cannot. `provisioning_failed` takes precedence (the round never verified).
@@ -1324,6 +1423,61 @@ function recordImplementationCommit(
       ...loopState.worktree,
       lastImplementationCommit: { round, commit },
     },
+  });
+}
+
+/**
+ * B3: the git ref the §16 probe resolves as the merge DESTINATION.
+ *
+ * `HEAD` is right in worktree mode — the primary checkout still sits on the
+ * user's branch while the agent works elsewhere. It is WRONG in-place: the
+ * assignment branch is checked out in that very repo, so `HEAD` is the work
+ * itself, and the probe would compare the run against its own commit (no drift,
+ * no conflicts, always). The checkpoint's recorded pre-run `headRef` is the
+ * branch the work would actually merge into.
+ */
+function defaultDestinationRef(checkpoint: InPlaceCheckpoint | undefined): string {
+  return checkpoint?.headRef ?? 'HEAD';
+}
+
+/**
+ * B3: the durable start-checkpoint write, executed BEFORE the branch switch.
+ *
+ * It seeds the loop-state projection when the loop has not written one yet —
+ * which is the normal case, because the workspace is created before the binding
+ * is persisted. Ordering is the guarantee: a crash between this write and the
+ * branch switch leaves a checkpoint whose `headRef` is still where the user is,
+ * which is exactly what a resume needs; the reverse order would leave a moved
+ * tree with no recorded way back.
+ */
+function recordStartCheckpoint(
+  deps: ImplementVerifyLoopDeps,
+  input: ImplementVerifyLoopInput,
+  checkpoint: InPlaceCheckpoint,
+): void {
+  const existing = deps.service.getImplementVerifyLoopState(input.runId);
+  const worktree = {
+    assignmentId: input.assignmentId,
+    repoRoot: checkpoint.rootPath,
+    worktreePath: checkpoint.rootPath,
+    branch: checkpoint.branch,
+    baseSha: checkpoint.baseSha,
+    createdAt: checkpoint.createdAt,
+    executionMode: 'in_place' as const,
+    ...(input.writeScope !== undefined ? { writeScope: input.writeScope } : {}),
+    inPlaceCheckpoint: checkpoint,
+  };
+  deps.service.saveImplementVerifyLoopState(input.runId, {
+    ...(existing ?? {
+      assignmentId: input.assignmentId,
+      implementor: input.implementor,
+      verifier: input.verifier,
+      specHash: input.specHash,
+      taskScope: input.taskScope,
+      destinationLabel: checkpoint.headRef,
+      destinationRef: checkpoint.headRef,
+    }),
+    worktree: { ...(existing?.worktree ?? {}), ...worktree },
   });
 }
 

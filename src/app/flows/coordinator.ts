@@ -52,6 +52,8 @@ import type { SessionUpdate } from '../../adapters/spi.js';
 import type { ArtifactSink } from '../../artifacts/store.js';
 import type { Profile } from '../../config/profile.js';
 import type { ReadOnlyRoleRunner, RoleSession } from '../role-runner.js';
+import { EXECUTION_MODES } from '../../domain/execution-mode.js';
+import { declaredScopesOverlap, normalizeDeclaredScopePath } from '../../worktree/write-scope.js';
 import type {
   PlanningChatFactory,
   PlanningChatMessage,
@@ -88,6 +90,42 @@ const taskSchema = z
   .strict();
 
 /**
+ * B4 — the coordinator's DECOMPOSITION of the task into N implementors
+ * (execution-modes spec §3.1).
+ *
+ * `writeScope` is the load-bearing field: repo-relative paths this assignment,
+ * and only this assignment, may write. The coordinator declares it because it is
+ * the only role that has read the plan section and can judge task boundaries;
+ * the gate below refuses the spec if two of them can touch the same path.
+ *
+ * Absent `assignments` is EXACTLY today's single-assignment run — full backward
+ * compatibility, no migration of existing runs, and every check here is vacuous.
+ */
+const specAssignmentSchema = z
+  .object({
+    /** Stable id within the spec; also the durable assignment label. */
+    id: z.string().min(1, 'assignment id is required'),
+    /** The bounded task this implementor is given (§8). */
+    taskScope: z.string().min(1, 'assignment taskScope is required'),
+    /**
+     * Repo-relative paths this assignment may write. EMPTY means the whole
+     * execution root, which is legal for a lone assignment and refused for a
+     * decomposition (two "everything" scopes are the overlap R1 exists to stop).
+     */
+    writeScope: z.array(z.string().min(1, 'a write-scope path cannot be blank')).default([]),
+    /** Acceptance criteria this assignment is answerable for. */
+    criteria: z
+      .array(z.string().regex(CRITERION_ID_PATTERN, 'must reference a stable criterion id like "AC-1"'))
+      .min(1, 'each assignment must claim at least one acceptance criterion'),
+    /** B3 per-assignment execution mode; the run default applies when absent. */
+    executionMode: z.enum(EXECUTION_MODES).optional(),
+    proposedImplementorProfile: z.string().min(1).optional(),
+  })
+  .strict();
+
+export type SpecAssignment = z.infer<typeof specAssignmentSchema>;
+
+/**
  * The full §7 spec contract: goal; assumptions + unresolved questions;
  * constraints + permissions; non-goals; ordered tasks + dependencies;
  * acceptance criteria with stable IDs; verification commands + expected
@@ -113,8 +151,33 @@ export const coordinatorSpecSchema = z
     proposedVerifierProfile: z.string().min(1, 'a proposed verifier profile is required'),
     /** §15 shared exploration findings; stored bound to the observed commit. */
     explorationNotes: z.string().optional(),
+    /** B4: optional multi-implementor decomposition. Absent = today's run. */
+    assignments: z.array(specAssignmentSchema).optional(),
   })
-  .strict();
+  .strict()
+  // B4 / R1 — THE APPROVAL GATE, attached to the SCHEMA rather than to a
+  // validation helper beside it.
+  //
+  // `validateCoordinatorSpec` is the route every emission takes today, but a
+  // route is a thing a future contributor can add a second of. A refinement on
+  // the schema makes the guarantee a property of the TYPE: `CoordinatorSpecDocument`
+  // is `z.infer` of THIS schema, so the only way to obtain one is to parse — and
+  // a parse that would produce overlapping write scopes fails. `.parse`,
+  // `.safeParse`, a direct call from a test, a future importer: same answer.
+  //
+  // Why approval and not only execution: the spec hash binds the decomposition,
+  // so refusing here means an overlapping decomposition can never become an
+  // APPROVED, hash-bound artifact — the human sees exactly which scopes collided
+  // and revises, which is a spec-revision request rather than a run failure.
+  .superRefine((doc, ctx) => {
+    for (const issue of assessAssignmentDecomposition(doc)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: issue.path.split('.'),
+        message: issue.message,
+      });
+    }
+  });
 
 /** The parsed, validated §7 spec document (plain strings; ids are branded only
  * when projected onto the `SpecVersion` entity). */
@@ -143,6 +206,132 @@ export interface SpecValidationIssue {
   /** Dotted/indexed path into the spec (e.g. `acceptanceCriteria.1.expectedEvidence`). */
   readonly path: string;
   readonly message: string;
+}
+
+/**
+ * The R1 gate, as a pure function over the parsed decomposition.
+ *
+ * The input is deliberately structurally typed rather than
+ * `CoordinatorSpecDocument`: this runs INSIDE the schema's own refinement, where
+ * the document type does not exist yet.
+ *
+ * What it refuses, and why each one is a real hazard:
+ *
+ *  - **Duplicate assignment ids** — the id keys the worktree/lease/round state;
+ *    two assignments sharing one would share all of it.
+ *  - **A criterion claimed twice** — two implementors would be independently
+ *    remediated against the same criterion, and whichever finished last would
+ *    define the verdict.
+ *  - **A criterion that does not exist** — an assignment answerable for nothing
+ *    checkable is an assignment nothing can fail.
+ *  - **A missing write scope in a DECOMPOSITION** — an empty scope means "the
+ *    whole root", so two of them are the maximal overlap. Refused with its own
+ *    message because "your scopes overlap at '.'" reads as a bug in the checker.
+ *  - **Malformed scope paths** — absolute, `..`, `.` or empty segments. Delegated
+ *    verbatim to `normalizeDeclaredScopePath`, the same validator the runtime
+ *    boundary uses, so the spec cannot approve a path the substrate then rejects.
+ *  - **Overlapping scopes (R1 proper)** — segment-wise prefix containment, so
+ *    `src/app` never reads as containing `src/application`.
+ */
+export function assessAssignmentDecomposition(doc: {
+  readonly acceptanceCriteria: ReadonlyArray<{ readonly id: string }>;
+  readonly assignments?:
+    | ReadonlyArray<{
+        readonly id: string;
+        readonly writeScope: readonly string[];
+        readonly criteria: readonly string[];
+      }>
+    | undefined;
+}): readonly SpecValidationIssue[] {
+  const assignments = doc.assignments;
+  if (assignments === undefined || assignments.length === 0) return [];
+
+  const issues: SpecValidationIssue[] = [];
+  const criterionIds = new Set(doc.acceptanceCriteria.map((c) => c.id));
+  const assignmentIds = new Set<string>();
+  const claimedBy = new Map<string, string>();
+  const normalized: string[][] = [];
+
+  for (const [i, assignment] of assignments.entries()) {
+    if (assignmentIds.has(assignment.id)) {
+      issues.push({
+        path: `assignments.${i}.id`,
+        message: `duplicate assignment id "${assignment.id}" — assignment ids key the worktree, lease and round state, so they must be unique`,
+      });
+    }
+    assignmentIds.add(assignment.id);
+
+    for (const criterionId of assignment.criteria) {
+      if (!criterionIds.has(criterionId)) {
+        issues.push({
+          path: `assignments.${i}.criteria`,
+          message: `assignment "${assignment.id}" claims unknown acceptance criterion "${criterionId}"`,
+        });
+        continue;
+      }
+      const owner = claimedBy.get(criterionId);
+      if (owner !== undefined) {
+        issues.push({
+          path: `assignments.${i}.criteria`,
+          message: `acceptance criterion "${criterionId}" is claimed by both "${owner}" and "${assignment.id}" — each criterion must have exactly one answerable assignment`,
+        });
+      } else {
+        claimedBy.set(criterionId, assignment.id);
+      }
+    }
+
+    if (assignments.length > 1 && assignment.writeScope.length === 0) {
+      issues.push({
+        path: `assignments.${i}.writeScope`,
+        message: `assignment "${assignment.id}" declares no write scope. With more than one assignment an empty scope means the ENTIRE workspace, so every assignment would be able to write every path — declare the paths this implementor owns.`,
+      });
+    }
+
+    const scope: string[] = [];
+    for (const [j, declared] of assignment.writeScope.entries()) {
+      try {
+        scope.push(normalizeDeclaredScopePath(declared));
+      } catch (error) {
+        issues.push({
+          path: `assignments.${i}.writeScope.${j}`,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    normalized.push(scope);
+  }
+
+  // R1 proper. Only compared for assignments whose scopes all normalized —
+  // reporting an overlap derived from a path we already refused would be noise.
+  for (let i = 0; i < assignments.length; i += 1) {
+    for (let j = i + 1; j < assignments.length; j += 1) {
+      const left = assignments[i];
+      const right = assignments[j];
+      const leftScope = normalized[i];
+      const rightScope = normalized[j];
+      if (
+        left === undefined ||
+        right === undefined ||
+        leftScope === undefined ||
+        rightScope === undefined ||
+        leftScope.length !== left.writeScope.length ||
+        rightScope.length !== right.writeScope.length ||
+        leftScope.length === 0 ||
+        rightScope.length === 0
+      ) {
+        continue;
+      }
+      const overlap = declaredScopesOverlap(leftScope, rightScope);
+      if (overlap !== undefined) {
+        issues.push({
+          path: `assignments.${j}.writeScope`,
+          message: `write scopes overlap: "${right.id}" declares ${JSON.stringify(overlap.b)} which covers the same paths as "${left.id}"'s ${JSON.stringify(overlap.a)}. Two concurrently-driven assignments must never be able to write the same path (R1) — split the work so each implementor owns disjoint paths.`,
+        });
+      }
+    }
+  }
+
+  return issues;
 }
 
 /**
@@ -271,6 +460,25 @@ export function canonicalizeSpec(doc: CoordinatorSpecDocument): string {
     proposedImplementorProfile: doc.proposedImplementorProfile,
     proposedVerifierProfile: doc.proposedVerifierProfile,
     ...(doc.explorationNotes !== undefined ? { explorationNotes: doc.explorationNotes } : {}),
+    // B4: the decomposition is part of what approval BINDS. If the write scopes
+    // were outside the hash, an approved spec would not determine who may write
+    // what, and the whole approval-time R1 gate would be advisory. Emitted only
+    // when present, so a single-assignment spec canonicalizes byte-for-byte as
+    // it always has and every existing spec hash is unchanged.
+    ...(doc.assignments !== undefined
+      ? {
+          assignments: doc.assignments.map((a) => ({
+            id: a.id,
+            taskScope: a.taskScope,
+            writeScope: a.writeScope,
+            criteria: a.criteria,
+            ...(a.executionMode !== undefined ? { executionMode: a.executionMode } : {}),
+            ...(a.proposedImplementorProfile !== undefined
+              ? { proposedImplementorProfile: a.proposedImplementorProfile }
+              : {}),
+          })),
+        }
+      : {}),
   };
   return JSON.stringify(canonical, null, 2);
 }

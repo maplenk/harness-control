@@ -52,6 +52,7 @@
  * OWN prior evidence, not the coordinator's exploration) and re-verifying only
  * what the checkpoint did not establish. No predecessor turn is replayed.
  */
+import * as path from 'node:path';
 import type { Clock } from '../../lib/clock.js';
 import type { IdFactory } from '../../lib/id-factory.js';
 import { sha256Hex } from '../../artifacts/hash.js';
@@ -317,7 +318,30 @@ export async function executeEvidenceReceiptsUnderConfinement(
   const runnerViolations: VerificationRunnerViolation[] = [];
 
   // CHECK 1 — escape into the primary checkout.
-  const primaryViolation = await detectPrimaryCheckoutDrift(input.repoRoot, primaryBefore);
+  //
+  // B3: this check asks "did the commands touch a tree they were NOT given?".
+  // In `worktree` mode the primary checkout is exactly such a tree, and the
+  // manager REFUSES to place a worktree inside it (`unsafe_path`), so the two
+  // roots are always distinct and this check is unchanged.
+  //
+  // In `in_place` mode the primary checkout IS the tree the commands were given.
+  // Comparing it before/after would report every `dist/`, `.tsbuildinfo` or
+  // coverage file a declared build command legitimately emits as an ESCAPE, and
+  // block every in-place round on its own build output. The condition is DERIVED
+  // from the two roots rather than passed as a flag, so there is nothing a caller
+  // can forget and no way for worktree mode to take this branch.
+  //
+  // Nothing is weakened by skipping it here, and it is worth being precise about
+  // why: the same post-command dirt is caught by the §16 `worktreeClean` probe
+  // (which blocks readiness on it), and the same HEAD movement is caught by
+  // CHECK 2 below, which runs unconditionally. What genuinely IS lost is the
+  // ability to tell the agent apart from a human editing the same tree — and
+  // that is the documented, deliberate cost of in-place mode (execution-modes
+  // spec §2.2), not a hole this check would otherwise have covered.
+  const primaryIsExecutionRoot = path.resolve(input.repoRoot) === path.resolve(input.cwd);
+  const primaryViolation = primaryIsExecutionRoot
+    ? undefined
+    : await detectPrimaryCheckoutDrift(input.repoRoot, primaryBefore);
   if (primaryViolation !== undefined) runnerViolations.push(primaryViolation);
 
   // CHECK 2 — authorship inside the worktree. Runs whatever check 1 found, and

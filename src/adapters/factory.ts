@@ -120,6 +120,7 @@ import {
   type PreparedGrokHome,
   type VetoedMediation,
 } from './grok/index.js';
+import type { WriteBoundary } from '../worktree/write-scope.js';
 
 // ---------------------------------------------------------------------------
 // Options
@@ -201,6 +202,17 @@ export interface CreateGrokBuildAcpAdapterOptions extends CreateProviderAdapterO
   readonly model: string;
   readonly reasoningEffort?: string;
   readonly role?: RoleName;
+  /**
+   * B4 — the assignment's WRITE boundary, when the caller has one.
+   *
+   * Omitted, the boundary becomes the single root `cwd` — which is EXACTLY the
+   * pre-B4 `workspaceWriteRoot: cwd` binding, so omission is the status quo and
+   * can never be a widening. Supplying it can only NARROW. That asymmetry is
+   * what makes an optional field acceptable here and nowhere else in this
+   * change: the guarantee (a validated boundary always exists) lives in the
+   * type, and this field only says how tight it is.
+   */
+  readonly writeBoundary?: WriteBoundary;
   /** Exact approved commands the implementor may run while self-checking. */
   readonly allowedShellCommands?: readonly string[];
   /** Production defaults to an isolated HOME/GROK_HOME containing auth only. */
@@ -614,6 +626,11 @@ export function createGrokBuildAcpAdapter(
     ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
     ...(role !== undefined ? { role } : {}),
     cwd,
+    // Forwarded when the caller has one; `buildGrokMediation` falls back to the
+    // single root `cwd` (the pre-B4 binding) when it does not. The F14 guard
+    // above has already refused an implementor `cwd` that is absent or relative,
+    // so that fallback root is the assignment's proven absolute execution root.
+    ...(options.writeBoundary !== undefined ? { writeBoundary: options.writeBoundary } : {}),
     ...(options.allowedShellCommands !== undefined
       ? { allowedShellCommands: options.allowedShellCommands }
       : {}),

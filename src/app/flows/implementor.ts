@@ -116,14 +116,17 @@ import {
   addAll,
   addAllExceptNodeModules,
   commitAll,
+  pathsOutsideBoundary,
   porcelainPaths,
   resolveSha,
   runGit,
   statusPorcelain,
+  statusPorcelainPathsExact,
   WorktreeError,
   type GitWorktreeManager,
   type ProvisioningCause,
   type WorktreeHandle,
+  type WriteBoundary,
 } from '../../worktree/index.js';
 import { isSecretKeyName, redactText } from '../../redaction/index.js';
 import type { AppliedConfigOption, RoleModelSpec } from '../model-resolution.js';
@@ -572,6 +575,33 @@ export interface ProvisioningFailure {
   readonly implementationCommit?: GitSha;
 }
 
+/**
+ * B4/R1 — an implementor round wrote outside its declared scope.
+ *
+ * A HARD refusal at the commit boundary, not a filtered commit. Two things are
+ * true at once when this fires and both matter: the deliverable would have
+ * carried content this assignment does not own, AND the write already happened,
+ * which is a fact an operator must see. Committing a filtered subset would hide
+ * the second; committing everything would certify the first.
+ */
+export class WriteScopeViolationError extends Error {
+  override readonly name: string = 'WriteScopeViolationError';
+  constructor(
+    readonly assignmentId: AssignmentId,
+    readonly declaredScope: readonly string[],
+    readonly outsidePaths: readonly string[],
+  ) {
+    super(
+      `assignment ${String(assignmentId)} wrote outside its declared write scope ` +
+        `[${declaredScope.join(', ')}]: ${outsidePaths.slice(0, 10).join(', ')}` +
+        (outsidePaths.length > 10 ? ` (+${outsidePaths.length - 10} more)` : '') +
+        '. The round is refused rather than committed: two concurrently-driven assignments must never be ' +
+        'able to write the same path (R1), and a commit carrying paths this assignment does not own would ' +
+        'let the verifier certify another implementor\'s work — or a human\'s — as this one\'s deliverable.',
+    );
+  }
+}
+
 export interface RunnerViolationEventInput {
   readonly runId: RunId;
   readonly assignmentId: AssignmentId;
@@ -800,7 +830,22 @@ function defaultCommitMessage(handle: WorktreeHandle, context: ImplementorContex
  * scope, constraints, criteria (context only), and the coordinator exploration
  * artifact.
  */
-export function buildImplementorPrompt(context: ImplementorContext, cwd: string): string {
+export function buildImplementorPrompt(
+  context: ImplementorContext,
+  cwd: string,
+  /**
+   * B4 — the assignment's write boundary. Omitted, or covering the whole root,
+   * the prompt is byte-for-byte what it has always been. NARROWED, one extra
+   * Hard Rule names the scope.
+   *
+   * The prompt is not the enforcement (the ACP write rule prevents and the
+   * commit gate refuses); it exists because an agent that is told its scope
+   * complies, while an agent that is only DENIED loses its turn — and a denied
+   * request ends the turn before any work is committed, which is the failure
+   * mode F14 was about.
+   */
+  boundary?: WriteBoundary,
+): string {
   const commands = resolveVerificationCommands(context);
   const criteriaBlock =
     context.criteria.length > 0
@@ -828,6 +873,13 @@ export function buildImplementorPrompt(context: ImplementorContext, cwd: string)
     '',
     '## Hard Rules (read first)',
     `- You may create, modify, or delete files ONLY inside your assigned worktree: ${cwd}. Never write outside it.`,
+    ...(boundary !== undefined && boundary.declared.length > 0
+      ? [
+          `- Your assignment's WRITE SCOPE is narrower than the worktree: you may create, modify or delete files ONLY under ${boundary.declared
+            .map((d) => `\`${d}\``)
+            .join(', ')} (relative to ${cwd}). You may READ anywhere in the tree. Another implementor is working on the rest of it concurrently; a write outside your scope is refused by the host and your round fails.`,
+        ]
+      : []),
     '- Use structured repository tools (Read, Grep/Glob, Write, and Edit) for inspection and file changes. Structured Write can create missing parent directories.',
     // MERGE COHERENCE: this rule used to also grant "and the exact declared
     // verification commands below", which directly contradicts main's separate
@@ -905,6 +957,13 @@ export class ImplementorFlow {
   readonly role = 'implementor' as const;
   /** Exact approved commands Grok may request through ACP while self-checking. */
   readonly allowedShellCommands: readonly string[];
+  /**
+   * B4 — the assignment's write boundary, taken verbatim from the handle (where
+   * it is a REQUIRED field). `runRole` forwards it to the provider's permission
+   * mediation, so the boundary the ACP write rule enforces and the boundary the
+   * commit gate below enforces are THE SAME VALUE, not two derivations of it.
+   */
+  readonly writeBoundary: WriteBoundary;
   readonly #handle: WorktreeHandle;
   readonly #context: ImplementorContext;
   readonly #options: ImplementorFlowOptions;
@@ -913,6 +972,7 @@ export class ImplementorFlow {
     this.#handle = handle;
     this.#context = context;
     this.#options = options;
+    this.writeBoundary = handle.writeBoundary;
     this.allowedShellCommands = resolveVerificationCommands(context);
   }
 
@@ -970,7 +1030,7 @@ export class ImplementorFlow {
     };
 
     const prompts = [
-      buildImplementorPrompt(this.#context, cwd),
+      buildImplementorPrompt(this.#context, cwd, this.writeBoundary),
       ...(this.#options.followUpPrompts ?? []),
     ];
     let stopReason: AcpStopReason = 'end_turn';
@@ -998,6 +1058,41 @@ export class ImplementorFlow {
     // regardless. Round-2 #3: under `worktree.provision='none'` (provisioning
     // inactive, the operator owns node_modules) keep normal `git add -A` semantics so
     // a repo that legitimately tracks node_modules changes still commits them.
+    // -----------------------------------------------------------------------
+    // B4 — THE WRITE-SCOPE GATE, at the moment the host decides what enters HEAD.
+    //
+    // Implementors never run git; the host stages and commits. That is what makes
+    // N implementors in one checkout safe, and it is also what makes THIS the
+    // right chokepoint: whatever an agent managed to write, nothing becomes part
+    // of the deliverable except through these three lines. The ACP permission
+    // rule (`admitsWorkspaceWrite`) PREVENTS an out-of-scope write on the
+    // harnesses whose writes this engine mediates; this DETECTS one on every
+    // harness, including the ones it does not mediate — so the guarantee does not
+    // depend on which provider the run happened to resolve.
+    //
+    // In today's single-assignment shape the boundary is the whole worktree, so
+    // nothing dirty can be outside it and this is provably a no-op: worktree mode
+    // behaves exactly as it did. It fires only when an assignment declared a
+    // NARROWER scope, which is precisely when a second implementor might be
+    // sharing the tree.
+    //
+    // Refusal, not filtering. An out-of-scope path is either another
+    // assignment's work or a human's, and committing it would let the verifier
+    // certify content this assignment never owned — while dropping it silently
+    // would hide an R1 violation that already happened. Positively-identified
+    // breakage refuses.
+    const boundary = handle.writeBoundary;
+    if (boundary.declared.length > 0) {
+      const dirty = await statusPorcelainPathsExact(cwd);
+      const outside = pathsOutsideBoundary(
+        boundary,
+        dirty.map((relative) => path.resolve(cwd, relative)),
+      );
+      if (outside.length > 0) {
+        throw new WriteScopeViolationError(handle.assignmentId, boundary.declared, outside);
+      }
+    }
+
     const provisionActive = this.#options.provisionActive ?? true;
     if (provisionActive) {
       // F10: ONE helper now owns the whole guarantee — it stages `-A`, unstages
@@ -1212,6 +1307,12 @@ export interface RunImplementorInput {
   readonly context: ImplementorContext;
   /** F5: the run's exact, immutable start-time base commit. */
   readonly baseCommit: GitSha;
+  /**
+   * B4 — repo-relative paths this assignment may write. Omitted means the whole
+   * worktree, which is what a single implementor has always had; supplying it
+   * narrows both the ACP write rule and the commit gate.
+   */
+  readonly writeScope?: readonly string[];
   readonly options?: ImplementorFlowOptions;
 }
 
@@ -1270,6 +1371,7 @@ export async function runImplementor(
   const handle = await deps.worktrees.createWorktree({
     assignmentId: input.assignmentId,
     baseCommit: input.baseCommit,
+    ...(input.writeScope !== undefined ? { writeScope: input.writeScope } : {}),
   });
   // F7 (§2.1): provision deps at the post-commit boundary (fail closed on failure).
   // An explicit caller-supplied callback wins; otherwise default to the manager's
@@ -1292,6 +1394,7 @@ export async function runImplementor(
   const runner: RoleRunner<ImplementorResult> = {
     role: 'implementor',
     allowedShellCommands: flow.allowedShellCommands,
+    writeBoundary: flow.writeBoundary,
     run: (session) => flow.run(session),
     diagnoseRoundOutcome: (result) => receiptMismatch ?? describeImplementorRoundDiagnostic(result),
     adjudicateRoundOutcome: async (result) => {

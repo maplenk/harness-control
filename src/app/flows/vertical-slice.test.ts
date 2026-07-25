@@ -2420,3 +2420,196 @@ describe('F7 round-3 #7 — toProvisioningFailure redacts the surfaced detail', 
     expect(toProvisioningFailure(inDetail, handle).detail).not.toContain(secret);
   });
 });
+
+
+// ===========================================================================
+// B3 — the `in_place` execution mode, end to end through the SAME loop.
+//
+// The claim these pin is narrow and specific: in-place mode swaps ONLY the
+// workspace lifecycle. The implement->verify loop, the deliverable adjudication,
+// the receipts, the §16 gate and the remediation bound are the code that already
+// exists, because the handle they all read is the same shape either way. So the
+// assertions are about the things that DO differ — where the work lands, what the
+// §16 destination is, what is persisted for a resume, and where the operator ends
+// up — plus `merge_ready` itself, which is what proves the rest still works.
+// ===========================================================================
+describe('B3 — in_place execution mode (execution-modes spec §2.2)', () => {
+  function inPlaceScripts() {
+    return {
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose in place.')],
+        },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+            ]),
+          ],
+        },
+      ],
+    };
+  }
+
+  it('works IN the checkout on an assignment branch, reaches merge_ready, and restores HEAD', async () => {
+    const slice = await openSlice(inPlaceScripts());
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_in_place');
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+        executionMode: 'in_place',
+      },
+    );
+
+    expect(result.outcome).toBe('merge_ready');
+    // The work happened in the CHECKOUT — no sibling worktree was created, which
+    // is the mode's entire point (and with it, the whole F7/F9 provisioning lane).
+    expect(result.worktree.executionMode).toBe('in_place');
+    expect(result.worktree.worktreePath).toBe(result.worktree.repoRoot);
+    expect(fs.existsSync(slice.worktrees.baseDir)).toBe(false);
+
+    // The commit is on the ASSIGNMENT branch, never on the operator's branch…
+    expect(await git.resolveSha(slice.repo.dir, result.worktree.branch)).toBe(String(result.implementationCommit));
+    expect(String(result.implementationCommit)).not.toBe(String(slice.baseCommit));
+    expect(await git.resolveSha(slice.repo.dir, 'main')).toBe(String(slice.baseCommit));
+
+    // …and the operator is put back where they started, with the branch left for
+    // a human to merge (§16: the engine never merges).
+    expect(result.inPlaceHeadRestored).toBe(true);
+    expect(await git.currentBranch(slice.repo.dir)).toBe('main');
+    expect(fs.existsSync(path.join(slice.repo.dir, 'src/cli/verbose.ts'))).toBe(false);
+  });
+
+  it('records the start checkpoint durably, and uses the PRE-RUN head as the §16 destination', async () => {
+    const slice = await openSlice(inPlaceScripts());
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: assignmentId('asg_in_place_ckpt'),
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+        executionMode: 'in_place',
+      },
+    );
+    expect(result.outcome).toBe('merge_ready');
+
+    const state = slice.service.getImplementVerifyLoopState(runId);
+    const facts = state?.worktree;
+    expect(facts?.executionMode).toBe('in_place');
+    // The revert target and the pre-run HEAD are durable — a crashed in-place run
+    // always has a recorded way back.
+    expect(facts?.inPlaceCheckpoint?.baseSha).toBe(slice.baseCommit);
+    expect(facts?.inPlaceCheckpoint?.headRef).toBe('main');
+    expect(facts?.inPlaceCheckpoint?.branch).toBe(result.worktree.branch);
+
+    // The §16 destination is the operator's branch, NOT `HEAD`. In-place mode
+    // checks the assignment branch out in the very repo the probe reads, so
+    // `HEAD` would make the run compare its own work against itself and report
+    // no base drift and no conflicts by construction.
+    expect(state?.destinationRef).toBe('main');
+    expect(state?.destinationLabel).toBe('main');
+    expect(result.mergeReadiness?.baseDrifted).toBe(false);
+    expect(result.mergeReadiness?.ready).toBe(true);
+  });
+
+  it('REFUSES to start in a dirty checkout — nothing of the operator`s is in the blast radius', async () => {
+    const slice = await openSlice(inPlaceScripts());
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    // A human edit present at entry. §16.1 is not relaxed by in-place mode — it
+    // is DEPENDED ON, because the start checkpoint is a revert target.
+    await slice.repo.writeFile('docs/notes.md', 'my work in progress\n');
+
+    const error: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: assignmentId('asg_in_place_dirty'),
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+        executionMode: 'in_place',
+      },
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/workspace|clean|dirty|porcelain/i);
+    // The tree is exactly as the operator left it.
+    expect(await git.currentBranch(slice.repo.dir)).toBe('main');
+    expect(fs.existsSync(path.join(slice.repo.dir, 'docs/notes.md'))).toBe(true);
+  });
+
+  it('worktree mode is unchanged: the same run in the default mode still uses a sibling worktree', async () => {
+    const slice = await openSlice(inPlaceScripts());
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_default_mode');
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+        // executionMode deliberately OMITTED.
+      },
+    );
+
+    expect(result.outcome).toBe('merge_ready');
+    expect(result.worktree.executionMode).toBe('worktree');
+    expect(result.worktree.worktreePath).not.toBe(result.worktree.repoRoot);
+    expect(result.inPlaceHeadRestored).toBeUndefined();
+    // The primary checkout never moved: the §19 test-17 invariant, intact.
+    expect(await git.currentBranch(slice.repo.dir)).toBe('main');
+    expect(await git.resolveSha(slice.repo.dir, 'HEAD')).toBe(String(slice.baseCommit));
+    await slice.worktrees.removeWorktree(asg);
+  });
+});

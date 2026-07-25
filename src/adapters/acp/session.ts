@@ -54,6 +54,7 @@ import type { RoleName } from '../../domain/state.js';
 import { SystemClock, type Clock } from '../../lib/clock.js';
 import type { IsoTimestamp } from '../../lib/clock.js';
 import { resolvesInsideRoot } from '../../lib/path-containment.js';
+import type { WriteBoundary } from '../../worktree/write-scope.js';
 import { referenceClassifyError } from '../fake/in-process.js';
 import {
   AdapterError,
@@ -117,8 +118,18 @@ export interface HeadlessPermissionPolicy {
    * Optional canonical workspace boundary for structured path-qualified
    * `Write` / `Edit` operations. Shell-shaped or unparseable operations never
    * match. The provider factory enables this only for the Grok implementor.
+   *
+   * B4 — this is a `WriteBoundary`, not a bare root string, because a bare
+   * string can only say "everything under here". Shared-tree parallelism needs
+   * "reads may span the execution root; WRITES may land only in these N
+   * sub-paths", and the two statements cannot live in one string. Making it the
+   * boundary VALUE (constructible only by `writeBoundary()`, never empty) means
+   * a policy either has a validated boundary or has no workspace-write
+   * allowance at all — there is no third state in which a write is admitted
+   * against something unvalidated. A single-root boundary is byte-for-byte the
+   * pre-B4 decision.
    */
-  readonly workspaceWriteRoot?: string;
+  readonly workspaceWriteBoundary?: WriteBoundary;
 }
 
 /**
@@ -233,6 +244,24 @@ export function isWorkspaceWriteOperation(
 }
 
 /**
+ * B4 — the same rule against a write BOUNDARY: admitted iff the target resolves
+ * inside at least one of its roots.
+ *
+ * Deliberately a composition of `isWorkspaceWriteOperation`, not a reimplementation
+ * of it. The title parsing, the absolute-path requirement and the containment call
+ * stay in exactly one place; this adds only the disjunction over roots, so a
+ * boundary with one root cannot behave differently from the pre-B4 single-root
+ * check — which is what makes "worktree mode is unchanged" a property of the code
+ * rather than a claim about it.
+ */
+export function admitsWorkspaceWrite(
+  operation: string | undefined,
+  boundary: WriteBoundary,
+): boolean {
+  return boundary.roots.some((root) => isWorkspaceWriteOperation(operation, root));
+}
+
+/**
  * Decision core (unit-testable): §10.2 — interactive → surface;
  * headless → allowlist EXACT match else deny; unknown → deny;
  * coordinator/verifier write requests ALWAYS denied (every mode).
@@ -284,8 +313,8 @@ export function decidePermission(
   }
   if (
     role === 'implementor' &&
-    config.policy?.workspaceWriteRoot !== undefined &&
-    isWorkspaceWriteOperation(operation, config.policy.workspaceWriteRoot)
+    config.policy?.workspaceWriteBoundary !== undefined &&
+    admitsWorkspaceWrite(operation, config.policy.workspaceWriteBoundary)
   ) {
     return { action: 'allow', reason: 'allowlisted_workspace_write' };
   }
