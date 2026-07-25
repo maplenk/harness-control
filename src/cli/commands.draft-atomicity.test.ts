@@ -55,6 +55,7 @@ import { createLegacyRunFixture, createRunFixture } from '../app/test-support.js
 import { artifactHash } from '../domain/ids.js';
 import { executeCommand, type CliFlowDeps } from './commands.js';
 import { makeTempGitRepo, type TempGitRepo } from '../worktree/test-support.js';
+import { appendableEvents } from '../domain/events.js';
 
 const GOAL = 'Add a --verbose flag to the CLI so debug lines print to stderr.';
 const COORDINATOR: RoleModelSpec = { harness: 'claude', model: 'opus', effort: 'low' };
@@ -229,7 +230,7 @@ function crashOnCompletionAdvance(db: TestDatabaseHandle['db']): { restore: () =
       crashes += 1;
       throw new Error('injected crash: process died appending the completion advance');
     }
-    return original(drafts);
+    return original(appendableEvents(drafts));
   };
   return {
     restore: () => {

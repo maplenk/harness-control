@@ -45,6 +45,7 @@ import type {
   OperationKind,
   RoleName,
   RunPhase,
+  SpecApprovalMode,
   StopIntentCause,
   SuccessorIntentSeed,
   SuccessorReason,
@@ -179,11 +180,19 @@ export interface SpecDraftRef {
 // ---------------------------------------------------------------------------
 export interface EventPayloads {
   // ---- Trigger events (one per §6.3 row) ---------------------------------
-  /** T1 — spec approved by human; binds the exact SpecVersion hash. */
+  /**
+   * T1 — spec approved; binds the exact SpecVersion hash.
+   *
+   * B2: `approvedBy` names WHO signed — `human` (an operator ran `harness
+   * approve`) or `auto` (the engine signed it under a run pinned to
+   * `approval: 'auto'`). Both bind the REAL drafted hash through the same
+   * W1-F3/W3-4 validation; the distinction exists so the audit trail can
+   * show, for any run, that no human reviewed the intent.
+   */
   'spec.approved': {
     readonly specVersionId: SpecVersionId;
     readonly specHash: SpecHash;
-    readonly approvedBy: 'human';
+    readonly approvedBy: SpecApprovalMode;
   };
   /** T2 — `spec revise --feedback` during awaiting_approval. */
   'spec.revise.requested': {
@@ -868,6 +877,126 @@ export type EventOfType<T extends DomainEventType> = EventBase<T, EventPayloads[
 
 /** The `Event` entity of PLAN §6.1. */
 export type DomainEvent = { [K in DomainEventType]: EventOfType<K> }[DomainEventType];
+
+/**
+ * Events the application service OWNS: each has exactly ONE legal producer,
+ * which validates before appending, so the PUBLIC `ingest` surface refuses
+ * them.
+ *
+ *  - `workflow.dispatch.advanced` (W2-0) — `advanceWorkflowPhase` validates the
+ *    edge + phase + suspension axis first.
+ *  - `spec.approved` (B2 round 3) — approval is a service VERB (`approve`, and
+ *    the auto-approval folded into `completeCoordinationRound`), never an
+ *    ingestible transition. Codex reproduced the entire approval gate being
+ *    bypassed by handing a hand-built T1 to public `ingest`: a human-pinned,
+ *    draft-less run reached `approved` with a fabricated hash and a durable
+ *    `approvedBy:'auto'`.
+ *
+ * Refusing them here is only the OUTER layer. The load-bearing guard is on the
+ * transition itself (`#ingestTransition` asserts the approval binding for every
+ * T1 it applies, whatever produced it), because guarding the routes is a list
+ * you must keep complete forever and guarding the state is one you cannot forget.
+ */
+export type ServiceOwnedEventType = 'workflow.dispatch.advanced' | 'spec.approved';
+
+/**
+ * Compile-time half of that refusal. A caller holding a PRECISELY typed
+ * service-owned event (`EventOfType<'spec.approved'>`) cannot pass it to
+ * `ingest` at all — the parameter resolves to `never`. A caller that has
+ * deliberately widened to `DomainEvent` (`as DomainEvent`, or JavaScript) still
+ * compiles and meets the runtime refusal instead; past that it meets the
+ * transition-level assertion, which nothing can route around.
+ */
+export type NotServiceOwned<E extends DomainEvent> = E['type'] extends ServiceOwnedEventType
+  ? never
+  : E;
+
+// ---------------------------------------------------------------------------
+// B2 round 4 — the DURABLE-LOG append boundary
+// ---------------------------------------------------------------------------
+declare const VALIDATED_APPROVAL: unique symbol;
+
+/**
+ * A `spec.approved` that has passed the service's binding gate. The brand is
+ * mintable only by `OrchestrationService`'s validated path (the sole
+ * `validateApproval` call site) — nothing else can produce this type without an
+ * explicit, greppable `as ValidatedApproval`, which is the same visible act as
+ * the `as DomainEvent` widening that the `ingest` guard tolerates.
+ *
+ * WHY IT EXISTS: `EventRepository.append`/`appendBatch` and
+ * `appendTriggerWithEffects` are PUBLIC (re-exported from persistence/index)
+ * and used to accept any `DomainEvent`, so a T1 could be written straight into
+ * the durable log beneath every service check. Requiring the brand makes that
+ * append not COMPILE for a caller holding a precisely typed T1.
+ *
+ * It is not the whole defence, and deliberately so: a caller who widens to
+ * `DomainEvent` first still compiles. The guarantee that holds regardless is in
+ * `applyTransition` — a T1 whose provenance the LOG contradicts throws when
+ * folded, including during `recover()`.
+ */
+export type ValidatedApproval = EventOfType<'spec.approved'> & {
+  readonly [VALIDATED_APPROVAL]: true;
+};
+
+/**
+ * What the durable log accepts: every event except an UNBRANDED `spec.approved`.
+ *
+ * B2 round 5 — this is now DISTRIBUTIVE (`E extends …` over a naked type
+ * parameter), and that change is the whole point. Round 4 wrote
+ * `E['type'] extends 'spec.approved'`, which tests the union's `type` as ONE
+ * type: for `E = DomainEvent` the union `'a'|'b'|'spec.approved'` does not
+ * extend `'spec.approved'`, so a widened `DomainEvent` — and any
+ * `appendBatch([approval, other])` whose element type infers to a union —
+ * satisfied the constraint with an unbranded approval inside. I reported the
+ * resulting zero call-site churn as a win; it was the evidence the constraint
+ * bound nothing. A constraint that costs nothing to satisfy usually is not
+ * constraining anything.
+ *
+ * Distributing means `AppendableEvent<DomainEvent>` is
+ * `<every non-approval member> | ValidatedApproval`, so a plain `DomainEvent`
+ * is NOT assignable and every append site must say which it has. Callers
+ * holding a widened event that they know is not an approval go through
+ * `appendableEvent()`, which CHECKS at runtime — so the widening escape is a
+ * refusal, not a hole.
+ */
+export type AppendableEvent<E extends DomainEvent = DomainEvent> = E extends {
+  readonly type: 'spec.approved';
+}
+  ? ValidatedApproval
+  : E;
+
+/**
+ * Thrown when an unvalidated `spec.approved` reaches the durable-log append
+ * boundary through a widened (`DomainEvent`) path. The compile-time constraint
+ * stops precisely typed callers; this stops the ones that erased the type.
+ */
+export class UnvalidatedApprovalAppendError extends Error {
+  override readonly name: string = 'UnvalidatedApprovalAppendError';
+  readonly runId: RunId;
+  constructor(runId: RunId) {
+    super(
+      `refusing to append an unvalidated 'spec.approved' for run ${runId}: approval events reach the ` +
+        `durable log only as a ValidatedApproval, minted by the service's binding gate. Call ` +
+        `approve(), or let completeCoordinationRound sign under approval='auto'.`,
+    );
+    this.runId = runId;
+  }
+}
+
+/**
+ * Widen a `DomainEvent` to the append boundary's type, REFUSING an approval.
+ * The one supported way for a caller holding an erased type to append, and the
+ * reason the distributive constraint has no silent bypass.
+ */
+export function appendableEvent(event: DomainEvent): AppendableEvent {
+  if (event.type === 'spec.approved') throw new UnvalidatedApprovalAppendError(event.runId);
+  return event as AppendableEvent;
+}
+
+/** Batch form of `appendableEvent` — same refusal, per element. */
+export function appendableEvents(events: readonly DomainEvent[]): readonly AppendableEvent[] {
+  return events.map(appendableEvent);
+}
 
 // ---------------------------------------------------------------------------
 // Construction helpers

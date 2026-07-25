@@ -20,7 +20,7 @@
  * recorded via SUPPORTING events by their coordinators, not via this engine.
  */
 import type { IsoTimestamp } from '../lib/clock.js';
-import type { ProcessGenerationId, SegmentId, SpecHash } from './ids.js';
+import type { ProcessGenerationId, RunId, SegmentId, SpecHash } from './ids.js';
 import {
   DEFAULT_BOUNDS,
   OPERATION_IDLE,
@@ -35,6 +35,7 @@ import {
   type RestartCounters,
   type ResumeReentryPending,
   type RunPhase,
+  type SpecApprovalMode,
   type StopIntentCause,
   stopIntentConfirmation,
   type SuccessorIntent,
@@ -51,6 +52,7 @@ import {
   type EventPayloads,
   type LimitClassification,
   type NotifyTopic,
+  type SpecDraftRef,
   type SuccessorReason,
 } from './events.js';
 
@@ -214,7 +216,9 @@ export const TRANSITION_TABLE: readonly TransitionRow[] = [
   {
     id: 'T1',
     event: 'spec.approved',
-    description: 'Spec approved (human): bind spec hash; phase=approved.',
+    description:
+      'Spec approved: bind spec hash + signer (human, or the engine under B2 ' +
+      "`approval: 'auto'`); phase=approved.",
     preconditions: [{ kind: 'phase_in', phases: ['awaiting_approval'] }],
     effects: [{ kind: 'bind_spec_hash' }, { kind: 'set_phase', phase: 'approved' }],
     invariants: ['suspension_unchanged'],
@@ -604,8 +608,72 @@ export interface EngineState {
    * suspension-clear — and cleared by the SAME `resume_reentry.completed` ack.
    */
   readonly successorIntent?: SuccessorIntent;
+  /**
+   * B2 round 4 — the latest coordinator-completion draft ref, folded from the
+   * `workflow.dispatch.advanced` that carried it. This is the run's own LOG
+   * saying which SpecVersion was drafted, so `applyTransition` can check a T1's
+   * provenance PURELY, with no database read: a `spec.approved` must name this
+   * exact version+hash, and the ENGINE may not sign at all when it is absent.
+   * That is what makes an unvalidated T1 unable to produce `approved` even when
+   * it was written straight into the durable log and replayed by `recover()`.
+   */
+  readonly lastDraftRef?: SpecDraftRef;
+  /**
+   * B2 round 5 — was this state built from the run's COMPLETE history?
+   *
+   * `lastDraftRef` being absent used to mean two different things, and the
+   * provenance check treated both as the permissive one:
+   *   - "this run never completed a coordinator round" (legitimate — the
+   *     imported/legacy human-approval case), and
+   *   - "this projection never folded the event that would have established it"
+   *     (UNKNOWN — `ProjectionRepository.recover` is INCREMENTAL: it resumes
+   *     from a stored cursor and never backfills, so a projection written by a
+   *     build that predates `lastDraftRef` resumes past the completion advance
+   *     and never learns of it).
+   *
+   * `initialEngineState` sets this, so any state folded from sequence 1 by this
+   * build carries it and every later fold preserves it. A projection persisted
+   * by an older build does NOT, which is exactly the "cannot judge" case.
+   *
+   * B2 round 6 — the marker gates the ENGINE signature ONLY, and that is a
+   * deliberate, load-bearing asymmetry rather than a softening:
+   *  - it closes the hole, because it is checked BEFORE the reference branch,
+   *    so a stale-but-present reference can no longer carry an `auto` approval;
+   *  - it keeps the UPGRADE path open, because `recover()` is incremental and
+   *    there is NO operation that rebuilds a projection from sequence 1. Gating
+   *    human approval on the marker would strand every run already in the live
+   *    store at `awaiting_approval` with no way forward.
+   *
+   * That is only sound because no run lacking the marker can be pinned `auto`:
+   * `approval` did not exist before this branch, and `loadRunConfig` re-parses
+   * a persisted config through the schema, so a config written without the key
+   * resolves to `'human'`. The one exception is a run created by an
+   * INTERMEDIATE commit of this branch (rounds 1–4, where `auto` existed but
+   * this marker did not) — that state fails CLOSED here, and cannot exist
+   * outside a developer's checkout of this unmerged branch.
+   */
+  readonly historyComplete?: true;
   /** Bound on T1. */
   readonly approvedSpecHash?: SpecHash;
+  /**
+   * B2: WHO signed the T1 that bound `approvedSpecHash` — folded from the
+   * same `spec.approved` payload, in the same effect. Absent when
+   * `approvedSpecHash` is absent (never approved) OR the run was approved by
+   * a pre-B2 build, which folded no signer.
+   *
+   * Absent is NOT read as `'human'`. An earlier revision of this comment said
+   * it was, and that was the false attestation this field exists to prevent:
+   * `#resolveApprovalSigner` re-reads the durable `spec.approved` row, and if
+   * even that cannot substantiate a signer it leaves the value ABSENT, which
+   * downstream consumers surface as UNKNOWN and REFUSE on. A pre-B2 approval
+   * whose signer cannot be recovered from the log is unsubstantiated, and
+   * "probably a human" is exactly the guess that would make this field lie.
+   *
+   * Never inferred from config either: this records the actual signature, so a
+   * human who approved a run pinned to `approval: 'auto'` still shows as
+   * `human`.
+   */
+  readonly specApprovedBy?: SpecApprovalMode;
   readonly counters: RestartCounters;
   readonly bounds: EngineBounds;
 }
@@ -617,6 +685,12 @@ export function initialEngineState(overrides: Partial<EngineState> = {}): Engine
     operation: OPERATION_IDLE,
     counters: ZERO_COUNTERS,
     bounds: DEFAULT_BOUNDS,
+    // B2 round 5: a state seeded here is folded from sequence 1, so its
+    // `lastDraftRef` (present or absent) is TRUSTWORTHY. Everything that
+    // resumes from a stored projection inherits whatever that projection
+    // recorded — and a pre-round-5 projection records nothing, which is
+    // precisely the "cannot judge provenance" case.
+    historyComplete: true,
     ...overrides,
   };
 }
@@ -747,8 +821,41 @@ interface MutableDraft {
   activeChild: ActiveChild | undefined;
   resumeReentryPending: ResumeReentryPending | undefined;
   successorIntent: SuccessorIntent | undefined;
+  lastDraftRef: SpecDraftRef | undefined;
   approvedSpecHash: SpecHash | undefined;
+  specApprovedBy: SpecApprovalMode | undefined;
   counters: RestartCounters;
+}
+
+/**
+ * B2 round 4 — a `spec.approved` in the durable log whose provenance the LOG
+ * ITSELF contradicts. Thrown (not rejected) because this is corruption, not an
+ * illegal-but-expected transition: the same treatment, and the same reasoning,
+ * as `WorkflowDispatchReplayError`. A rejection would silently no-op and leave
+ * the caller believing the log is sound.
+ *
+ * Reachable only by writing a T1 into the event store directly — every service
+ * route validates against the projection AND the completion ref first. This is
+ * the backstop for exactly that: `recover()` replaying a hand-appended T1 must
+ * not produce `approved`.
+ */
+export type SpecApprovalProvenanceReason =
+  /** `approvedBy:'auto'` with no completed coordinator round in the log. */
+  | 'no_completion_ref'
+  /** The approval names a version/hash the completed round did not draft. */
+  | 'binding_mismatch'
+  /** B2 round 5: this state cannot see enough history to judge provenance. */
+  | 'provenance_undeterminable';
+
+export class SpecApprovalProvenanceError extends Error {
+  override readonly name: string = 'SpecApprovalProvenanceError';
+  readonly runId: RunId;
+  readonly reason: SpecApprovalProvenanceReason;
+  constructor(runId: RunId, reason: SpecApprovalProvenanceReason, detail: string) {
+    super(`Corrupt event log for run ${runId}: ${detail}`);
+    this.runId = runId;
+    this.reason = reason;
+  }
 }
 
 function classificationOf(event: DomainEvent): LimitClassification | undefined {
@@ -823,14 +930,102 @@ function reject(
 }
 
 /**
+ * B2 round 4 — PURE provenance check on a `spec.approved`, using only the
+ * run's own folded log. No database read, so it is safe inside the reducer and
+ * inside `recover()`'s replay, which is exactly where it is needed.
+ *
+ * Two rules, mirroring the service-side gate's log-derived half:
+ *  - a completion ref folded from `workflow.dispatch.advanced` means the run
+ *    HAS drafted provenance, and the approval must name that exact
+ *    version+hash;
+ *  - no completion ref means there is no drafted provenance at all, so the
+ *    ENGINE may not sign (`approvedBy:'auto'`). A HUMAN may — that is the
+ *    documented pre-B2 explicit-hash path for imported/legacy specs, and the
+ *    same deliberate asymmetry the service applies: a person can attest to an
+ *    externally produced hash, the engine must have provenance.
+ *
+ * What this canNOT see (and the service still must): the run's PINNED approval
+ * mode, and whether the draft PROJECTION agrees with the ref. Both need reads a
+ * reducer must not do. The residual, stated plainly: a raw-log writer can still
+ * append a HUMAN approval that matches the log's own completion ref — which is
+ * precisely the approval `approve()` would itself have accepted, so it is not
+ * an escalation.
+ */
+function assertApprovalProvenance(state: EngineState, event: DomainEvent): void {
+  if (event.type !== 'spec.approved') return;
+  const payload = (event as EventOfType<'spec.approved'>).payload;
+  const ref = state.lastDraftRef;
+  // B2 round 6 — ORDER MATTERS, and this is the order:
+  //   1. an ENGINE signature requires a judgeable state (this check),
+  //   2. then it requires drafted provenance to exist,
+  //   3. then the binding must match that provenance.
+  //
+  // Round 5 checked the marker only INSIDE the `ref === undefined` branch, so a
+  // projection with no marker but a STALE reference still behind its cursor was
+  // trusted — codex probed exactly that and an `approvedBy:'auto'` approval
+  // matching the stale reference reached `approved`. Hoisting the check makes a
+  // present-but-untrustworthy reference unable to carry an engine signature.
+  //
+  // It is gated on `auto` ALONE, and that is what keeps the upgrade path open:
+  // a HUMAN signature never depends on the marker, so a run persisted by an
+  // older build — which necessarily has no marker — is still approvable. See
+  // the note on `historyComplete` for why no such run can be pinned `auto`.
+  if (payload.approvedBy === 'auto' && state.historyComplete !== true) {
+    throw new SpecApprovalProvenanceError(
+      event.runId,
+      'provenance_undeterminable',
+      `spec.approved claims approvedBy='auto' but this projection was not built from the run's complete ` +
+        `history (no history-complete marker), so its drafted provenance cannot be judged — a reference ` +
+        `it happens to carry may be stale, and one it lacks may simply never have been folded. Absent ` +
+        `provenance and UNKNOWN provenance are not the same thing, and the engine signs on neither. ` +
+        `A human may still approve this run explicitly; otherwise cancel and re-start it.`,
+    );
+  }
+  if (ref === undefined) {
+    if (payload.approvedBy === 'auto') {
+      throw new SpecApprovalProvenanceError(
+        event.runId,
+        'no_completion_ref',
+        `spec.approved claims approvedBy='auto' but the log records no completed coordinator round ` +
+          `(no workflow.dispatch.advanced carrying a draft ref). The engine never signs a spec it ` +
+          `cannot prove was drafted.`,
+      );
+    }
+    return;
+  }
+  if (
+    String(payload.specVersionId) !== String(ref.specVersionId) ||
+    String(payload.specHash) !== String(ref.specHash)
+  ) {
+    throw new SpecApprovalProvenanceError(
+      event.runId,
+      'binding_mismatch',
+      `spec.approved binds spec ${payload.specVersionId} (hash ${payload.specHash}) but the latest ` +
+        `completed coordinator round drafted ${ref.specVersionId} (hash ${ref.specHash}, revision ` +
+        `${ref.revision}). Approval must bind the drafted SpecVersion exactly (W1-F3).`,
+    );
+  }
+}
+
+/**
  * Pure, deterministic transition engine over the §6.3 table.
  * Never throws for domain-level illegality; never mutates `state`.
+ * (B2 round 4 exception: a `spec.approved` whose provenance the LOG itself
+ * contradicts throws `SpecApprovalProvenanceError` — that is corruption, not
+ * illegality, and is treated exactly as `WorkflowDispatchReplayError` is.)
  */
 export function applyTransition(state: EngineState, event: DomainEvent): TransitionOutcome {
   const row = TRANSITIONS_BY_EVENT.get(event.type);
   if (!row) {
     return reject(state, event, 'unlisted_event', `No §6.3 row triggers on event '${event.type}'`);
   }
+  // B2 round 4: the DEEPEST approval guard, and the only one a durable-log
+  // writer cannot go under. Every §6.3 application funnels through here — the
+  // engine reducer, `recover()`'s replay, the service's transition path, and
+  // the direct `applyTransition` call in the limit-pause composite — so a T1
+  // whose provenance the log contradicts can never become `approved`, no
+  // matter which surface wrote it.
+  assertApprovalProvenance(state, event);
   const failures = checkPreconditions(row, state, event);
   if (failures.length > 0) {
     return reject(state, event, 'precondition_failed', `${row.id}: ${failures.join('; ')}`);
@@ -844,7 +1039,9 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
     activeChild: state.activeChild,
     resumeReentryPending: state.resumeReentryPending,
     successorIntent: state.successorIntent,
+    lastDraftRef: state.lastDraftRef,
     approvedSpecHash: state.approvedSpecHash,
+    specApprovedBy: state.specApprovedBy,
     counters: { ...state.counters },
   };
 
@@ -888,9 +1085,14 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
       case 'set_phase_to_return_phase':
         if (initial.suspension.kind !== 'none') draft.phase = initial.suspension.returnPhase;
         break;
-      case 'bind_spec_hash':
-        draft.approvedSpecHash = (event as EventOfType<'spec.approved'>).payload.specHash;
+      case 'bind_spec_hash': {
+        // B2: hash AND signer are bound together from the ONE T1 payload — the
+        // audit answer to "which spec, signed by whom" can never come apart.
+        const approval = (event as EventOfType<'spec.approved'>).payload;
+        draft.approvedSpecHash = approval.specHash;
+        draft.specApprovedBy = approval.approvedBy;
         break;
+      }
       case 'mark_assignments_stale': {
         const payload = (event as EventOfType<'spec.superseded'>).payload;
         emit('assignments.marked_stale', {
@@ -1277,7 +1479,10 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
       ? { resumeReentryPending: draft.resumeReentryPending }
       : {}),
     ...(draft.successorIntent !== undefined ? { successorIntent: draft.successorIntent } : {}),
+    ...(state.historyComplete === true ? { historyComplete: true as const } : {}),
+    ...(draft.lastDraftRef !== undefined ? { lastDraftRef: draft.lastDraftRef } : {}),
     ...(draft.approvedSpecHash !== undefined ? { approvedSpecHash: draft.approvedSpecHash } : {}),
+    ...(draft.specApprovedBy !== undefined ? { specApprovedBy: draft.specApprovedBy } : {}),
   };
 
   return { status: 'applied', transitionId: row.id, next, emitted };

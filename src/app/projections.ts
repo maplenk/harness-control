@@ -41,6 +41,7 @@ import type {
   OperationKind,
   RoleName,
   RunPhase,
+  SpecApprovalMode,
   SuspensionKind,
 } from '../domain/state.js';
 import {
@@ -201,6 +202,10 @@ export interface MergeReadinessBlockedState {
   readonly requiredTestsPassed: boolean;
   /** Spec-drift gate input the blocked round checked against. */
   readonly approvedSpecHash?: SpecHash;
+  // B2 (codex F5): the approval SIGNER is deliberately NOT stored here. A
+  // recheck re-reads it from the run's event-derived engine state, so there is
+  // exactly one place a missing signer is resolved and no persisted record —
+  // possibly written by an older build — can quietly report `'human'`.
   /** The latest §16 readiness report (`ready === false` while `blocked`). */
   readonly mergeReadiness: MergeReadiness;
   /** The latest probe's blockers (all user-actionable while `blocked`). */
@@ -454,10 +459,25 @@ export function makeEngineReducer(
   return (state, event) => {
     const withBounds: EngineState = { ...state, bounds };
     if (event.type === 'workflow.dispatch.advanced') {
-      const { from, to } = event.payload;
+      const { from, to, draft } = event.payload;
       const listed = WORKFLOW_DISPATCH_EDGES.some(([a, b]) => a === from && b === to);
       if (!listed || withBounds.phase !== from) {
         throw new WorkflowDispatchReplayError(event.runId, from, to, withBounds.phase);
+      }
+      // B2 round 4: fold the coordinator-completion draft ref. This is the run's
+      // own LOG recording which SpecVersion was drafted, and it is what lets
+      // `applyTransition` check a T1's provenance purely — including during
+      // `recover()`, where no database read is permissible.
+      //
+      // B2 round 5: an advance INTO `awaiting_approval` REPLACES the reference,
+      // clearing it when the advance carries none. Round 4 only ever set it, so
+      // a revise round that completed BARE (no draft ref — the pure-runner seam)
+      // left the SUPERSEDED reference in place, and an approval matching the old
+      // version/hash satisfied the check. The latest completion is the only one
+      // that can be approved, so it is the only one the state may remember.
+      if (to === 'awaiting_approval') {
+        const { lastDraftRef: _superseded, ...rest } = withBounds;
+        return { ...rest, phase: to, ...(draft !== undefined ? { lastDraftRef: draft } : {}) };
       }
       return { ...withBounds, phase: to };
     }

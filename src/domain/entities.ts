@@ -36,6 +36,7 @@ import type {
   RestartCounters,
   RoleName,
   RunPhase,
+  SpecApprovalAttribution,
   Suspension,
   WorktreeTaint,
 } from './state.js';
@@ -331,6 +332,20 @@ export interface MergeReadiness {
   readonly requiredTestsPassed: boolean;
   /** CAS refs of the host receipts enforced for this report. */
   readonly evidenceReceiptRefs: readonly ArtifactHash[];
+  /**
+   * B2: WHO signed the approval of the spec this commit was built against.
+   * `auto` means the ENGINE bound the drafted hash and NO human reviewed the
+   * INTENT — the merge review is then the first and only human judgement of
+   * whether this was the right work. Never a blocker: an auto-approved run
+   * can be perfectly merge-ready; the reviewer just has to know.
+   *
+   * B2 round 4: `'unknown'` is reachable ONLY by migrating a record persisted
+   * by an older build whose attribution the event log cannot substantiate — a
+   * freshly built report always knows its signer. Reported honestly rather than
+   * defaulted to `'human'`, which would be a false attestation in the one field
+   * that exists to prevent one.
+   */
+  readonly specApprovedBy: SpecApprovalAttribution;
   readonly ready: boolean;
   /** The §16 blockers when NOT ready (empty iff `ready`); W1-F1 maps these to
    * `integration_blocker` fix-requests and the T23 trigger payload. */

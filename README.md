@@ -85,9 +85,11 @@ checkout.
 harness-orchestrator doctor --json
 
 # 2. Create a run: the coordinator drafts + validates a spec, then STOPS at
-#    the human approval gate. --config binds the engine config (bounds,
-#    budget, quotas, probe ladder) to this run — it is persisted and every
-#    later command reloads it.
+#    the human approval gate (unless the bound config sets approval:"auto",
+#    in which case the engine signs the drafted hash and the run goes straight
+#    to `approved` — see "Safety posture"). --config binds the engine config
+#    (approval mode, bounds, budget, quotas, probe ladder) to this run — it is
+#    persisted and every later command reloads it.
 harness-orchestrator start --workspace /path/to/repo \
   --goal "Add a --verbose flag to the CLI" \
   --coordinator claude --model opus --effort low \
@@ -110,9 +112,11 @@ harness-orchestrator start --workspace /path/to/repo \
 # 2b. Optional revision round before approving:
 harness-orchestrator spec revise RUN_ID --feedback "Tighten AC-2; no new deps"
 
-# 3. Explicit human approval — the ONLY production approval path. The hash
-#    binds the exact SpecVersion; omit --spec-hash to bind the drafted spec's
-#    hash, or pass it to have it validated against the draft.
+# 3. Explicit human approval — the DEFAULT production approval path (the other
+#    is the engine signing on a run configured approval:"auto", which already
+#    happened during `start`). The hash binds the exact SpecVersion; omit
+#    --spec-hash to bind the drafted spec's hash, or pass it to have it
+#    validated against the draft.
 harness-orchestrator approve RUN_ID --spec-version SPEC_ID --spec-hash HASH
 
 # 4. Drive implement → verify → (bounded remediation) → merge-readiness.
@@ -386,10 +390,36 @@ automation is possible only through `--test-approve` with
   integrate", and the report prints the exact manual commands. Nothing is
   merged, committed to your branch, or pushed on your behalf — you review the
   diff and integrate yourself.
-- **Approval is human and explicit.** There is no auto-approve path; the
-  `--test-approve` seam refuses to run unless `HARNESS_TEST_MODE=1` and, when
-  a draft exists, binds the real draft hash. `run` refuses to execute if the
-  approved hash does not match the current draft.
+- **Approval is human and explicit by default.** The `--test-approve` seam
+  refuses to run unless `HARNESS_TEST_MODE=1` and, when a draft exists, binds
+  the real draft hash. `run` refuses to execute if the approved hash does not
+  match the current draft.
+- **Autonomy is opt-in, per run, and never silent.** Setting
+  `approval: "auto"` in the config `start` binds (default: `"human"`) has the
+  ENGINE sign the drafted spec so an autonomous run does not wait at the input
+  gate. It is a signature, not a bypass: the signature is applied inside the
+  same transaction that persists the drafted spec, it binds the REAL drafted
+  hash, and it never touches the `--test-approve` synthetic-hash path. The mode
+  is pinned into the run at creation, so it cannot be granted or revoked
+  mid-run. Every auto-approval is recorded as
+  `spec.approved {approvedBy:"auto"}`, and the merge-readiness report carries
+  `specApprovedBy` plus an explicit warning — when you review a merge, you are
+  told whether anyone reviewed the intent. **The merge gate is unchanged and
+  still human: nothing auto-merges.**
+- **The approval gate lives in the engine, not the CLI.** The service enforces
+  the run's pinned approval mode and validates the approved version, hash and
+  revision against the durable coordinator-completion record, inside the
+  transaction that records the approval. A run configured `"human"` refuses an
+  engine signature outright, whatever calls it.
+- **Under autonomy, the run decides what counts as proof.** The testability
+  gate that rejects vague acceptance criteria is a text filter, and a
+  determined model can satisfy it with a meaningless command. So
+  `approval: "auto"` requires you to declare `verification.allowedCommands`,
+  and every acceptance criterion must cite one of them verbatim — the
+  coordinator picks which of your commands proves a criterion, it cannot invent
+  `true` or weaken one with `|| true`. This does not make a criterion
+  *meaningful* ("the suite passes" is satisfied by a no-op); the guards for
+  that are the requirement of a real new commit and your merge review.
 - **Source pinning is fail-closed.** New runs are not created from non-Git,
   unborn, dirty, unresolvable, or drifting workspaces. Every fresh
   implementation worktree is created from the run's branded full commit SHA;

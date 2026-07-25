@@ -427,6 +427,8 @@ describe('verifier flow — mixed verdicts drive remediation (T23, §8)', () => 
     const { recorder } = fakeEvidence();
 
     const result = await runVerification({
+      // B2 (codex F5): required signer — this fixture is a human-approved run.
+      specApprovedBy: 'human',
       engine: service,
       runId,
       verifierSpec: CLAUDE_LOW,
@@ -485,6 +487,8 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
     const result = await runVerification({
       engine: service,
       runId,
+      // B2 × F13 MERGE: fixtures model an operator-approved run.
+      specApprovedBy: 'human',
       verifierSpec: CLAUDE_LOW,
       cwd: '/worktree',
       binding: binding(),
@@ -531,6 +535,8 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
     const result = await runVerification({
       engine: service,
       runId,
+      // B2 × F13 MERGE: fixtures model an operator-approved run.
+      specApprovedBy: 'human',
       verifierSpec: CLAUDE_LOW,
       cwd: '/worktree',
       binding: binding(),
@@ -589,6 +595,8 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
     const result = await runVerification({
       engine: service,
       runId,
+      // B2 × F13 MERGE: fixtures model an operator-approved run.
+      specApprovedBy: 'human',
       verifierSpec: CLAUDE_LOW,
       cwd: '/worktree',
       binding: binding(),
@@ -660,6 +668,8 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
     const result = await runVerification({
       engine: service,
       runId,
+      // B2 × F13 MERGE: fixtures model an operator-approved run.
+      specApprovedBy: 'human',
       verifierSpec: CLAUDE_LOW,
       cwd: '/worktree',
       binding: binding(),
@@ -706,6 +716,8 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
     const result = await runVerification({
       engine: service,
       runId,
+      // B2 × F13 MERGE: fixtures model an operator-approved run.
+      specApprovedBy: 'human',
       verifierSpec: CLAUDE_LOW,
       cwd: '/worktree',
       binding: binding(),
@@ -737,6 +749,8 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
     const { recorder, records } = fakeEvidence();
 
     const result = await runVerification({
+      // B2 (codex F5): required signer — this fixture is a human-approved run.
+      specApprovedBy: 'human',
       engine: service,
       runId,
       verifierSpec: CLAUDE_LOW,
@@ -796,6 +810,8 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
     const { recorder } = fakeEvidence();
 
     const result = await runVerification({
+      // B2 (codex F5): required signer — this fixture is a human-approved run.
+      specApprovedBy: 'human',
       engine: service,
       runId,
       verifierSpec: CLAUDE_LOW,
@@ -833,6 +849,8 @@ describe('verifier flow — missing evidence blocks merge_ready (§19 test 12)',
     const { recorder, records } = fakeEvidence();
 
     const result = await runVerification({
+      // B2 (codex F5): required signer — this fixture is a human-approved run.
+      specApprovedBy: 'human',
       engine: service,
       runId,
       verifierSpec: CLAUDE_LOW,
@@ -895,6 +913,8 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
     await driveToVerifying(service, runId);
     const { recorder } = fakeEvidence();
     const result = await runVerification({
+      // B2 (codex F5): required signer — this fixture is a human-approved run.
+      specApprovedBy: 'human',
       engine: service,
       runId,
       verifierSpec: CLAUDE_LOW,
@@ -1054,6 +1074,8 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
     const { recorder } = fakeEvidence();
     await expect(
       runVerification({
+        // B2 (codex F5): required signer — this fixture is a human-approved run.
+        specApprovedBy: 'human',
         engine: service,
         runId,
         verifierSpec: CLAUDE_LOW,
@@ -1122,6 +1144,8 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
     const { recorder } = fakeEvidence();
     await expect(
       runVerification({
+        // B2 (codex F5): required signer — this fixture is a human-approved run.
+        specApprovedBy: 'human',
         engine: service,
         runId,
         verifierSpec: CLAUDE_LOW,
@@ -1182,6 +1206,8 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
       // The destination was cleaned meanwhile, but the base DRIFTED — the
       // fresh probe decides; the verification is never recomputed.
       const recheck = await recheckMergeReadiness({
+        // B2 (codex F5): required signer — this fixture is a human-approved run.
+        specApprovedBy: 'human',
         engine: outcome.service,
         runId: outcome.runId,
         blocked,
@@ -1245,6 +1271,10 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
       const recheck = await recheckMergeReadiness({
         engine: outcome.service,
         runId: outcome.runId,
+        // B2 × F13 MERGE: recheck re-publishes the readiness report, so it must
+        // carry a signer. This test is about F13's receipt migration on a legacy
+        // record, and that record is operator-approved.
+        specApprovedBy: 'human',
         blocked,
         probe: fixedProbe(goodFacts()),
         ids: outcome.ids,
@@ -1268,6 +1298,8 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
       const outcome = await blockedRound();
       const blocked = outcome.service.getMergeReadinessBlocked(outcome.runId)!;
       const recheck = await recheckMergeReadiness({
+        // B2 (codex F5): required signer — this fixture is a human-approved run.
+        specApprovedBy: 'human',
         engine: outcome.service,
         runId: outcome.runId,
         blocked,
@@ -1297,6 +1329,8 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
       const outcome = await blockedRound();
       const blocked = outcome.service.getMergeReadinessBlocked(outcome.runId)!;
       const recheck = await recheckMergeReadiness({
+        // B2 (codex F5): required signer — this fixture is a human-approved run.
+        specApprovedBy: 'human',
         engine: outcome.service,
         runId: outcome.runId,
         blocked,
@@ -1316,6 +1350,8 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
       const before = outcome.db.events.listByRun(outcome.runId).length;
       await expect(
         recheckMergeReadiness({
+          // B2 (codex F5): required signer — this fixture is a human-approved run.
+          specApprovedBy: 'human',
           engine: outcome.service,
           runId: outcome.runId,
           blocked,
@@ -1369,6 +1405,8 @@ describe('verifier flow — successor resumes from checkpoint alone (§19 test 2
     const { recorder } = fakeEvidence();
 
     const result = await runVerification({
+      // B2 (codex F5): required signer — this fixture is a human-approved run.
+      specApprovedBy: 'human',
       engine: service,
       runId,
       verifierSpec: CLAUDE_LOW,
@@ -1430,6 +1468,8 @@ describe('buildMergeReadiness — §16 gate (§19 test 18)', () => {
     approvedSpecHash = SPEC_HASH,
   ): ReturnType<typeof buildMergeReadiness> {
     return buildMergeReadiness({
+      // B2 (codex F5): required signer — this fixture is a human-approved run.
+      specApprovedBy: 'human',
       runId: mkRunId('run_1'),
       verification: v,
       binding: binding(),
@@ -1503,6 +1543,8 @@ describe('buildMergeReadiness — §16 gate (§19 test 18)', () => {
 
   it('W4-6: shell-quotes a repoRoot/ref with spaces into a valid copy-pasteable command', () => {
     const mr = buildMergeReadiness({
+      // B2 (codex F5): required signer — this fixture is a human-approved run.
+      specApprovedBy: 'human',
       runId: mkRunId('run_1'),
       verification: verified('all_verified'),
       binding: binding({
@@ -1553,6 +1595,8 @@ describe('verification trigger event + requiredTests derivation', () => {
       clock,
     });
     const readyReadiness = buildMergeReadiness({
+      // B2 (codex F5): required signer — this fixture is a human-approved run.
+      specApprovedBy: 'human',
       runId: mkRunId('run_1'),
       verification: passing,
       binding: binding(),

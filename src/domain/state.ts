@@ -306,6 +306,34 @@ export const DEFAULT_PROBE_LADDER_MINUTES = [30, 60, 120, 240] as const;
 export type RoleName = 'coordinator' | 'implementor' | 'verifier';
 
 /**
+ * B2 — WHO signed the T1 approval. `human` is an operator running `harness
+ * approve` (the historical only path); `auto` is the ENGINE binding the
+ * drafted hash itself under a run pinned to `approval: 'auto'`. This is a
+ * signature attribution, never a relaxation: both modes bind the exact
+ * drafted SpecVersion hash through the same W1-F3/W3-4 validation, and the
+ * spec stays immutable either way. Carried on the `spec.approved` payload,
+ * folded into `EngineState.specApprovedBy`, and surfaced on the §16
+ * merge-readiness report so a human reviewing a merge can see that nobody
+ * reviewed the intent.
+ */
+export type SpecApprovalMode = 'human' | 'auto';
+
+/**
+ * B2 round 4 — what a REPORT may say about the signer. Adds `'unknown'` to the
+ * two real modes, for the one case that genuinely arises: a persisted record
+ * written by an older build whose attribution the event log cannot
+ * substantiate. Codex's rule is that such a record is UNKNOWN and must never be
+ * reported as `'human'` — so "unknown" has to be sayable, rather than
+ * approximated by the safest-looking lie.
+ *
+ * Deliberately NOT accepted on the INPUT side: a freshly computed report always
+ * knows its signer (it is derived from the event log at build time), so
+ * `BuildMergeReadinessInput.specApprovedBy` stays a real `SpecApprovalMode` and
+ * `'unknown'` can only ever come from migrating an old record on read.
+ */
+export type SpecApprovalAttribution = SpecApprovalMode | 'unknown';
+
+/**
  * Why a checkpoint-successor generation is required (§11, §12.2): a limit
  * during an unconfirmed model switch (T5), a mid-turn limit, a cross-harness
  * switch, or crash/restart recovery. Shared vocabulary — consumed by both the

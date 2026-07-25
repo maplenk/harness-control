@@ -9,7 +9,7 @@
  * interpreted during replay.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { draftEvent, type DomainEvent, type DomainEventType, type EventPayloads } from '../domain/events.js';
+import {appendableEvent, appendableEvents,  draftEvent, type DomainEvent, type DomainEventType, type EventPayloads } from '../domain/events.js';
 import {
   idempotencyKey,
   processGenerationId,
@@ -112,7 +112,7 @@ function confirmation(key = 't22-confirmed'): DomainEvent {
 function appendT22Batch(handle: TestDatabaseHandle, trigger: DomainEvent): void {
   const outcome = applyTransition(activeState(), trigger);
   if (outcome.status !== 'applied') throw new Error(`setup: ${trigger.type} unexpectedly rejected`);
-  handle.db.events.appendBatch([...spawnEvents(), trigger, ...outcome.emitted]);
+  handle.db.events.appendBatch(appendableEvents([...spawnEvents(), trigger, ...outcome.emitted]));
 }
 
 function recover(handle: TestDatabaseHandle): EngineState {
@@ -164,7 +164,7 @@ describe.each(DRIVER_KINDS)('T22 semantics-version replay compatibility (%s)', (
 
     // This is the startup recovery contract: append a new fact; never mutate
     // or reinterpret the already-persisted legacy trigger.
-    handle.db.events.append(confirmation());
+    handle.db.events.append(appendableEvent(confirmation()));
     const reconciled = recover(handle);
 
     expect(reconciled.suspension.kind).toBe('resource_exhausted');
@@ -183,7 +183,7 @@ describe.each(DRIVER_KINDS)('T22 semantics-version replay compatibility (%s)', (
   it('replays a mixed legacy T22 plus an existing confirmation idempotently', async () => {
     handle = await openTestDatabase({ kind, file: false });
     appendT22Batch(handle, legacyT22());
-    handle.db.events.append(confirmation());
+    handle.db.events.append(appendableEvent(confirmation()));
 
     const first = recover(handle);
     const second = recover(handle);
@@ -217,7 +217,7 @@ describe.each(DRIVER_KINDS)('T22 semantics-version replay compatibility (%s)', (
       ]),
     );
 
-    handle.db.events.append(confirmation('t22-v2-confirmed'));
+    handle.db.events.append(appendableEvent(confirmation('t22-v2-confirmed')));
     const confirmed = recover(handle);
     expect(confirmed.suspension.kind).toBe('resource_exhausted');
     expect(confirmed.activeChild?.status).toBe('stopped');

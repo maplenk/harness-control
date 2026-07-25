@@ -14,7 +14,14 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { isoTimestamp } from '../lib/clock.js';
 import { idempotencyKey, runId, specHash, specVersionId } from '../domain/ids.js';
-import { draftEvent, type DomainEvent, type DomainEventType, type EventPayloads } from '../domain/events.js';
+import {
+  appendableEvent,
+  draftEvent,
+  type AppendableEvent,
+  type DomainEvent,
+  type DomainEventType,
+  type EventPayloads,
+} from '../domain/events.js';
 import {
   EVENT_FREE_TEXT_FIELDS,
   PROJECTION_FREE_TEXT_FIELDS,
@@ -120,8 +127,8 @@ describe.each(DRIVER_KINDS)('W3-3 metadata-sink redaction at the repositories (%
 
   it('spec.revise.requested feedback: raw DB row redacted; returned event, listByRun, and dedup readback all match the row', () => {
     const outcome = handle.db.events.append(
-      ev('spec.revise.requested', { feedback: `too broad — and ${PLANTED} leaked in here` }, 'revise-1'),
-    );
+      appendableEvent(ev('spec.revise.requested', { feedback: `too broad — and ${PLANTED} leaked in here` }, 'revise-1'),
+    ));
 
     // Raw row: the planted secret is gone, a redaction marker is present.
     const raw = rawEventPayload('spec.revise.requested');
@@ -142,8 +149,8 @@ describe.each(DRIVER_KINDS)('W3-3 metadata-sink redaction at the repositories (%
 
     // A redelivered append under the same key returns the redacted row too.
     const deduped = handle.db.events.append(
-      ev('spec.revise.requested', { feedback: `too broad — and ${PLANTED} leaked in here` }, 'revise-1'),
-    );
+      appendableEvent(ev('spec.revise.requested', { feedback: `too broad — and ${PLANTED} leaked in here` }, 'revise-1'),
+    ));
     expect(deduped.deduped).toBe(true);
     expect(deduped.event.payload).toEqual(outcome.event.payload);
   });
@@ -154,7 +161,13 @@ describe.each(DRIVER_KINDS)('W3-3 metadata-sink redaction at the repositories (%
       specHash: specHash('a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90'),
       approvedBy: 'human' as const,
     };
-    handle.db.events.append(ev('spec.approved', payload, 'approve-1'));
+    // B2 round 5: this suite tests the persistence layer's PAYLOAD handling, so
+    // it legitimately needs an approval row in the store. `appendableEvent()`
+    // refuses one by design, so the type is forced openly — the deliberate,
+    // greppable act the binding constraint is meant to require.
+    handle.db.events.append(
+      ev('spec.approved', payload, 'approve-1') as unknown as AppendableEvent,
+    );
     // The raw row is EXACTLY the stringified input — no field touched.
     expect(rawEventPayload('spec.approved')).toBe(JSON.stringify(payload));
   });
@@ -263,8 +276,8 @@ describe.each(DRIVER_KINDS)('W3-3 metadata-sink redaction at the repositories (%
 
   it('replay/recover folds the SAME redacted bytes the live path folded', () => {
     handle.db.events.append(
-      ev('spec.revise.requested', { feedback: `narrow the scope; ${PLANTED}` }, 'revise-replay'),
-    );
+      appendableEvent(ev('spec.revise.requested', { feedback: `narrow the scope; ${PLANTED}` }, 'revise-replay'),
+    ));
     type Fold = { seen: readonly string[] };
     const reduce = (state: Fold, event: DomainEvent): Fold =>
       event.type === 'spec.revise.requested'

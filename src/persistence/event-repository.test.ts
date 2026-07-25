@@ -10,7 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { isoTimestamp } from '../lib/clock.js';
 import { idempotencyKey, runId, segmentId } from '../domain/ids.js';
-import { draftEvent, type DomainEvent, type DomainEventType, type EventPayloads } from '../domain/events.js';
+import {appendableEvent, appendableEvents,  draftEvent, type DomainEvent, type DomainEventType, type EventPayloads } from '../domain/events.js';
 import { availableDriverKinds, openTestDatabase, type TestDatabaseHandle } from './test-support.js';
 
 const DRIVER_KINDS = await availableDriverKinds();
@@ -55,12 +55,12 @@ describe.each(DRIVER_KINDS)('EventRepository (%s) — §19 test 9', (kind) => {
       'provider-notification-abc',
     );
 
-    const first = handle.db.events.append(notification);
+    const first = handle.db.events.append(appendableEvent(notification));
     expect(first.deduped).toBe(false);
     expect(first.event.sequence).toBe(1);
 
     // The SAME provider notification is redelivered (at-least-once delivery).
-    const second = handle.db.events.append(notification);
+    const second = handle.db.events.append(appendableEvent(notification));
     expect(second.deduped).toBe(true);
     expect(second.event.sequence).toBe(1); // no new sequence burned
     expect(second.event).toEqual(first.event);
@@ -69,7 +69,7 @@ describe.each(DRIVER_KINDS)('EventRepository (%s) — §19 test 9', (kind) => {
     expect(handle.db.events.listByRun(RUN)).toHaveLength(1);
 
     // A genuinely different event still advances the counter by exactly one.
-    const other = handle.db.events.append(ev('pause.user.requested', {}, 'distinct-key'));
+    const other = handle.db.events.append(appendableEvent(ev('pause.user.requested', {}, 'distinct-key')));
     expect(other.event.sequence).toBe(2);
     expect(handle.db.events.countByRun(RUN)).toBe(2);
   });
@@ -79,12 +79,12 @@ describe.each(DRIVER_KINDS)('EventRepository (%s) — §19 test 9', (kind) => {
     const effectA = ev('checkpoint.requested', { reason: 'pre_pause' }, 'effect-a');
     const effectB = ev('segment.stop.requested', { mode: 'graceful' }, 'effect-b');
 
-    const firstBatch = handle.db.events.appendBatch([trigger, effectA, effectB]);
+    const firstBatch = handle.db.events.appendBatch(appendableEvents([trigger, effectA, effectB]));
     expect(firstBatch.map((o) => o.deduped)).toEqual([false, false, false]);
     expect(firstBatch.map((o) => o.event.sequence)).toEqual([1, 2, 3]);
 
     // Caller doesn't know whether the batch landed before a crash — retries the identical batch.
-    const secondBatch = handle.db.events.appendBatch([trigger, effectA, effectB]);
+    const secondBatch = handle.db.events.appendBatch(appendableEvents([trigger, effectA, effectB]));
     expect(secondBatch.map((o) => o.deduped)).toEqual([true, true, true]);
     expect(secondBatch.map((o) => o.event.sequence)).toEqual([1, 2, 3]);
     // The events themselves (ignoring the `deduped` flag, which correctly
@@ -96,11 +96,11 @@ describe.each(DRIVER_KINDS)('EventRepository (%s) — §19 test 9', (kind) => {
 
   it('dedupes a PARTIALLY-seen batch: some events already durable, some new', () => {
     const trigger = ev('pause.user.requested', {}, 'trigger-2');
-    handle.db.events.append(trigger); // only the trigger landed before "the crash"
+    handle.db.events.append(appendableEvent(trigger)); // only the trigger landed before "the crash"
 
     const effectA = ev('checkpoint.requested', { reason: 'pre_pause' }, 'effect-a2');
     const effectB = ev('segment.stop.requested', { mode: 'graceful' }, 'effect-b2');
-    const retried = handle.db.events.appendBatch([trigger, effectA, effectB]);
+    const retried = handle.db.events.appendBatch(appendableEvents([trigger, effectA, effectB]));
 
     expect(retried.map((o) => o.deduped)).toEqual([true, false, false]);
     expect(retried.map((o) => o.event.sequence)).toEqual([1, 2, 3]);
@@ -108,8 +108,8 @@ describe.each(DRIVER_KINDS)('EventRepository (%s) — §19 test 9', (kind) => {
   });
 
   it('rejects reusing an idempotency key for a different event type (key collision is a caller bug)', () => {
-    handle.db.events.append(ev('pause.user.requested', {}, 'shared-key'));
-    expect(() => handle.db.events.append(ev('resume.user.requested', {}, 'shared-key'))).toThrow(
+    handle.db.events.append(appendableEvent(ev('pause.user.requested', {}, 'shared-key')));
+    expect(() => handle.db.events.append(appendableEvent(ev('resume.user.requested', {}, 'shared-key')))).toThrow(
       /idempotency key/i,
     );
     // The failed attempt must not have consumed a sequence number or left a partial row.
@@ -118,7 +118,7 @@ describe.each(DRIVER_KINDS)('EventRepository (%s) — §19 test 9', (kind) => {
 
   it('assigns a strictly monotonic, gapless per-run sequence across many appends', () => {
     for (let i = 0; i < 5; i += 1) {
-      handle.db.events.append(ev('pause.user.requested', {}, `key-${i}`));
+      handle.db.events.append(appendableEvent(ev('pause.user.requested', {}, `key-${i}`)));
     }
     const events = handle.db.events.listByRun(RUN);
     expect(events.map((e) => e.sequence)).toEqual([1, 2, 3, 4, 5]);
@@ -126,9 +126,9 @@ describe.each(DRIVER_KINDS)('EventRepository (%s) — §19 test 9', (kind) => {
 
   it('keeps independent sequence counters per run', () => {
     const otherRun = runId('run_evt_2');
-    handle.db.events.append(ev('pause.user.requested', {}, 'a', RUN));
-    handle.db.events.append(ev('pause.user.requested', {}, 'b', otherRun));
-    handle.db.events.append(ev('resume.user.requested', {}, 'c', RUN));
+    handle.db.events.append(appendableEvent(ev('pause.user.requested', {}, 'a', RUN)));
+    handle.db.events.append(appendableEvent(ev('pause.user.requested', {}, 'b', otherRun)));
+    handle.db.events.append(appendableEvent(ev('resume.user.requested', {}, 'c', RUN)));
 
     expect(handle.db.events.listByRun(RUN).map((e) => e.sequence)).toEqual([1, 2]);
     expect(handle.db.events.listByRun(otherRun).map((e) => e.sequence)).toEqual([1]);
@@ -136,7 +136,7 @@ describe.each(DRIVER_KINDS)('EventRepository (%s) — §19 test 9', (kind) => {
 
   it('listByRun supports replay-by-sequence from a given cursor (fromSequence)', () => {
     for (let i = 0; i < 4; i += 1) {
-      handle.db.events.append(ev('pause.user.requested', {}, `seq-${i}`));
+      handle.db.events.append(appendableEvent(ev('pause.user.requested', {}, `seq-${i}`)));
     }
     const fromThree = handle.db.events.listByRun(RUN, { fromSequence: handle.db.events.listByRun(RUN)[2]!.sequence });
     expect(fromThree.map((e) => e.sequence)).toEqual([3, 4]);
@@ -148,7 +148,7 @@ describe.each(DRIVER_KINDS)('EventRepository (%s) — §19 test 9', (kind) => {
       { segmentId: SEG, fromModel: 'sonnet', toModel: 'opus', mechanism: 'session/set_config_option' },
       'switch-1',
     );
-    handle.db.events.append(trigger);
+    handle.db.events.append(appendableEvent(trigger));
     const found = handle.db.events.getByIdempotencyKey(RUN, idempotencyKey('switch-1'));
     expect(found).toBeDefined();
     expect(found?.payload).toEqual(trigger.payload);

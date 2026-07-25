@@ -24,7 +24,7 @@ import {
   verificationId,
 } from '../domain/ids.js';
 import type { MergeReadiness } from '../domain/entities.js';
-import { draftEvent, type DomainEvent } from '../domain/events.js';
+import {appendableEvent,  draftEvent, type DomainEvent } from '../domain/events.js';
 import { initialEngineState } from '../domain/transitions.js';
 import {
   AdapterError,
@@ -193,6 +193,7 @@ function readyMergeReadiness(forRunId: Parameters<OrchestrationService['status']
     conflicts: false,
     requiredTestsPassed: true,
     evidenceReceiptRefs: [],
+    specApprovedBy: 'human', // B2: this fixture models an operator-approved run
     ready: true,
     blockers: [],
     manualIntegrationCommands: [],
@@ -939,7 +940,7 @@ describe('OrchestrationService.recover — replay-by-sequence (§12.3)', () => {
       idempotencyKey: idempotencyKey('cancel_1'),
       occurredAt: db.clock.nowIso(),
     }) as DomainEvent;
-    db.events.append(cancel);
+    db.events.append(appendableEvent(cancel));
 
     // The stale projection still says created; recovery folds the event.
     expect(service.status(runId).phase).toBe('created');
@@ -1028,27 +1029,27 @@ describe('OrchestrationService.recover — replay-by-sequence (§12.3)', () => {
     // A LISTED edge folded from the wrong phase (run is still at created).
     const { runId: wrongPhaseRun } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     db.events.append(
-      draftEvent({
+      appendableEvent(draftEvent({
         type: 'workflow.dispatch.advanced',
         runId: wrongPhaseRun,
         payload: { from: 'approved', to: 'implementing' },
         idempotencyKey: idempotencyKey('corrupt_wrong_phase'),
         occurredAt: db.clock.nowIso(),
       }) as DomainEvent,
-    );
+    ));
     expect(() => service.recover(wrongPhaseRun)).toThrow(WorkflowDispatchReplayError);
 
     // An edge that is not in WORKFLOW_DISPATCH_EDGES at all.
     const { runId: nonEdgeRun } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
     db.events.append(
-      draftEvent({
+      appendableEvent(draftEvent({
         type: 'workflow.dispatch.advanced',
         runId: nonEdgeRun,
         payload: { from: 'created', to: 'implementing' },
         idempotencyKey: idempotencyKey('corrupt_non_edge'),
         occurredAt: db.clock.nowIso(),
       }) as DomainEvent,
-    );
+    ));
     expect(() => service.recover(nonEdgeRun)).toThrow(WorkflowDispatchReplayError);
   });
 });

@@ -132,8 +132,22 @@ export type CoordinatorSpecDocument = z.infer<typeof coordinatorSpecSchema>;
  * Evidence containing NONE of these ("the feature works properly", "looks
  * good", "as expected") is rejected as untestable. Broad on purpose: the
  * priority is never rejecting genuinely concrete evidence — only catching the
- * blatantly unverifiable (documented false-negatives like "the output is nice"
- * are acceptable; the human still approves every spec, §7).
+ * blatantly unverifiable.
+ *
+ * B2 round 2 (codex F4) — READ THIS BEFORE TRUSTING THIS REGEX. It used to end
+ * "the human still approves every spec, §7". Under `approval: 'auto'` that is
+ * FALSE: nobody reads the spec. And the filter is trivially gameable — codex
+ * reproduced a spec with the task "Remove the authorization check",
+ * verification command `true`, and expected evidence "exit code is 0", which
+ * passes every check here. F13 makes execution evidence honest; it does NOT
+ * make the criteria meaningful, so after F13 the host would truthfully attest
+ * that a meaningless command passed.
+ *
+ * The real guard is therefore STRUCTURAL and lives beside this one:
+ * `verification.allowedCommands` (pinned per run at `start`) restricts which
+ * commands a criterion may cite, and `approval: 'auto'` refuses an empty set at
+ * config parse. This regex remains as a second, weaker filter on the EVIDENCE
+ * prose. Do not try to make it smarter — that is an arms race it loses.
  */
 export const CONCRETE_EVIDENCE_ANCHOR =
   /\d|`[^`]+`|"[^"]+"|'[^']+'|\/[\w.\-/]+|\b[\w-]+\.(?:ts|js|mjs|cjs|json|md|txt|toml|lock|sh|py|go|rs|ya?ml|html|css|sql)\b|\b(?:exit|exits|exited|code|returns?|returned|prints?|printed|outputs?|stdout|stderr|status|contains?|includes?|matche?s?|matched|equals?|equal|passe?s?|passed|fails?|failed|errors?|throws?|thrown|logs?|logged|exists?|response|responds?|renders?|rendered|http|https|json|true|false|null|empty|non-empty)\b/i;
@@ -146,12 +160,31 @@ export interface SpecValidationIssue {
 }
 
 /**
- * Semantic checks beyond the zod shape: stable-id uniqueness (criteria + tasks),
- * dependency references resolve, and every acceptance criterion is objectively
- * TESTABLE (§7). Pure — safe to unit-test in isolation.
+ * B2 F4: the run-pinned restriction on what a criterion may cite as proof.
+ * Absent or empty = unrestricted (the pre-B2 behavior, and the only behavior
+ * reachable under `approval: 'human'` unless an operator opts in); the config
+ * schema REFUSES an empty set under `approval: 'auto'`, so autonomy can never
+ * run unrestricted.
  */
-export function assessSpecSemantics(doc: CoordinatorSpecDocument): readonly SpecValidationIssue[] {
+export interface SpecValidationOptions {
+  /** Exact commands (`verification.allowedCommands`) a criterion may cite. */
+  readonly allowedVerificationCommands?: readonly string[];
+}
+
+/**
+ * Semantic checks beyond the zod shape: stable-id uniqueness (criteria + tasks),
+ * dependency references resolve, every acceptance criterion is objectively
+ * TESTABLE (§7), and — B2 F4 — every verification command it cites is one the
+ * RUN declared rather than one the coordinator invented. Pure — safe to
+ * unit-test in isolation.
+ */
+export function assessSpecSemantics(
+  doc: CoordinatorSpecDocument,
+  options: SpecValidationOptions = {},
+): readonly SpecValidationIssue[] {
   const issues: SpecValidationIssue[] = [];
+  const allowed = options.allowedVerificationCommands ?? [];
+  const allowedSet = new Set(allowed);
 
   // Unique, resolvable task ids.
   const taskIds = new Set<string>();
@@ -191,6 +224,24 @@ export function assessSpecSemantics(doc: CoordinatorSpecDocument): readonly Spec
         )} names no concrete, observable outcome. State a checkable signal — an exit code, exact stdout/stderr text, a file state, or a matched string.`,
       });
     }
+
+    // B2 F4: the STRUCTURAL gate. The commands belong to the run, not to the
+    // coordinator, so a criterion cannot be "proven" by a command the
+    // coordinator made up (`true`, `echo ok`, `npm test || true`).
+    if (allowedSet.size > 0) {
+      for (const [j, command] of criterion.verificationCommands.entries()) {
+        if (!allowedSet.has(command)) {
+          issues.push({
+            path: `acceptanceCriteria.${i}.verificationCommands.${j}`,
+            message:
+              `criterion ${criterion.id} cites verification command ${JSON.stringify(command)}, which this ` +
+              `run does not declare. Verification commands are pinned by the run, not chosen by you: cite one ` +
+              `of exactly [${allowed.map((c) => JSON.stringify(c)).join(', ')}]. If none of them can prove this ` +
+              `criterion, the criterion is not verifiable here — restate it in terms one of them proves, or drop it.`,
+          });
+        }
+      }
+    }
   }
 
   return issues;
@@ -204,6 +255,7 @@ export function assessSpecSemantics(doc: CoordinatorSpecDocument): readonly Spec
  */
 export function validateCoordinatorSpec(
   raw: unknown,
+  options: SpecValidationOptions = {},
 ): Result<CoordinatorSpecDocument, readonly SpecValidationIssue[]> {
   const parsed = coordinatorSpecSchema.safeParse(raw);
   if (!parsed.success) {
@@ -214,7 +266,7 @@ export function validateCoordinatorSpec(
       })),
     );
   }
-  const semantic = assessSpecSemantics(parsed.data);
+  const semantic = assessSpecSemantics(parsed.data, options);
   if (semantic.length > 0) return err(semantic);
   return ok(parsed.data);
 }
@@ -312,6 +364,13 @@ export interface CoordinatorRunnerDeps {
   readonly baseCommit: GitSha;
   /** Present for T2 `spec revise` re-drives; absent for the initial draft. */
   readonly revise?: CoordinatorReviseContext;
+  /**
+   * B2 F4: the run's pinned `verification.allowedCommands`. Empty/absent =
+   * unrestricted (the config schema refuses that under `approval: 'auto'`).
+   * Declared to the coordinator in the emission contract AND enforced by the
+   * host validator — telling it the rule is a courtesy, the check is the gate.
+   */
+  readonly allowedVerificationCommands?: readonly string[];
   /** Bounded validation re-prompt rounds (default 3). */
   readonly maxRounds?: number;
   /** Opt-in room transport. Absence preserves the original one-agent flow. */
@@ -652,7 +711,11 @@ export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome>
       };
     }
 
-    const result = validateCoordinatorSpec(parsed);
+    const allowed = this.#deps.allowedVerificationCommands;
+    const result = validateCoordinatorSpec(
+      parsed,
+      allowed !== undefined ? { allowedVerificationCommands: allowed } : {},
+    );
     return result.ok
       ? { kind: 'valid', document: result.value }
       : { kind: 'invalid', issues: result.error };
@@ -814,6 +877,7 @@ export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome>
 
   /** The exact machine-readable emission contract the host parses (§7). */
   #emissionContract(): string {
+    const allowed = this.#deps.allowedVerificationCommands ?? [];
     return [
       '## Required output',
       'Emit exactly ONE fenced ```json code block containing the complete specification with this shape (unknown keys are rejected):',
@@ -833,7 +897,19 @@ export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome>
       '  "explorationNotes": "string (optional)"',
       '}',
       '```',
-      'Every acceptance criterion MUST be objectively testable: a concrete verification command AND concrete expected evidence (an exit code, exact stdout/stderr text, a file state, or a matched string). Vague evidence like "works properly" or "looks good" is rejected. Then STOP and wait for human approval (T1).',
+      'Every acceptance criterion MUST be objectively testable: a concrete verification command AND concrete expected evidence (an exit code, exact stdout/stderr text, a file state, or a matched string). Vague evidence like "works properly" or "looks good" is rejected.',
+      // B2 F4: state the pinned command set up front so the first emission can
+      // satisfy it, instead of burning a bounded round discovering the rule.
+      ...(allowed.length > 0
+        ? [
+            `This run PINS the verification commands. Every entry in \`verificationCommands\` MUST be an exact string from this list — you may not invent one, wrap one, or append \`|| true\`:\n${allowed
+              .map((c) => `  - ${JSON.stringify(c)}`)
+              .join(
+                '\n',
+              )}\nChoose WHICH of these proves each criterion. If none can prove a criterion, restate the criterion in terms one of them proves, or drop it.`,
+          ]
+        : []),
+      'Then STOP. The host decides whether approval is human (T1, the default) or engine-signed; either way you never approve your own spec.',
     ].join('\n');
   }
 }

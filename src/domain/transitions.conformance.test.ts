@@ -133,6 +133,7 @@ function readyMergeReadinessFor(verification: VerificationId): MergeReadiness {
     conflicts: false,
     requiredTestsPassed: true,
     evidenceReceiptRefs: [],
+    specApprovedBy: 'human', // B2: this fixture models an operator-approved run
     ready: true,
     blockers: [],
     manualIntegrationCommands: ['git merge --no-ff impl_conf_1'],

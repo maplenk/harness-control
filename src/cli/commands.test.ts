@@ -607,6 +607,7 @@ function syntheticBlockedState(runId: RunId): Parameters<OrchestrationService['s
       conflicts: false,
       requiredTestsPassed: true,
       evidenceReceiptRefs: [],
+      specApprovedBy: 'human', // B2: this fixture models an operator-approved run
       ready: false,
       blockers: ['the destination working tree is dirty (human action: commit or stash the destination changes)'],
       manualIntegrationCommands: [],

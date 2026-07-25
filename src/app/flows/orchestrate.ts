@@ -50,7 +50,7 @@ import type { Clock } from '../../lib/clock.js';
 import type { IdFactory } from '../../lib/id-factory.js';
 import { gitSha, type AssignmentId, type GitSha, type RunId, type SpecHash } from '../../domain/ids.js';
 import type { AcceptanceCriterion, CheckpointContent, MergeReadiness } from '../../domain/entities.js';
-import type { RunPhase } from '../../domain/state.js';
+import type { RunPhase, SpecApprovalMode } from '../../domain/state.js';
 import * as git from '../../worktree/git.js';
 import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import { redactText } from '../../redaction/index.js';
@@ -212,6 +212,13 @@ export interface ImplementVerifyLoopCommonInput {
   readonly verifier: RoleModelSpec;
   /** The approved immutable spec hash (§6.3 binds this exactly). */
   readonly specHash: SpecHash;
+  /**
+   * B2: WHO signed that approval (`EngineState.specApprovedBy`). Forwarded
+   * verbatim to the §16 readiness report so a merge reviewer sees when the
+   * ENGINE, not a human, approved the intent. REQUIRED (codex F5) — an
+   * omitted signer must not be able to become `'human'` on its own.
+   */
+  readonly specApprovedBy: SpecApprovalMode;
   /** The approved structured spec, serialized for implementor injection (§7). */
   readonly specDocument: string;
   readonly goal: string;
@@ -1124,8 +1131,17 @@ export async function runImplementVerifyLoop(
         // so `harness recheck` re-runs the SAME probe from a fresh process.
         probeDestinationRef: destinationRef,
         approvedSpecHash: input.specHash,
+        // B2: honest signer attribution on the §16 merge-readiness report.
+        specApprovedBy: input.specApprovedBy,
         // W3-1: a runner-confinement violation observed across THIS round's
         // declared-command execution blocks the §16 readiness gate.
+        //
+        // MERGE NOTE (B2 × F13): B2 read this off `implementation?.runnerViolation`,
+        // which was correct when the implementor half executed the declared
+        // commands. F13 moved that execution to the VERIFICATION boundary, so
+        // the signal is computed there and the implementor-side field is no
+        // longer the one that carries it. HEAD's form is kept deliberately;
+        // taking B2's would have silently stopped blocking on confinement.
         ...(runnerViolation !== undefined ? { runnerViolation } : {}),
         dispatch: {
           round,

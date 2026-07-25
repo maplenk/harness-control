@@ -257,6 +257,11 @@ export function buildCliFlows(db: Database, config: EngineConfig = DEFAULT_ENGIN
         // F5 (must-fix 4): bind the coordinator's exploration to the PINNED base
         // commit so a spec drafted against a drifted tree is detectable.
         baseCommit,
+        // B2 F4: the run's pinned verification-command allowlist. `config` here
+        // is the run's own EngineConfig (bound at `start`, reloaded from the
+        // run's persisted config on every later command), so the coordinator is
+        // held to the set THIS run declared — it cannot invent `true`.
+        allowedVerificationCommands: config.verification.allowedCommands,
         ...(revise !== undefined ? { revise } : {}),
         ...(enableChat === true ? { planningChat } : {}),
       });

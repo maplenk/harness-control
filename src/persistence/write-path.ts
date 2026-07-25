@@ -7,7 +7,7 @@
  * as a tested primitive rather than left as "wrap two repository calls in
  * `db.transaction`" — §19 tests 9 and 10 both exercise it.
  */
-import type { DomainEvent } from '../domain/events.js';
+import type { AppendableEvent, DomainEvent } from '../domain/events.js';
 import type { Database } from './database.js';
 import type { AppendOutcome } from './event-repository.js';
 import type { ProjectionRecord } from './projection-repository.js';
@@ -60,14 +60,22 @@ export interface AppendTriggerOptions {
  */
 export function appendTriggerWithEffects<S>(
   db: Database,
-  trigger: DomainEvent,
-  emitted: readonly DomainEvent[],
+  // B2 round 4/5: everything here reaches the durable log, so it all carries the
+  // append boundary's brand requirement — an approval must be a
+  // `ValidatedApproval`, and a caller holding an erased type must come through
+  // `appendableEvent()` (which refuses one). See `AppendableEvent`.
+  trigger: AppendableEvent,
+  emitted: readonly AppendableEvent[],
   projection: ProjectionUpdate<S>,
-  extraEvents: readonly DomainEvent[] = [],
+  extraEvents: readonly AppendableEvent[] = [],
   options: AppendTriggerOptions = {},
 ): AppendWithProjectionResult<S> {
   const body = (): AppendWithProjectionResult<S> => {
-    const appended = db.events.appendBatch([trigger, ...emitted, ...extraEvents]);
+    // B2 round 5: the branded trigger is carried THROUGH to the append —
+    // round 4 widened it back to `DomainEvent` here, so the guarantee never
+    // reached the boundary it exists to protect.
+    const batch: readonly AppendableEvent[] = [trigger, ...emitted, ...extraEvents];
+    const appended = db.events.appendBatch(batch);
     const triggerOutcome = appended[0];
     const lastOutcome = appended[appended.length - 1];
     if (!triggerOutcome || !lastOutcome) {

@@ -15,8 +15,10 @@ import {
   BYTES_PER_GB,
   DEFAULT_ENGINE_CONFIG,
   DEFAULT_FAILOVER_POLICY,
+  DEFAULT_SPEC_APPROVAL_MODE,
   FAILOVER_POLICIES,
   RESTART_WINDOW_OFF,
+  SPEC_APPROVAL_MODES,
 } from './schema.js';
 
 function issuePaths(issues: readonly ConfigIssue[]): string[] {
@@ -63,12 +65,18 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
       checkpoint: { cadenceTurns: 3 },
       budget: { conservativeReservationUsd: 0.5 },
       // W3-1: the verification runner's per-run env additions default EMPTY —
-      // the minimal allowlist is the whole default surface.
-      verification: { envAllowlist: [], allowSameHarness: false },
+      // the minimal allowlist is the whole default surface. F13: cross-vendor
+      // independence is fail-closed, so the opt-out defaults false. B2 F4: the
+      // spec-citable command allowlist likewise defaults EMPTY (unrestricted),
+      // and `approval:'auto'` refuses that combination at parse.
+      verification: { envAllowlist: [], allowSameHarness: false, allowedCommands: [] },
       // F7 (§3): worktree dependency provisioning defaults to `auto` (clone when
       // the committed fingerprint matches the primary + APFS is available, else
       // `npm ci`).
       worktree: { provision: 'auto' },
+      // B2: approval defaults to the HUMAN gate. Autonomy is opt-in, per run,
+      // and pinned at createRun — never the default a fresh config inherits.
+      approval: 'human',
     });
   });
 
@@ -109,6 +117,53 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
   it('exposes exactly the four failover policies, defaulting to wait', () => {
     expect(FAILOVER_POLICIES).toEqual(['wait', 'switch_model', 'switch_harness', 'ask']);
     expect(DEFAULT_FAILOVER_POLICY).toBe('wait');
+  });
+
+  // B2 — the approval vocabulary is exactly two values, both of which ACT
+  // (W4-1): `human` holds the run at awaiting_approval, `auto` has the engine
+  // sign the drafted hash. Anything else is a LOUD config error, never a
+  // silently-ignored knob. (The behavioural halves live in
+  // ../cli/commands.auto-approval.test.ts.)
+  it('exposes exactly two spec-approval modes, defaulting to human', () => {
+    expect(SPEC_APPROVAL_MODES).toEqual(['human', 'auto']);
+    expect(DEFAULT_SPEC_APPROVAL_MODE).toBe('human');
+    expect(DEFAULT_ENGINE_CONFIG.approval).toBe('human');
+  });
+
+  it("accepts approval:'auto' and REFUSES any other value", () => {
+    const auto = { approval: 'auto', verification: { allowedCommands: ['npm test'] } };
+    expect(unwrap(parseEngineConfig(auto)).approval).toBe('auto');
+    expect(unwrap(parseEngineConfig({ approval: 'human' })).approval).toBe('human');
+    for (const bogus of ['yes', 'engine', 'always', true, 1, null]) {
+      const result = parseEngineConfig({ ...auto, approval: bogus });
+      expect(isErr(result), `approval: ${JSON.stringify(bogus)} must be refused`).toBe(true);
+      if (isErr(result)) expect(issuePaths(result.error)).toContain('approval');
+    }
+  });
+
+  // B2 round 2 (codex F4): the §7 testability gate is LEXICAL and gameable —
+  // `true` + "exit code is 0" passes it. The structural guard is a run-pinned
+  // command allowlist, so autonomy without one is refused at parse: under the
+  // human gate a person reads the spec, under autonomy nobody does.
+  it("approval:'auto' REQUIRES a non-empty verification.allowedCommands", () => {
+    const refused = parseEngineConfig({ approval: 'auto' });
+    expect(isErr(refused)).toBe(true);
+    if (isErr(refused)) {
+      expect(issuePaths(refused.error)).toContain('verification.allowedCommands');
+      expect(refused.error[0]?.message).toContain('the coordinator must not also choose what counts as proof');
+    }
+    expect(isErr(parseEngineConfig({ approval: 'auto', verification: { allowedCommands: [] } }))).toBe(true);
+    expect(
+      isOk(parseEngineConfig({ approval: 'auto', verification: { allowedCommands: ['npm run typecheck'] } })),
+    ).toBe(true);
+  });
+
+  it('allowedCommands defaults empty (unrestricted) and rejects padded entries that could never match', () => {
+    expect(DEFAULT_ENGINE_CONFIG.verification.allowedCommands).toEqual([]);
+    // Matching is exact, so a padded entry is dead config — refuse it (W4-1).
+    const padded = parseEngineConfig({ verification: { allowedCommands: [' npm test '] } });
+    expect(isErr(padded)).toBe(true);
+    if (isErr(padded)) expect(issuePaths(padded.error)).toContain('verification.allowedCommands');
   });
 });
 

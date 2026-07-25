@@ -245,6 +245,8 @@ function loopInput(rig: Rig) {
     implementor: IMPLEMENTOR,
     verifier: VERIFIER,
     specHash: SPEC_HASH,
+    // B2 (codex F5): required signer — these fixtures model human-approved runs.
+    specApprovedBy: 'human' as const,
     specDocument: '{"goal":"g"}',
     goal: 'g',
     taskScope: 'Implement the approved specification end to end.',

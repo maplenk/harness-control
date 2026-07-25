@@ -481,6 +481,8 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
       { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
       {
         runId,
+        // B2 × F13 MERGE: fixtures model an operator-approved run.
+        specApprovedBy: 'human',
         assignmentId: assignmentId('asg_same_harness_refused'),
         implementor: IMPLEMENTOR,
         verifier: sameHarnessVerifier,
@@ -556,6 +558,8 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
       { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
       {
         runId,
+        // B2 × F13 MERGE: fixtures model an operator-approved run.
+        specApprovedBy: 'human',
         assignmentId: assignmentId('asg_boundary_independence'),
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
@@ -612,6 +616,8 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
       { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
       {
         runId,
+        // B2 × F13 MERGE: fixtures model an operator-approved run.
+        specApprovedBy: 'human',
         assignmentId: assignmentId('asg_same_harness_allowed'),
         implementor: IMPLEMENTOR,
         verifier: { ...IMPLEMENTOR },
@@ -670,6 +676,8 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
       { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
       {
         runId,
+        // B2 × F13 MERGE: fixtures model an operator-approved run.
+        specApprovedBy: 'human',
         assignmentId: assignmentId('asg_single_exec'),
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
@@ -731,6 +739,8 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
         specHash: outcome.specVersion.contentHash,
+        // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+        specApprovedBy: 'human',
         specDocument: outcome.canonicalSpec,
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
@@ -847,6 +857,8 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
         specHash: outcome.specVersion.contentHash,
+        // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+        specApprovedBy: 'human',
         specDocument: outcome.canonicalSpec,
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
@@ -915,6 +927,8 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
         specHash: outcome.specVersion.contentHash,
+        // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+        specApprovedBy: 'human',
         specDocument: outcome.canonicalSpec,
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
@@ -1004,6 +1018,8 @@ describe('W1-F1/W1-F4 — a mutating verification command never yields merge_rea
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
         specHash: outcome.specVersion.contentHash,
+        // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+        specApprovedBy: 'human',
         specDocument: outcome.canonicalSpec,
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
@@ -1127,6 +1143,8 @@ describe('F8 authorship — a verification command that COMMITS hard-stops the r
       { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
       {
         runId,
+        // B2 × F13 MERGE: fixtures model an operator-approved run.
+        specApprovedBy: 'human',
         assignmentId: asg,
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
@@ -1226,6 +1244,8 @@ describe('F8 authorship — a verification command that COMMITS hard-stops the r
       { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
       {
         runId,
+        // B2 × F13 MERGE: fixtures model an operator-approved run.
+        specApprovedBy: 'human',
         assignmentId: asg,
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
@@ -1307,6 +1327,8 @@ describe('F8 authorship — a verification command that COMMITS hard-stops the r
       { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
       {
         runId,
+        // B2 × F13 MERGE: fixtures model an operator-approved run.
+        specApprovedBy: 'human',
         assignmentId: asg,
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
@@ -1383,6 +1405,8 @@ describe('W3-1 — a verification command that writes into the PRIMARY checkout 
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
         specHash: outcome.specVersion.contentHash,
+        // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+        specApprovedBy: 'human',
         specDocument: outcome.canonicalSpec,
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
@@ -1681,6 +1705,8 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
       resumeFrom,
       mergeReadinessProbe: probe,
       approvedSpecHash: specHash,
+      // B2 (codex F5): required signer — this slice approved as a human.
+      specApprovedBy: 'human',
       ids: successorIds,
       clock: db.clock,
     });
@@ -1728,6 +1754,8 @@ describe('F2 — a round with no real deliverable never dispatches a verifier (p
       implementor: IMPLEMENTOR,
       verifier: VERIFIER,
       specHash: outcome.specVersion.contentHash,
+      // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+      specApprovedBy: 'human',
       specDocument: outcome.canonicalSpec,
       goal: GOAL,
       taskScope: 'Implement the --verbose flag end to end in the CLI.',
@@ -2014,6 +2042,8 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
         specHash: outcome.specVersion.contentHash,
+        // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+        specApprovedBy: 'human',
         specDocument: outcome.canonicalSpec,
         goal: GOAL,
         taskScope: 'Implement --verbose.',
@@ -2050,6 +2080,8 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
         specHash: outcome.specVersion.contentHash,
+        // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+        specApprovedBy: 'human',
         specDocument: outcome.canonicalSpec,
         goal: GOAL,
         taskScope: 'Implement --verbose.',
@@ -2081,6 +2113,8 @@ describe('F5 — the implementation base is pinned at start, not resolved live a
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
         specHash: outcome.specVersion.contentHash,
+        // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+        specApprovedBy: 'human',
         specDocument: outcome.canonicalSpec,
         goal: GOAL,
         taskScope: 'x',
@@ -2190,6 +2224,8 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
         implementor: IMPLEMENTOR,
         verifier: VERIFIER,
         specHash: outcome.specVersion.contentHash,
+        // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+        specApprovedBy: 'human',
         specDocument: outcome.canonicalSpec,
         goal: GOAL,
         taskScope: 'Implement the --verbose flag end to end in the CLI.',
@@ -2268,6 +2304,8 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
       implementor: IMPLEMENTOR,
       verifier: VERIFIER,
       specHash: outcome.specVersion.contentHash,
+      // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+      specApprovedBy: 'human',
       specDocument: outcome.canonicalSpec,
       goal: GOAL,
       taskScope: 'Implement the --verbose flag end to end in the CLI.',
@@ -2351,6 +2389,8 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
       implementor: IMPLEMENTOR,
       verifier: VERIFIER,
       specHash: outcome.specVersion.contentHash,
+      // B2 (codex F5): required signer — the slice approves as a human (T1 via the service).
+      specApprovedBy: 'human',
       specDocument: outcome.canonicalSpec,
       goal: GOAL,
       taskScope: 'Implement the --verbose flag end to end in the CLI.',
