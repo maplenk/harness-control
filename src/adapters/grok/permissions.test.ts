@@ -13,10 +13,21 @@
  * not assignable, so omitting the veto fails to compile rather than failing in
  * production.
  */
-import { describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { RoleName } from '../../domain/state.js';
 import { decidePermission, noPayloadToVerify, type PermissionMediationConfig } from '../acp/session.js';
 import { buildGrokMediation } from './permissions.js';
+
+const tempDirs: string[] = [];
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 const ROLES: readonly (RoleName | undefined)[] = [undefined, 'coordinator', 'implementor', 'verifier'];
 
@@ -108,6 +119,41 @@ describe('buildGrokMediation — the payload veto is universal', () => {
     const policy = (config as { policy?: { allow: readonly string[]; workspaceWriteRoot?: string } }).policy;
     expect(policy?.allow).toEqual(['keep me', 'Execute `npm run typecheck`']);
     expect(policy?.workspaceWriteRoot).toBe('/repo/worktree');
+  });
+
+  // -------------------------------------------------------------------------
+  // F14 — the read-only shell classifier is only as good as the ROOT it judges
+  // against, and this is the ONLY production site that supplies one. A unit test
+  // that calls the classifier with a root it made up proves nothing about the
+  // engine; this one drives `decidePermission` through the config the Grok
+  // factory really builds, so an unbound (or wrongly bound) root fails here.
+  // -------------------------------------------------------------------------
+  it('binds the assignment worktree root into the read-only shell classifier', () => {
+    const base = mkdtempSync(path.join(tmpdir(), 'grok-permissions-test-'));
+    tempDirs.push(base);
+    const cwd = path.join(base, 'harness-orchestration.worktrees', 'assignment-asg_run_f14');
+    mkdirSync(path.join(cwd, 'web'), { recursive: true });
+    const config = buildGrokMediation({
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: [] } },
+      role: 'implementor',
+      cwd,
+    });
+
+    // The shape that killed run_60ccbfda: the prompt hands the agent this exact
+    // absolute path, so the engine must not deny the agent for using it.
+    const insideCommand = `ls -la ${cwd} && ls -la web 2>/dev/null`;
+    expect(decidePermission(config, `Execute \`${insideCommand}\``, { command: insideCommand })).toEqual({
+      action: 'allow',
+      reason: 'allowlisted_read_only_operation',
+    });
+
+    // ...and the boundary is still a boundary, through the same production path.
+    for (const outsideCommand of ['ls -la /etc', `ls -la ${path.dirname(cwd)}`, `cat ${cwd}/../secret`]) {
+      expect(decidePermission(config, `Execute \`${outsideCommand}\``, { command: outsideCommand })).toEqual({
+        action: 'deny',
+        reason: 'denied_default',
+      });
+    }
   });
 
   it('leaves a NON-implementor policy untouched apart from the veto', () => {

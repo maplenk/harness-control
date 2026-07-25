@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { accessSync, constants, statSync } from 'node:fs';
 import * as path from 'node:path';
 import type { RoleName } from '../../domain/state.js';
+import { resolvesInsideRoot } from '../../lib/path-containment.js';
 import { err, ok, type Result } from '../../lib/result.js';
 import { AdapterError, isAdapterError } from '../spi.js';
 import {
@@ -279,15 +280,54 @@ function stripSafeRedirections(tokens: readonly ShellToken[]): readonly string[]
   return argv.length > 0 ? argv : undefined;
 }
 
-function hasEscapingPathArgument(argv: readonly string[]): boolean {
-  return argv.slice(1).some((arg) =>
-    arg === '..' ||
-    arg.startsWith('../') ||
-    arg.includes('/../') ||
-    arg.startsWith('/') ||
-    arg.startsWith('~/') ||
-    arg.includes('=/')
-  );
+/**
+ * F14 — an argument ESCAPES when it can name something outside the agent's own
+ * worktree. The predicate used to answer that with `arg.startsWith('/')`, i.e.
+ * every absolute path escapes. It does not: the implementor prompt hands the
+ * agent its worktree BY ABSOLUTE PATH ("You may create, modify, or delete files
+ * ONLY inside your assigned worktree: <abs>"), so the engine named a path and
+ * then denied every command that used it. A denied permission ends the turn
+ * before the work is committed, so the run dies `no_deliverable` — four dogfood
+ * runs were lost to it, the last (run_60ccbfda) on nothing but
+ * `ls -la <worktree> && ls -la web …`.
+ *
+ * The rule now: an absolute argument is admissible IFF it RESOLVES inside
+ * `worktreeRoot` — realpath containment via the nearest existing ancestor
+ * (`resolvesInsideRoot`, shared with the ACP structured-write rule). Everything
+ * else is refused byte-for-byte as before:
+ *
+ *  - the `..` forms are still refused, and now apply to ABSOLUTE paths too
+ *    (`<root>/web/../x`, `<root>/link/..`) rather than being skipped by the
+ *    blanket `/` rejection they used to hide behind. Refusing more here can only
+ *    cost a denial the agent can trivially rewrite; admitting a `..` we did not
+ *    have to admit is how a symlink escape gets in.
+ *  - `~/` (the shell would expand it to a home outside the worktree) and `=/`
+ *    (an option value naming an absolute path) stay refused unconditionally.
+ *
+ * FAIL CLOSED: no root, a relative or unresolvable root, a path with no existing
+ * ancestor, any filesystem error — all refusals. `worktreeRoot` is a REQUIRED
+ * parameter (`string | undefined`) precisely so a call site must state which one
+ * it has: a caller that cannot supply a root must say so, and gets today's
+ * behaviour (no absolute path admissible) rather than silently getting it.
+ */
+function hasEscapingPathArgument(
+  argv: readonly string[],
+  worktreeRoot: string | undefined,
+): boolean {
+  return argv.slice(1).some((arg) => {
+    if (
+      arg === '..' ||
+      arg.startsWith('../') ||
+      arg.includes('/../') ||
+      arg.endsWith('/..') ||
+      arg.startsWith('~/') ||
+      arg.includes('=/')
+    ) {
+      return true;
+    }
+    if (!arg.startsWith('/')) return false;
+    return worktreeRoot === undefined || !resolvesInsideRoot(worktreeRoot, arg);
+  });
 }
 
 function isSafeGitRead(argv: readonly string[]): boolean {
@@ -314,8 +354,8 @@ function isSafeGitRead(argv: readonly string[]): boolean {
   );
 }
 
-function isSafeReadOnlyArgv(argv: readonly string[]): boolean {
-  if (hasEscapingPathArgument(argv)) return false;
+function isSafeReadOnlyArgv(argv: readonly string[], worktreeRoot: string | undefined): boolean {
+  if (hasEscapingPathArgument(argv, worktreeRoot)) return false;
   if (argv[0] === 'git') return isSafeGitRead(argv);
   if (argv[0] === 'rg' && argv.slice(1).some((arg) => arg === '--pre' || arg.startsWith('--pre='))) {
     return false;
@@ -355,11 +395,21 @@ function commandFromPermissionTitle(operation: string): string | undefined {
 /**
  * Recognizes only shell compositions whose every segment is a conservative
  * read-only repository inspection. This intentionally rejects shell
- * expansions, subshells, backgrounding, arbitrary redirection, absolute or
- * parent-traversing paths, executable ripgrep preprocessors, mutating git
- * forms, network clients, and all unknown commands.
+ * expansions, subshells, backgrounding, arbitrary redirection,
+ * parent-traversing paths, absolute paths that do not resolve inside
+ * `worktreeRoot`, executable ripgrep preprocessors, mutating git forms, network
+ * clients, and all unknown commands.
+ *
+ * `worktreeRoot` is the agent's ASSIGNED WORKTREE — the same path the prompt
+ * confines it to and the same path `workspaceWriteRoot` uses. It is required,
+ * and `undefined` is a legitimate value meaning "this call site has no root":
+ * the classifier then admits no absolute path at all (F14). Production binds it
+ * in exactly one place, `buildGrokMediation`.
  */
-export function isGrokReadOnlyShellPermissionTitle(operation: string): boolean {
+export function isGrokReadOnlyShellPermissionTitle(
+  operation: string,
+  worktreeRoot: string | undefined,
+): boolean {
   const command = commandFromPermissionTitle(operation);
   if (command === undefined) return false;
   const segments = splitShellSegments(command);
@@ -368,7 +418,7 @@ export function isGrokReadOnlyShellPermissionTitle(operation: string): boolean {
     const tokens = tokenizeShellSegment(segment);
     if (tokens === undefined) return false;
     const argv = stripSafeRedirections(tokens);
-    return argv !== undefined && isSafeReadOnlyArgv(argv);
+    return argv !== undefined && isSafeReadOnlyArgv(argv, worktreeRoot);
   });
 }
 

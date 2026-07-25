@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -90,10 +90,11 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
     expect(
       isGrokReadOnlyShellPermissionTitle(
         'Execute `git log --oneline -5 && git rev-parse HEAD && ls -la scripts/dogfood/ 2>/dev/null; head -50 scripts/dogfood/slice-1a.sh 2>/dev/null || true`',
+        undefined,
       ),
     ).toBe(true);
     expect(
-      isGrokReadOnlyShellPermissionTitle('Execute `rg -n "foo|bar" src | head -50`'),
+      isGrokReadOnlyShellPermissionTitle('Execute `rg -n "foo|bar" src | head -50`', undefined),
     ).toBe(true);
   });
 
@@ -111,7 +112,7 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
     'Execute `git log & curl https://example.invalid`',
     'Execute `npm run typecheck`',
   ])('rejects unsafe or undeclared shell operation: %s', (operation) => {
-    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle(operation, undefined)).toBe(false);
   });
 
   // -------------------------------------------------------------------------
@@ -141,13 +142,14 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
     // were reordered, the tokenizer's own scan would still reject this command.
     const operation = "Execute `rg -n 'a\\.b|c$' src`";
     expect(operation).not.toContain(';');
-    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(true);
+    expect(isGrokReadOnlyShellPermissionTitle(operation, undefined)).toBe(true);
   });
 
   it('accepts the exact command whose denial killed the implementor turn (single-quoted regex)', () => {
     expect(
       isGrokReadOnlyShellPermissionTitle(
         "Execute `git show 481e772:docs/UI-IMPLEMENTATION-PLAN.md | head -n 5; rg -n '3A\\.1|ApplicationCommand|Phase A0' docs/UI-IMPLEMENTATION-PLAN.md | head -50; ls -la src/cli/ src/app/ 2>/dev/null | head -80`",
+        undefined,
       ),
     ).toBe(true);
   });
@@ -158,7 +160,7 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
     ['single-quoted command-substitution TEXT (inert: sh never expands it)', "Execute `rg -n '$(rm -rf /)' src`"],
     ['single-quoted parentheses/braces', "Execute `rg -n '(a|b){2}' src`"],
   ])('accepts %s', (_label, operation) => {
-    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(true);
+    expect(isGrokReadOnlyShellPermissionTitle(operation, undefined)).toBe(true);
   });
 
   it.each([
@@ -170,23 +172,23 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
     ['an unquoted parenthesis (subshell)', 'Execute `(rg -n foo src)`'],
     ['an UNTERMINATED single quote', "Execute `rg -n 'unterminated src`"],
   ])('still rejects %s', (_label, operation) => {
-    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle(operation, undefined)).toBe(false);
   });
 
   it('a single-quoted span never smuggles a segment separator or a redirection', () => {
     // `;` / `&&` / `|` / `>` inside single quotes are literal ARGUMENT bytes, so
     // the command stays ONE segment whose leading token is still an allowlisted
     // reader — it cannot introduce a second, unclassified command.
-    expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a; rm -rf /' src`")).toBe(true);
-    expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a > out.txt' src`")).toBe(true);
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a; rm -rf /' src`", undefined)).toBe(true);
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a > out.txt' src`", undefined)).toBe(true);
     // ...while the UNQUOTED forms are classified as what they are.
-    expect(isGrokReadOnlyShellPermissionTitle('Execute `rg -n a src; rm -rf /`')).toBe(false);
-    expect(isGrokReadOnlyShellPermissionTitle('Execute `rg -n a src > out.txt`')).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `rg -n a src; rm -rf /`', undefined)).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `rg -n a src > out.txt`', undefined)).toBe(false);
   });
 
   it('a single-quoted ESCAPING path argument is still refused (quoting is not a bypass)', () => {
-    expect(isGrokReadOnlyShellPermissionTitle("Execute `cat '/etc/passwd'`")).toBe(false);
-    expect(isGrokReadOnlyShellPermissionTitle("Execute `cat '../outside.txt'`")).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `cat '/etc/passwd'`", undefined)).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `cat '../outside.txt'`", undefined)).toBe(false);
   });
 
   // -------------------------------------------------------------------------
@@ -213,7 +215,7 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
     ['a mixed token that only LOOKS like a safe null redirection', "Execute `echo x'2>/dev/nul'l>owned.txt`"],
     ['no whitespace anywhere between the quoted part and the operator', "Execute `ls'>'x>owned.txt`"],
   ])('refuses a WRITE hidden by mixed quoting: %s', (_label, operation) => {
-    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle(operation, undefined)).toBe(false);
   });
 
   it.each([
@@ -225,7 +227,7 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
     ['a quoted token that merely looks like a redirection is a FILENAME', "Execute `cat f '2>/dev/null'`"],
     ['a > quoted mid-token is still not an operator (sh recognises operators pre-quote-removal)', "Execute `echo x'2>/dev/null'`"],
   ])('still admits %s', (_label, operation) => {
-    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(true);
+    expect(isGrokReadOnlyShellPermissionTitle(operation, undefined)).toBe(true);
   });
 
   // -------------------------------------------------------------------------
@@ -235,24 +237,195 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
   // -------------------------------------------------------------------------
   it('accepts a literal backtick INSIDE single quotes (the old capture made this impossible)', () => {
     const bt = String.fromCharCode(96);
-    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls ' + "'x" + bt + "y'" + '`')).toBe(true);
-    expect(isGrokReadOnlyShellPermissionTitle('Execute `rg -n ' + "'a" + bt + "b'" + ' src`')).toBe(true);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls ' + "'x" + bt + "y'" + '`', undefined)).toBe(true);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `rg -n ' + "'a" + bt + "b'" + ' src`', undefined)).toBe(true);
   });
 
   it('still refuses an UNQUOTED backtick (command substitution) and a malformed wrapper', () => {
     const bt = String.fromCharCode(96);
-    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls ' + bt + 'whoami' + bt + '`')).toBe(false);
-    expect(isGrokReadOnlyShellPermissionTitle('Execute `')).toBe(false); // empty interior
-    expect(isGrokReadOnlyShellPermissionTitle('Execute ls`')).toBe(false); // no prefix backtick
-    expect(isGrokReadOnlyShellPermissionTitle('Run `ls`')).toBe(false); // wrong verb
-    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls')).toBe(false); // no suffix
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls ' + bt + 'whoami' + bt + '`', undefined)).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `', undefined)).toBe(false); // empty interior
+    expect(isGrokReadOnlyShellPermissionTitle('Execute ls`', undefined)).toBe(false); // no prefix backtick
+    expect(isGrokReadOnlyShellPermissionTitle('Run `ls`', undefined)).toBe(false); // wrong verb
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls', undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F14 — an absolute path INSIDE the assigned worktree is admissible.
+//
+// THE DEFECT. `hasEscapingPathArgument` refused EVERY argument starting with
+// `/`, so no absolute path was ever admissible — not even the agent's OWN
+// worktree, which the implementor prompt hands it BY ABSOLUTE PATH ("You may
+// create, modify, or delete files ONLY inside your assigned worktree: <abs>").
+// The engine named a path and then denied every command that used it. A denied
+// permission ends the turn before the work is committed, so the run dies
+// `no_deliverable` — that is how four dogfood runs were lost.
+//
+// THE RULE THAT REPLACES IT. An absolute argument is admissible IFF it resolves
+// inside the worktree root — `path.relative` containment against the REALPATH of
+// both sides, via the nearest EXISTING ancestor (the same construction as
+// `isWorkspaceWriteOperation` in `../acp/session.ts`). Everything else is refused
+// exactly as before, and anything that cannot be DECIDED is refused too: no root,
+// an unresolvable root, a filesystem error. Inability to determine safety is
+// never evidence of safety.
+//
+// WHY REALPATH AND NOT `path.resolve`. `path.resolve` collapses `..` LEXICALLY,
+// before symlinks resolve, so `<root>/link/../x` can look inside while landing
+// outside. `symlinkEscape` below pins exactly that: the test asserts the lexical
+// answer is "inside" and the classifier still refuses.
+// ---------------------------------------------------------------------------
+interface WorktreeFixture {
+  /** The assignment worktree root — what production passes as the mediation cwd. */
+  readonly root: string;
+  /** A SHARED-PREFIX sibling worktree: `root` is a string prefix of it. */
+  readonly sibling: string;
+  /** The directory holding the worktrees (`<repo>.worktrees/` in production). */
+  readonly parent: string;
+  /** A directory outside the worktree tree entirely. */
+  readonly outside: string;
+}
+
+/**
+ * A hermetic stand-in for a production assignment worktree, in the REAL shape:
+ * the engine creates them as siblings under `<repo>.worktrees/` (verified on
+ * disk for run_60ccbfda), which is precisely the layout in which a prefix-string
+ * containment test is wrong.
+ */
+function worktreeFixture(): WorktreeFixture {
+  const base = tempDir();
+  const parent = path.join(base, 'harness-orchestration.worktrees');
+  const root = path.join(parent, 'assignment-asg_run_60ccbfda-c514-4b71-aa90-bf7328e11e5c');
+  const sibling = `${root}-2`; // `root` IS a string prefix of this path.
+  const outside = path.join(base, 'outside');
+  mkdirSync(path.join(root, 'web'), { recursive: true });
+  mkdirSync(path.join(root, 'docs'), { recursive: true });
+  mkdirSync(path.join(root, 'src', 'adapters'), { recursive: true });
+  mkdirSync(sibling, { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(path.join(root, 'package.json'), '{"name":"harness"}\n', 'utf8');
+  writeFileSync(path.join(root, 'docs', 'HANDOFF-dogfood-F7.md'), '# handoff\n', 'utf8');
+  writeFileSync(path.join(sibling, 'secret.txt'), 'sibling\n', 'utf8');
+  writeFileSync(path.join(outside, 'secret.txt'), 'outside\n', 'utf8');
+  // A symlink INSIDE the worktree pointing OUT of it — the escape a lexical
+  // check cannot see.
+  symlinkSync(outside, path.join(root, 'escape'));
+  return { root, sibling, parent, outside };
+}
+
+describe('F14 — absolute paths are judged by CONTAINMENT, not by their first byte', () => {
+  it('classifies grok’s EXACT denied command from run_60ccbfda as read-only', () => {
+    const { root } = worktreeFixture();
+    // The first exploration of the fourth killed dogfood run. Every token is
+    // individually safe; the ONLY reason it was denied is that `ls -la <root>`
+    // names the worktree the prompt had just handed the agent.
+    const operation =
+      'Execute `ls -la ' +
+      root +
+      ' && ls -la web 2>/dev/null; head -n 5 docs/HANDOFF-dogfood-F7.md; git rev-parse HEAD; git status --porcelain | head -20`';
+    expect(isGrokReadOnlyShellPermissionTitle(operation, root)).toBe(true);
+    // ...and the SAME command with no worktree root to judge against stays
+    // denied: not knowing where the boundary is is not permission to cross it.
+    expect(isGrokReadOnlyShellPermissionTitle(operation, undefined)).toBe(false);
   });
 
-  it('control characters are refused inside single quotes too (a NUL is never a literal)', () => {
-    // CR/LF cannot even reach the scanner (the `Execute ...` wrapper excludes
-    // them), but a NUL can — and single-quoting must not make it acceptable.
-    const nul = String.fromCharCode(0);
-    expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a" + nul + "b' src`")).toBe(false);
+  it.each([
+    ['the worktree root itself', (f: WorktreeFixture) => `ls -la ${f.root}`],
+    ['the worktree root with a trailing slash', (f: WorktreeFixture) => `ls -la ${f.root}/`],
+    ['a subdirectory of the worktree', (f: WorktreeFixture) => `ls -la ${f.root}/web`],
+    ['a file inside the worktree', (f: WorktreeFixture) => `head -n 5 ${f.root}/package.json`],
+    ['a SINGLE-QUOTED absolute path inside the worktree', (f: WorktreeFixture) => `cat '${f.root}/package.json'`],
+    ['several absolute paths inside the worktree', (f: WorktreeFixture) => `ls -la ${f.root}/web ${f.root}/docs`],
+    ['a deep path inside the worktree', (f: WorktreeFixture) => `rg -n 'foo' ${f.root}/src/adapters`],
+    [
+      'a not-yet-existing file whose nearest EXISTING ancestor is inside',
+      (f: WorktreeFixture) => `cat ${f.root}/docs/not-created-yet.md`,
+    ],
+    ['a git read scoped to an absolute path inside', (f: WorktreeFixture) => `git log --oneline -5 ${f.root}/docs`],
+    ['relative paths, exactly as before', () => 'ls -la . && ls -la web && head -n 5 docs/x.md'],
+  ])('ADMITS %s', (_label, build) => {
+    const fixture = worktreeFixture();
+    expect(isGrokReadOnlyShellPermissionTitle(`Execute \`${build(fixture)}\``, fixture.root)).toBe(true);
+  });
+
+  it.each([
+    ['a genuinely outside absolute path', (f: WorktreeFixture) => `ls -la /etc`],
+    ['a secret outside the worktree', () => 'cat /etc/passwd'],
+    ['the same path SINGLE-QUOTED (quoting is not a bypass)', () => "cat '/etc/passwd'"],
+    ['/tmp', () => 'ls -la /tmp'],
+    ['the PARENT of the worktree (every sibling assignment lives there)', (f: WorktreeFixture) => `ls -la ${f.parent}`],
+    ['a SHARED-PREFIX sibling worktree (string prefixes are not containment)', (f: WorktreeFixture) => `cat ${f.sibling}/secret.txt`],
+    ['a symlink inside the worktree pointing OUT (no `..` anywhere — containment alone catches it)', (f: WorktreeFixture) => `cat ${f.root}/escape/secret.txt`],
+    ['the symlink itself', (f: WorktreeFixture) => `ls -la ${f.root}/escape`],
+    ['a symlink escape that `path.resolve` collapses to a path INSIDE the root', (f: WorktreeFixture) => `cat ${f.root}/escape/../secret.txt`],
+    ['`/../` inside an otherwise-contained absolute path', (f: WorktreeFixture) => `cat ${f.root}/web/../package.json`],
+    ['a trailing `/..` on an absolute path', (f: WorktreeFixture) => `ls -la ${f.root}/..`],
+    ['an absolute path that does not exist at all', () => 'cat /no-such-root/no-such-file'],
+    ['ONE outside argument among admissible ones', (f: WorktreeFixture) => `ls -la ${f.root} /etc`],
+    ['a `=/` option value, even one pointing INSIDE the worktree', (f: WorktreeFixture) => `rg -n foo --file=${f.root}/pat.txt`],
+    ['a bare `..`', () => 'cat ..'],
+    ['a leading `../`', () => 'cat ../outside.txt'],
+    ['an interior `/../`', () => 'cat web/../../etc/passwd'],
+    ['a `~/` home path', () => 'cat ~/.ssh/id_ed25519'],
+  ])('REFUSES %s', (_label, build) => {
+    const fixture = worktreeFixture();
+    expect(isGrokReadOnlyShellPermissionTitle(`Execute \`${build(fixture)}\``, fixture.root)).toBe(false);
+  });
+
+  it('the symlink escape is one `path.resolve` — and `realpathSync` — would have called contained', () => {
+    const { root, outside } = worktreeFixture();
+    // Built as a STRING: `path.join` would collapse the `..` before we could
+    // show the collapse is the bug.
+    const lexicalEscape = `${root}/escape/../secret.txt`;
+
+    // (1) What a `path.resolve`-only check sees: a path inside the root.
+    expect(path.resolve(lexicalEscape).startsWith(`${root}${path.sep}`)).toBe(true);
+
+    // (2) What the filesystem really has: `escape` points OUT of the worktree,
+    // so the `..` after it leaves from THERE — the shell opens
+    // `<parent-of-outside>/secret.txt`, not `<root>/secret.txt`.
+    expect(realpathSync(path.join(root, 'escape'))).toBe(realpathSync(outside));
+
+    // (3) And the trap that makes "just call realpathSync" wrong: Node's
+    // `realpathSync` is not POSIX `realpath(3)` — it `path.resolve`s FIRST, so
+    // it collapses the `..` lexically and reports the escape as the root itself.
+    // This is why a `..` segment is REFUSED rather than resolved. If a future
+    // Node makes this assertion fail, the refusal is still correct — but the
+    // reasoning in `lib/path-containment.ts` needs re-reading.
+    expect(realpathSync(`${root}/escape/..`)).toBe(realpathSync(root));
+
+    expect(isGrokReadOnlyShellPermissionTitle(`Execute \`cat ${lexicalEscape}\``, root)).toBe(false);
+  });
+
+  it.each([
+    ['no worktree root at all', undefined],
+    ['an empty root', ''],
+    ['a relative root', 'relative/not/absolute'],
+    ['a root that does not exist', '/no-such-worktree-root-f14'],
+  ])('FAILS CLOSED when containment cannot be decided: %s', (_label, root) => {
+    const { root: real } = worktreeFixture();
+    // The argument is inside the REAL worktree; the root we are judging against
+    // is unusable. Undecidable is refused, never approved.
+    expect(isGrokReadOnlyShellPermissionTitle(`Execute \`ls -la ${real}\``, root)).toBe(false);
+    // ...while relative inspection still works with an unusable root, so a
+    // misconfigured root degrades to today's behaviour rather than to nothing.
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls -la .`', root)).toBe(true);
+  });
+
+  it('supplying a root does not widen anything else the classifier refuses', () => {
+    const { root } = worktreeFixture();
+    for (const operation of [
+      `Execute \`ls -la ${root} && rm -rf ${root}\``,
+      `Execute \`cat ${root}/package.json > ${root}/owned.txt\``,
+      `Execute \`mkdir -p ${root}/src/app\``,
+      `Execute \`npm run typecheck\``,
+      `Execute \`git log --output=${root}/history.txt\``,
+      `Execute \`rg --pre ./steal needle ${root}\``,
+      `Execute \`cat $(echo ${root}/package.json)\``,
+      `Execute \`curl https://example.invalid/${path.basename(root)}\``,
+    ]) {
+      expect(isGrokReadOnlyShellPermissionTitle(operation, root)).toBe(false);
+    }
   });
 });
 
