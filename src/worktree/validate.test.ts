@@ -209,6 +209,9 @@ describe('validateWorktree — §16.3 reconciliation outcome matrix', () => {
 
   it('F7 (#1): the WIP commit EXCLUDES node_modules when managed provisioning is active', async () => {
     const r = await makeRepo();
+    // ROUND 10 (Regression 4): the exclusion is scoped to the ENGINE's tree, and a
+    // provisioned tree is git-IGNORED. An unignored one is user content now.
+    await r.writeFile('.gitignore', 'node_modules/\n');
     await r.writeFile('src/app.ts', 'export const x = 1;\n');
     await r.commitAll('source');
     await r.writeFile('node_modules/left-pad/index.js', 'module.exports = () => {};\n');

@@ -1202,6 +1202,18 @@ export function describeImplementorRoundDiagnostic(
 // ---------------------------------------------------------------------------
 // Entry point: worktree lifecycle around the engine-driven role
 // ---------------------------------------------------------------------------
+/**
+ * ROUND 10 (LOW) — the ONE wording for a receipt disagreement, shared by the loop
+ * driver and the standalone entry point so the same failure never reads two ways.
+ */
+export function describeReceiptMismatch(hostHead: GitSha, receipt: GitSha): string {
+  return (
+    `the round's worktree HEAD (${String(hostHead)}) does not match the pre_verify_handoff receipt it published ` +
+    `(${String(receipt)}). A declared VERIFICATION COMMAND that creates a commit causes this — verification ` +
+    'commands must observe, never author. Fix the spec so no verification command commits, then re-run.'
+  );
+}
+
 export interface ImplementorFlowDeps {
   readonly service: OrchestrationService;
   readonly worktrees: GitWorktreeManager;
@@ -1288,19 +1300,24 @@ export async function runImplementor(
       input.options?.provisionForVerification ??
       (() => deps.worktrees.provisionForVerification(input.assignmentId)),
   });
+  // ROUND 10 (LOW): the standalone path explains a receipt disagreement in the
+  // SAME words as the loop path — it is the identical failure and deserves the
+  // identical message, not the generic "no deliverable adjudicated".
+  let receiptMismatch: string | undefined;
   const runner: RoleRunner<ImplementorResult> = {
     role: 'implementor',
     allowedShellCommands: flow.allowedShellCommands,
     run: (session) => flow.run(session),
-    diagnoseRoundOutcome: describeImplementorRoundDiagnostic,
-    adjudicateRoundOutcome: async (result) =>
-      adjudicateImplementorDeliverable(
-        result,
-        1,
-        gitSha(await resolveSha(handle.worktreePath, 'HEAD')),
-        // ROUND 8 (Blocker 1a): the standalone path binds to the receipt too.
-        deps.service.resolveRoundReceiptHead(input.runId, 1, input.assignmentId),
-      ),
+    diagnoseRoundOutcome: (result) => receiptMismatch ?? describeImplementorRoundDiagnostic(result),
+    adjudicateRoundOutcome: async (result) => {
+      const hostHead = gitSha(await resolveSha(handle.worktreePath, 'HEAD'));
+      // ROUND 8 (Blocker 1a): the standalone path binds to the receipt too.
+      const receipt = deps.service.resolveRoundReceiptHead(input.runId, 1, input.assignmentId);
+      if (receipt !== undefined && String(hostHead) !== String(receipt)) {
+        receiptMismatch = describeReceiptMismatch(hostHead, receipt);
+      }
+      return adjudicateImplementorDeliverable(result, 1, hostHead, receipt);
+    },
   };
   try {
     return await deps.service.runRole(input.runId, runner, input.implementor, handle.worktreePath, {

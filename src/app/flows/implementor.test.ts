@@ -1084,12 +1084,16 @@ describe('ImplementorFlow — F7 round-2 #3 node_modules commit semantics follow
     expect(files).toContain('node_modules/tracked.js'); // committed, not excluded
   });
 
-  it('with provisioning ACTIVE, the same tracked node_modules edit is EXCLUDED from the commit', async () => {
+  // ROUND 10 (Regression 4): a TRACKED node_modules is committed user content —
+  // a vendored dependency tree main commits without complaint — so provisioning
+  // being ACTIVE does not make it ours to strip. The exclusion is scoped to the
+  // ENGINE's tree: git-ignored, or carrying the provisioner's marker.
+  it('with provisioning ACTIVE, a TRACKED node_modules edit is still COMMITTED (it is user content)', async () => {
     const result = await runOnceTrackingNodeModules('auto', 'asg_f7_active_exclude');
     expect(result.committed).toBe(true);
     const files = await committedFiles(result);
     expect(files).toContain('feature.txt');
-    expect(files.every((f) => !f.startsWith('node_modules'))).toBe(true); // never entered HEAD
+    expect(files).toContain('node_modules/tracked.js'); // main commits this; so do we
   });
 });
 
@@ -1174,6 +1178,9 @@ describe('ImplementorFlow — F7 round-4 #3 a pre-staged node_modules is unstage
       turns: [REPORTING_TURN],
       stageAfterWrite: true, // the "implementor" runs `git add -A`, STAGING node_modules
     });
+    // ROUND 10: IGNORE node_modules so the planted tree is the ENGINE's.
+    await r.writeFile('.gitignore', 'node_modules/\n');
+    await r.commitAll('ignore node_modules');
     const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const result = await runImplementor(
       { service, worktrees: wt },
@@ -1187,8 +1194,11 @@ describe('ImplementorFlow — F7 round-4 #3 a pre-staged node_modules is unstage
       },
     );
 
-    // The work IS committed; provisioning then fails closed (no ignore rule) but that
-    // does not undo the commit. The pre-staged node_modules is NOT in it.
+    // The work IS committed, and the pre-staged ENGINE tree is NOT in it.
+    // ROUND 10 (Regression 4): the fixture now IGNORES node_modules, which is what
+    // makes the tree the engine's — force-adding an ignored tree must not launder
+    // it past the guard (that is the round-4 #3 invariant). An UNIGNORED, unmarked
+    // node_modules would now be user content and stay.
     expect(result.committed).toBe(true);
     const committed = (
       await runGit(['diff', '--name-only', `${String(result.baseSha)}..HEAD`], result.worktreePath)

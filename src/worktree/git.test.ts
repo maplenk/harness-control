@@ -100,7 +100,11 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
     expect(staged).toContain('README.md'); // the deletion is staged too
   });
 
-  it('never stages an UNIGNORED node_modules (the belt that survives a deleted ignore rule)', async () => {
+  // REGRESSION 4 (round 10): an UNIGNORED node_modules is intentional USER
+  // content — a vendored tree main commits without complaint. The guard exists to
+  // stop the engine's PROVISIONED tree entering a commit, and a provisioned tree
+  // is by definition git-ignored (provisioning fails closed otherwise).
+  it('KEEPS an unignored (vendored) node_modules staged — it is user content, not ours', async () => {
     const r = await repoWithIgnore(''); // no ignore rule at all
     plantNodeModules(r.dir, 'node_modules');
     await r.writeFile('src/feature.ts', 'export const feature = true;\n');
@@ -109,13 +113,11 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
 
     const staged = await stagedPaths(r.dir);
     expect(staged).toContain('src/feature.ts');
-    expect(staged.some((p) => p.includes('node_modules'))).toBe(false);
-    // ...and the tree itself is untouched on disk (never deleted, only unstaged).
-    expect(await stagedPaths(r.dir)).not.toContain('node_modules/left-pad/index.js');
+    expect(staged).toContain('node_modules/left-pad/index.js'); // committable, as on main
   });
 
-  it('never stages a NESTED node_modules — at any depth, ignored or not', async () => {
-    const r = await repoWithIgnore(''); // the old root-only pathspec staged this
+  it('KEEPS a nested vendored node_modules staged when it is not ignored', async () => {
+    const r = await repoWithIgnore('');
     plantNodeModules(r.dir, 'web/node_modules');
     plantNodeModules(r.dir, 'packages/api/node_modules');
     await r.writeFile('web/app.ts', 'export const web = 1;\n');
@@ -124,7 +126,7 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
 
     const staged = await stagedPaths(r.dir);
     expect(staged).toContain('web/app.ts');
-    expect(staged.some((p) => p.includes('node_modules'))).toBe(false);
+    expect(staged.some((p) => p.includes('node_modules'))).toBe(true);
   });
 
   it('a nested node_modules covered by a bare `node_modules/` rule is likewise never staged', async () => {
@@ -153,7 +155,9 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
     expect(staged.some((p) => p.includes('node_modules'))).toBe(false);
   });
 
-  it('a TRACKED node_modules modification is never staged, and the working tree keeps the new bytes', async () => {
+  // REGRESSION 4: a TRACKED node_modules is the clearest case of user content —
+  // main commits its changes, and so must this.
+  it('a TRACKED node_modules modification IS staged and commits (main does; so do we)', async () => {
     const r = await repoWithIgnore('');
     plantNodeModules(r.dir, 'node_modules');
     await r.commitAll('a repo that (wrongly) tracks node_modules');
@@ -162,9 +166,11 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
 
     await addAllExceptNodeModules(r.dir);
 
-    expect(await stagedPaths(r.dir)).toEqual(['src/feature.ts']);
-    // The provisioned bytes stay on disk — the helper unstages, never deletes.
-    expect((await r.run(['show', ':node_modules/left-pad/index.js'])).trim()).toBe('module.exports = () => {};');
+    const staged = await stagedPaths(r.dir);
+    expect(staged).toContain('src/feature.ts');
+    expect(staged).toContain('node_modules/left-pad/index.js');
+    const sha = await r.commitAll('vendored dependency update');
+    expect(sha).toMatch(/^[0-9a-f]{40}$/);
   });
 
   it('CONTROL: the pathspec form this replaced is still fatal on this git, with the same tree', async () => {
@@ -200,7 +206,7 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
   // node_modules entries STAGED — the invariant silently broken by a "successful"
   // command. Verified against real git before the fix.
   it('unstages a node_modules under a path that LOOKS like pathspec magic', async () => {
-    const r = await repoWithIgnore('');
+    const r = await repoWithIgnore('node_modules/\n');
     plantNodeModules(r.dir, ':(top)foo/node_modules');
     await r.writeFile(':(top)foo/app.ts', 'export const app = 1;\n');
 
@@ -241,13 +247,50 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
   });
 });
 
+// REGRESSION 4 (round 10) — the two cases side by side, both shapes MAIN handles.
+describe('F10 exclusion is scoped to the ENGINE tree, not to every node_modules', () => {
+  it('a tracked vendored NESTED node_modules stays staged and COMMITS (as on main)', async () => {
+    const r = await repoWithIgnore(''); // no ignore rule: this tree is user content
+    plantNodeModules(r.dir, 'vendor/web/node_modules');
+    await r.writeFile('vendor/web/app.ts', 'export const web = 1;\n');
+
+    await addAllExceptNodeModules(r.dir);
+    const sha = await r.commitAll('vendored dependencies');
+
+    expect(sha).toMatch(/^[0-9a-f]{40}$/);
+    const tree = (await r.run(['ls-tree', '-r', '--name-only', 'HEAD'])).trim().split('\n');
+    expect(tree).toContain('vendor/web/node_modules/left-pad/index.js');
+    expect(tree).toContain('vendor/web/app.ts');
+    expect((await r.statusPorcelain()).trim()).toBe(''); // no post-verification dirt
+  });
+
+  it('a PROVISIONED (ignored) node_modules is still refused from the commit', async () => {
+    const r = await repoWithIgnore('node_modules/\n');
+    plantNodeModules(r.dir, 'node_modules');
+    await r.writeFile('src/feature.ts', 'export const feature = true;\n');
+    // Even force-added by an agent, the engine's tree never enters the commit.
+    await r.run(['add', '-f', '--', 'node_modules']);
+
+    await addAllExceptNodeModules(r.dir);
+    await r.commitAll('the round');
+
+    const tree = (await r.run(['ls-tree', '-r', '--name-only', 'HEAD'])).trim().split('\n');
+    expect(tree).toContain('src/feature.ts');
+    expect(tree.some((f) => f.includes('node_modules'))).toBe(false);
+  });
+});
+
 describe('unstageNodeModules — F10 depth-aware unstage', () => {
-  it('unstages node_modules at every depth and leaves everything else staged', async () => {
-    const r = await repoWithIgnore('');
+  it('unstages IGNORED node_modules at every depth and leaves everything else staged', async () => {
+    const r = await repoWithIgnore('node_modules/\n');
     plantNodeModules(r.dir, 'node_modules');
     plantNodeModules(r.dir, 'web/node_modules');
     await r.writeFile('web/app.ts', 'export const web = 1;\n');
     await r.run(['add', '-A']);
+    // The ignore rule keeps them out of `add -A`, so FORCE them in — the round-4 #3
+    // shape (an agent running `git add -f`). Force-adding must not launder the
+    // engine's own tree past the guard.
+    await r.run(['add', '-f', '--', 'node_modules', 'web/node_modules']);
     expect((await stagedPaths(r.dir)).some((p) => p.includes('node_modules'))).toBe(true);
 
     await unstageNodeModules(r.dir);
@@ -268,7 +311,7 @@ describe('unstageNodeModules — F10 depth-aware unstage', () => {
   });
 
   it('does NOT unstage a path that merely CONTAINS the substring node_modules', async () => {
-    const r = await repoWithIgnore('');
+    const r = await repoWithIgnore('node_modules/\n');
     await r.writeFile('src/node_modules_helper.ts', 'export const helper = 1;\n');
     await r.writeFile('src/my_node_modules/keep.ts', 'export const keep = 1;\n');
     await r.run(['add', '-A']);

@@ -117,6 +117,7 @@ export { NoDeliverableError } from '../service.js';
  */
 export { adjudicateImplementorDeliverable } from './deliverable.js';
 import { adjudicateImplementorDeliverable } from './deliverable.js';
+import { describeReceiptMismatch } from './implementor.js';
 
 export interface ImplementVerifyLoopDeps {
   readonly service: OrchestrationService;
@@ -732,11 +733,7 @@ export async function runImplementVerifyLoop(
             // ROUND 8 (Blocker 1a): the round`s own receipt is authoritative.
             const receipt = service.resolveRoundReceiptHead(input.runId, round, input.assignmentId);
             if (receipt !== undefined && String(hostHead) !== String(receipt)) {
-              receiptMismatch =
-                `the round's worktree HEAD (${String(hostHead)}) does not match the pre_verify_handoff receipt ` +
-                `it published (${String(receipt)}). A declared VERIFICATION COMMAND that creates a commit causes ` +
-                'this — verification commands must observe, never author. Fix the spec so no verification command ' +
-                'commits, then re-run.';
+              receiptMismatch = describeReceiptMismatch(hostHead, receipt);
             }
             adjudicatedHead = hostHead;
             return adjudicateImplementorDeliverable(result, round, hostHead, receipt);

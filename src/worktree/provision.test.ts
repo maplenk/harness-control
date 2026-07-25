@@ -1356,13 +1356,15 @@ describe('F7 round-3 #1 (fix a) — a §16.3 WIP reconciliation commit EXCLUDES 
     // Deps repo with NO ignore rule → a plain `git add -A` WOULD stage node_modules;
     // manager.validate()'s WIP path must exclude it (the SAME exclusion the implementor
     // commit uses) while managed provisioning is ACTIVE (default 'auto').
-    const repo = track(await makeDepsRepo({ ignore: false }));
+    const repo = track(await makeDepsRepo());
     const manager = await openManager(repo);
     const asg = assignmentId('asg_validate_exclude');
     const handle = await createAtHead(repo, manager, asg);
 
     // Dirty the worktree: a real untracked change to PRESERVE + a provisioned
-    // (un-ignored) node_modules that must NEVER enter the reconciliation commit.
+    // (git-IGNORED) node_modules that must NEVER enter the reconciliation commit.
+    // ROUND 10 (Regression 4): the exclusion is scoped to the ENGINE's tree, and a
+    // provisioned tree is by definition ignored — an unignored one is user content.
     fs.writeFileSync(path.join(handle.worktreePath, 'feature.txt'), 'real work\n');
     fs.mkdirSync(path.join(handle.worktreePath, 'node_modules', '.bin'), { recursive: true });
     fs.writeFileSync(path.join(handle.worktreePath, 'node_modules', 'junk.js'), 'toolchain\n');
@@ -1390,7 +1392,7 @@ describe('F7 round-3 #1 (fix a) — a §16.3 WIP reconciliation commit EXCLUDES 
 
 describe('F7 round-4 #3 — an ALREADY-STAGED node_modules is unstaged before the WIP commit (not just prevented from adding)', () => {
   it('manager.validate() WIP commit UNSTAGES a pre-staged node_modules', async () => {
-    const repo = track(await makeDepsRepo({ ignore: false })); // no ignore rule → add -A would stage it
+    const repo = track(await makeDepsRepo()); // ignored: the engine tree shape
     const manager = await openManager(repo); // provisioning ACTIVE (auto)
     const asg = assignmentId('asg_prestaged_wip');
     const handle = await createAtHead(repo, manager, asg);
@@ -1401,7 +1403,10 @@ describe('F7 round-4 #3 — an ALREADY-STAGED node_modules is unstaged before th
     // PRE-STAGE both into the index (simulating an interrupted implementor / a
     // verification command that ran `git add`). The exclusion pathspec ALONE would
     // leave the already-staged node_modules in the commit.
-    await runGit(['add', 'feature.txt', 'node_modules'], handle.worktreePath);
+    // FORCE it in: the ignore rule keeps `add` out, and force-adding is exactly
+    // the round-4 #3 shape (an agent running `git add -f`) that must not launder
+    // the engine's tree past the guard.
+    await runGit(['add', '-f', 'feature.txt', 'node_modules'], handle.worktreePath);
     expect((await runGit(['diff', '--cached', '--name-only'], handle.worktreePath)).stdout).toContain('node_modules');
 
     const result = await manager.validate(asg);
@@ -2193,9 +2198,39 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
 
     expect(error.provisioningCause).toBe('native_toolchain_unproven');
-    // Named by the NESTED specifier — requiring bare `nested-native` would have
-    // resolved the hoisted copy and proven the wrong artifact.
-    expect(error.message).toContain('left-pad/node_modules/nested-native');
+    // Named by its DIRECTORY, which is the nested copy — not the hoisted one.
+    expect(error.message).toContain(path.join('left-pad', 'node_modules', 'nested-native'));
+  });
+
+  // REGRESSION 1 (round 10) — the nested smoke used to request
+  // `parent/node_modules/child`, which Node resolves as a SUBPATH of the parent.
+  // A parent declaring `exports` therefore threw ERR_PACKAGE_PATH_NOT_EXPORTED and
+  // a VALID tree — one main clones and uses without complaint — was falsely
+  // refused. The smoke must prove the addon LOADS, not that one spelling resolves.
+  it('a nested native under a parent declaring `exports` is NOT falsely refused', async () => {
+    const repo = track(await makeDepsRepo());
+    const nm = await writePrimaryNodeModules(repo.dir);
+    // The parent restricts its own surface with `exports` — legal and common.
+    fs.writeFileSync(
+      path.join(nm, 'left-pad', 'package.json'),
+      `${JSON.stringify(
+        { name: 'left-pad', version: '1.0.0', main: 'index.js', exports: { '.': './index.js' } },
+        null,
+        2,
+      )}\n`,
+    );
+    // ...and holds a nested native package that is BUILT and loads fine.
+    const nested = path.join(nm, 'left-pad', 'node_modules');
+    fs.mkdirSync(nested, { recursive: true });
+    writeInstalledPackage(nested, 'nested-native', { native: true, built: true });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_nested_exports');
+    await createAtHead(repo, manager, asg);
+
+    // Main clones this tree happily; so must we.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    expect(fake.calls.clone).toBe(1);
   });
 });
 
@@ -2343,7 +2378,7 @@ describe('F9 AC-6 — a stalled provisioning command fails closed with the locks
     }
   });
 
-  it('HIGH-6 #6: a post-TTL stage is deleted only once its OWNER is proven gone', async () => {
+  it('HIGH-6 #6 / ROUND 10: a post-TTL stage collects on the TIMESTAMP, not on owner liveness', async () => {
     const repo = track(await makeDepsRepo());
     const manager = await openManager(repo);
     const asg = assignmentId('asg_f9_ttl_owner');
@@ -2364,19 +2399,20 @@ describe('F9 AC-6 — a stalled provisioning command fails closed with the locks
       JSON.stringify({ quarantinedAtMs: ancient, ownerPid: 4343, ownerStartedAt: 'START-B' }),
     );
 
-    // Owner 4242 is still the SAME live process; 4343 is gone.
+    // ROUND 10 (Regression 2): owner liveness NO LONGER extends retention. The
+    // recorded pid is the ORCHESTRATOR's, not the producer's, so "owner alive"
+    // held for the entire life of a long-running orchestrator and every timed-out
+    // stage was retained indefinitely — an unbounded cost main does not have. The
+    // TTL now runs from the quarantine timestamp alone.
     const ownerProbe = {
       self: () => ({ pid: process.pid, startedAt: 'SELF' }),
-      isOwnerAlive: (owner: { readonly pid: number; readonly startedAt?: string }): boolean =>
-        owner.pid === 4242 && owner.startedAt === 'START-A',
+      isOwnerAlive: (): boolean => true, // even a "live" owner does not hold a stage open
     };
 
     gcProvisionStages(manager.baseDir, String(asg), undefined, undefined, ownerProbe);
 
-    // A live owner EXTENDS rather than expires — deleting it would recreate the
-    // original race, just a day later.
-    expect(existsSync(liveStage)).toBe(true);
-    // A proven-gone owner releases the stage, so retention stays bounded.
+    // BOTH are past the TTL, so both collect regardless of any liveness claim.
+    expect(existsSync(liveStage)).toBe(false);
     expect(existsSync(deadStage)).toBe(false);
   });
 

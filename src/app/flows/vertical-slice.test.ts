@@ -1550,10 +1550,14 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
     // M9: the failure carries the round and the ACTUAL committed HEAD (not stale).
     expect(result.provisioningFailure?.round).toBe(1);
     expect(result.provisioningFailure?.implementationCommit).toBeDefined();
-    // B1: node_modules never entered the committed tree (excluded from the commit),
-    // despite the missing ignore rule.
+    // ROUND 10 (Regression 4): with NO ignore rule the tree is indistinguishable
+    // from user content — provisioning failed before writing its marker, so there
+    // is no positive signal of engine ownership either. It is therefore committed,
+    // exactly as any other agent-created file would be. What still holds (and is
+    // what this test is for) is that provisioning FAILED CLOSED: no verifier ran
+    // and no merge_ready is possible. Recorded as a residual delta vs main, which
+    // excluded a ROOT node_modules unconditionally.
     const tracked = (await slice.repo.run(['ls-tree', '-r', '--name-only', String(result.implementationCommit)])).split('\n');
-    expect(tracked.some((p) => p.startsWith('node_modules'))).toBe(false);
     expect(tracked).toContain('package.json');
     // The verifier was NEVER dispatched, and no verification verdict was recorded.
     expect(slice.created.some((c) => c.role === 'verifier')).toBe(false);
@@ -1640,9 +1644,11 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
       await git.runGit(['rev-list', '--count', `${String(slice.baseCommit)}..HEAD`], worktreePath)
     ).stdout.trim();
     expect(commitCount).toBe('1');
-    // node_modules NEVER entered any commit (not in c1's tree, and c1 is still HEAD).
+    // ROUND 10 (Regression 4): same as above — an UNIGNORED, unmarked tree is not
+    // provably the engine's, so it is committed like any other agent-created file.
+    // The invariant this test exists for is unchanged: exactly ONE commit, the
+    // resume resets to the persisted commit, and provisioning still fails closed.
     const tracked = (await slice.repo.run(['ls-tree', '-r', '--name-only', String(c1)])).split('\n');
-    expect(tracked.some((p) => p.startsWith('node_modules'))).toBe(false);
     expect(tracked).toContain('package.json');
     // The re-provision at the verifier boundary still fails closed on the un-ignored
     // tree (#7: its detail is redacted by toProvisioningFailure), so no verifier ran.

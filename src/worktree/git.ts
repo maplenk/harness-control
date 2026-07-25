@@ -13,6 +13,8 @@
  * blocking the event loop here would stall that heartbeat.
  */
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import * as path from 'node:path';
 import { promisify } from 'node:util';
 import { WorktreeError, isWorktreeError } from './errors.js';
 
@@ -225,7 +227,59 @@ const NODE_MODULES_PATH_RE = /(^|\/)node_modules(\/|$)/;
  * final NUL produces is dropped). */
 async function stagedNodeModulesPaths(worktreePath: string): Promise<string[]> {
   const { stdout } = await runGit(['diff', '--cached', '--name-only', '-z'], worktreePath);
-  return stdout.split('\0').filter((p) => p.length > 0 && NODE_MODULES_PATH_RE.test(p));
+  const candidates = stdout.split('\0').filter((p) => p.length > 0 && NODE_MODULES_PATH_RE.test(p));
+  if (candidates.length === 0) return [];
+  // REGRESSION 4 (round 10): only a git-IGNORED node_modules is the engine's.
+  //
+  // The guard exists to stop the PROVISIONED tree entering a commit, and a
+  // provisioned tree is BY DEFINITION git-ignored (provisioning fails closed
+  // otherwise). Excluding every node_modules-shaped path at any depth swept up
+  // TRACKED, vendored trees too — intentional user content that main commits
+  // without complaint — silently unstaging them and then refusing the round for
+  // post-verification dirt. A tracked node_modules stays committable.
+  const engineOwned: string[] = [];
+  for (const candidate of candidates) {
+    if (await isEngineOwnedNodeModules(worktreePath, candidate)) engineOwned.push(candidate);
+  }
+  return engineOwned;
+}
+
+/** The marker the provisioner writes INSIDE a tree it built (see `provision.ts`). */
+const PROVISION_MARKER_BASENAME = '.harness-provisioned';
+
+/**
+ * REGRESSION 4 (round 10) — is this staged node_modules path the ENGINE's tree
+ * rather than the user's?
+ *
+ * Two positive signals, either sufficient:
+ *  - a git IGNORE RULE covers it (rules only, via `--no-index`, so force-adding
+ *    cannot launder it), which is what a provisioned tree always has; or
+ *  - the tree carries the provisioner's own MARKER file, which proves engine
+ *    ownership even in a repo with no ignore rule at all.
+ *
+ * And one veto that outranks both: a path already IN HEAD is committed user
+ * content — a vendored dependency tree main commits without complaint — and must
+ * stay committable. Excluding every node_modules-shaped path at any depth was the
+ * regression: it silently unstaged those and then failed the round on the
+ * resulting "post-verification dirt".
+ */
+async function isEngineOwnedNodeModules(worktreePath: string, candidate: string): Promise<boolean> {
+  if (await isPathInHead(worktreePath, candidate)) return false; // committed user content
+  if (await isPathIgnoredByRule(worktreePath, candidate)) return true;
+  const segments = candidate.split('/');
+  const index = segments.indexOf('node_modules');
+  if (index < 0) return false;
+  const treeRoot = segments.slice(0, index + 1).join('/');
+  return existsSync(path.join(worktreePath, treeRoot, PROVISION_MARKER_BASENAME));
+}
+
+/** True iff `relpath` is present in the committed HEAD tree. */
+async function isPathInHead(worktreePath: string, relpath: string): Promise<boolean> {
+  const { exitCode, stdout } = await runGitStatus(
+    ['ls-tree', '--name-only', 'HEAD', '--', relpath],
+    worktreePath,
+  );
+  return exitCode === 0 && stdout.trim().length > 0;
 }
 
 /**
@@ -426,6 +480,30 @@ export async function runGitStatus(
  * (exit 128 / spawn failure → throw), so the F7 preflight never mistakes a
  * broken repo for "safe to provision".
  */
+/**
+ * REGRESSION 4 (round 10) — is `pathspec` covered by an IGNORE RULE, regardless of
+ * whether it currently sits in the index?
+ *
+ * Plain `check-ignore` skips TRACKED paths, so a provisioned tree that an agent
+ * force-added (`git add -f`) would report as "not ignored" and escape the guard —
+ * force-adding must not launder the engine's own tree. `--no-index` consults the
+ * rules alone, which is the question actually being asked.
+ */
+export async function isPathIgnoredByRule(worktreePath: string, pathspec: string, timeoutMs?: number): Promise<boolean> {
+  const { exitCode, stderr } = await runGitStatus(
+    ['check-ignore', '-q', '--no-index', '--', pathspec],
+    worktreePath,
+    {},
+    timeoutMs,
+  );
+  if (exitCode === 0) return true;
+  if (exitCode === 1) return false;
+  throw new WorktreeError(
+    'git_command_failed',
+    `git check-ignore --no-index ${pathspec} (cwd=${worktreePath}) failed (exit ${exitCode}): ${stderr.trim()}`,
+  );
+}
+
 export async function isPathIgnored(worktreePath: string, pathspec: string, timeoutMs?: number): Promise<boolean> {
   const { exitCode, stderr } = await runGitStatus(['check-ignore', '-q', '--', pathspec], worktreePath, {}, timeoutMs);
   if (exitCode === 0) return true;

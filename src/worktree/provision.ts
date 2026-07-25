@@ -153,6 +153,8 @@ export type ProvisionWarnEvent =
   /** ROUND 5 (#4): the stage could NOT be marked, so it is not protected — said
    * plainly rather than reported as a quarantine that did not happen. */
   | { readonly kind: 'stage_quarantine_failed'; readonly stage: string; readonly detail: string }
+  /** REGRESSION 2: quarantined stages exceeded the cap; the oldest were evicted. */
+  | { readonly kind: 'quarantine_cap_evicted'; readonly evicted: number; readonly retained: number }
   /** F9: the runtime native smoke loaded these packages from the staged tree. */
   | { readonly kind: 'native_smoke_passed'; readonly packages: readonly string[] };
 
@@ -833,6 +835,12 @@ export const QUARANTINE_MARKER_FILE = '.harness-quarantined';
 /** How long a quarantined stage is presumed to have a live writer, when the
  * owner's liveness cannot be positively disproven. */
 export const QUARANTINE_TTL_MS = 24 * 60 * 60 * 1000;
+/**
+ * REGRESSION 2 (round 10) — the hard cap on retained quarantine stages per
+ * assignment. Bounds the cost even inside a TTL window, so repeated timeouts
+ * cannot accumulate trees without limit.
+ */
+export const MAX_QUARANTINED_STAGES = 8;
 
 /** The recorded §14 identity of the process that abandoned a stage. */
 export interface QuarantineOwner {
@@ -907,10 +915,22 @@ function quarantineStage(stageDir: string, warn: ProvisionWarnSink, probe: Quara
       'utf8',
     );
   } catch (error) {
-    warn({ kind: 'stage_quarantine_failed', stage: path.basename(stageDir), detail: messageOf(error) });
+    // REGRESSION 3 (round 10): this runs from the timeout `finally`, so a throwing
+    // warn SINK would replace the primary cause-coded refusal. Same masking family
+    // guarded three times elsewhere; guarded identically here.
+    safeWarn(warn, { kind: 'stage_quarantine_failed', stage: path.basename(stageDir), detail: messageOf(error) });
     return;
   }
-  warn({ kind: 'stage_quarantined', stage: path.basename(stageDir) });
+  safeWarn(warn, { kind: 'stage_quarantined', stage: path.basename(stageDir) });
+}
+
+/** REGRESSION 3: a warning must never replace the failure it is describing. */
+function safeWarn(warn: ProvisionWarnSink, event: ProvisionWarnEvent): void {
+  try {
+    warn(event);
+  } catch {
+    /* an observability sink can never be allowed to mask a refusal */
+  }
 }
 
 /**
@@ -960,13 +980,13 @@ function isQuarantineProtected(stageDir: string, nowMs: number, probe: Quarantin
   }
 
   // A still-live owner extends the quarantine for as long as it lives.
-  if (owner !== undefined) {
-    try {
-      if (probe.isOwnerAlive(owner)) return true;
-    } catch {
-      return true; // a probe we cannot run is not a proof of death
-    }
-  }
+  // REGRESSION 2 (round 10): the TTL runs from the QUARANTINE TIMESTAMP and is
+  // NOT extended by owner liveness. The recorded pid is the ORCHESTRATOR's, not
+  // the producer's, so "owner still alive" was true for the entire life of a
+  // long-running orchestrator — every timed-out stage was retained indefinitely
+  // even after its producer had long settled. That is a new, unbounded resource
+  // cost against main. The pid is still recorded, for diagnostics only.
+  void owner;
 
   // Owner gone (or never recorded): hold only until the TTL elapses. A marker
   // with no usable timestamp uses the stage's own mtime, so a malformed marker
@@ -1340,20 +1360,48 @@ function gcAbandonedStages(
   }
 
   const nowMs = Date.now();
+  const retained: string[] = [];
   for (const name of entries) {
     const stageDir = path.join(assignmentStageRoot, name);
     // HIGH-6: never sweep a QUARANTINED stage while a producer abandoned on a
     // deadline may still be writing into it. Deleting it would race that writer
-    // — the very hazard quarantining exists to avoid — and the round-3 shape
-    // made it worse by GC'ing the renamed copy indiscriminately. Past the TTL
-    // no writer can plausibly remain, so it collects like anything else.
-    if (isQuarantineProtected(stageDir, nowMs, ownerProbe)) continue;
+    // — the very hazard quarantining exists to avoid. Past the TTL no writer can
+    // plausibly remain, so it collects like anything else.
+    if (isQuarantineProtected(stageDir, nowMs, ownerProbe)) {
+      retained.push(name);
+      continue;
+    }
     try {
       fs.rmSync(stageDir, { recursive: true, force: true });
       warn({ kind: 'stage_gc_removed', stage: name });
     } catch {
       /* best effort */
     }
+  }
+
+  // REGRESSION 2 (round 10): a HARD CAP on retained quarantine stages, so the
+  // cost is bounded even when the TTL has not yet elapsed (or a marker is
+  // unreadable and therefore held open). Repeated timeouts within one TTL window
+  // would otherwise accumulate without limit — a resource cost main does not
+  // have. Oldest-first eviction, and the count is LOGGED rather than silent:
+  // bounded-and-logged beats unbounded-and-silent.
+  if (retained.length > MAX_QUARANTINED_STAGES) {
+    const byAge = retained
+      .map((name) => ({ name, at: mtimeMsOf(path.join(assignmentStageRoot, name)) ?? 0 }))
+      .sort((a, b) => a.at - b.at);
+    const evicting = byAge.slice(0, retained.length - MAX_QUARANTINED_STAGES);
+    for (const { name } of evicting) {
+      try {
+        fs.rmSync(path.join(assignmentStageRoot, name), { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+    warn({
+      kind: 'quarantine_cap_evicted',
+      evicted: evicting.length,
+      retained: MAX_QUARANTINED_STAGES,
+    });
   }
   // Best-effort: drop the now-empty per-assignment namespace dir. `rmdirSync` removes
   // it ONLY when empty, so a preserved `old-*` backup (fail-closed above threw before
@@ -1631,18 +1679,34 @@ function lockedRootVersions(manifests: ManifestSet): LockVersions {
  * including one level under `@scope/`. Unreadable/malformed package manifests are
  * skipped, not fatal: they are not evidence of a missing BUILD.
  */
-function nativeBuildPackages(treePath: string): string[] {
-  const found: string[] = [];
+/**
+ * REGRESSION 1 (round 10) — a package the smoke must load, identified by its
+ * absolute DIRECTORY and its BARE name.
+ *
+ * The nested case used to be requested as `parent/node_modules/child`, which
+ * Node resolves as a SUBPATH OF `parent` — so a parent declaring `exports`
+ * threw ERR_PACKAGE_PATH_NOT_EXPORTED and a perfectly valid tree (one main
+ * clones and uses) was falsely refused. The smoke must prove the addon LOADS,
+ * not that one specifier spelling resolves.
+ */
+interface NativePackage {
+  readonly dir: string;
+  readonly name: string;
+}
+
+function nativeBuildPackages(treePath: string): NativePackage[] {
+  const found: NativePackage[] = [];
 
   /** `dir` holds a package; `specifier` is how `require()` names it. */
-  const consider = (dir: string, specifier: string): void => {
+  const consider = (dir: string, specifier: string, name: string): void => {
     // HIGH-4: `binding.gyp` is decisive ON ITS OWN, checked BEFORE any script
     // lookup. npm runs an IMPLICIT `node-gyp rebuild` for a package that has a
     // binding.gyp and declares no `install`/`preinstall` script — so requiring a
     // `scripts` object first (and returning early without one) skipped exactly
     // the packages whose build npm supplies for them.
     if (fs.existsSync(path.join(dir, 'binding.gyp'))) {
-      found.push(specifier);
+      found.push({ dir, name });
+      void specifier;
       return;
     }
     let manifestRaw: string;
@@ -1684,7 +1748,8 @@ function nativeBuildPackages(treePath: string): string[] {
       .map((hook) => (scripts as Record<string, unknown>)[hook])
       .filter((value): value is string => typeof value === 'string');
     if (hooks.some((script) => /node-gyp|node-pre-gyp|prebuild|cmake-js/i.test(script))) {
-      found.push(specifier);
+      found.push({ dir, name });
+      void specifier;
     }
   };
 
@@ -1721,8 +1786,8 @@ function nativeBuildPackages(treePath: string): string[] {
         'native_toolchain_unproven',
       );
     }
-    const visit = (dir: string, specifier: string): void => {
-      consider(dir, specifier);
+    const visit = (dir: string, specifier: string, name: string): void => {
+      consider(dir, specifier, name);
       const nested = path.join(dir, 'node_modules');
       if (lstatSafe(nested)?.isDirectory() === true) walk(nested, `${specifier}/node_modules/`, depth + 1);
     };
@@ -1747,17 +1812,23 @@ function nativeBuildPackages(treePath: string): string[] {
         }
         for (const child of scoped) {
           if (child.isDirectory()) {
-            visit(path.join(root, entry.name, child.name), `${specifierPrefix}${entry.name}/${child.name}`);
+            visit(
+              path.join(root, entry.name, child.name),
+              `${specifierPrefix}${entry.name}/${child.name}`,
+              `${entry.name}/${child.name}`,
+            );
           }
         }
       } else {
-        visit(path.join(root, entry.name), `${specifierPrefix}${entry.name}`);
+        visit(path.join(root, entry.name), `${specifierPrefix}${entry.name}`, entry.name);
       }
     }
   };
 
   walk(treePath, '', 0);
-  return [...new Set(found)].sort();
+  const unique = new Map<string, NativePackage>();
+  for (const pkg of found) unique.set(pkg.dir, pkg);
+  return [...unique.values()].sort((a, b) => (a.dir < b.dir ? -1 : a.dir > b.dir ? 1 : 0));
 }
 
 /**
@@ -1794,9 +1865,16 @@ async function runNativeSmoke(
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
   }
-  for (const name of packages) {
+  for (const pkg of packages) {
     try {
-      await execFileAsync(process.execPath, ['-e', `require(${JSON.stringify(name)})`], {
+      // REGRESSION 1: resolve from the package's OWN package.json, so a bare
+      // specifier walks up into the directory that actually holds it. Requesting
+      // `parent/node_modules/child` instead asked Node for a SUBPATH of the
+      // parent, which a parent declaring `exports` rejects outright.
+      const script =
+        'const {createRequire}=require("node:module");' +
+        `createRequire(${JSON.stringify(path.join(pkg.dir, 'package.json'))})(${JSON.stringify(pkg.name)});`;
+      await execFileAsync(process.execPath, ['-e', script], {
         cwd,
         env,
         timeout: Math.min(timeoutMs, NATIVE_SMOKE_TIMEOUT_MS),
@@ -1807,15 +1885,15 @@ async function runNativeSmoke(
         ? ((error as { stderr: string }).stderr).trim().split('\n').slice(0, 6).join(' | ')
         : messageOf(error);
       throw failClosed(
-        `provisioned node_modules for ${treePath} could not LOAD '${name}', which declares a native build step — ` +
+        `provisioned node_modules for ${treePath} could not LOAD '${pkg.dir}', which declares a native build step — ` +
           'the package is present but was never built (a script-less install cannot build it). Refusing to verify ' +
           `against an unproven toolchain: ${stderr}`,
-        `native smoke failed for ${name}`,
+        `native smoke failed for ${pkg.dir}`,
         'native_toolchain_unproven',
       );
     }
   }
-  warn({ kind: 'native_smoke_passed', packages });
+  warn({ kind: 'native_smoke_passed', packages: packages.map((pkg) => pkg.dir) });
 }
 
 /**
