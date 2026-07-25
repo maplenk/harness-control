@@ -52,7 +52,7 @@ import {
   grokAuthJsonPath,
 } from './grok/index.js';
 import { fakeAcpChildPath, writeScenarioFile, type FakeAcpScenario } from './fake/index.js';
-import type { PermissionRequest, SessionUpdate } from './spi.js';
+import { isAdapterError, type PermissionRequest, type SessionUpdate } from './spi.js';
 import { noPayloadToVerify } from './acp/session.js';
 import {
   createClaudeAcpAdapter,
@@ -175,6 +175,65 @@ describe('provider adapter factory — command resolution + version pin (§3, §
     expect(resolved.version).toBe(EXPECTED_OPENCODE_VERSION);
     expect(spawn.command).toBe(resolved.binPath);
     expect(spawn.args).toEqual(['acp', '--pure']);
+  });
+
+  // -------------------------------------------------------------------------
+  // F14 — the implementor's containment ROOT is not defaultable.
+  //
+  // `CreateProviderAdapterOptions.cwd` is optional and this factory used to
+  // substitute `process.cwd()`. Once the read-only shell classifier judges
+  // absolute paths by CONTAINMENT, that substitution binds the boundary to
+  // whatever directory the process happens to be in — which is not proven to be
+  // the agent's assignment worktree, and which on a dev machine is the primary
+  // checkout. Main declined every absolute path, so a defaulted root is a
+  // genuine widening rather than a preserved status quo.
+  //
+  // The role is a RUNTIME value, so the type system cannot demand the pairing;
+  // the refusal therefore happens before anything is constructed. It is the same
+  // move as `NotServiceOwned`: the unsupplied case is unrepresentable in the
+  // path that would consume it.
+  // -------------------------------------------------------------------------
+  it('grok: REFUSES to construct an implementor adapter without an explicit worktree cwd', () => {
+    const fixture = fixtureGrok();
+    const base = {
+      clock: CLOCK,
+      processEnv: { HOME: fixture.realHome, [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin },
+      grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
+      model: 'grok-build',
+    } as const;
+
+    // Role stated directly...
+    expect(() => createGrokBuildAcpAdapter({ ...base, role: 'implementor' })).toThrow(/cwd/i);
+    // ...and role inferred from the mediation config, which is the other way
+    // `buildGrokMediation` learns it is shaping an implementor policy.
+    expect(() =>
+      createGrokBuildAcpAdapter({
+        ...base,
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
+      }),
+    ).toThrow(/cwd/i);
+    // A RELATIVE cwd is refused too: `resolvesInsideRoot` declines a relative
+    // root, so accepting one would silently restore "no absolute path is ever
+    // admissible" — F14 all over again, but quietly.
+    expect(() =>
+      createGrokBuildAcpAdapter({ ...base, role: 'implementor', cwd: 'relative/worktree' }),
+    ).toThrow(/absolute/i);
+
+    // It is an `invalid_argument` adapter error, refused before any resource is
+    // built — no isolated home, no temp dir to leak.
+    try {
+      createGrokBuildAcpAdapter({ ...base, role: 'implementor' });
+      expect.unreachable('construction should have been refused');
+    } catch (error) {
+      expect(isAdapterError(error)).toBe(true);
+      expect((error as { kind?: string }).kind).toBe('invalid_argument');
+    }
+
+    // NEGATIVE CONTROL: roles that never receive a containment-bound policy are
+    // untouched — the refusal is scoped to the role that would consume the root.
+    const verifier = createGrokBuildAcpAdapter({ ...base, role: 'verifier' });
+    cleanups.push(async () => verifier.adapter.close());
+    expect(verifier.adapter.harnessId).toBe(GROK_HARNESS_ID);
   });
 
   it('grok: resolves the installed first-party binary and pins its ACP argv', () => {

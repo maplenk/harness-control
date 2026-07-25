@@ -47,7 +47,7 @@ worktree root.** Everything else is refused exactly as before.
 
 | file | what changed |
 | --- | --- |
-| `src/lib/path-containment.ts` (new) | `isPathInside` (:61), `nearestExistingAncestor` (:75), `resolvesInsideRoot` (:99) — the containment computation, extracted so there is ONE copy. |
+| `src/lib/path-containment.ts` (new) | `isPathInside` (:66), `nearestExistingAncestor` (:115), `resolvesInsideRoot` (:143) — the containment computation, extracted so there is ONE copy. |
 | `src/adapters/grok/command.ts:313` | `hasEscapingPathArgument(argv, worktreeRoot)` — `startsWith('/')` replaced by `worktreeRoot === undefined || !resolvesInsideRoot(worktreeRoot, arg)`. |
 | `src/adapters/grok/command.ts:357` | `isSafeReadOnlyArgv(argv, worktreeRoot)` threads it. |
 | `src/adapters/grok/command.ts:409` | `isGrokReadOnlyShellPermissionTitle(operation, worktreeRoot)` — second parameter REQUIRED (`string \| undefined`). |
@@ -57,7 +57,7 @@ worktree root.** Everything else is refused exactly as before.
 
 ### Why the root is trustworthy at that call site
 
-`buildGrokMediation({ cwd })` ← `createGrokBuildAcpAdapter` (`src/adapters/factory.ts:560,583`)
+`buildGrokMediation({ cwd })` ← `createGrokBuildAcpAdapter` (`src/adapters/factory.ts:561,613`)
 ← `RoleAdapterFactory.create({ cwd })` (`src/app/service.ts:769`)
 ← `OrchestrationService.runRole(runId, runner, spec, cwd)` (`src/app/service.ts:2771`)
 ← `deps.service.runRole(…, handle.worktreePath, …)` (`src/app/flows/implementor.ts:1324`).
@@ -87,9 +87,10 @@ admissible, i.e. exactly today's behaviour, stated rather than assumed.
 1. both sides must be ABSOLUTE (a relative path would silently be resolved against
    `process.cwd()`);
 2. neither may contain a `..` segment (see §4);
-3. `realpathSync(root)`, then `realpathSync(nearestExistingAncestor(candidate))`;
+3. `realpathSync(root)`, then the `lstat`-probed nearest existing ancestor of
+   `candidate` (§4b blocker 1), then `realpathSync` of THAT;
 4. `path.relative` containment between those two realpaths;
-5. any throw, or no existing ancestor → `false`.
+5. any throw, an undecidable ancestor walk, or no existing ancestor → `false`.
 
 `path.relative`, not a string prefix: worktrees are siblings under
 `<repo>.worktrees/`, so `…/assignment-asg_run_a` is a string prefix of
@@ -120,6 +121,66 @@ Resolving it correctly means reimplementing `realpath(3)` component by component
 declining to answer is the honest alternative and `..` appears in no path anyone
 needs. The Grok classifier keeps its own lexical `..` rejections on top (now applied
 to absolute paths too, which the blanket `/` rejection used to hide).
+
+## 4b. Codex round 1 — two blockers, one rule
+
+Both findings were the same rule: **inability to determine containment is not
+evidence of containment.** Both were mine, both were real, both are fixed
+regression-first.
+
+### Blocker 1 — `existsSync` conflates "absent" with "unresolvable"
+
+`nearestExistingAncestor` probed with `existsSync`, which FOLLOWS symlinks (a
+dangling link reports `false`) and swallows every error code (ELOOP, EACCES,
+ENAMETOOLONG report `false` too). The walk therefore stepped OVER an undecidable
+component and answered about a shallower path that really is inside the root.
+
+The sharpest form needs no race: `Write <root>/dangling` where `dangling` is a
+symlink to a not-yet-existing path outside. `existsSync` says the link is not
+there, the walk selects `<root>`, containment says yes — and the write follows the
+link and CREATES the file outside the worktree.
+
+Fixed at `src/lib/path-containment.ts:88-129`: probe with `lstat` (a symlink is an
+ENTRY whether or not its target exists) and act on the error CODE —
+`ENOENT`/`ENOTDIR` are the only definitive absences, per the F9 `lstatSafe`
+contract in `worktree/provision.ts:2450`. Everything else ends the walk as
+`undecidable`, which refuses. Stopping AT a dangling link hands `realpathSync` the
+job of resolving it, and its ENOENT/ELOOP throw is caught as a refusal.
+`nearestExistingAncestor` now returns `{kind:'found',path} | {kind:'undecidable'}`
+— an absent tail component is still skipped, which is what keeps the
+not-yet-created target answerable.
+
+### Blocker 2 — an implementor adapter could default its containment root
+
+`CreateProviderAdapterOptions.cwd` is optional and `createGrokBuildAcpAdapter`
+substituted `process.cwd()` before `buildGrokMediation` bound it as BOTH
+`workspaceWriteRoot` and the classifier's containment root. Main declined every
+absolute path, so a defaulted root is a genuine widening, not a preserved status
+quo. Production always supplies a real worktree (`RoleAdapterOptions.cwd` is
+required), but nothing made that a rule.
+
+The role is a RUNTIME value (`options.role ?? options.permissions?.role`), so the
+type system cannot demand the pairing. `src/adapters/factory.ts:588-603` therefore
+REFUSES to construct an implementor adapter without an explicit `cwd`, and refuses
+a relative one — before `assertSafeGrokProjectConfig`, before the isolated home,
+before any resource exists to leak. A relative cwd is refused rather than accepted
+because `resolvesInsideRoot` declines a relative root, so accepting one would
+silently reinstate "no absolute path is ever admissible" — F14 again, quietly.
+`process.cwd()` remains the default for the version probe and the project-config
+scan, which are not containment decisions.
+
+### Not blocking, restored
+
+`command.test.ts` — the F11-era pin proving a single-quoted NUL is still rejected
+had been deleted. Cause: my own scripted rewrite of the 22 call sites had a branch
+that advanced its output cursor without copying the text it skipped, silently
+dropping ~28 lines. The behaviour was never broken, but deleting a guard's proof is
+how the guard later dies quietly. Restored, plus a second assertion that it stays
+refused WITH a root in hand (F14 widened which absolute PATHS are admissible,
+nothing about which BYTES are). I then diffed every touched file against `a77f3da`
+for parent lines with no counterpart in HEAD: the only remaining absences are the
+intended edits (import rewrites, the moved containment helpers, the rewritten
+predicate). Nothing else was lost.
 
 ## 5. Fails-on-parent proof
 
@@ -155,6 +216,23 @@ Every REFUSE-direction case already passed on the parent (it refused everything)
 that is the point of pinning them: they prove the fix did not trade one direction
 for the other. The §4 finding fails on the parent too (proof above).
 
+### Round 2 (codex blockers), same discipline
+
+```
+$ npx vitest run src/lib/path-containment.test.ts src/adapters/grok/command.test.ts src/adapters/factory.test.ts
+      Tests  6 failed | 136 passed (142)
+
+FAIL … factory … > grok: REFUSES to construct an implementor adapter without an explicit worktree cwd
+FAIL … resolvesInsideRoot > DECLINES a dangling symlink component instead of treating it as absent
+FAIL … resolvesInsideRoot > DECLINES when a component cannot be stat-ed at all (errors are not absence)
+FAIL … nearestExistingAncestor > walks up to the first path that exists, and reports what it could not decide
+FAIL … F14 … > REFUSES a DANGLING symlink inside the worktree (an entry that exists and resolves nowhere)
+FAIL … F14 … > REFUSES a path THROUGH a dangling symlink
+```
+
+Written against the round-1 implementation, i.e. they fail on `5733c7f` — the commit
+codex reviewed — for the reasons codex named, not for a compile error.
+
 ## 6. The case table actually pinned
 
 ### ADMITTED (absolute, inside the worktree)
@@ -166,7 +244,9 @@ for the other. The §4 finding fails on the parent too (proof above).
 | a subdirectory, a deep subdirectory, a file | both |
 | a SINGLE-QUOTED absolute path inside | `command.test.ts` |
 | several absolute inside-paths in one command | `command.test.ts` |
-| a not-yet-existing file whose nearest existing ancestor is inside | both |
+| a not-yet-existing file whose nearest existing ancestor is inside — the case the `lstat` tightening had to preserve, re-asserted after it | both |
+| a not-yet-existing file under a not-yet-existing directory | `path-containment.test.ts` |
+| a non-implementor Grok adapter constructed without `cwd` (negative control: the refusal is scoped to the role that consumes the root) | `factory.test.ts` |
 | `git log --oneline -5 <root>/docs` | `command.test.ts` |
 | a symlink inside the worktree pointing to another place inside it | `path-containment.test.ts` |
 | relative paths (`.`, `web`, `docs/x.md`) — unchanged | `command.test.ts` |
@@ -191,6 +271,13 @@ for the other. The §4 finding fails on the parent too (proof above).
 | absolute paths with no root / `''` / a relative root / a nonexistent root (relative inspection still works) | `command.test.ts`, `path-containment.test.ts` |
 | a `..` in the ROOT | `path-containment.test.ts` |
 | a NUL-bearing path | `path-containment.test.ts` |
+| **a DANGLING symlink inside the worktree** — the entry exists, `existsSync` calls it absent, following it would create/read outside | `command.test.ts`, `path-containment.test.ts` |
+| **a path THROUGH a dangling symlink** | `command.test.ts`, `path-containment.test.ts` |
+| **a symlink LOOP** (ELOOP — an error that is not absence) | `path-containment.test.ts` |
+| **a component longer than `NAME_MAX`** (ENAMETOOLONG — the other suppressed-error shape) | `path-containment.test.ts` |
+| a NUL-bearing single-quoted argument, with AND without a root (restored F11 pin) | `command.test.ts` |
+| **constructing a Grok implementor adapter with no `cwd`** (role stated, and role inferred from the mediation config) → `invalid_argument`, before any resource is built | `factory.test.ts` |
+| **constructing one with a RELATIVE `cwd`** → `invalid_argument` | `factory.test.ts` |
 | non-widening sweep with a root supplied: `rm -rf`, `>` write redirection, `mkdir -p`, `npm run typecheck`, `--output=`, `rg --pre`, `$( … )`, `curl` | `command.test.ts` |
 | **production wiring**: `/etc`, the worktree's parent, `<cwd>/../secret` → `denied_default` | `permissions.test.ts` |
 | `Write \`<root>/escape/../pwned.txt\`` (§4, newly closed) | `session.test.ts` |
@@ -198,26 +285,29 @@ for the other. The §4 finding fails on the parent too (proof above).
 
 ## 7. Green bar
 
-| | parent | with fix |
-| --- | --- | --- |
-| `npm run typecheck` | exit 0 | exit 0 |
-| `npx vitest run` | 106 files / 1945 passed | **107 files / 1987 passed**, 0 failed |
-| `npx vitest list --filesOnly` | 106 | 107 (floor is 103) |
+| | parent | round 1 | after the codex blockers |
+| --- | --- | --- | --- |
+| `npm run typecheck` | exit 0 | exit 0 | exit 0 |
+| `npx vitest run` | 106 files / 1945 passed | 107 / 1987 | **107 files / 1993 passed**, 0 failed |
+| `npx vitest list --filesOnly` | 106 | 107 | 107 (floor is 103) |
 
-42 new tests. Each commit in the map is independently green — verified by extracting
-it with `git archive` (read-only) and running typecheck + the suite there:
-`794b6c5` 107 files / 1952 passed, `efd0a9c` 107 / 1987, `ee9d133` 107 / 1987,
-`4281200` (docs only) 107 / 1987. All typecheck exit 0.
+48 new tests. Each round-1 commit was verified independently green by extracting it
+with `git archive` (read-only) and running typecheck + the suite there: `794b6c5`
+107 files / 1952 passed, `efd0a9c` 107 / 1987, `ee9d133` 107 / 1987, `4281200`
+(docs) 107 / 1987 — all typecheck exit 0.
 
-A green suite is not the gate — codex adversarial review is.
+A green suite is not the gate — codex adversarial review is. Round 1 was green and
+still had two blockers in it.
 
 ## 8. What I could NOT verify, and known residuals
 
-- **No live grok run.** The fix is proven at the classifier and at the
-  mediation-construction boundary, not end-to-end against a real grok binary. The
-  next dogfood run is the real test.
-- **`dist/` is gitignored and was not rebuilt here.** `npm run build` before the next
-  dogfood run, or the run executes the old classifier.
+- **LANDING STEP — `dist/` must be rebuilt.** `dist/` is gitignored and is not built
+  in this worktree, and the dogfood run executes the BUILT classifier. Without
+  `npm run build` at merge, the next run executes the old one and F14 reproduces
+  exactly as before. (Coordinator is handling this at merge.)
+- **No live grok run.** The fix is proven at the classifier, at the
+  mediation-construction boundary, and at the adapter-construction boundary — not
+  end-to-end against a real grok binary. The next dogfood run is the real test.
 - **The `docs/…` component of run_60ccbfda's command was truncated** in the report I
   was given; I reconstructed it as `docs/HANDOFF-dogfood-F7.md`. Immaterial to the
   verdict: it is a relative path, admissible before and after.
@@ -238,3 +328,17 @@ A green suite is not the gate — codex adversarial review is.
   what stands between a relative argument and a symlink traversal. Adding the
   trailing-`/..` clause is the one place I tightened relative handling; it is
   strictly additive and can be reverted in one line if a reviewer disagrees.
+- **The dangling-symlink tightening costs denials in one plausible case.** A broken
+  entry inside a provisioned `node_modules` (e.g. a `.bin` link whose target was not
+  installed) makes an ABSOLUTE path naming it undecidable, so it is denied. The
+  relative form is unaffected, and the prompt steers toward relative. Provisioning
+  itself refuses escaping symlinks at clone time (`clone_symlinks_unsafe`), so the
+  common case is a real directory.
+- **Only the Grok implementor construction path is guarded.** Claude/Codex/OpenCode
+  adapters still default `cwd` to `process.cwd()`; none of them binds a containment
+  root today, so the guard would be decoration rather than enforcement. If any of
+  them gains one, it needs the same refusal — the check is role-scoped precisely so
+  that omission is visible rather than inherited.
+- **`ENOTDIR` is treated as absence** (the F9 `lstatSafe` contract). A path under a
+  non-directory cannot exist, so the walk continues to the non-directory itself and
+  resolves THAT — which is where the containment answer actually lives.

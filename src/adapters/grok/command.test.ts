@@ -247,7 +247,19 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
     expect(isGrokReadOnlyShellPermissionTitle('Execute `', undefined)).toBe(false); // empty interior
     expect(isGrokReadOnlyShellPermissionTitle('Execute ls`', undefined)).toBe(false); // no prefix backtick
     expect(isGrokReadOnlyShellPermissionTitle('Run `ls`', undefined)).toBe(false); // wrong verb
-    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls', undefined)).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls', undefined)).toBe(false); // no suffix
+  });
+
+  it('control characters are refused inside single quotes too (a NUL is never a literal)', () => {
+    // CR/LF cannot even reach the scanner (the `Execute ...` wrapper excludes
+    // them), but a NUL can — and single-quoting must not make it acceptable.
+    const nul = String.fromCharCode(0);
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a" + nul + "b' src`", undefined)).toBe(false);
+    // ...and it stays refused with a worktree root in hand: F14 widened WHICH
+    // absolute paths are admissible, nothing about which BYTES are.
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a" + nul + "b' src`", worktreeFixture().root)).toBe(
+      false,
+    );
   });
 });
 
@@ -310,6 +322,10 @@ function worktreeFixture(): WorktreeFixture {
   // A symlink INSIDE the worktree pointing OUT of it — the escape a lexical
   // check cannot see.
   symlinkSync(outside, path.join(root, 'escape'));
+  // A DANGLING symlink pointing out of the worktree: the entry exists, its
+  // target does not. `existsSync` calls this "absent", which is how an
+  // undecidable component gets stepped over.
+  symlinkSync(path.join(base, 'not-created-yet'), path.join(root, 'dangling'));
   return { root, sibling, parent, outside };
 }
 
@@ -363,6 +379,8 @@ describe('F14 — absolute paths are judged by CONTAINMENT, not by their first b
     ['an absolute path that does not exist at all', () => 'cat /no-such-root/no-such-file'],
     ['ONE outside argument among admissible ones', (f: WorktreeFixture) => `ls -la ${f.root} /etc`],
     ['a `=/` option value, even one pointing INSIDE the worktree', (f: WorktreeFixture) => `rg -n foo --file=${f.root}/pat.txt`],
+    ['a DANGLING symlink inside the worktree (an entry that exists and resolves nowhere)', (f: WorktreeFixture) => `ls -la ${f.root}/dangling`],
+    ['a path THROUGH a dangling symlink', (f: WorktreeFixture) => `cat ${f.root}/dangling/file.txt`],
     ['a bare `..`', () => 'cat ..'],
     ['a leading `../`', () => 'cat ../outside.txt'],
     ['an interior `/../`', () => 'cat web/../../etc/passwd'],

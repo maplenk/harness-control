@@ -23,11 +23,16 @@
  *    can look contained while landing outside. Only asking the filesystem what a
  *    path really names answers the question that matters.
  *
- *  - **The nearest EXISTING ancestor.** `realpathSync` fails on a path that does
- *    not exist yet, and "the file is not there yet" is a legitimate answer for a
- *    write target (and for a read that will simply fail). Walking up to the first
- *    existing ancestor and resolving THAT keeps the symlink resolution honest for
- *    every component that exists, which is every component an escape could use.
+ *  - **The nearest EXISTING ancestor, probed with `lstat`.** `realpathSync` fails
+ *    on a path that does not exist yet, and "the file is not there yet" is a
+ *    legitimate answer for a write target (and for a read that will simply fail).
+ *    Walking up to the first existing ancestor and resolving THAT keeps the
+ *    symlink resolution honest for every component that exists, which is every
+ *    component an escape could use. The walk probes with `lstat` and acts on the
+ *    error CODE, because an unresolvable component is not an absent one: a
+ *    dangling symlink is a real entry that `existsSync` calls `false`, and
+ *    stepping over it approves a shallower path while `Write <root>/dangling`
+ *    follows the link and creates a file OUTSIDE the root — no race required.
  *
  *  - **A `..` SEGMENT is refused, not resolved.** Node's `fs.realpathSync` is NOT
  *    POSIX `realpath(3)`: it begins with `path.resolve(p)`, which collapses `..`
@@ -51,7 +56,7 @@
  *    relative path on either side: inability to determine containment is never
  *    evidence of containment.
  */
-import { existsSync, realpathSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import * as path from 'node:path';
 
 /**
@@ -67,17 +72,56 @@ export function isPathInside(root: string, candidate: string): boolean {
 }
 
 /**
- * The first ancestor of `candidate` that exists on disk (the path itself when it
- * exists). `undefined` only when the walk reaches a filesystem root that does not
- * exist, which cannot happen on a mounted tree but is reported honestly rather
- * than assumed away.
+ * What one path component turned out to be.
+ *
+ * `existsSync` cannot express this, and that is the whole problem: it FOLLOWS
+ * symlinks (so a dangling link reports `false`) and it swallows every error code
+ * (so ELOOP, EACCES and ENAMETOOLONG report `false` too). An ancestor walk built
+ * on it steps OVER an undecidable component and answers about a shallower path
+ * that really is inside the root — an approval derived from a question we failed
+ * to ask.
+ *
+ * `ENOENT`/`ENOTDIR` are the only definitive non-existence answers (the F9
+ * `lstatSafe` contract, `worktree/provision.ts`). Everything else is an unknown,
+ * and unknowns refuse.
  */
-export function nearestExistingAncestor(candidate: string): string | undefined {
+type ComponentProbe = 'present' | 'absent' | 'undecidable';
+
+function probeComponent(target: string): ComponentProbe {
+  try {
+    // lstat, NOT stat: a symlink is an ENTRY whether or not its target exists.
+    // Stopping AT the link hands `realpathSync` the job of resolving it, which
+    // is exactly who should decide whether it lands inside the root.
+    lstatSync(target);
+    return 'present';
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? 'absent' : 'undecidable';
+  }
+}
+
+/** The outcome of the ancestor walk — `undecidable` is a first-class answer. */
+export type AncestorResolution =
+  | { readonly kind: 'found'; readonly path: string }
+  | { readonly kind: 'undecidable' };
+
+/**
+ * The first ancestor of `candidate` that EXISTS as a directory entry (the path
+ * itself when it does). A genuinely absent tail component is skipped — that is
+ * what makes a not-yet-created target answerable — but a component that exists
+ * and cannot be resolved, or whose stat fails for any reason other than plain
+ * absence, ends the walk as `undecidable`.
+ */
+export function nearestExistingAncestor(candidate: string): AncestorResolution {
   let current = candidate;
   for (;;) {
-    if (existsSync(current)) return current;
+    const probe = probeComponent(current);
+    if (probe === 'present') return { kind: 'found', path: current };
+    if (probe === 'undecidable') return { kind: 'undecidable' };
     const parent = path.dirname(current);
-    if (parent === current) return undefined;
+    // A filesystem root that does not exist cannot happen on a mounted tree;
+    // reported honestly rather than assumed away.
+    if (parent === current) return { kind: 'undecidable' };
     current = parent;
   }
 }
@@ -102,8 +146,11 @@ export function resolvesInsideRoot(root: string, candidate: string): boolean {
   try {
     const realRoot = realpathSync(root);
     const ancestor = nearestExistingAncestor(candidate);
-    if (ancestor === undefined) return false;
-    return isPathInside(realRoot, realpathSync(ancestor));
+    if (ancestor.kind !== 'found') return false;
+    // `realpathSync` on a DANGLING link throws ENOENT and on a LOOP throws
+    // ELOOP; both land in the catch below, which is the correct answer — the
+    // path exists and names nothing we can place.
+    return isPathInside(realRoot, realpathSync(ancestor.path));
   } catch {
     return false;
   }

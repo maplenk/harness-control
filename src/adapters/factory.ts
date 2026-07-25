@@ -50,6 +50,7 @@
  * live gate — offline tests exercise this factory against the fake child via
  * `spawnOverride` (documented below).
  */
+import * as path from 'node:path';
 import type { Clock } from '../lib/clock.js';
 import { SystemClock } from '../lib/clock.js';
 import type { RoleName } from '../domain/state.js';
@@ -567,6 +568,38 @@ export function createGrokBuildAcpAdapter(
     throw new AdapterError('invalid_argument', 'Grok Build role and permission role must match', {
       harnessId: GROK_HARNESS_ID,
     });
+  }
+  // F14 — the implementor's `cwd` is a SECURITY BOUNDARY, not a convenience.
+  //
+  // `buildGrokMediation` binds it as both `workspaceWriteRoot` and the
+  // containment root of the read-only shell classifier. The `?? process.cwd()`
+  // above is a fine default for the version probe and the project-config scan;
+  // it is NOT a defensible containment root, because the process's directory is
+  // not proven to be the agent's assignment worktree (on a dev machine it is the
+  // primary checkout). Before F14 the classifier declined every absolute path, so
+  // a defaulted root would be a genuine WIDENING, not a preserved status quo.
+  //
+  // The role is a runtime value, so the type system cannot demand the pairing.
+  // The refusal therefore happens here — before `assertSafeGrokProjectConfig`,
+  // before the isolated home, before any resource exists to leak. A relative cwd
+  // is refused for the mirror-image reason: `resolvesInsideRoot` declines a
+  // relative root, so accepting one would silently reinstate "no absolute path is
+  // ever admissible" — F14 again, but quietly.
+  if (role === 'implementor') {
+    if (options.cwd === undefined) {
+      throw new AdapterError(
+        'invalid_argument',
+        'Grok Build implementor sessions require an explicit cwd (the assignment worktree): it is the containment root for workspace writes and read-only shell inspection, and process.cwd() is not proven to be it',
+        { harnessId: GROK_HARNESS_ID },
+      );
+    }
+    if (!path.isAbsolute(options.cwd)) {
+      throw new AdapterError(
+        'invalid_argument',
+        `Grok Build implementor cwd must be an absolute path (the assignment worktree), received ${JSON.stringify(options.cwd)}`,
+        { harnessId: GROK_HARNESS_ID },
+      );
+    }
   }
   assertSafeGrokProjectConfig(cwd);
 
