@@ -583,13 +583,14 @@ export function createGrokBuildAcpAdapter(
               ]),
             ],
             allowReadOnlyOperation: isGrokReadOnlyShellPermissionTitle,
-            // HIGH-5: the payload VETO, applied to EVERY approval path (the exact
-            // allowlist included — that is the path the first attempt missed). A
-            // shell title is approved only when `rawInput.command` is
-            // byte-identical to the command the title displays.
-            verifyOperationPayload: grokShellPayloadMatchesTitle,
             workspaceWriteRoot: cwd,
           },
+          // HIGH-5: the payload VETO, on the config ROOT so it gates EVERY
+          // approval in EVERY mediation mode — the exact allowlist and the
+          // interactive branch included, which are the two paths the earlier
+          // attempts missed. A shell title is approved only when
+          // `rawInput.command` is byte-identical to the command the title shows.
+          verifyOperationPayload: grokShellPayloadMatchesTitle,
         }
       : options.permissions;
   const providerOptions: CreateProviderAdapterOptions = {

@@ -200,15 +200,17 @@ describe('permission mediation decision core (§10.2, T20)', () => {
   describe('verifyOperationPayload — the veto applies to every allow', () => {
     const shellTitle = 'Execute `npm run typecheck`';
     /** Byte-identity between the title's command and the payload's. */
-    const verifyOperationPayload = (operation: string, rawInput: unknown): boolean => {
-      const match = /^Execute `(.+)`$/.exec(operation);
-      if (match === null) return true; // not a shell operation: nothing to bind
+    const verifyOperationPayload = (operation: string | undefined, rawInput: unknown): boolean => {
       const command = (rawInput as { command?: unknown } | null | undefined)?.command;
+      const match = operation !== undefined ? /^Execute `(.+)`$/.exec(operation) : null;
+      // Fail closed on ambiguity: an unreadable title is non-shell ONLY when the
+      // payload also carries no command (mirrors grokShellPayloadMatchesTitle).
+      if (match === null) return typeof command !== 'string'
       return typeof command === 'string' && command === match[1];
     };
 
     it('VETOES an ALLOWLISTED title whose payload is missing or hostile', () => {
-      const policy = { mode: 'headless', policy: { allow: [shellTitle], verifyOperationPayload } } as const;
+      const policy = { mode: 'headless', policy: { allow: [shellTitle] }, verifyOperationPayload } as const;
       // The regression: allowlisted + no payload used to be `allow/allowlisted`.
       expect(decidePermission(policy, shellTitle, undefined)).toEqual({
         action: 'deny',
@@ -228,7 +230,8 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     it('VETOES a READ-ONLY-classified title whose payload diverges', () => {
       const policy = {
         mode: 'headless',
-        policy: { allow: [], allowReadOnlyOperation: () => true, verifyOperationPayload },
+        policy: { allow: [], allowReadOnlyOperation: () => true },
+        verifyOperationPayload,
       } as const;
       expect(decidePermission(policy, 'Execute `ls`', { command: 'rm -rf /' })).toEqual({
         action: 'deny',
@@ -244,7 +247,8 @@ describe('permission mediation decision core (§10.2, T20)', () => {
       const policy = {
         mode: 'headless',
         role: 'implementor',
-        policy: { allow: [], workspaceWriteRoot: '/repo', verifyOperationPayload: () => false },
+        policy: { allow: [], workspaceWriteRoot: '/repo' },
+        verifyOperationPayload: () => false,
       } as const;
       expect(decidePermission(policy, 'Write `/repo/src/a.ts`', undefined).action).toBe('deny');
     });
@@ -252,17 +256,33 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     it('a THROWING veto is a denial, never a pass', () => {
       const policy = {
         mode: 'headless',
-        policy: {
-          allow: [shellTitle],
-          verifyOperationPayload: (): boolean => {
-            throw new Error('classifier exploded');
-          },
+        policy: { allow: [shellTitle] },
+        verifyOperationPayload: (): boolean => {
+          throw new Error('classifier exploded');
         },
       } as const;
       expect(decidePermission(policy, shellTitle, { command: 'npm run typecheck' })).toEqual({
         action: 'deny',
         reason: 'denied_raw_input_mismatch',
       });
+    });
+
+    it('runs BEFORE the interactive branch — no mediation mode can bypass it', () => {
+      // Round-4 evaluated the veto only after `mode === 'interactive'` returned,
+      // so an interactive decider (or a configured handler) could forward a
+      // `selected` option for a payload that was never bound to its title.
+      const policy = { mode: 'interactive', onRequest: async () => ({ kind: 'cancelled' as const }) };
+      expect(
+        decidePermission({ ...policy, verifyOperationPayload } as never, shellTitle, {
+          command: 'rm -rf /',
+        }),
+      ).toEqual({ action: 'deny', reason: 'denied_raw_input_mismatch' });
+      // An honest interactive request still reaches the human.
+      expect(
+        decidePermission({ ...policy, verifyOperationPayload } as never, shellTitle, {
+          command: 'npm run typecheck',
+        }),
+      ).toEqual({ action: 'interactive', reason: 'interactive' });
     });
 
     it('no veto configured leaves every existing decision untouched', () => {

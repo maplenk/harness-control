@@ -52,7 +52,7 @@ import {
   grokAuthJsonPath,
 } from './grok/index.js';
 import { fakeAcpChildPath, writeScenarioFile, type FakeAcpScenario } from './fake/index.js';
-import type { SessionUpdate } from './spi.js';
+import type { PermissionRequest, SessionUpdate } from './spi.js';
 import {
   createClaudeAcpAdapter,
   createCodexAcpAdapter,
@@ -646,10 +646,13 @@ describe('provider adapter factory — composed initialize() over the fake wire 
           action: 'allow',
           reason: 'allowlisted_read_only_operation',
         }),
+        // The scenario sends this scaffolding attempt with no rawInput, so the
+        // payload VETO refuses it before the read-only classifier is even
+        // consulted — a stricter denial than the round-4 'denied_default'.
         expect.objectContaining({
           operation: 'Execute `mkdir -p src/app/commands`',
           action: 'deny',
-          reason: 'denied_default',
+          reason: 'denied_raw_input_mismatch',
         }),
         expect.objectContaining({
           operation: 'Execute `npm run typecheck`',
@@ -708,10 +711,19 @@ describe('provider adapter factory — composed initialize() over the fake wire 
       });
       cleanups.push(async () => created.adapter.close());
 
+      const updates: SessionUpdate[] = [];
       await created.adapter.initialize();
       const session = await created.adapter.createSession({ cwd: fixture.cwd });
-      await created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'divergent payload' });
-      await created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'no raw input' });
+      await created.adapter.prompt({
+        sessionId: session.acpSessionId,
+        prompt: 'divergent payload',
+        onUpdate: (u) => updates.push(u),
+      });
+      await created.adapter.prompt({
+        sessionId: session.acpSessionId,
+        prompt: 'no raw input',
+        onUpdate: (u) => updates.push(u),
+      });
 
       expect(created.adapter.permissionDecisions).toEqual([
         expect.objectContaining({
@@ -725,6 +737,12 @@ describe('provider adapter factory — composed initialize() over the fake wire 
           reason: 'denied_raw_input_mismatch',
         }),
       ]);
+      // HIGH-5: the surfaced request carries what will EXECUTE, so an
+      // interactive decider judges the payload rather than the prose.
+      const surfaced = updates.filter((u) => u.kind === 'permission_request');
+      expect(surfaced).toHaveLength(2);
+      expect(surfaced[0]).toMatchObject({ request: { rawInput: { command: 'rm -rf /' } } });
+      expect((surfaced[1] as { request: PermissionRequest }).request.rawInput).toBeUndefined();
     },
     GENEROUS_MS,
   );

@@ -113,24 +113,6 @@ export interface HeadlessPermissionPolicy {
    */
   readonly allowReadOnlyOperation?: (operation: string) => boolean;
   /**
-   * HIGH-5 — a VETO consulted before EVERY `allow` this function can return.
-   *
-   * A permission TITLE is human-readable prose the provider composes; ACP
-   * `rawInput` is the payload it EXECUTES. Approving on the title alone
-   * authorizes a string nothing runs. The first attempt at this bound the two
-   * INSIDE `allowReadOnlyOperation` — which left the exact-allowlist match,
-   * checked FIRST, approving `Execute \`npm run typecheck\`` with a missing or
-   * hostile payload and never consulting the binding at all. (The verifier
-   * legitimately keeps exact per-criterion allowlisted commands, so that path
-   * has to be sound on its own.)
-   *
-   * Return false to REFUSE an approval that would otherwise be granted; a THROW
-   * is likewise a refusal. Return true for operations with no payload to bind
-   * (structured `Write`/`Edit` titles), so the veto never denies them for
-   * lacking a shell command.
-   */
-  readonly verifyOperationPayload?: (operation: string, rawInput: unknown) => boolean;
-  /**
    * Optional canonical workspace boundary for structured path-qualified
    * `Write` / `Edit` operations. Shell-shaped or unparseable operations never
    * match. The provider factory enables this only for the Grok implementor.
@@ -138,10 +120,27 @@ export interface HeadlessPermissionPolicy {
   readonly workspaceWriteRoot?: string;
 }
 
+/**
+ * HIGH-5 — a VETO consulted before EVERY approval, in EVERY mediation mode.
+ *
+ * A permission TITLE is human-readable prose the provider composes; ACP
+ * `rawInput` is the payload it EXECUTES. Approving on the title alone authorizes
+ * a string nothing runs. This lives on the config ROOT, not on the headless
+ * policy, because it is not an allowlist concern: it is a precondition of any
+ * approval. Round 4 placed it on the headless policy and evaluated it after the
+ * interactive branch had already returned, so an interactive decider could
+ * forward a `selected` option for an unbound payload.
+ *
+ * Return false to REFUSE an approval that would otherwise be granted; a THROW is
+ * likewise a refusal. Return true only when there is genuinely nothing to bind.
+ */
+export type VerifyOperationPayload = (operation: string | undefined, rawInput: unknown) => boolean;
+
 export type PermissionMediationConfig =
   | {
       readonly mode: 'interactive';
       readonly role?: RoleName;
+      readonly verifyOperationPayload?: VerifyOperationPayload;
       /**
        * Interactive surface. When present, invoked per request (the outcome
        * is forwarded to the agent). When absent, the request is surfaced via
@@ -152,6 +151,7 @@ export type PermissionMediationConfig =
   | {
       readonly mode: 'headless';
       readonly role?: RoleName;
+      readonly verifyOperationPayload?: VerifyOperationPayload;
       /** Omitted policy = empty allowlist = default DENY everything. */
       readonly policy?: HeadlessPermissionPolicy;
     };
@@ -248,32 +248,38 @@ export function decidePermission(
   if ((role === 'coordinator' || role === 'verifier') && isWriteOperation(operation)) {
     return { action: 'deny', reason: 'denied_role_write' };
   }
+  // HIGH-5 (round 5): the payload binding runs BEFORE ANY MEDIATION BRANCH.
+  // Round 4 evaluated it only after the interactive branch had returned, so an
+  // interactive decider — or a configured handler — could forward a `selected`
+  // option for a payload never bound to its title. Every path that can end in an
+  // approval now passes through here first, headless and interactive alike. A
+  // throw is a refusal: a veto that cannot run must never widen a decision.
+  //
+  // The operation is passed through even when undefined/empty: deciding whether
+  // an unreadable title is "not a shell request" or "a shell request we cannot
+  // read" is the veto's job, not this function's (see
+  // `grokShellPayloadMatchesTitle`).
+  if (config.verifyOperationPayload !== undefined) {
+    let vetoed: boolean;
+    try {
+      vetoed = config.verifyOperationPayload(operation, rawInput) !== true;
+    } catch {
+      vetoed = true;
+    }
+    if (vetoed) return { action: 'deny', reason: 'denied_raw_input_mismatch' };
+  }
   if (config.mode === 'interactive') {
     return { action: 'interactive', reason: 'interactive' };
   }
   if (operation === undefined || operation.trim() === '') {
     return { action: 'deny', reason: 'denied_unknown_operation' };
   }
-  // HIGH-5: the payload binding gates EVERY approval below — allowlist included.
-  // Evaluated once, here, so no future approval path can be added that forgets
-  // it. A throw is a refusal: a veto that cannot run must never widen a decision.
-  let payloadVetoed = false;
-  if (config.policy?.verifyOperationPayload !== undefined) {
-    try {
-      payloadVetoed = config.policy.verifyOperationPayload(operation, rawInput) !== true;
-    } catch {
-      payloadVetoed = true;
-    }
-  }
-  const approve = (reason: PermissionDecisionReason): PermissionDecision =>
-    payloadVetoed ? { action: 'deny', reason: 'denied_raw_input_mismatch' } : { action: 'allow', reason };
-
   if ((config.policy?.allow ?? []).includes(operation)) {
-    return approve('allowlisted');
+    return { action: 'allow', reason: 'allowlisted' };
   }
   try {
     if (config.policy?.allowReadOnlyOperation?.(operation) === true) {
-      return approve('allowlisted_read_only_operation');
+      return { action: 'allow', reason: 'allowlisted_read_only_operation' };
     }
   } catch {
     // A classifier failure must never widen a headless permission decision.
@@ -283,7 +289,7 @@ export function decidePermission(
     config.policy?.workspaceWriteRoot !== undefined &&
     isWorkspaceWriteOperation(operation, config.policy.workspaceWriteRoot)
   ) {
-    return approve('allowlisted_workspace_write');
+    return { action: 'allow', reason: 'allowlisted_workspace_write' };
   }
   return { action: 'deny', reason: 'denied_default' };
 }
@@ -1124,6 +1130,9 @@ export class AcpStdioAdapter implements HarnessAdapter {
       sessionId: acpSessionId(sessionKey),
       description: title ?? 'Permission requested',
       ...(title !== undefined ? { toolTitle: title } : {}),
+      // HIGH-5: an interactive decider must see what will EXECUTE, not only the
+      // title describing it.
+      ...(toolCall?.['rawInput'] !== undefined ? { rawInput: toolCall['rawInput'] } : {}),
       options,
     };
     const pending: PendingPermission = { jsonrpcId: id, sessionId: sessionKey, request, operation: title };

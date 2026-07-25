@@ -401,10 +401,20 @@ export function grokRawShellCommand(rawInput: unknown): string | undefined {
  * those on the path itself. Fail-closed for shell titles on every gap: absent
  * `rawInput`, a non-object, a missing/non-string `command`, or any divergence.
  */
-export function grokShellPayloadMatchesTitle(operation: string, rawInput: unknown): boolean {
-  const titled = commandFromPermissionTitle(operation);
-  if (titled === undefined) return true; // not a shell operation — nothing to bind
+export function grokShellPayloadMatchesTitle(operation: string | undefined, rawInput: unknown): boolean {
   const executed = grokRawShellCommand(rawInput);
+  const titled = operation !== undefined ? commandFromPermissionTitle(operation) : undefined;
+  if (titled === undefined) {
+    // ROUND 5 — the default is INVERTED. "Non-shell" used to be inferred from
+    // TITLE SYNTAX alone, which is attacker-shaped input: a malformed but
+    // exactly-allowlisted shell title, or a `Write` title carrying
+    // `{command: …}`, parsed as non-shell and so bound NOTHING — vacuously
+    // valid. A title we cannot parse is only genuinely non-shell when the
+    // PAYLOAD also carries no command; if it does carry one, we are looking at a
+    // shell request whose title we cannot read, which is precisely the case to
+    // refuse. Fail closed on ambiguity.
+    return executed === undefined;
+  }
   return executed !== undefined && executed === titled;
 }
 
