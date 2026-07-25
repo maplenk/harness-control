@@ -96,6 +96,8 @@ async function expectRejectsWithKind(promise: Promise<unknown>, kind: WorktreeEr
  * `node_modules/` ignore rule — the shape provisioning acts on. */
 async function makeDepsRepo(opts: {
   readonly deps?: Record<string, string>;
+  /** F9: declared devDependencies — proven by the primary-tree check like `deps`. */
+  readonly devDeps?: Record<string, string>;
   readonly lock?: string;
   readonly npmrc?: string;
   readonly ignore?: boolean;
@@ -105,7 +107,16 @@ async function makeDepsRepo(opts: {
   if (opts.ignore !== false) await repo.writeFile('.gitignore', 'node_modules/\n');
   await repo.writeFile(
     'package.json',
-    `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: opts.deps ?? { 'left-pad': '1.0.0' } }, null, 2)}\n`,
+    `${JSON.stringify(
+      {
+        name: 'x',
+        version: '1.0.0',
+        dependencies: opts.deps ?? { 'left-pad': '1.0.0' },
+        ...(opts.devDeps !== undefined ? { devDependencies: opts.devDeps } : {}),
+      },
+      null,
+      2,
+    )}\n`,
   );
   await repo.writeFile('package-lock.json', opts.lock ?? DEFAULT_LOCK);
   if (opts.npmrc !== undefined) await repo.writeFile('.npmrc', opts.npmrc);
@@ -113,18 +124,61 @@ async function makeDepsRepo(opts: {
   return repo;
 }
 
+/**
+ * F9: writes an INSTALLED package dir under `nm`. `native:true` gives it a
+ * `binding.gyp` + an install script (the better-sqlite3 shape the runtime smoke
+ * targets); `built:false` leaves its entry point loading a `.node` that was never
+ * compiled — the exact P1 breakage a script-less install produces.
+ */
+function writeInstalledPackage(
+  nm: string,
+  name: string,
+  opts: { readonly native?: boolean; readonly built?: boolean } = {},
+): void {
+  const dir = path.join(nm, name);
+  fs.mkdirSync(dir, { recursive: true });
+  const manifest: Record<string, unknown> = { name, version: '1.0.0', main: 'index.js' };
+  if (opts.native === true) {
+    manifest['scripts'] = { install: 'prebuild-install || node-gyp rebuild' };
+    fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
+    fs.writeFileSync(
+      path.join(dir, 'index.js'),
+      opts.built === false
+        ? "module.exports = require('./build/Release/bind.node');\n" // never built -> load fails
+        : 'module.exports = { native: true };\n',
+    );
+  } else {
+    fs.writeFileSync(path.join(dir, 'index.js'), 'CLONE_SOURCE\n');
+  }
+  fs.writeFileSync(path.join(dir, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
 /** A REAL on-disk primary `node_modules` (the clone source), with a safe relative
  * `.bin` link — exactly the shape a dev's installed tree has. Git-ignored, so it
  * sits on disk untracked, never committed. */
 async function writePrimaryNodeModules(
   root: string,
-  opts: { readonly withVite?: boolean; readonly badLink?: 'absolute' | 'escaping' } = {},
+  opts: {
+    readonly withVite?: boolean;
+    readonly badLink?: 'absolute' | 'escaping';
+    /** F9: which declared packages actually exist in the tree (default `left-pad`). */
+    readonly packages?: readonly string[];
+    /** F9: a script-bearing native package, optionally left unbuilt. */
+    readonly native?: { readonly name: string; readonly built: boolean };
+  } = {},
 ): Promise<string> {
   const nm = path.join(root, 'node_modules');
   fs.mkdirSync(path.join(nm, '.bin'), { recursive: true });
-  fs.mkdirSync(path.join(nm, 'left-pad'), { recursive: true });
-  fs.writeFileSync(path.join(nm, 'left-pad', 'index.js'), 'CLONE_SOURCE\n');
-  await symlink('../left-pad/index.js', path.join(nm, '.bin', 'left-pad')); // safe relative link
+  for (const name of opts.packages ?? ['left-pad']) writeInstalledPackage(nm, name);
+  if (opts.native !== undefined) {
+    writeInstalledPackage(nm, opts.native.name, { native: true, built: opts.native.built });
+  }
+  // Safe relative link — present whenever `left-pad` is (the default tree shape).
+  if (fs.existsSync(path.join(nm, 'left-pad'))) {
+    await symlink('../left-pad/index.js', path.join(nm, '.bin', 'left-pad'));
+  } else {
+    fs.writeFileSync(path.join(nm, '.bin', 'placeholder'), '#!/bin/sh\n');
+  }
   if (opts.withVite === true) {
     fs.mkdirSync(path.join(nm, '.vite'), { recursive: true });
     fs.writeFileSync(path.join(nm, '.vite', 'deps.json'), 'stale-cache\n');
@@ -181,6 +235,8 @@ async function openManager(
     readonly provision?: ProvisionStrategy;
     readonly warn?: (event: ProvisionWarnEvent) => void;
     readonly provisionGit?: ProvisionGit;
+    /** F9: the bounded-command deadline, shrunk so a hung fake seam is testable. */
+    readonly timeoutMs?: number;
   } = {},
 ): Promise<GitWorktreeManager> {
   const manager = await GitWorktreeManager.open({
@@ -190,6 +246,7 @@ async function openManager(
     ...(opts.provision !== undefined ? { provision: opts.provision } : {}),
     ...(opts.warn !== undefined ? { provisionWarn: opts.warn } : {}),
     ...(opts.provisionGit !== undefined ? { provisionGit: opts.provisionGit } : {}),
+    ...(opts.timeoutMs !== undefined ? { provisionTimeoutMs: opts.timeoutMs } : {}),
   });
   managers.push(manager);
   return manager;
@@ -1394,6 +1451,344 @@ describe('F7 round-4 #2 (production path) — provisionWorktreeDeps preserves th
     const backups = findBackups(path.join(manager.baseDir, PROVISION_STAGE_SUBDIR, String(asg)));
     expect(backups).toHaveLength(1);
     expect(readFileSync(path.join(backups[0]!, 'gen.txt'), 'utf8')).toBe('GEN1\n'); // the prior tree, intact
+  });
+});
+
+// ===========================================================================
+// F9 — provisioning must PROVE the tree it provides, or fail closed.
+//
+// F7 shipped three lanes that could hand verification an UNPROVEN tree:
+//  P1 the INSTALL lane ran `npm ci --ignore-scripts`, which cannot build a
+//     script-installed native dep (better-sqlite3 lands with no `.node`), while
+//     `hasBinDir` stamped the result "proven" — `.bin/` is populated at UNPACK
+//     time from `bin` fields, entirely independent of lifecycle scripts, so it
+//     can never be a toolchain proof;
+//  P2 that broken tree became STICKY (its marker matched, so every later round
+//     short-circuited onto it and the run burned to terminal);
+//  P3 the FALSE CLONE — eligibility compared manifest FINGERPRINTS but never
+//     validated the primary tree's CONTENTS, so a primary that had not been
+//     `npm install`ed since a dep-adding merge was cloned wholesale;
+//  P4 the config lied: `'clone'` silently fell through to install;
+//  P5 `npm ci` / git ran unbounded while holding the mutex + advisory lease.
+//
+// Every lane that cannot be proven now refuses with a CAUSE CODE the CLI turns
+// into a specific remedy.
+// ===========================================================================
+
+/** Awaits a rejection and returns the WorktreeError for cause/message assertions. */
+async function expectProvisioningFailure(promise: Promise<unknown>): Promise<WorktreeError> {
+  let thrown: unknown;
+  try {
+    await promise;
+  } catch (error) {
+    thrown = error;
+  }
+  expect(isWorktreeError(thrown)).toBe(true);
+  const error = thrown as WorktreeError;
+  expect(error.kind).toBe('provisioning_failed');
+  return error;
+}
+
+describe('F9 AC-1 — a manifest mismatch fails closed (the install fallback is gone)', () => {
+  it('the implementor changed manifests → deps_changed_in_worktree, npm is never invoked', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_f9_deps_changed');
+    const handle = await createAtHead(repo, manager, asg);
+    // The implementor committed a dependency change inside the worktree.
+    fs.writeFileSync(
+      path.join(handle.worktreePath, 'package.json'),
+      `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0', chalk: '5.0.0' } }, null, 2)}\n`,
+    );
+    await commitInWorktree(handle.worktreePath, 'add a dependency');
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('deps_changed_in_worktree');
+    expect(error.message).toContain('package.json'); // names the diverged manifest
+    expect(error.message).toMatch(/engine track/i); // states the remedy
+    // The whole point: no npm, no clone — nothing was built from an unproven input.
+    expect(fake.calls.install).toBe(0);
+    expect(fake.calls.clone).toBe(0);
+    // ...and NO marker was written, so a later round cannot short-circuit onto it.
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
+  });
+
+  it('the PRIMARY has uncommitted manifest edits → primary_manifests_diverged', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_f9_primary_diverged');
+    await createAtHead(repo, manager, asg);
+    // The worktree is untouched; the PRIMARY's on-disk manifest drifted from HEAD.
+    await repo.writeFile(
+      'package.json',
+      `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '2.0.0' } }, null, 2)}\n`,
+    );
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('primary_manifests_diverged');
+    expect(error.message).toContain('package.json');
+    expect(error.message).toMatch(/npm install/i); // the operator's remedy
+    expect(fake.calls.install).toBe(0);
+  });
+
+  it('names the LOCKFILE (only) when that is what diverged', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_f9_lock_diverged');
+    await createAtHead(repo, manager, asg);
+    await repo.writeFile('package-lock.json', `${DEFAULT_LOCK}\n`); // byte-different
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.message).toContain('package-lock.json');
+    expect(error.cause).toBe('primary_manifests_diverged');
+  });
+});
+
+describe('F9 AC-2 — a stale primary tree is never cloned (primary_tree_stale)', () => {
+  it('fingerprints match but a declared package is MISSING from the primary tree → refuse, no clone', async () => {
+    // The exact P3 shape: a dep-adding commit was merged into the primary, but
+    // `npm install` was never run there before the next run started.
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0', chalk: '5.0.0' } }));
+    await writePrimaryNodeModules(repo.dir, { packages: ['left-pad'] }); // chalk missing
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_f9_stale_primary');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('primary_tree_stale');
+    expect(error.message).toContain('chalk'); // names the missing package
+    expect(error.message).toMatch(/npm install/i);
+    expect(fake.calls.clone).toBe(0); // never cloned an unproven source
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules'))).toBe(false);
+  });
+
+  it('devDependencies are proven too (a missing devDep is just as fatal)', async () => {
+    const repo = track(await makeDepsRepo({ devDeps: { vite: '5.0.0' } }));
+    await writePrimaryNodeModules(repo.dir, { packages: ['left-pad'] }); // vite missing
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_f9_stale_devdep');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('primary_tree_stale');
+    expect(error.message).toContain('vite');
+  });
+
+  it('a SCOPED declared package resolves under its scope directory', async () => {
+    const repo = track(await makeDepsRepo({ deps: { '@scope/pkg': '1.0.0' } }));
+    await writePrimaryNodeModules(repo.dir, { packages: ['@scope/pkg'] });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_f9_scoped');
+    await createAtHead(repo, manager, asg);
+
+    const outcome = await manager.provisionForVerification(asg);
+
+    expect(outcome.strategy).toBe('clone');
+    expect(fake.calls.clone).toBe(1);
+  });
+
+  it('AC-3: a healthy primary + matching fingerprints still clones, and the marker still short-circuits', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_f9_happy');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const first = await manager.provisionForVerification(asg);
+    expect(first.strategy).toBe('clone');
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(true);
+
+    const second = await manager.provisionForVerification(asg);
+    expect(second.strategy).toBe('short_circuit');
+    expect(fake.calls.clone).toBe(1); // the second call built nothing
+  });
+});
+
+describe('F9 AC-5 — an unbuilt native dependency is caught BEFORE the tree is marked', () => {
+  it('a script-bearing package that cannot be loaded → native_toolchain_unproven, no marker (never sticky)', async () => {
+    const repo = track(
+      await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'fake-native': '1.0.0' } }),
+    );
+    // The primary's tree has the package dir AND a populated `.bin` — exactly what
+    // `hasBinDir` accepted as "proven" — but the binding was never built.
+    await writePrimaryNodeModules(repo.dir, {
+      packages: ['left-pad'],
+      native: { name: 'fake-native', built: false },
+    });
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_f9_unbuilt_native');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('native_toolchain_unproven');
+    expect(error.message).toContain('fake-native'); // names the package
+    // P2: nothing was marked, so the next round cannot short-circuit onto it.
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules'))).toBe(false);
+  });
+
+  it('a BUILT native dependency passes the smoke and the tree is provisioned + marked', async () => {
+    const repo = track(
+      await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'fake-native': '1.0.0' } }),
+    );
+    await writePrimaryNodeModules(repo.dir, {
+      packages: ['left-pad'],
+      native: { name: 'fake-native', built: true },
+    });
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_f9_built_native');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const outcome = await manager.provisionForVerification(asg);
+
+    expect(outcome.strategy).toBe('clone');
+    expect(readFileSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE), 'utf8')).toBe(
+      outcome.fingerprint,
+    );
+  });
+
+  it('the smoke runs on the CLONE lane too — a primary broken by a past script-less install never propagates', async () => {
+    // The clone lane is CHEAP, not SAFE: its correctness is inherited from the
+    // last real `npm install` in the primary, so it gets the same proof.
+    const repo = track(await makeDepsRepo({ devDeps: { 'fake-native': '1.0.0' } }));
+    await writePrimaryNodeModules(repo.dir, {
+      packages: ['left-pad'],
+      native: { name: 'fake-native', built: false },
+    });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'clone' });
+    const asg = assignmentId('asg_f9_clone_lane_smoke');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(fake.calls.clone).toBe(1); // the clone happened...
+    expect(error.cause).toBe('native_toolchain_unproven'); // ...and was then refused
+  });
+});
+
+describe('F9 AC-4 — the config vocabulary means what it says', () => {
+  it("'clone' with an unsafe-symlink clone result FAILS CLOSED (no silent lane switch)", async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir, { badLink: 'absolute' });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'clone' });
+    const asg = assignmentId('asg_f9_clone_unsafe');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('unsafe_clone_symlinks');
+    expect(fake.calls.install).toBe(0);
+  });
+
+  it("'auto' with an unsafe-symlink clone result ALSO fails closed (auto = clone-or-fail)", async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir, { badLink: 'escaping' });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'auto' });
+    const asg = assignmentId('asg_f9_auto_unsafe');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('unsafe_clone_symlinks');
+    expect(fake.calls.install).toBe(0); // the OLD auto path retried as install here
+  });
+
+  it("'install' is refused outright with a migration message", async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'install' });
+    const asg = assignmentId('asg_f9_install_refused');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('install_provisioning_removed');
+    expect(error.message).toMatch(/cannot prove native toolchains/i);
+    expect(fake.calls.install).toBe(0);
+  });
+
+  it('a non-APFS host fails closed instead of installing (auto = clone-or-fail)', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const fake = fakeRuntime({ cloneSupported: false });
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_f9_no_apfs');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('clone_unsupported');
+    expect(fake.calls.install).toBe(0);
+  });
+
+  it("'none' is unchanged — a proven skip that never reads a manifest", async () => {
+    const repo = track(await makeDepsRepo());
+    const manager = await openManager(repo, { provision: 'none' });
+    const asg = assignmentId('asg_f9_none');
+    await createAtHead(repo, manager, asg);
+
+    const outcome = await manager.provisionForVerification(asg);
+
+    expect(outcome.provisioned).toBe(true);
+    expect(outcome.strategy).toBe('none');
+  });
+});
+
+describe('F9 AC-6 — a stalled provisioning command fails closed with the locks released', () => {
+  it('a hung clone times out, refuses, and the mutex + advisory lease are immediately reacquirable', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const hung: ProvisionRuntime = {
+      cloneSupported: true,
+      platformKey: 'test-platform',
+      cloneDir: () => new Promise<void>(() => undefined), // never settles
+      install: async () => undefined,
+    };
+    const manager = await openManager(repo, { runtime: hung, timeoutMs: 60 });
+    const asg = assignmentId('asg_f9_hung_clone');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('provisioning_timeout');
+    expect(error.message).toMatch(/timed out/i);
+    // The critical section really was left: a fresh operation acquires at once.
+    const validated = await manager.validate(asg);
+    expect(validated.outcome).toBe('clean');
+  });
+
+  it('a hung provisioning GIT probe times out the same way', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const hangingGit: ProvisionGit = {
+      isPathIgnored: () => new Promise<boolean>(() => undefined), // never settles
+      isPathTracked,
+      readFileAtHead: realReadFileAtHead,
+    };
+    const manager = await openManager(repo, { provisionGit: hangingGit, timeoutMs: 60 });
+    const asg = assignmentId('asg_f9_hung_git');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.cause).toBe('provisioning_timeout');
   });
 });
 
