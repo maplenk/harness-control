@@ -670,3 +670,66 @@ describe('isGrokReadOnlyShellPermissionTitle — git list-mode subcommands', () 
     ).toBe(true);
   });
 });
+
+// ===========================================================================
+// `2>&1` — file-descriptor duplication.
+//
+// FOUND LIVE on dogfood run `run_c4648778`, after the `git tag -l` fix above
+// had already been made: `git show --stat <tag> 2>/dev/null` was ADMITTED while
+// the SAME command with `2>&1` was REFUSED. A compound is admitted only when
+// every segment is, so one `2>&1` denied the whole request — and that ended the
+// implementor turn with nothing written, three times across the round and two
+// resumes.
+//
+// Two independent causes had to be fixed, which is why the first attempt at
+// this did not work:
+//   1. `SAFE_NULL_REDIRECTIONS` listed only the `/dev/null` forms, and
+//   2. the segment splitter rejected any lone `&` (the background operator)
+//      BEFORE the token ever reached that allowlist.
+//
+// A duplication touches the filesystem not at all — strictly safer than the
+// `/dev/null` forms already admitted, which at least name a path. What must
+// keep failing is a redirection that can NAME a file, and a bare background
+// `&`, so both directions are pinned below.
+// ===========================================================================
+describe('isGrokReadOnlyShellPermissionTitle — descriptor duplication', () => {
+  const admits = (command: string): boolean =>
+    isGrokReadOnlyShellPermissionTitle(`Execute \`${command}\``, undefined);
+
+  it.each([
+    'git log --oneline -5 2>&1',
+    'git show --stat HEAD 2>&1 | head -50',
+    'git tag -l 2>&1 | head -20',
+    'ls -la 2>&1',
+    "git log --oneline --all --grep='b0' 2>&1 | head -20",
+    'echo hi 1>&2',
+    'ls &>/dev/null',
+    'ls -la . && git log 2>&1',
+  ])('ADMITS the duplication/discard form: %s', (command) => {
+    expect(admits(command)).toBe(true);
+  });
+
+  it.each([
+    'ls > out.txt', // names a file
+    'git log 2>out.txt',
+    'echo x >> f',
+    'cat f 1>g',
+    'ls 2>&1 > out.txt', // a safe duplication does NOT launder the write beside it
+    'ls &> out.txt', // `&>` targets both streams AT A FILE
+    'ls 2>&3', // only descriptors 1 and 2 are known to be the host's own pipes
+    'sleep 5 &', // a bare `&` still backgrounds a process
+    'npm run build &',
+  ])('REFUSES the writing or backgrounding form: %s', (command) => {
+    expect(admits(command)).toBe(false);
+  });
+
+  it('admits the exact compound that closed run_c4648778 round 1 on its second resume', () => {
+    expect(
+      admits(
+        'git show dogfood/b0-first-implementor-commit --stat 2>&1 | head -50; ' +
+          "git tag -l 'dogfood/*' 2>&1 | head -20; " +
+          "git log --oneline --all --grep='b0' 2>&1 | head -20",
+      ),
+    ).toBe(true);
+  });
+});

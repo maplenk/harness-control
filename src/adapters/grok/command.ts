@@ -75,7 +75,33 @@ export function grokShellPermissionTitle(command: string): string {
 
 const MAX_READ_ONLY_SHELL_BYTES = 8_192;
 const MAX_READ_ONLY_SHELL_SEGMENTS = 24;
-const SAFE_NULL_REDIRECTIONS = new Set(['>/dev/null', '1>/dev/null', '2>/dev/null']);
+/**
+ * Redirections that cannot name a file to write.
+ *
+ * `>/dev/null` and friends discard; `2>&1` and `1>&2` DUPLICATE a file
+ * descriptor onto another and touch the filesystem not at all — strictly safer
+ * than the `/dev/null` forms already admitted here, which at least name a path.
+ *
+ * The `&`-forms were missing, and `2>&1` is in essentially every exploratory
+ * command an agent writes. Measured on dogfood run `run_c4648778`:
+ * `git show --stat <tag> 2>/dev/null` was ADMITTED while the same command with
+ * `2>&1` was REFUSED, and because a compound is admitted only when every segment
+ * is, one `2>&1` denied the whole request. That ended the implementor turn with
+ * nothing written — three times, across the round and two resumes.
+ *
+ * Deliberately NOT admitted: `2>&3` or any other descriptor number. Only 1 and 2
+ * are known to be the pipes the host itself created; a higher descriptor could
+ * have been opened onto a file by the caller, and duplicating onto it would
+ * write. Refusing those costs an agent a rewrite it can trivially do.
+ */
+const SAFE_NULL_REDIRECTIONS = new Set([
+  '>/dev/null',
+  '1>/dev/null',
+  '2>/dev/null',
+  '&>/dev/null',
+  '2>&1',
+  '1>&2',
+]);
 const SAFE_SIMPLE_READ_COMMANDS = new Set([
   'cat',
   'grep',
@@ -174,6 +200,20 @@ function splitShellSegments(command: string): readonly string[] | undefined {
       return undefined;
     }
     if (char === '&') {
+      // An `&` adjacent to a `>` belongs to a REDIRECTION, not to the control
+      // grammar: `2>&1` / `1>&2` duplicate a descriptor, `&>` targets both
+      // streams. Let those through as ordinary token bytes so the redirection
+      // allowlist in `stripSafeRedirections` decides them — it admits only the
+      // exact discard/duplicate forms, so `&>out.txt` is still refused there.
+      //
+      // Without this the bare-`&` rejection below fired FIRST and made every
+      // command containing `2>&1` unclassifiable. That is not theoretical: it
+      // denied three consecutive implementor turns on run_c4648778, each of
+      // which ended with nothing written, while the same commands written with
+      // `2>/dev/null` were admitted.
+      if (command[index - 1] === '>' || command[index + 1] === '>') continue;
+      // A LONE `&` still backgrounds a process, which is outside anything this
+      // classifier can reason about. Only `&&` may split a segment.
       if (command[index + 1] !== '&' || !push(index)) return undefined;
       index += 1;
       start = index + 1;
