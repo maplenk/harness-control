@@ -1402,26 +1402,216 @@ confirmed correct.
 
 ---
 
+---
+
+# Round 13 — codex verdict on `3d7aaef`
+
+(Section numbering follows the REVIEW round; this doc's previous section is
+"Round 10", which was the terminal regression check.)
+
+Four items, each with an exact minimal fix specified. All four implemented as
+specified — no redesign, no scope expansion. Commit map:
+
+| item | commit |
+| --- | --- |
+| ITEM 1 (blocking) — root node_modules committed before provisioning | `08e3a5e` |
+| ITEM 3 — per-file ownership resetting a whole root | `d3c0d7b` |
+| ITEM 4 — the native smoke's require-only load proof | `fd9b68e` |
+| ITEM 2 — quarantine cap evicting protected stages | `4678950` |
+
+Every regression test was written and RUN BEFORE its fix, against the parent
+commit, and observed to fail. For items 1, 3 and 4 the fixtures are trees MAIN
+handles successfully, so what they demonstrate is the false refusal / unwanted
+commit being gone. All staging tests drive REAL git (`makeTempGitRepo`).
+
+## ITEM 1 — the commit happens BEFORE provisioning, so a positive signal cannot exist yet
+
+The ordering is the whole finding. `implementor.ts:1000` and `validate.ts:216`
+commit at the post-turn / §16.3 boundary, and provisioning runs AFTER. So at
+staging time an agent-created `node_modules` is necessarily UNIGNORED and
+UNMARKED — provisioning is what refuses a missing ignore rule and what writes the
+marker. Round 10's positive-signal policy therefore committed it: a large
+generated tree, native binaries, or generated secrets added permanently to the
+branch and the object database, with the later fail-closed check arriving after
+the damage. A previously provisioned tree whose marker an `npm ci` deleted along
+with its ignore rule lands in the same place.
+
+**What changed** — `src/worktree/git.ts:309-330` (`isEngineOwnedNodeModulesRoot`).
+While managed provisioning is ACTIVE the ROOT tree is excluded UNCONDITIONALLY,
+as main did (`:(exclude)node_modules` + a root-only `git reset -- node_modules`);
+the ignore-rule-or-marker signal with its HEAD veto now applies to NESTED roots
+ONLY, which is where F10's real defect was. `provision='none'` keeps unrestricted
+`addAll` at both call sites (`implementor.ts:1002`, `validate.ts:218`), and those
+gates are what makes "these helpers are only reached while provisioning is
+active" true: `manager.ts:475` sets `excludeNodeModulesFromWip` from
+`provisionStrategy !== 'none'`, and the flow passes `provisionActive`.
+
+**Fails on parent (`3d7aaef`)** — `git.test.ts` ITEM 1 block `PASS(1) FAIL(2)`:
+the unignored root tree was committed, and a tracked root modification was
+staged. (The third row, `provision='none'` still staging it via `addAll`, passes
+on both sides by design — it pins the boundary.)
+
+**Tests updated rather than deleted, because they asserted the over-correction:**
+
+| test | was | now |
+| --- | --- | --- |
+| `git.test.ts` "KEEPS an unignored (vendored) node_modules staged" | root | NESTED (the case main really does commit) |
+| `git.test.ts` "a TRACKED node_modules modification IS staged" | root | NESTED, same reason |
+| `implementor.test.ts:1091` | tracked ROOT edit is committed | tracked ROOT edit is EXCLUDED (as on main) |
+| `vertical-slice.test.ts` x2 | assertion removed in round 10 | `node_modules` absent from the commit, RESTORED |
+
+This closes **R9**: the case codex asked me to flag (unignored + unmarked +
+untracked root) is exactly the one the ordering makes universal, and it is now
+excluded again.
+
+## ITEM 3 — ownership is a property of the ROOT, and the probes prove it once
+
+Ownership was decided PER FILE while the unstage necessarily acts on the outer
+root (one pathspec per file would blow ARG_MAX on a 100k-entry tree). One
+ignored, not-yet-committed file inside a legitimately vendored tree therefore
+condemned the whole root, unstaging its TRACKED siblings' modifications — a tree
+main commits without complaint — and leaving them as post-verification dirt.
+
+**What changed** — `src/worktree/git.ts:247-262` groups the staged candidates by
+outer root (`outerNodeModulesRoot`, :264, now also the source of the reset
+pathspecs so what is reset is exactly what was classified), and
+`isEngineOwnedNodeModulesRoot` (:309) answers once per root: ROOT → excluded;
+otherwise ANY HEAD content under the root vetoes exclusion for the ENTIRE root
+(`rootHasHeadContent`, :336), then one ignore probe, then the marker.
+
+Two deliberate details, both verified against real git 2.55 before coding:
+
+- the HEAD probe is `ls-tree -r --name-only HEAD -- :(literal)<root>`. `ls-tree`
+  supports `:(literal)`, so a path that begins with a colon can no longer be
+  parsed as pathspec MAGIC and report a tracked tree as untracked (MED-8's bug
+  class, on the read side).
+- the IGNORE probe stays on a staged FILE under the root, not on the root path:
+  `git check-ignore --no-index` answers "not ignored" for a DIRECTORY absent from
+  disk (a trailing-slash rule must know it is one), while a file path under it
+  answers correctly either way. One subprocess either way.
+
+**Fails on parent (`08e3a5e`)** — ITEM 3 block `PASS(0) FAIL(2)`: the tracked
+sibling was unstaged (`expected ['src/feature.ts'] to include
+'vendor/web/node_modules/left-pad/index.js'`), and the probe count was **160**
+(`expected 160 to be less than or equal to 8`) — 2 probes x 40 staged files x 2
+classification passes. The probe-budget test installs a `git` SHIM first on PATH
+that records each invocation and execs the real binary, so it counts ACTUAL
+subprocesses rather than trusting the implementation's shape.
+
+**Honest note.** `rootHasHeadContent` treats a non-zero `ls-tree` exit as "no
+HEAD content" (unborn HEAD, or a spawn failure). That is the pre-existing
+`isPathInHead` contract, unchanged; a spawn failure there would already have
+broken the `git add` that precedes it. I did not change it, since the directive
+was the classification granularity.
+
+## ITEM 4 — prove the addon LOADS, not that one specifier form works
+
+`require` was the only mechanism, so an ESM-only native package was refused for
+the mechanism it DECLARES rather than for being broken: with `exports` declaring
+only an `import` condition, `require` throws ERR_PACKAGE_PATH_NOT_EXPORTED (a
+`"type":"module"` entry point reaches the same place via ERR_REQUIRE_ESM, or
+ERR_REQUIRE_ASYNC_MODULE with a top-level await). Main clones and uses such a
+tree without complaint. Same principle as R1/REGRESSION 1, one layer over.
+
+**What changed** — `src/worktree/provision.ts:1893-1913` (`runNativeSmoke`): the
+child attempts `createRequire(<pkg>/package.json)(name)` and, on ANY failure,
+falls back to a dynamic `import(name)`; both errors are reported on refusal
+(`require: … / import: …`). The child's cwd is now the package's OWN directory,
+so the bare `import()` resolves through the same node_modules walk
+`createRequire` uses — the NESTED copy for a nested package, never the hoisted
+namesake, which is REGRESSION 1's property preserved.
+
+The fallback cannot launder a broken addon: importing a CJS package evaluates it
+through the same CommonJS loader, so a missing `.node` binding fails identically.
+That is asserted by a second new test (an ESM-only package whose entry point
+imports an unbuilt addon is still refused, naming both attempts) and by the
+pre-existing unbuilt-native rows, which still pass unchanged.
+
+**Fails on parent (`d3c0d7b`)** — `provision.test.ts -t ESM` `PASS(0) FAIL(2)`,
+the first with the verbatim production refusal: `could not LOAD
+'<stage>/node_modules/esm-native' … Error [ERR_PACKAGE_PATH_NOT_EXPORTED]: No
+"exports" main defined`.
+
+## ITEM 2 — a cap is a reason to stop STARTING producers, not a licence to delete
+
+Cap enforcement deleted the oldest stages classified PROTECTED. Those stages are
+protected precisely because a producer that outlived its deadline may still be
+writing into them (`withDeadline` stops waiting, not the writer), so the eviction
+recreated the exact race quarantining exists to prevent — and it counted every
+stage it merely TRIED to delete as evicted.
+
+**What changed**
+
+- `provision.ts:1300-1332` — `gcAbandonedStages` no longer evicts and now RETURNS
+  the protected stages it left alone. Removal is reported (`stage_gc_removed`)
+  only after an `rmSync` that actually returned.
+- `provision.ts:715-727` — at the cap, provisioning REFUSES to start another
+  producer: new cause `quarantine_cap_reached` (`errors.ts:91`) with a CLI remedy
+  (`commands.ts:1203`) and a `quarantine_cap_reached` warn event carrying the
+  retained count and the cap. Placed exactly where a producer would start, so
+  `'none'`, the no-deps path and the proven short-circuit — none of which starts
+  one — are unaffected.
+
+Retention stays bounded, and more honestly than before: the cap is now a real
+ceiling (no stage can be created above it, so at most 8 quarantined + 1 in
+flight) rather than a trigger for destroying someone else's tree, and the 24h TTL
+still releases them.
+
+**Fails on parent (`fd9b68e`)** — `provision.test.ts -t "ROUND 13 ITEM 2"`
+`PASS(0) FAIL(2)`: provisioning did not refuse at all (it evicted and proceeded),
+and the GC-level test proved a PROTECTED stage was deleted.
+
+**Not a regression against main, and here is the check:** the state that triggers
+back-pressure cannot arise on main at all — `git show main:src/worktree/
+provision.ts` contains zero occurrences of `withDeadline`/quarantine, so on main
+a wedged `cp`/`npm` hangs the orchestrator indefinitely rather than timing out 8
+times. The comparison is "hangs forever" versus "refuses with a named cause and a
+remedy after 8 timeouts".
+
+**Coverage I did NOT claim:** the third new test ("a stage that cannot be REMOVED
+is never reported as removed") PASSES on the parent — the ordinary sweep already
+warned only after a successful `rmSync`; the dishonest count lived solely in the
+eviction block, which is gone. It is a pin, not a regression proof.
+
+## Round-13 regression proofs, in one place
+
+| item | command | on parent | after |
+| --- | --- | --- | --- |
+| 1 | `vitest run src/worktree/git.test.ts -t "ROUND 13 ITEM 1"` | PASS 1 FAIL 2 | 3/3 |
+| 3 | `vitest run src/worktree/git.test.ts -t "ROUND 13 ITEM 3"` | PASS 0 FAIL 2 (incl. 160 probes) | 2/2 |
+| 4 | `vitest run src/worktree/provision.test.ts -t "ESM"` | PASS 0 FAIL 2 | 2/2 |
+| 2 | `vitest run src/worktree/provision.test.ts -t "ROUND 13 ITEM 2"` | PASS 0 FAIL 2 | 2/2 |
+
+No fix was ever reverted to produce a proof except ITEM 1's one-line root
+short-circuit, which was restored from a byte-for-byte copy and then re-verified
+by grepping for the restored symbols (`git.ts:315`) — the failure mode that bit
+two earlier rounds.
+
+---
+
 # Final residual list for the merge record
 
 | # | residual | disposition |
 | --- | --- | --- |
 | R1 | Veto universality's syntactic defeat — typed no-op combinable with an interactive handler by direct generic construction. Production Grok safe (`buildGrokMediation` overwrites last). | Non-blocking (codex) |
 | R2 | Claude/Codex payload-binding gap — both carry `noPayloadToVerify` though their tool calls carry executable payloads. Typed and greppable, not silent. | Tracked |
-| R3 | Quarantine retention — **now bounded** (TTL from timestamp + capped, logged eviction). Residual cost vs main is a bounded number of retained stages. | Reduced this round |
+| R3 | Quarantine retention — **now genuinely bounded** (ITEM 2: TTL from timestamp + a cap that stops new producers instead of deleting live ones). Residual cost vs main is at most 8 retained stages per assignment; at the cap, provisioning refuses with a named cause. | Reduced again this round |
 | R4 | `factory.ts` `prepared.dispose()` unguarded — can mask a primary failure. | Non-blocking |
-| R5 | **Closed this round** (Regression 3). | — |
+| R5 | Closed in round 10 (Regression 3). | — |
 | R6 | Transitive dependency versions unverified — only root deps/devDeps proven. | Stated limit |
 | R7 | F13 — role-independent stop-reason adjudication, host-attested evidence receipts. | Out of the LAND window |
-| R8 | No deterministic test for Blocker 1's race window; the invariant is asserted instead. | **Known untested invariant** |
-| R9 | **New:** an UNIGNORED, UNMARKED, untracked node_modules is now committed where main excluded a root one. See above. | **For codex to rule on** |
+| R8 | No deterministic test for Blocker 1's race window; the invariant is asserted instead. | **Known untested invariant** (codex: coverage debt, not a defect) |
+| R9 | **Closed this round** (ITEM 1): the unignored/unmarked/untracked ROOT tree is excluded again, as main did. A NESTED unignored, unmarked, untracked tree is still committed — which is what main did too, since main's exclusion was root-only. | — |
+| R10 | **New (ITEM 2):** an assignment that accumulates 8 quarantined stages cannot provision until a TTL expires or the stages are cleared. Fail-closed, named cause, CLI remedy; unreachable on main, which has no deadline to time out. | Stated consequence |
 
 ---
 
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1906 passed, 0 failed**, 106 files
+- `npx vitest run` (full, from this worktree) → **1916 passed, 0 failed**, 106
+  files (1906 → 1916: ten new tests, three of them for ITEM 1, two for ITEM 3,
+  two for ITEM 4, three for ITEM 2)
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
