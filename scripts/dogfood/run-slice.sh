@@ -19,18 +19,22 @@ cd "$ROOT"
 : "${HARNESS_HOME:=$HOME/.harness}"; export HARNESS_HOME
 LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"; mkdir -p "$LOGDIR"
 CLI=(node "$ROOT/dist/cli/index.js")
+. "$ROOT/scripts/dogfood/lib.sh"
 
 # L11 ENFORCEMENT: approve+run is where the real money and the real worktree
-# commits happen — refuse without a fresh PASSING preflight (verdict=pass, same
-# HEAD, same toolchain, <30 min old). "diagnostic" records (SKIP_BUILD=1) are
-# rejected too: the staging drill must have run against the CURRENT dist.
+# commits happen — refuse without a fresh PASSING preflight: same HEAD, same
+# DIST DIGEST (dist/ is gitignored and mutable, so the commit alone does not
+# identify what we are about to execute), same toolchain, same resolved roles
+# and config, <30 min old. "diagnostic" records (SKIP_BUILD=1) are rejected too.
 bash "$ROOT/scripts/dogfood/require-preflight.sh" || exit 1
 
 RUN_ID="${1:?usage: run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH}"
 SPEC_VERSION="${2:?spec version id required}"
 SPEC_HASH="${3:?spec hash required (binds the exact drafted spec)}"
-IMPLEMENTOR="${IMPLEMENTOR:-grok:grok-build:high}"
-VERIFIER="${VERIFIER:-codex:gpt-5.6-sol:xhigh}"
+# Roles come from lib.sh — the SAME resolution preflight gated doctor on and the
+# gate re-checked. Restating the defaults here is what let an overridden role
+# dispatch an adapter the battery had declared "unused and not gating".
+dogfood_resolve_roles
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 APPROVE_JSON="$LOGDIR/slice-$STAMP-approve.json"

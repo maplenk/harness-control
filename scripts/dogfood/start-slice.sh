@@ -20,25 +20,33 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
+. "$ROOT/scripts/dogfood/lib.sh"
+
 : "${HARNESS_HOME:=$HOME/.harness}"; export HARNESS_HOME
 LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"; mkdir -p "$LOGDIR"
 CLI=(node "$ROOT/dist/cli/index.js")
 
 # L11 ENFORCEMENT: never spend a coordinator dollar without a fresh PASSING
-# preflight (verdict=pass, same HEAD, same toolchain, <30 min old). The gate
-# rejects "diagnostic" records, so SKIP_BUILD=1 cannot be used to slip past it.
+# preflight — same HEAD, same dist digest, same toolchain, same resolved roles
+# and config, <30 min old. The gate rejects "diagnostic" records, so
+# SKIP_BUILD=1 cannot be used to slip past it. It runs BEFORE the role
+# resolution below deliberately: the gate re-resolves the same values itself
+# from the same env, via the same lib.sh helpers.
 bash "$ROOT/scripts/dogfood/require-preflight.sh" || exit 1
 
 SECTION="${SECTION:?set SECTION (e.g. §3A.1)}"
 SLICE="${SLICE:?set SLICE (one-line scope)}"
 PATHS="${PATHS:?set PATHS (files the implementor may touch)}"
 PLAN_SHA="${PLAN_SHA:-$(git rev-parse HEAD)}"
-COORDINATOR="${COORDINATOR:-claude:opus:xhigh}"
-# Per-run engine config (F4 per-role memory budget, etc.). Default: the committed
-# dogfood config (implementor RSS budget pinned to 2048 MB). Set CONFIG="" to run
-# on engine defaults. --config at `start` pins it into the run's persisted config,
-# so the `run` stage inherits it (no need to pass it to run-slice.sh).
-CONFIG="${CONFIG-$ROOT/scripts/dogfood/dogfood.config.json}"
+# Roles and per-run engine config come from lib.sh — the SAME resolution the
+# preflight battery gated doctor on and the gate re-checked. Restating the
+# defaults here is what let an overridden role dispatch an unchecked adapter.
+# (COORDINATOR default claude:opus:xhigh; CONFIG defaults to the committed
+# dogfood config with the implementor RSS budget pinned to 2048 MB — set
+# CONFIG="" for engine defaults. --config at `start` pins it into the run's
+# persisted config, so the `run` stage inherits it.)
+dogfood_resolve_roles
+dogfood_resolve_config "$ROOT"
 
 [ -f "$ROOT/dist/cli/index.js" ] || { echo "!! dist not built — run: npm run build" >&2; exit 1; }
 

@@ -37,15 +37,33 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
 [ -n "${ROOT:-}" ] && cd "$ROOT" || { echo "!! cannot resolve/enter repo root" >&2; exit 1; }
 
+# Role/config/digest/containment helpers, shared with the gate and the slice
+# scripts so the facts this record binds are the facts the run will execute.
+. "$ROOT/scripts/dogfood/lib.sh" || { echo "!! cannot source scripts/dogfood/lib.sh" >&2; exit 1; }
+
 : "${HARNESS_HOME:=$HOME/.harness}"
 LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"
+# The store and the log dir must live OUTSIDE the repo. If they resolve inside
+# it, this battery's own provenance write becomes repo dirt — and since the
+# append happens after the clean-tree check, a PASS could leave behind exactly
+# the dirt that fails the NEXT run's clean-tree check.
+if dogfood_path_inside "$HARNESS_HOME" "$ROOT"; then
+  echo "!! HARNESS_HOME resolves inside the repo ($HARNESS_HOME) — refusing: run artifacts would dirty the tree" >&2; exit 1
+fi
+if dogfood_path_inside "$LOGDIR" "$ROOT"; then
+  echo "!! the log dir resolves inside the repo ($LOGDIR) — refusing: the provenance record would dirty the tree" >&2; exit 1
+fi
 mkdir -p "$LOGDIR" || { echo "!! cannot create log dir $LOGDIR" >&2; exit 1; }
 RECORD="$LOGDIR/preflight.jsonl"
 BASELINE="$ROOT/scripts/dogfood/preflight-baseline.json"
-DOGFOOD_CONFIG="$ROOT/scripts/dogfood/dogfood.config.json"
 HELPER_JS="$ROOT/dist/worktree/git.js"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 T0=$(date +%s)
+
+# Resolve exactly what the slice scripts will dispatch, using their own logic.
+dogfood_resolve_roles
+dogfood_resolve_config "$ROOT"
+CONFIG_SHA="$(dogfood_config_sha "${CONFIG:-}")"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/harness-preflight-XXXXXX")" || { echo "!! mktemp failed" >&2; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
@@ -65,6 +83,8 @@ echo "── dogfood PREFLIGHT (L11) ──────────────�
 echo " repo   : $ROOT"
 echo " store  : $HARNESS_HOME"
 echo " record : $RECORD"
+echo " roles  : $COORDINATOR / $IMPLEMENTOR / $VERIFIER"
+echo " config : ${CONFIG:-<engine defaults>} (${CONFIG_SHA:0:12})"
 echo "───────────────────────────────────────────────────────────────"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,23 +202,32 @@ if [ ! -f "$ROOT/dist/cli/index.js" ]; then
   fail "dist/cli/index.js missing — cannot run doctor"
 else
   DOCTOR_ARGS=(doctor --json)
-  if [ -f "$DOGFOOD_CONFIG" ]; then
-    DOCTOR_ARGS+=(--config "$DOGFOOD_CONFIG")
-    info "config: $(basename "$DOGFOOD_CONFIG") (the pinned dogfood engine config)"
+  if [ -z "${CONFIG:-}" ]; then
+    info "config: <engine defaults> (CONFIG is set but empty — the same resolution the slice scripts use)"
+  elif [ -f "$CONFIG" ]; then
+    DOCTOR_ARGS+=(--config "$CONFIG")
+    info "config: $(basename "$CONFIG") sha256=${CONFIG_SHA:0:12}"
   else
-    warn "pinned dogfood config missing at $DOGFOOD_CONFIG — doctor ran on engine defaults"
+    fail "the resolved engine config does not exist: $CONFIG"
   fi
   node "$ROOT/dist/cli/index.js" "${DOCTOR_ARGS[@]}" >"$WORK/doctor.json" 2>"$WORK/doctor.err"
   if [ ! -s "$WORK/doctor.json" ]; then
     fail "doctor produced no JSON"
     [ -s "$WORK/doctor.err" ] && tail -n 5 "$WORK/doctor.err" | sed 's/^/       /'
   else
-    DOCTOR_EVAL="$(node - "$WORK/doctor.json" <<'NODE'
+    DOCTOR_EVAL="$(node - "$WORK/doctor.json" \
+      "$(dogfood_harness_of "$COORDINATOR")" "$(dogfood_harness_of "$IMPLEMENTOR")" "$(dogfood_harness_of "$VERIFIER")" <<'NODE'
 const fs = require('node:fs');
-// The three harnesses this dogfood actually dispatches. Anything else is
-// reported but never gates — an unused adapter must not block a run, and
-// `overall` cannot be trusted as a gate because it folds all four together.
-const ROLES = { claude: 'coordinator', grok: 'implementor', codex: 'verifier' };
+// The harnesses THIS INVOCATION will dispatch, resolved by lib.sh from exactly
+// the env the slice scripts read — never a hard-coded triple. With
+// IMPLEMENTOR=opencode:… the opencode adapter gates and grok becomes the
+// unused one. Anything not dispatched is reported but never gates, and
+// `overall` is not trusted as a gate because it folds all adapters together.
+const [coordinator, implementor, verifier] = process.argv.slice(3);
+const ROLES = {};
+ROLES[coordinator] = 'coordinator';
+ROLES[implementor] = ROLES[implementor] ? `${ROLES[implementor]}+implementor` : 'implementor';
+ROLES[verifier] = ROLES[verifier] ? `${ROLES[verifier]}+verifier` : 'verifier';
 const out = [];
 let r;
 try { r = JSON.parse(fs.readFileSync(process.argv[2], 'utf8')); }
@@ -248,7 +277,7 @@ NODE
     DOCTOR_STATUS="$(printf '%s\n' "$DOCTOR_EVAL" | awk -F'\t' '$1=="STATUS"{print $2; exit}')"
     DOCTOR_OVERALL="${DOCTOR_STATUS:-unparsed}"
     if [ "$DOCTOR_STATUS" = "ok" ]; then
-      pass "doctor: all three dispatched roles healthy (claude/grok/codex)"
+      pass "doctor: every dispatched role healthy ($(dogfood_harness_of "$COORDINATOR")/$(dogfood_harness_of "$IMPLEMENTOR")/$(dogfood_harness_of "$VERIFIER"))"
     else
       fail "doctor: one or more dispatched roles unhealthy"
     fi
@@ -305,13 +334,23 @@ const [helperPath, dir] = process.argv.slice(2);
     const detail = (e && (e.detail || e.message)) || String(e);
     process.stdout.write('THREW ' + String(detail).split('\n')[0] + '\n');
   }
-})().catch((e) => { process.stdout.write('IMPORT_ERROR ' + String((e && e.message) || e) + '\n'); });
+})().catch((e) => { process.stdout.write('IMPORT_ERROR ' + String((e && e.message) || e) + '\n'); process.exitCode = 1; });
 NODE
 )"
+  HELPER_RC=$?
   HELPER_OUT="$(printf '%s\n' "$HELPER_OUT" | head -1)"
+  # The printed verdict is not the whole story: a probe that prints OK, stages
+  # correctly and then exits nonzero (unhandled rejection, late throw, OOM) has
+  # not demonstrated a healthy helper. Both must agree.
+  if [ "$HELPER_RC" -ne 0 ] && [ "$HELPER_OUT" = "OK" ]; then
+    fail "the real-helper probe reported OK but its process exited $HELPER_RC — treating as a failure"
+    HELPER_OUT="EXIT_MISMATCH"
+  fi
   case "$HELPER_OUT" in
     OK)
-      pass "addAllExceptNodeModules() from dist/ ran without throwing" ;;
+      pass "addAllExceptNodeModules() from dist/ ran without throwing (probe exit 0)" ;;
+    EXIT_MISMATCH)
+      : ;;
     THREW*)
       fail "the ENGINE'S OWN staging helper FAILS on this machine — ${HELPER_OUT#THREW }"
       info "F10 class: every harness commit path (implementor post-turn commit AND the §16.3 WIP commit) calls this helper. Do NOT start a run." ;;
@@ -397,7 +436,7 @@ fi
 #     tracked-file edit during a live run poisons the round (W3-1 drift guard).
 #     Running this LAST also re-proves that nothing above dirtied the repo.
 # ─────────────────────────────────────────────────────────────────────────────
-hdr "f. clean tree (F5 base pin + repo-freeze precondition)"
+hdr "f. clean tree + executable identity"
 DIRT="$(git status --porcelain 2>/dev/null)"; DIRT_RC=$?
 if [ "$DIRT_RC" -ne 0 ]; then
   fail "\`git status --porcelain\` exited $DIRT_RC"
@@ -406,6 +445,16 @@ elif [ -z "$DIRT" ]; then
 else
   fail "working tree is dirty — commit, stash, or move edits to the scratchpad before \`start\`"
   printf '%s\n' "$DIRT" | sed 's/^/       /'
+fi
+
+# The commit sha does NOT identify what the run will execute: dist/ is gitignored
+# and mutable, so a record binding only HEAD authorises whatever bytes are in
+# dist/ when the slice script finally runs. Bind the built tree itself.
+DIST_DIGEST="$(dogfood_dist_digest "$ROOT")"
+if [ -z "$DIST_DIGEST" ]; then
+  fail "could not digest dist/ — the executable tree cannot be bound to this record"
+else
+  pass "dist digest ${DIST_DIGEST:0:16}… (390-odd files, content+paths)"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -420,13 +469,16 @@ else
   VERDICT="pass"
 fi
 
-node - "$RECORD" "$STARTED_AT" "$VERDICT" "$GIT_V" "$NODE_V" "$NPM_V" "$HEAD_SHA" "$BRANCH" \
-  "$DOCTOR_OVERALL" "$COLLECTED" "$FLOOR" "$ELAPSED" "${#WARNINGS[@]}" "${#FAILURES[@]}" "${SKIP_BUILD:-0}" <<'NODE'
+append_record() { # $1 = verdict to record
+  node - "$RECORD" "$STARTED_AT" "$1" "$GIT_V" "$NODE_V" "$NPM_V" "$HEAD_SHA" "$BRANCH" \
+    "$DOCTOR_OVERALL" "$COLLECTED" "$FLOOR" "$ELAPSED" "${#WARNINGS[@]}" "${#FAILURES[@]}" "${SKIP_BUILD:-0}" \
+    "$DIST_DIGEST" "$COORDINATOR" "$IMPLEMENTOR" "$VERIFIER" "$CONFIG_SHA" <<'NODE'
 const fs = require('node:fs');
-const [record, at, verdict, git, node, npm, head, branch, doctor, collected, floor, elapsedS, warns, fails, skipBuild] =
-  process.argv.slice(2);
+const [record, at, verdict, git, node, npm, head, branch, doctor, collected, floor, elapsedS,
+  warns, fails, skipBuild, distDigest, coordinator, implementor, verifier, configSha] = process.argv.slice(2);
 const line = JSON.stringify({
   at, verdict, git, node, npm, head, branch,
+  distDigest, coordinator, implementor, verifier, configSha,
   doctor: doctor || null,
   skipBuild: skipBuild === '1',
   collectedTestFiles: Number(collected) || 0, floor: Number(floor) || 0,
@@ -435,11 +487,42 @@ const line = JSON.stringify({
 fs.appendFileSync(record, line + '\n');
 process.stdout.write(line + '\n');
 NODE
-RECORD_RC=$?
-if [ "$RECORD_RC" -ne 0 ]; then
-  FAILURES+=("provenance record not written to $RECORD — enforcement will refuse the next run")
-  VERDICT="fail"
-  printf '   ✖ %s\n' "${FAILURES[${#FAILURES[@]}-1]}"
+}
+
+# A failed append is NOT a cosmetic problem. The gate reads the FILE, not this
+# process's memory, so flipping VERDICT here would leave the previous PASS as the
+# last record — and it would authorise the very run this battery just rejected.
+# Escalate: write a fail record; failing that, destroy the log. The gate refuses
+# on missing/empty/unreadable, which is the safe landing state.
+if ! append_record "$VERDICT"; then
+  echo
+  echo "!! could not append the provenance record to $RECORD"
+  if append_record "fail"; then
+    echo "!! wrote a FAIL record instead — the gate will refuse"
+  elif : > "$RECORD" 2>/dev/null; then
+    echo "!! truncated $RECORD — no stale pass remains"
+  elif rm -f "$RECORD" 2>/dev/null; then
+    echo "!! removed $RECORD — no stale pass remains"
+  else
+    echo "!! COULD NOT INVALIDATE $RECORD — a stale PASS may still authorise a run. Delete it by hand NOW."
+  fi
+  echo "── PREFLIGHT FAILED (record not written) — do NOT start a run ──"
+  exit 1
+fi
+
+# Belt to the containment refusal's suspenders: the append happens after the
+# clean-tree check, so re-prove the tree did not change underneath it. Compare
+# against the section-(f) snapshot, not against "clean" — an already-dirty tree
+# has already failed (f), and what matters here is dirt this write INTRODUCED,
+# which would make the record we just wrote false.
+POST_DIRT="$(git status --porcelain 2>/dev/null)"
+if [ "$POST_DIRT" != "$DIRT" ]; then
+  echo
+  echo "!! the provenance write dirtied the repo — invalidating the record just written"
+  printf '%s\n' "$POST_DIRT" | sed 's/^/     /'
+  append_record "fail" >/dev/null 2>&1 || : > "$RECORD" 2>/dev/null || rm -f "$RECORD" 2>/dev/null
+  echo "── PREFLIGHT FAILED (post-write dirt) — do NOT start a run ──"
+  exit 1
 fi
 
 echo
