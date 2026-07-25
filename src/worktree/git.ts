@@ -208,32 +208,99 @@ export async function addAll(worktreePath: string): Promise<void> {
   await runGit(['add', '-A'], worktreePath);
 }
 
-/**
- * Stage every change EXCEPT a root `node_modules/` (`git add -A -- . :(exclude)node_modules`),
- * preserving full `-A` semantics (adds, modifications, AND deletions) for
- * everything else. F7 (B1): the harness provisions a git-ignored `node_modules`
- * into agent worktrees; if a target repo lacks a `node_modules/` ignore rule (or
- * an agent removed it), a plain `git add -A` would stage the provisioned toolchain
- * INTO the commit. Excluding it here guarantees a provisioned tree can never enter
- * a harness commit — independent of, and complementary to, provisioning's own
- * fail-closed refusal of an unignored/tracked `node_modules`.
- */
-export async function addAllExceptNodeModules(worktreePath: string): Promise<void> {
-  await runGit(['add', '-A', '--', '.', ':(exclude)node_modules'], worktreePath);
+/** A repo-root-relative path that lies IN (or IS) a `node_modules` directory, at
+ * ANY depth: `node_modules/x`, `web/node_modules/x`, `node_modules`. Deliberately
+ * segment-anchored so `src/node_modules_helper.ts` / `src/my_node_modules/` — real
+ * source files that merely contain the substring — are never touched. */
+const NODE_MODULES_PATH_RE = /(^|\/)node_modules(\/|$)/;
+
+/** The staged paths (index vs HEAD) that live under a `node_modules`, at any depth.
+ * `-z` is NUL-TERMINATED and disables git's path quoting, so paths with spaces,
+ * newlines or non-ASCII bytes come through verbatim (the trailing empty field the
+ * final NUL produces is dropped). */
+async function stagedNodeModulesPaths(worktreePath: string): Promise<string[]> {
+  const { stdout } = await runGit(['diff', '--cached', '--name-only', '-z'], worktreePath);
+  return stdout.split('\0').filter((p) => p.length > 0 && NODE_MODULES_PATH_RE.test(p));
+}
+
+/** The OUTERMOST `node_modules` directory each staged path sits under — a tiny,
+ * bounded pathspec set (`node_modules`, `web/node_modules`, …) rather than one
+ * argument per file, so a 100k-entry tree cannot blow past ARG_MAX. */
+function nodeModulesPathspecs(paths: readonly string[]): string[] {
+  const roots = new Set<string>();
+  for (const p of paths) {
+    const segments = p.split('/');
+    const index = segments.indexOf('node_modules');
+    if (index < 0) continue; // unreachable for NODE_MODULES_PATH_RE matches; defensive
+    roots.add(segments.slice(0, index + 1).join('/'));
+  }
+  return [...roots].sort();
 }
 
 /**
- * Unstage any ALREADY-STAGED `node_modules` from the index (`git reset -- node_modules`),
- * WITHOUT touching the working tree. F7 (round-4 #3): `addAllExceptNodeModules` prevents
- * ADDING `node_modules` but does NOT remove entries a prior `git add` already placed in
- * the index — e.g. a verification command or an interrupted implementor that ran
- * `git add node_modules`. Called (while provisioning is active) BEFORE the implementor
- * commit AND the §16.3 WIP reconciliation commit, so a provisioned (git-ignored)
- * toolchain can never enter a harness commit even when it was pre-staged. Resetting a
- * non-matching pathspec is a no-op (exit 0); the file stays on disk.
+ * Stage every change EXCEPT anything under a `node_modules` (at any depth),
+ * preserving full `-A` semantics (adds, modifications, AND deletions) for
+ * everything else.
+ *
+ * F7 (B1): the harness provisions a git-ignored `node_modules` into agent
+ * worktrees; if a target repo lacks a `node_modules/` ignore rule (or an agent
+ * removed it), a plain `git add -A` would stage the provisioned toolchain INTO the
+ * commit. Guaranteeing it never enters a harness commit is the invariant — held
+ * here independently of, and complementary to, provisioning's own fail-closed
+ * refusal of an unignored/tracked `node_modules`.
+ *
+ * F10 — HOW that invariant is held changed, because the old mechanism stopped
+ * working. `git add -A -- . ':(exclude)node_modules'` exits 1 under git 2.55 with
+ * "The following paths are ignored by one of your .gitignore files: node_modules"
+ * whenever an ignored `node_modules` exists on disk: the exclude pathspec ITEM is
+ * treated as an explicit mention of an ignored path. Since F7 provisions exactly
+ * such a tree into every worktree, that made BOTH callers (the implementor's
+ * post-turn commit and the §16.3 WIP reconciliation) fail on every provisioned
+ * round. So: stage with a plain `git add -A -- .` — .gitignore alone already keeps
+ * an ignored tree out — and then PROVE the index is clean of `node_modules`,
+ * unstaging what is there and FAILING CLOSED if anything survives. The proof is
+ * strictly stronger than the old pathspec, which only ever covered a ROOT
+ * `node_modules` and silently staged a nested `web/node_modules`.
+ *
+ * Never deletes: unstaging leaves the provisioned tree on disk for the verifier.
  */
-export async function unstageNodeModules(worktreePath: string): Promise<void> {
-  await runGit(['reset', '--quiet', '--', 'node_modules'], worktreePath);
+export async function addAllExceptNodeModules(worktreePath: string): Promise<void> {
+  await runGit(['add', '-A', '--', '.'], worktreePath);
+  // Covers BOTH what `add -A` just staged and anything a prior `git add` had
+  // already placed in the index (F7 round-4 #3 — e.g. a verification command or an
+  // interrupted implementor that ran `git add -f node_modules`).
+  await unstageNodeModules(worktreePath);
+  const remaining = await stagedNodeModulesPaths(worktreePath);
+  if (remaining.length > 0) {
+    throw new WorktreeError(
+      'git_command_failed',
+      `refusing to commit: ${remaining.length} node_modules path(s) remain STAGED after unstaging them ` +
+        `(cwd=${worktreePath}): ${remaining.slice(0, 5).join(', ')}. A provisioned dependency tree must never ` +
+        'enter a harness commit.',
+      { detail: remaining.slice(0, 20).join('\n') },
+    );
+  }
+}
+
+/**
+ * Unstage every ALREADY-STAGED `node_modules` path from the index, at ANY depth,
+ * WITHOUT touching the working tree. F7 (round-4 #3): staging must not merely
+ * avoid ADDING `node_modules` — it must also remove entries a prior `git add`
+ * already placed in the index. F10: the old form (`git reset -- node_modules`) was
+ * root-only, so a nested `web/node_modules` slipped through; the index is now
+ * enumerated and every `node_modules` root found is reset.
+ *
+ * A tracked-in-HEAD `node_modules` is reset back to its HEAD content, so it is no
+ * longer a staged CHANGE (exactly what the old exclusion achieved); an untracked
+ * one leaves the index entirely. Either way the bytes stay on disk. Resetting a
+ * pathspec that matches nothing is a no-op (exit 0), and no reset runs at all when
+ * nothing is staged. Returns the paths it unstaged.
+ */
+export async function unstageNodeModules(worktreePath: string): Promise<string[]> {
+  const staged = await stagedNodeModulesPaths(worktreePath);
+  if (staged.length === 0) return [];
+  await runGit(['reset', '--quiet', '--', ...nodeModulesPathspecs(staged)], worktreePath);
+  return staged;
 }
 
 const NOTHING_TO_COMMIT_RE = /nothing to commit/i;

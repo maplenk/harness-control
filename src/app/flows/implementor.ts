@@ -119,7 +119,6 @@ import {
   resolveSha,
   runGit,
   statusPorcelain,
-  unstageNodeModules,
   WorktreeError,
   type GitWorktreeManager,
   type WorktreeHandle,
@@ -972,10 +971,10 @@ export class ImplementorFlow {
     // a repo that legitimately tracks node_modules changes still commits them.
     const provisionActive = this.#options.provisionActive ?? true;
     if (provisionActive) {
-      // round-4 #3: unstage any ALREADY-STAGED node_modules FIRST (the exclusion
-      // pathspec only prevents adding it, not removing an existing index entry), then
-      // stage everything else — so a pre-staged provisioned tree can never enter HEAD.
-      await unstageNodeModules(cwd);
+      // F10: ONE helper now owns the whole guarantee — it stages `-A`, unstages
+      // every node_modules path in the index at any depth (round-4 #3's
+      // already-staged case included), and FAILS CLOSED if any survives. The
+      // separate pre-unstage call this used to make is folded into it.
       await addAllExceptNodeModules(cwd);
     } else {
       await addAll(cwd);

@@ -1195,8 +1195,12 @@ describe('ImplementorFlow — F10 commit with a provisioned (git-ignored) node_m
       await runGit(['diff', '--name-only', `${String(result.baseSha)}..HEAD`], result.worktreePath)
     ).stdout;
     expect(committed.split('\n').some((p) => p.includes('node_modules'))).toBe(false);
-    // The provisioned tree is still ON DISK for the verifier — excluded, not deleted.
-    expect(fs.existsSync(path.join(result.worktreePath, 'node_modules', '.bin', 'tsc'))).toBe(true);
+    // ...and it is in NO commit reachable from HEAD, not merely absent from the delta.
+    const tree = (await runGit(['ls-tree', '-r', '--name-only', 'HEAD'], result.worktreePath)).stdout;
+    expect(tree.split('\n').some((p) => p.includes('node_modules'))).toBe(false);
+    // (What happens to the tree ON DISK afterwards is F7's business: this fixture
+    // repo declares no dependencies, so provisioning legitimately removes the stale
+    // toolchain — covered by provision.test.ts, not asserted here.)
 
     await wt.removeWorktree(assignmentId('asg_ignored_nm_commit'));
   });

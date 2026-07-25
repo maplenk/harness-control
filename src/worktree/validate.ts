@@ -197,11 +197,11 @@ async function commitWip(
   // the implementor commit uses. Under provision='none' (the operator owns
   // node_modules) keep full `git add -A` so legitimately-tracked node_modules
   // changes are preserved (round-2 #3). For a repo with no node_modules the two are
-  // identical. round-4 #3: unstage any ALREADY-STAGED node_modules FIRST — the
-  // exclusion pathspec only prevents ADDING it, not removing an index entry an
-  // interrupted implementor / a verification command already staged.
+  // identical. F10: `addAllExceptNodeModules` now owns the whole guarantee itself
+  // (stage, unstage every node_modules index entry at any depth — round-4 #3's
+  // already-staged case included — then fail closed if any survives), so the
+  // separate pre-unstage call this used to make is folded into it.
   if (excludeNodeModules) {
-    await git.unstageNodeModules(worktreePath);
     await git.addAllExceptNodeModules(worktreePath);
   } else {
     await git.addAll(worktreePath);
