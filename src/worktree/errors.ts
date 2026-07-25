@@ -55,15 +55,10 @@ export type WorktreeErrorKind = (typeof WORKTREE_ERROR_KINDS)[number];
  * (the pre-F9 refusals that keep their prose) falls back to the generic hint.
  */
 export const PROVISIONING_CAUSES = [
-  /** The worktree's COMMITTED manifests differ from the primary's — the
-   * implementor's commit changed dependencies. Deps land via the engine track. */
-  'deps_changed_in_worktree',
-  /** The PRIMARY's on-disk manifests differ from its own HEAD — uncommitted or
-   * unsynced edits there. Commit/sync + `npm install`, then re-run. */
-  'primary_manifests_diverged',
-  /** Manifests diverged but the classifying probe (the primary's HEAD manifests)
-   * could not be read, so neither remedy can be asserted. Fail closed naming both. */
-  'manifest_divergence_unclassified',
+  // ROUND 15: `deps_changed_in_worktree`, `primary_manifests_diverged` and
+  // `manifest_divergence_unclassified` were REMOVED with the refusals that raised
+  // them. A primary whose manifests are not this round's is not a usable clone
+  // source, so the round installs from its own manifests instead of refusing.
   /** Fingerprints match, but a manifest-declared package has no directory in the
    * primary's `node_modules` — the primary was never `npm install`ed since the
    * manifests changed. Cloning it would propagate a stale tree (the false clone). */
@@ -75,9 +70,10 @@ export const PROVISIONING_CAUSES = [
   /** A cloned tree held an absolute / worktree-escaping symlink. Refused outright:
    * `auto` and `clone` are both clone-or-fail; there is no install lane to fall to. */
   'unsafe_clone_symlinks',
-  /** `provision:'install'` was requested. The lane is gone — script-less installs
-   * cannot prove native toolchains. */
-  'install_provisioning_removed',
+  /** ROUND 15: the install lane RAN and failed (npm ci errored, or produced no
+   * node_modules). The lane itself is back — a script-less install is fine for a
+   * project with no native dependencies, and the artifact proof gates the rest. */
+  'install_failed',
   /** Clone is the only lane and this host cannot copy-on-write clone. */
   'clone_unsupported',
   /** The clone itself failed (cross-volume stage, FS error). */

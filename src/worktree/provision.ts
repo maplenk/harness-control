@@ -588,22 +588,6 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
     return proven('none', '', repoRoot, worktreePath, "provisioning disabled (worktree.provision='none')");
   }
 
-  // F9 (P4/§4): the install lane is GONE. `npm ci --ignore-scripts` cannot build a
-  // script-installed native dependency, so a tree it produces can never be proven
-  // — and stamping it proven made the breakage STICKY for the rest of the run. The
-  // config schema refuses `'install'` at parse; this is the programmatic belt for
-  // a manager constructed directly. Accepted config must ACT or be REFUSED.
-  if (strategy === 'install') {
-    throw failClosed(
-      `worktree.provision='install' is no longer supported (repo ${repoRoot}): script-less installs cannot prove ` +
-        'native toolchains (a `--ignore-scripts` install leaves better-sqlite3 with no compiled binding while still ' +
-        "populating node_modules/.bin). Land dependency changes in the primary checkout, run `npm install` there, and use " +
-        "worktree.provision='clone' (or 'auto').",
-      'install provisioning removed',
-      'install_provisioning_removed',
-    );
-  }
-
   // Dependency fingerprint from the COMMITTED HEAD manifests (bound to what the
   // implementor just committed — not the base, not the working tree). B3/#5:
   // collectManifests fails closed on a git/read error, malformed manifest JSON, or
@@ -1062,52 +1046,57 @@ interface BuildArgs {
  * whole run. `auto` and `clone` are both clone-or-fail-closed; they differ only
  * in that neither retries anything any more.
  */
-async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; strategyTaken: 'clone' }> {
-  const { runtime, primaryRepoRoot, worktreeFingerprint, warn } = args;
+async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; strategyTaken: ProvisionStrategyTaken }> {
+  const { strategy, runtime, primaryRepoRoot, worktreeFingerprint, warn } = args;
   const primaryNodeModules = path.join(primaryRepoRoot, 'node_modules');
 
-  if (!runtime.cloneSupported) {
+  // ROUND 15 (REGRESSION 3) — the CLONE is an optimisation over the install, and
+  // it is eligible only when the primary really is the right tree. Every way of
+  // being ineligible now falls through to the install lane, as main did, instead
+  // of refusing: no copy-on-write on this host, no cloneable primary, an
+  // unreadable clone source, or a primary whose dependency set is not this
+  // round's. What made the old install lane dangerous was stamping its output
+  // PROVEN; the artifact proof downstream is what fixes that, and it applies to
+  // both lanes.
+  const wantsClone = strategy === 'auto' || strategy === 'clone';
+  let cloneEligible = wantsClone;
+
+  if (cloneEligible && !runtime.cloneSupported) {
     warn({ kind: 'clone_unsupported', reason: 'APFS copy-on-write (cp -c) is not available on this platform' });
-    throw failClosed(
-      `worktree dependency provisioning requires a copy-on-write clone of ${primaryNodeModules}, which this host ` +
-        'does not support (no APFS `cp -c`). The install lane was removed because a script-less install cannot ' +
-        "prove native toolchains; set worktree.provision='none' and provision node_modules yourself on this host.",
-      'clone unsupported on this platform',
-      'clone_unsupported',
-    );
+    cloneEligible = false;
   }
-  // A real directory (never a symlinked root) with a real `.bin/`. B2: a hollow or
-  // toolchain-less primary is never cloned — that is how the exit-127 false
-  // negative got in. There is nothing to fall back to now, so it refuses.
-  if (!isPrimaryCloneable(primaryNodeModules)) {
-    throw failClosed(
-      `the primary checkout's node_modules at ${primaryNodeModules} is missing, hollow, a symlink, or has no .bin/ — ` +
-        'there is no proven tree to clone. Run `npm install` in the primary checkout and re-run.',
-      'primary node_modules is not a cloneable tree',
-      'primary_tree_stale',
-    );
+  // B2: a hollow or toolchain-less primary is never CLONED — that is how the
+  // exit-127 false negative got in. It is a reason to install, not to refuse.
+  if (cloneEligible && !isPrimaryCloneable(primaryNodeModules)) {
+    warn({ kind: 'clone_source_fingerprint_mismatch', primaryRepoRoot });
+    cloneEligible = false;
   }
 
-  // Clone ONLY when the primary's INSTALLED (working-tree) manifests fingerprint
-  // matches the worktree's COMMITTED one. A failure reading the primary's own
-  // manifests used to be non-fatal ("the primary is only the SOURCE") and fell
-  // through to install; with no install lane, an unreadable clone source is a
-  // refusal — never a guess.
-  let primaryManifests: ManifestSet;
-  try {
-    primaryManifests = await collectManifests(diskSource(primaryRepoRoot), runtime.platformKey);
-  } catch (error) {
-    warn({ kind: 'clone_failed', detail: `primary manifest read failed: ${messageOf(error)}` });
-    throw failClosed(
-      `could not read the primary checkout's dependency manifests at ${primaryRepoRoot}: ${messageOf(error)}. ` +
-        'Refusing to clone a source whose dependency set cannot be established.',
-      messageOf(error),
-      'manifest_divergence_unclassified',
-    );
+  let primaryManifests: ManifestSet | undefined;
+  if (cloneEligible) {
+    // Clone ONLY when the primary's INSTALLED (working-tree) manifests fingerprint
+    // matches the worktree's COMMITTED one. The primary is only the clone SOURCE,
+    // never the authority, so a failure reading its manifests means "not a usable
+    // source" — install — rather than a run-ending refusal.
+    try {
+      primaryManifests = await collectManifests(diskSource(primaryRepoRoot), runtime.platformKey);
+    } catch (error) {
+      warn({ kind: 'clone_failed', detail: `primary manifest read failed: ${messageOf(error)}` });
+      cloneEligible = false;
+    }
   }
-  if (computeDependencyFingerprint(primaryManifests, runtime.platformKey) !== worktreeFingerprint) {
-    warn({ kind: 'clone_source_fingerprint_mismatch', primaryRepoRoot });
-    throw await manifestDivergenceFailure(args, primaryManifests);
+  if (cloneEligible && primaryManifests !== undefined) {
+    if (computeDependencyFingerprint(primaryManifests, runtime.platformKey) !== worktreeFingerprint) {
+      // The commonest case by far: the implementor added a dependency, so the
+      // primary's tree is the WRONG dependency set. That is exactly what the
+      // install lane exists for — it builds from the round's OWN manifests.
+      warn({ kind: 'clone_source_fingerprint_mismatch', primaryRepoRoot });
+      cloneEligible = false;
+    }
+  }
+
+  if (!cloneEligible) {
+    return { treePath: await buildViaInstall(args), strategyTaken: 'install' };
   }
 
   // F9 (P3) — fingerprints agreeing proves only that the two MANIFESTS match. Prove
@@ -1140,90 +1129,64 @@ async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; str
       /* cleanup must never mask the primary failure */
     }
     if (error instanceof WorktreeError && error.kind === 'provisioning_failed') throw error;
+    // ROUND 15: a clone that fails at RUNTIME (a cross-volume stage, a non-APFS
+    // filesystem under an APFS-capable host) is the optimisation failing, not the
+    // run. Install instead — the proof downstream is the same either way.
     warn({ kind: 'clone_failed', detail: messageOf(error) });
-    throw failClosed(
-      `copy-on-write clone of ${primaryNodeModules} into the provisioning stage failed: ${messageOf(error)}. ` +
-        'Refusing — there is no install fallback (a script-less install cannot prove native toolchains).',
-      messageOf(error),
-      'clone_failed',
-    );
+    return { treePath: await buildViaInstall(args), strategyTaken: 'install' };
   }
   return { treePath: dst, strategyTaken: 'clone' };
 }
 
 /**
- * F9 (§1) — turn a fingerprint mismatch into a message that names WHICH manifest
- * diverged and WHOSE fault it is, because the two cases have opposite remedies
- * and the old generic hint ("ensure the primary's node_modules is installed")
- * sent the commonest one (a dep-adding implementor commit) in circles.
+ * ROUND 15 (REGRESSION 3) — build the tree from the round's OWN committed
+ * manifests, restored from main.
  *
- * Classification needs a third reference, since the two sets in hand — the
- * worktree at HEAD and the primary ON DISK — cannot by themselves say which side
- * moved. The primary's own HEAD is that reference:
- *   - worktree-HEAD manifests differ from primary-HEAD manifests
- *       → the implementor's COMMIT changed dependencies (`deps_changed_in_worktree`);
- *   - they agree, so the divergence is primary on-disk vs primary HEAD
- *       → uncommitted/unsynced edits in the primary (`primary_manifests_diverged`).
- * If the primary's HEAD cannot be read, neither remedy can be asserted, so the
- * refusal says so and names both (`manifest_divergence_unclassified`) rather than
- * guessing — fail closed, honestly.
+ * The manifests are written into a scratch directory and `npm ci` runs there, so
+ * the install never sees the worktree (no lifecycle script can touch the round's
+ * checkout) and the resulting `node_modules` is swapped in like any other staged
+ * tree. `runtime.install` pins `--ignore-scripts` and a minimal env, which is why
+ * a NATIVE dependency comes out unbuilt — and why the artifact proof, not the
+ * absence of this lane, is what must catch that.
  */
-async function manifestDivergenceFailure(
-  args: BuildArgs,
-  primaryManifests: ManifestSet,
-): Promise<WorktreeError> {
-  const { wtManifests, primaryRepoRoot, runtime } = args;
-  const diverged = divergedManifestNames(wtManifests, primaryManifests);
-  const named =
-    diverged.length > 0
-      ? `diverged manifests: ${diverged.join(', ')}`
-      : `the manifests are byte-identical, so the platform key differs (${runtime.platformKey}) — the primary's tree was installed under a different Node/OS/arch`;
-
-  let primaryHead: ManifestSet | undefined;
-  try {
-    primaryHead = await collectManifests(headSource(args.git, primaryRepoRoot), runtime.platformKey);
-  } catch {
-    primaryHead = undefined;
+async function buildViaInstall(args: BuildArgs): Promise<string> {
+  const cwd = path.join(args.stageDir, 'install');
+  fs.rmSync(cwd, { recursive: true, force: true });
+  fs.mkdirSync(cwd, { recursive: true });
+  for (const [rel, content] of args.wtManifests.entries) {
+    if (content === null) continue;
+    const dst = path.join(cwd, rel);
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.writeFileSync(dst, content, 'utf8');
   }
-  if (primaryHead === undefined) {
-    return failClosed(
-      `worktree dependency provisioning refused (repo ${primaryRepoRoot}): the committed manifests do not match the ` +
-        `primary checkout's installed ones — ${named}. The primary's own HEAD could not be read, so the cause cannot ` +
-        'be attributed: either the implementor committed a dependency change (land dependency changes via the engine ' +
-        'track, not inside runs) or the primary has uncommitted manifest edits (commit/sync and run `npm install`).',
-      named,
-      'manifest_divergence_unclassified',
+  try {
+    await withDeadline(() => args.runtime.install(cwd), args.timeoutMs, 'install node_modules');
+  } catch (error) {
+    if (error instanceof WorktreeError && error.provisioningCause === 'provisioning_timeout') throw error;
+    throw failClosed(
+      `dependency install (npm ci) failed in ${cwd}: ${messageOf(error)}`,
+      messageOf(error),
+      'install_failed',
     );
   }
-  const worktreeMoved = divergedManifestNames(wtManifests, primaryHead).length > 0;
-  return worktreeMoved
-    ? failClosed(
-        `worktree dependency provisioning refused (repo ${primaryRepoRoot}): the implementor's commit CHANGED the ` +
-          `dependency manifests — ${named}. Dependency changes are landed via the engine track, not inside runs: ` +
-          'no provable tree exists for the new manifests (a script-less install cannot build native dependencies). ' +
-          'Revert the manifest change in the round, or land it in the primary checkout, `npm install` there, and re-run.',
-        named,
-        'deps_changed_in_worktree',
-      )
-    : failClosed(
-        `worktree dependency provisioning refused (repo ${primaryRepoRoot}): the PRIMARY checkout has uncommitted or ` +
-          `unsynced dependency manifest edits — ${named}. Its committed manifests match the worktree's, so the drift ` +
-          'is on disk in the primary. Commit/sync the manifests, run `npm install` in the primary checkout, and re-run.',
-        named,
-        'primary_manifests_diverged',
-      );
+  const treePath = path.join(cwd, 'node_modules');
+  if (lstatSafe(treePath)?.isDirectory() !== true) {
+    throw failClosed(
+      `dependency install produced no node_modules directory in ${cwd}`,
+      'npm ci left no node_modules',
+      'install_failed',
+    );
+  }
+  return treePath;
 }
 
-/** Which fingerprinted manifest files differ between two sets (present-vs-absent
- * counts as a difference — `null` is the absent sentinel). */
-function divergedManifestNames(a: ManifestSet, b: ManifestSet): string[] {
-  const names = new Set<string>([...a.entries.keys(), ...b.entries.keys()]);
-  const diverged: string[] = [];
-  for (const name of [...names].sort()) {
-    if (a.entries.get(name) !== b.entries.get(name)) diverged.push(name);
-  }
-  return diverged;
-}
+// ROUND 15 (REGRESSION 3): `manifestDivergenceFailure` and `divergedManifestNames`
+// were DELETED here. They existed to explain a refusal that no longer happens: a
+// primary whose manifests are not this round's is simply not a usable clone
+// SOURCE, so the round installs from its own manifests (which is what main did).
+// The three causes they raised — `deps_changed_in_worktree`,
+// `primary_manifests_diverged`, `manifest_divergence_unclassified` — are gone from
+// the vocabulary too, rather than left unreachable.
 
 /**
  * Two-step move-aside / move-in swap (§2.3), all under the caller's lock. POSIX

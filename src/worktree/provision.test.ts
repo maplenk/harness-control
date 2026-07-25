@@ -458,7 +458,7 @@ describe('F7 AC-3 — clone-vs-install selection by dependency fingerprint', () 
   // what changed is the ALTERNATIVE — there is no install lane to fall to, because
   // a `--ignore-scripts` install cannot produce a provable tree. Each is now a
   // cause-coded refusal.
-  it('the primary node_modules being ABSENT is a refusal, not an install (never clone a missing source)', async () => {
+  it('the primary node_modules being ABSENT falls through to the install lane (never clones a missing source)', async () => {
     const repo = track(await makeDepsRepo());
     // No writePrimaryNodeModules → primary absent.
     const fake = fakeRuntime();
@@ -466,13 +466,14 @@ describe('F7 AC-3 — clone-vs-install selection by dependency fingerprint', () 
     const asg = assignmentId('asg_install_absent');
     const handle = await createAtHead(repo, manager, asg);
 
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-    expect(error.provisioningCause).toBe('primary_tree_stale');
-    expect(fake.calls).toEqual({ clone: 0, install: 0 });
-    expect(existsSync(path.join(handle.worktreePath, 'node_modules'))).toBe(false);
+    // ROUND 15: nothing to clone is a reason to INSTALL, never to refuse — main
+    // provisions here. The missing source is still never cloned.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('install');
+    expect(fake.calls).toEqual({ clone: 0, install: 1 });
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules'))).toBe(true);
   });
 
-  it('a HOLLOW primary node_modules is a refusal, not an install (never clone nothing)', async () => {
+  it('a HOLLOW primary node_modules falls through to the install lane (never clones nothing)', async () => {
     const repo = track(await makeDepsRepo());
     fs.mkdirSync(path.join(repo.dir, 'node_modules'), { recursive: true }); // empty/hollow
     const fake = fakeRuntime();
@@ -480,12 +481,13 @@ describe('F7 AC-3 — clone-vs-install selection by dependency fingerprint', () 
     const asg = assignmentId('asg_install_hollow');
     await createAtHead(repo, manager, asg);
 
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-    expect(error.provisioningCause).toBe('primary_tree_stale');
-    expect(fake.calls).toEqual({ clone: 0, install: 0 });
+    // ROUND 15: a hollow source is still never CLONED (B2's real invariant); it
+    // falls through to the install lane instead of refusing.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('install');
+    expect(fake.calls).toEqual({ clone: 0, install: 1 });
   });
 
-  it('a primary that DRIFTED from the committed manifests is a refusal, not an install', async () => {
+  it('a primary that DRIFTED from the committed manifests installs from the round\u2019s own manifests', async () => {
     const repo = track(await makeDepsRepo());
     await writePrimaryNodeModules(repo.dir);
     const fake = fakeRuntime();
@@ -499,12 +501,13 @@ describe('F7 AC-3 — clone-vs-install selection by dependency fingerprint', () 
       `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'right-pad': '9.9.9' } }, null, 2)}\n`,
     );
 
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-    expect(error.provisioningCause).toBe('primary_manifests_diverged');
-    expect(fake.calls).toEqual({ clone: 0, install: 0 });
+    // ROUND 15: a primary whose manifests are not this round's is not a usable
+    // clone SOURCE — so build from the round's own manifests. Still never cloned.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('install');
+    expect(fake.calls).toEqual({ clone: 0, install: 1 });
   });
 
-  it('a non-APFS host is a refusal, not an install (with a clone_unsupported warning)', async () => {
+  it('a non-APFS host installs (with a clone_unsupported warning explaining why)', async () => {
     const repo = track(await makeDepsRepo());
     await writePrimaryNodeModules(repo.dir);
     const fake = fakeRuntime({ cloneSupported: false });
@@ -513,9 +516,10 @@ describe('F7 AC-3 — clone-vs-install selection by dependency fingerprint', () 
     const asg = assignmentId('asg_non_apfs');
     await createAtHead(repo, manager, asg);
 
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-    expect(error.provisioningCause).toBe('clone_unsupported');
-    expect(fake.calls).toEqual({ clone: 0, install: 0 });
+    // ROUND 15: a host without copy-on-write installs, exactly as main does. The
+    // warning still says why the optimisation was skipped.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('install');
+    expect(fake.calls).toEqual({ clone: 0, install: 1 });
     expect(warnings.some((w) => w.kind === 'clone_unsupported')).toBe(true);
   });
 
@@ -795,10 +799,16 @@ describe('F7 AC-6 — transactional rollback and crash recovery', () => {
     const repo = track(await makeDepsRepo());
     await writePrimaryNodeModules(repo.dir);
     let failClone = false;
+    // ROUND 15: a clone failure now falls back to the INSTALL lane, so a test about
+    // what a failed BUILD leaves behind has to fault both lanes — otherwise it is
+    // testing the fallback, not the rollback.
     const fake = fakeRuntime({
       cloneImpl: async (src, dst) => {
         if (failClone) throw new Error('clone boom');
         await cp(src, dst, { recursive: true, verbatimSymlinks: true });
+      },
+      installImpl: async () => {
+        if (failClone) throw new Error('install boom');
       },
     });
     const manager = await openManager(repo, { runtime: fake.runtime });
@@ -1001,7 +1011,7 @@ describe('F7 B2 — never accept/short-circuit a tree without a real node_module
     expect(hasBin(nm)).toBe(true); // rebuilt with a real .bin
   });
 
-  it('a primary node_modules populated but with NO .bin is refused (broken clone source, no install to fall to)', async () => {
+  it('a primary node_modules populated but with NO .bin is never cloned (it installs instead)', async () => {
     const repo = track(await makeDepsRepo());
     // A primary node_modules with a package but NO `.bin` — a broken clone source.
     fs.mkdirSync(path.join(repo.dir, 'node_modules', 'left-pad'), { recursive: true });
@@ -1011,9 +1021,10 @@ describe('F7 B2 — never accept/short-circuit a tree without a real node_module
     const asg = assignmentId('asg_primary_no_bin');
     await createAtHead(repo, manager, asg);
 
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-    expect(error.provisioningCause).toBe('primary_tree_stale');
-    expect(fake.calls).toEqual({ clone: 0, install: 0 });
+    // ROUND 15: B2's invariant is that a toolchain-less tree is never CLONED (it
+    // would reintroduce the exit-127 false negative). It is a reason to install.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('install');
+    expect(fake.calls).toEqual({ clone: 0, install: 1 });
   });
 });
 
@@ -1068,8 +1079,8 @@ describe('F7 B3 — git/manifest ERRORS fail closed (never classified as safe ab
 
 describe('F7 B4 — crash-recovery restores the only rollback copy', () => {
   it('crash after move-aside + a FAILING rebuild → the prior valid tree is RESTORED', async () => {
-    // F9: the build being faulted is the CLONE (the install lane is gone); the
-    // crash-recovery invariant under test is unchanged.
+    // ROUND 15: both lanes are faulted, because a failed clone now falls back to
+    // the install — the crash-recovery invariant under test is unchanged.
     const repo = track(await makeDepsRepo());
     await writePrimaryNodeModules(repo.dir);
     fs.writeFileSync(path.join(repo.dir, 'node_modules', 'gen.txt'), 'ORIGINAL\n');
@@ -1078,6 +1089,9 @@ describe('F7 B4 — crash-recovery restores the only rollback copy', () => {
       cloneImpl: async (src, dst) => {
         if (failClone) throw new Error('rebuild boom');
         await cp(src, dst, { recursive: true, verbatimSymlinks: true });
+      },
+      installImpl: async () => {
+        if (failClone) throw new Error('rebuild boom (install)');
       },
     });
     const manager = await openManager(repo, { runtime: fake.runtime });
@@ -1458,7 +1472,7 @@ describe('F7 round-4 #3 — an ALREADY-STAGED node_modules is unstaged before th
 
 describe('F7 round-4 #2 — a non-ENOENT primary-manifest read error is never a false clone', () => {
   const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
-  it.skipIf(isRoot)('an UNREADABLE (present) primary .npmrc → clone NOT attempted; F9 refuses instead of installing', async () => {
+  it.skipIf(isRoot)('an UNREADABLE (present) primary .npmrc → clone NOT attempted; the round installs instead', async () => {
     // The worktree HEAD manifests match the primary's package.json/lock. The OLD
     // diskSource swallowed the EACCES on a PRESENT-but-unreadable primary .npmrc →
     // treated it as absent → false-matched the worktree's (genuinely absent) .npmrc →
@@ -1473,12 +1487,11 @@ describe('F7 round-4 #2 — a non-ENOENT primary-manifest read error is never a 
     const asg = assignmentId('asg_primary_npmrc_eacces');
     await createAtHead(repo, manager, asg);
     try {
-      // F9: the unreadable primary manifest still never becomes a clone — but with
-      // no install lane left, "cannot establish the source's dependency set" is a
-      // refusal rather than a silent switch to an unprovable build.
-      const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-      expect(error.provisioningCause).toBe('manifest_divergence_unclassified');
-      expect(fake.calls).toEqual({ clone: 0, install: 0 });
+      // ROUND 15: the unreadable primary manifest still never becomes a CLONE —
+      // that is the invariant this test exists for. A source whose dependency set
+      // cannot be established is not a source, so the round builds its own tree.
+      expect((await manager.provisionForVerification(asg)).strategy).toBe('install');
+      expect(fake.calls).toEqual({ clone: 0, install: 1 });
     } finally {
       fs.chmodSync(primaryNpmrc, 0o644);
     }
@@ -1603,68 +1616,12 @@ async function expectProvisioningFailure(promise: Promise<unknown>): Promise<Wor
   return error;
 }
 
-describe('F9 AC-1 — a manifest mismatch fails closed (the install fallback is gone)', () => {
-  it('the implementor changed manifests → deps_changed_in_worktree, npm is never invoked', async () => {
-    const repo = track(await makeDepsRepo());
-    await writePrimaryNodeModules(repo.dir);
-    const fake = fakeRuntime();
-    const manager = await openManager(repo, { runtime: fake.runtime });
-    const asg = assignmentId('asg_f9_deps_changed');
-    const handle = await createAtHead(repo, manager, asg);
-    // The implementor committed a dependency change inside the worktree.
-    fs.writeFileSync(
-      path.join(handle.worktreePath, 'package.json'),
-      `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0', chalk: '5.0.0' } }, null, 2)}\n`,
-    );
-    await commitInWorktree(handle.worktreePath, 'add a dependency');
-
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-
-    expect(error.provisioningCause).toBe('deps_changed_in_worktree');
-    expect(error.message).toContain('package.json'); // names the diverged manifest
-    expect(error.message).toMatch(/engine track/i); // states the remedy
-    // The whole point: no npm, no clone — nothing was built from an unproven input.
-    expect(fake.calls.install).toBe(0);
-    expect(fake.calls.clone).toBe(0);
-    // ...and NO marker was written, so a later round cannot short-circuit onto it.
-    expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
-  });
-
-  it('the PRIMARY has uncommitted manifest edits → primary_manifests_diverged', async () => {
-    const repo = track(await makeDepsRepo());
-    await writePrimaryNodeModules(repo.dir);
-    const fake = fakeRuntime();
-    const manager = await openManager(repo, { runtime: fake.runtime });
-    const asg = assignmentId('asg_f9_primary_diverged');
-    await createAtHead(repo, manager, asg);
-    // The worktree is untouched; the PRIMARY's on-disk manifest drifted from HEAD.
-    await repo.writeFile(
-      'package.json',
-      `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '2.0.0' } }, null, 2)}\n`,
-    );
-
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-
-    expect(error.provisioningCause).toBe('primary_manifests_diverged');
-    expect(error.message).toContain('package.json');
-    expect(error.message).toMatch(/npm install/i); // the operator's remedy
-    expect(fake.calls.install).toBe(0);
-  });
-
-  it('names the LOCKFILE (only) when that is what diverged', async () => {
-    const repo = track(await makeDepsRepo());
-    await writePrimaryNodeModules(repo.dir);
-    const manager = await openManager(repo);
-    const asg = assignmentId('asg_f9_lock_diverged');
-    await createAtHead(repo, manager, asg);
-    await repo.writeFile('package-lock.json', `${DEFAULT_LOCK}\n`); // byte-different
-
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-
-    expect(error.message).toContain('package-lock.json');
-    expect(error.provisioningCause).toBe('primary_manifests_diverged');
-  });
-});
+// ROUND 15: the F9 AC-1 block is GONE with the machinery it tested. A manifest
+// mismatch no longer refuses — it selects the install lane, which is what main
+// did and what `ROUND 15 REGRESSION 3` now asserts. The three divergence causes
+// (`deps_changed_in_worktree`, `primary_manifests_diverged`,
+// `manifest_divergence_unclassified`) and `manifestDivergenceFailure` were deleted
+// rather than left unreachable.
 
 describe('F9 AC-2 — a stale primary tree is never cloned (primary_tree_stale)', () => {
   it('fingerprints match but a declared package is MISSING from the primary tree → refuse, no clone', async () => {
@@ -2816,7 +2773,130 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
   });
 });
 
+// ---------------------------------------------------------------------------
+// ROUND 15 REGRESSION 3 — the install lane is BACK, gated on the native proof.
+//
+// F9 removed it because `npm ci --ignore-scripts` cannot build a native
+// dependency. True — and too broad: a script-less install is perfectly fine for a
+// project with no native dependencies at all, which is most of them. The removal
+// unconditionally refused three things MAIN does successfully: `provision:
+// 'install'`, a round whose implementor changed the manifests, and any host
+// without APFS copy-on-write.
+//
+// The hazard was never the lane, it was stamping its output PROVEN. So the lane
+// returns and the (now genuinely working) artifact proof decides: a tree with a
+// native package the install could not build is refused exactly as before, and a
+// pure-JS tree provisions. This DELETES the removal machinery rather than adding
+// more shape handling.
+// ---------------------------------------------------------------------------
+describe('ROUND 15 REGRESSION 3 — the install lane, gated on the native proof', () => {
+  it("DECISIVE (b): a pure-JS project on provision:'install' SUCCEEDS", async () => {
+    const repo = track(await makeDepsRepo());
+    // No primary node_modules at all — the install lane does not need one.
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'install' });
+    const asg = assignmentId('asg_r15_install_purejs');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const outcome = await manager.provisionForVerification(asg);
+
+    expect(outcome.provisioned).toBe(true);
+    expect(outcome.strategy).toBe('install');
+    expect(fake.calls.install).toBe(1);
+    expect(fake.calls.clone).toBe(0);
+    // A real, marked tree the verifier can use.
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules', '.bin'))).toBe(true);
+    expect(readFileSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE), 'utf8')).toBe(
+      `v3:${outcome.fingerprint}`,
+    );
+  });
+
+  it('the install lane is GATED: an unbuilt native dependency it produced is still REFUSED', async () => {
+    // The pair to the above, and the reason removal was the wrong remedy: the
+    // hazard is an unprovable TREE, and that is caught where it always should have
+    // been — at the proof, not by deleting the lane.
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0' } }));
+    const fake = fakeRuntime({
+      installImpl: async (cwd) => {
+        const nm = path.join(cwd, 'node_modules');
+        fs.mkdirSync(path.join(nm, '.bin'), { recursive: true });
+        fs.writeFileSync(path.join(nm, '.bin', 'placeholder'), '#!/bin/sh\n');
+        writeInstalledPackage(nm, 'left-pad');
+        // Exactly what `--ignore-scripts` leaves: present, declared native, unbuilt.
+        writeInstalledPackage(nm, 'needs-build', { native: true, built: false });
+      },
+    });
+    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'install' });
+    const asg = assignmentId('asg_r15_install_gated');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('native_toolchain_unproven');
+    expect(error.message).toContain('needs-build');
+    expect(fake.calls.install).toBe(1); // the lane RAN; the proof rejected its output
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
+  });
+
+  it('a non-COW host installs instead of refusing (main provisions here)', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const fake = fakeRuntime({ cloneSupported: false });
+    const manager = await openManager(repo, { runtime: fake.runtime }); // 'auto'
+    const asg = assignmentId('asg_r15_no_cow');
+    await createAtHead(repo, manager, asg);
+
+    const outcome = await manager.provisionForVerification(asg);
+
+    expect(outcome.strategy).toBe('install');
+    expect(fake.calls.install).toBe(1);
+  });
+
+  it('a round whose implementor CHANGED the manifests installs from the new ones', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_r15_deps_changed');
+    const handle = await createAtHead(repo, manager, asg);
+    // The implementor adds a dependency and commits — the primary's tree is now the
+    // WRONG dependency set, which is precisely what the install lane is for.
+    await writeFile(
+      path.join(handle.worktreePath, 'package.json'),
+      `${JSON.stringify(
+        { name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0', chalk: '5.0.0' } },
+        null,
+        2,
+      )}\n`,
+    );
+    await commitInWorktree(handle.worktreePath, 'add a dependency');
+
+    const outcome = await manager.provisionForVerification(asg);
+
+    expect(outcome.strategy).toBe('install');
+    expect(fake.calls.clone).toBe(0); // never clones a source that does not match
+    expect(fake.calls.install).toBe(1);
+  });
+
+  it('a primary with no cloneable tree installs rather than refusing', async () => {
+    const repo = track(await makeDepsRepo());
+    // No primary node_modules: nothing to clone, everything to install.
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'clone' });
+    const asg = assignmentId('asg_r15_no_source');
+    await createAtHead(repo, manager, asg);
+
+    const outcome = await manager.provisionForVerification(asg);
+
+    expect(outcome.strategy).toBe('install');
+    expect(fake.calls.install).toBe(1);
+  });
+});
+
 describe('F9 AC-4 — the config vocabulary means what it says', () => {
+  // ROUND 15: the two rows that asserted `'install'` was refused, and that a
+  // non-APFS host failed closed, are gone with the removal itself — both cases are
+  // asserted as INSTALLS in the `ROUND 15 REGRESSION 3` block above.
   it("'clone' with an unsafe-symlink clone result FAILS CLOSED (no silent lane switch)", async () => {
     const repo = track(await makeDepsRepo());
     await writePrimaryNodeModules(repo.dir, { badLink: 'absolute' });
@@ -2845,34 +2925,7 @@ describe('F9 AC-4 — the config vocabulary means what it says', () => {
     expect(fake.calls.install).toBe(0); // the OLD auto path retried as install here
   });
 
-  it("'install' is refused outright with a migration message", async () => {
-    const repo = track(await makeDepsRepo());
-    await writePrimaryNodeModules(repo.dir);
-    const fake = fakeRuntime();
-    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'install' });
-    const asg = assignmentId('asg_f9_install_refused');
-    await createAtHead(repo, manager, asg);
 
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-
-    expect(error.provisioningCause).toBe('install_provisioning_removed');
-    expect(error.message).toMatch(/cannot prove native toolchains/i);
-    expect(fake.calls.install).toBe(0);
-  });
-
-  it('a non-APFS host fails closed instead of installing (auto = clone-or-fail)', async () => {
-    const repo = track(await makeDepsRepo());
-    await writePrimaryNodeModules(repo.dir);
-    const fake = fakeRuntime({ cloneSupported: false });
-    const manager = await openManager(repo, { runtime: fake.runtime });
-    const asg = assignmentId('asg_f9_no_apfs');
-    await createAtHead(repo, manager, asg);
-
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-
-    expect(error.provisioningCause).toBe('clone_unsupported');
-    expect(fake.calls.install).toBe(0);
-  });
 
   it("'none' is unchanged — a proven skip that never reads a manifest", async () => {
     const repo = track(await makeDepsRepo());

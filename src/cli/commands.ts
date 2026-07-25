@@ -1159,20 +1159,6 @@ function loopResultOutput(
  */
 function provisioningNextHint(cause: ProvisioningCause | undefined): string {
   switch (cause) {
-    case 'deps_changed_in_worktree':
-      return (
-        'the round committed a dependency-manifest change. Dependency changes land via the engine track, not inside ' +
-        'runs: revert the manifest edit in the round, or land it on the primary checkout, run `npm install` there, ' +
-        'and start a fresh run.'
-      );
-    case 'primary_manifests_diverged':
-      return 'commit/sync the primary checkout\'s manifest edits, run `npm install` there, then re-run.';
-    case 'manifest_divergence_unclassified':
-      return (
-        'the manifests diverged but the primary\'s HEAD could not be read to attribute it — check the primary ' +
-        'checkout is a healthy git repo, then apply whichever applies: revert an in-round manifest change, or ' +
-        'commit/sync + `npm install` in the primary.'
-      );
     case 'primary_tree_stale':
       return 'run `npm install` in the primary checkout (its node_modules does not match its own manifests), then re-run.';
     case 'native_toolchain_unproven':
@@ -1186,8 +1172,11 @@ function provisioningNextHint(cause: ProvisioningCause | undefined): string {
         "the primary checkout's node_modules contains absolute or escaping symlinks; remove and reinstall it " +
         '(`rm -rf node_modules && npm install`), then re-run.'
       );
-    case 'install_provisioning_removed':
-      return "set worktree.provision to 'clone' (or 'auto'), or 'none' to provision node_modules yourself.";
+    case 'install_failed':
+      return (
+        'the dependency install for this round failed — check the npm output above, that the committed manifests ' +
+        'are installable, and that the host can reach the registry, then re-run.'
+      );
     case 'clone_unsupported':
       return (
         'this host cannot copy-on-write clone (no APFS `cp -c`), and there is no install lane. Set ' +
