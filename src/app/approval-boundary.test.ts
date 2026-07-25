@@ -988,17 +988,25 @@ describe.each(DRIVER_KINDS)('B2 round 5 — the append brand actually binds [%s]
 // alone — which also keeps the parent-to-branch UPGRADE path open, because
 // `recover()` is incremental and nothing rebuilds a projection from sequence 1.
 // ===========================================================================
-describe.each(DRIVER_KINDS)('B2 round 6 — a stale reference cannot carry an engine signature [%s]', (kind) => {
+describe.each(DRIVER_KINDS)('B2 round 6 — an UNVOUCHABLE reference cannot carry an engine signature [%s]', (kind) => {
   /** A projection as a pre-marker build left it: reference present, marker absent. */
   function stripMarkerKeepingRef(db: TestDatabaseHandle['db'], runId: RunId): void {
     const record = db.projections.get<Record<string, unknown>>(runId, ENGINE_STATE_PROJECTION);
     expect(record).toBeDefined();
-    expect(record!.state['lastDraftRef']).toBeDefined(); // the STALE reference survives
+    expect(record!.state['lastDraftRef']).toBeDefined(); // the reference survives
     const { historyComplete: _dropped, ...withoutMarker } = record!.state;
     db.projections.save(runId, ENGINE_STATE_PROJECTION, withoutMarker, record!.eventCursor);
   }
 
-  it("CODEX REPRO: no marker + a STALE PRESENT reference + an 'auto' approval MATCHING it → refused", async () => {
+  // ACCURACY NOTE (round-6 review): this constructs a reference that is CURRENT
+  // but unvouchable — round 1's own completion ref, with the marker stripped so
+  // the projection cannot testify that it saw enough history to judge it. No
+  // later bare advance supersedes it, so calling it "stale" (as the first draft
+  // of this test did) overstated the setup. The branch under test is the one
+  // that matters and is unchanged: marker absent + reference present + ENGINE
+  // signature must refuse, because round 5 checked the marker only INSIDE the
+  // `ref === undefined` arm and so never reached it when a reference existed.
+  it("no marker + a PRESENT reference + an 'auto' approval MATCHING it → refused", async () => {
     const { service, db } = await setup(kind, AUTO_CONFIG());
     // Round 1 completes and is auto-signed, leaving a reference in the state.
     const runId = await runWithCompletedDraft(service, draftFor(1));

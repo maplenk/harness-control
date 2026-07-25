@@ -657,12 +657,21 @@ export interface EngineState {
   readonly approvedSpecHash?: SpecHash;
   /**
    * B2: WHO signed the T1 that bound `approvedSpecHash` — folded from the
-   * same `spec.approved` payload, in the same effect. Absent exactly when
+   * same `spec.approved` payload, in the same effect. Absent when
    * `approvedSpecHash` is absent (never approved) OR the run was approved by
-   * a pre-B2 build, whose only possible signer was a human; readers treat
-   * absent as `'human'`. Never inferred from config: this records the actual
-   * signature, so a human who approved a run pinned to `approval: 'auto'`
-   * still shows as `human`.
+   * a pre-B2 build, which folded no signer.
+   *
+   * Absent is NOT read as `'human'`. An earlier revision of this comment said
+   * it was, and that was the false attestation this field exists to prevent:
+   * `#resolveApprovalSigner` re-reads the durable `spec.approved` row, and if
+   * even that cannot substantiate a signer it leaves the value ABSENT, which
+   * downstream consumers surface as UNKNOWN and REFUSE on. A pre-B2 approval
+   * whose signer cannot be recovered from the log is unsubstantiated, and
+   * "probably a human" is exactly the guess that would make this field lie.
+   *
+   * Never inferred from config either: this records the actual signature, so a
+   * human who approved a run pinned to `approval: 'auto'` still shows as
+   * `human`.
    */
   readonly specApprovedBy?: SpecApprovalMode;
   readonly counters: RestartCounters;

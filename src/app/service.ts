@@ -1033,10 +1033,15 @@ export interface RunStatus {
   readonly counters: RestartCounters;
   readonly approvedSpecHash?: SpecHash;
   /**
-   * B2: WHO signed the T1 that bound `approvedSpecHash`. Present exactly when
-   * `approvedSpecHash` is — i.e. absent iff the run is unapproved. A pre-B2
-   * approval (hash bound, no signer folded) resolves to `'human'` HERE, the
-   * single legacy-compat point; downstream consumers require the value.
+   * B2: WHO signed the T1 that bound `approvedSpecHash`, resolved by
+   * `#resolveApprovalSigner` from the durable `spec.approved` row.
+   *
+   * It is NOT present exactly when `approvedSpecHash` is, and a pre-B2
+   * approval does NOT resolve to `'human'` — an earlier revision of this
+   * comment claimed both. When the log cannot substantiate a signer the value
+   * stays ABSENT and is surfaced as UNKNOWN, which consumers REFUSE on. That
+   * refusal is the point: an unsubstantiated `'human'` would be a false
+   * attestation in the one field that exists to prevent one.
    */
   readonly specApprovedBy?: SpecApprovalMode;
   readonly cost: CostProjectionState;
@@ -2945,13 +2950,22 @@ export class OrchestrationService {
   }
 
   /**
-   * W3-4 — the latest durable coordinator-completion draft ref: the newest
-   * `workflow.dispatch.advanced` event into `awaiting_approval` that carries
-   * one. `undefined` for runs that never completed a drafting round through
-   * `completeCoordinationRound` (pure-unit runs advanced bare). This is the
-   * replay-side truth `approve`/`run`/`spec revise` compare the CURRENT
-   * `SPEC_DRAFT_PROJECTION` against — projection absent or hash-mismatched
-   * ⇒ the draft was lost/corrupted after the completion committed.
+   * W3-4 — the latest durable coordinator-completion draft ref.
+   *
+   * It is the ref carried by the LATEST `workflow.dispatch.advanced` event into
+   * `awaiting_approval` — **not** the newest such event that happens to carry
+   * one, which is what this comment said before B2 round 5 and is no longer
+   * true. The scan stops at the latest advance even when that advance is BARE,
+   * returning `undefined` rather than reaching further back. That is
+   * deliberate: a bare advance supersedes the ref before it, so continuing the
+   * search would resurrect a superseded draft as though it were current.
+   *
+   * `undefined` therefore means either "never completed a drafting round
+   * through `completeCoordinationRound`" (pure-unit runs advance bare) or "the
+   * latest advance carried no draft". This is the replay-side truth
+   * `approve`/`run`/`spec revise` compare the CURRENT `SPEC_DRAFT_PROJECTION`
+   * against — projection absent or hash-mismatched ⇒ the draft was
+   * lost/corrupted after the completion committed.
    */
   getCoordinatorCompletion(runId: RunId): SpecDraftRef | undefined {
     const events = this.#db.events.listByRun(runId);
