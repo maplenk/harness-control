@@ -101,7 +101,13 @@ esac
 # mandatory too — a gate that cannot record its own attempt cannot claim the
 # store is in a state it understands.
 [ -f "$CLAIM" ] || refuse "no attempt claim at $CLAIM — the preflight that wrote this record predates the claim, or could not write it"
-if ! printf '%s\tgate\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$HEAD_SHA" "${RUN_ID:-<start>}" >> "$ATTEMPTS" 2>/dev/null; then
+# The append goes through node rather than a shell redirect: bash reports a
+# failed redirect itself (noise above the refusal that matters), and in bash 3.2
+# a failed redirect on a group command does not reliably propagate its status —
+# which silently turned this mandatory check into a no-op.
+GATE_MARK="$(date -u +%Y-%m-%dT%H:%M:%SZ)	gate	$HEAD_SHA	${RUN_ID:-<start>}"
+if ! node -e 'require("node:fs").appendFileSync(process.argv[1], process.argv[2] + "\n")' \
+     "$ATTEMPTS" "$GATE_MARK" 2>/dev/null; then
   refuse "cannot write the gate attempt marker at $ATTEMPTS — refusing rather than proceeding on a store I cannot write"
 fi
 
