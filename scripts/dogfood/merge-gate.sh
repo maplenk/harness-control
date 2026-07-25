@@ -60,13 +60,17 @@ STATUS_JSON="$LOGDIR/merge-gate-$STAMP-status.json"
 "${CLI[@]}" status "$RUN_ID" --json >"$STATUS_JSON" 2>/dev/null \
   || die "cannot read status for $RUN_ID (is dist built?)"
 
+# `read` returns non-zero at EOF, which `set -e` would treat as fatal, so the
+# node side emits a trailing newline AND the read is guarded. Without both, the
+# gate exits 1 here with no message.
 read -r PHASE VERDICT COMMIT < <(node - "$STATUS_JSON" <<'NODE'
 const b = (o => o.json ?? o)(JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8')));
 const mr = b.mergeReadiness ?? b.merge_readiness ?? {};
 const commit = mr.implementationCommit ?? mr.commit ?? b.implementationCommit ?? '';
-process.stdout.write([b.phase ?? '?', mr.verdict ?? b.verdict ?? 'absent', commit || '-'].join(' '));
+console.log([b.phase ?? '?', mr.verdict ?? b.verdict ?? 'absent', commit || '-'].join(' '));
 NODE
-)
+) || true
+[ -n "${PHASE:-}" ] || die "could not parse run status from $STATUS_JSON"
 echo "  phase=$PHASE  verdict=$VERDICT  commit=$COMMIT"
 [ "$PHASE" = "merge_ready" ] || die "phase is '$PHASE', not merge_ready — nothing to gate"
 if [ "$VERDICT" != "passed" ] && [ "${ALLOW_UNPROVEN:-0}" != "1" ]; then
