@@ -76,11 +76,21 @@ import type {
   CriterionResult,
   CriterionVerdict,
   EvidenceReceipt,
+  HostEvidenceReceiptBody,
   MergeReadiness,
   Verification,
   VerificationHarnessPair,
 } from '../../domain/entities.js';
 import type { SpecApprovalMode } from '../../domain/state.js';
+import {
+  describeVerificationCommand,
+  HOST_TERMINATION_EXIT_CODE,
+  reservedExitCodeReason,
+  verificationCommandExpectedExitCode,
+  verificationCommandText,
+  verificationCommandTexts,
+  type VerificationCommand,
+} from '../../domain/verification-command.js';
 import type { SessionUpdate } from '../../adapters/spi.js';
 import type { ArtifactSink } from '../../artifacts/store.js';
 import * as git from '../../worktree/git.js';
@@ -154,6 +164,82 @@ export function verificationCommandArgv(command: string): readonly string[] {
 }
 
 /**
+ * F15 — THE host-proof decision, in one place: does this receipt prove this
+ * declared command? Returns the fail-closed reason it does not, or `undefined`.
+ *
+ * Kept as a pure exported function so no caller can express "compare an exit
+ * code" without holding the DECLARATION that says which code proves it. The
+ * pre-F15 gate compared against a literal `0` inline; that is the shape of bug
+ * that survives review because every individual comparison looks correct.
+ *
+ * The order of the refusals is load-bearing:
+ *
+ *  1. **A command that never launched proves nothing**, whatever the spec
+ *     declared. This is not a policy the spec may override, so it is checked
+ *     BEFORE the declared code and reports its own message — a spec declaring
+ *     `127` must not see "exit matched".
+ *  2. **A declaration that cannot be proven at all** (host-reserved or
+ *     unreadable, see `reservedExitCodeReason`) is reported as a defect in the
+ *     declaration, not as a mismatch, because no receipt could ever satisfy it.
+ *  3. **A host termination** (`124` — deadline or output cap) is the harness
+ *     giving up, not an observation of the command's verdict.
+ *  4. **Unknown launch state** (a receipt written before F15 carried the field)
+ *     may still prove a `0`-declared criterion — that is exactly what the
+ *     pre-F15 gate accepted, and house rule 3 forbids refusing it now — but may
+ *     never prove a NON-ZERO one, where the whole question is whether `127`
+ *     meant "ran and exited 127" or "never ran" (house rule 9).
+ *  5. Otherwise the declared code is an EQUALITY check, never a floor.
+ */
+export function hostReceiptProofIssue(
+  receipt: Pick<EvidenceReceipt, 'receiptId' | 'exitCode' | 'launchFailed'>,
+  declared: VerificationCommand,
+): string | undefined {
+  const expected = verificationCommandExpectedExitCode(declared);
+
+  if (receipt.launchFailed === true) {
+    return (
+      `Host receipt ${receipt.receiptId} records a command that never LAUNCHED ` +
+      '(the host could not start the process); execution proves nothing regardless ' +
+      'of the declared expected exit code, so the criterion is unproven.'
+    );
+  }
+
+  const reserved = reservedExitCodeReason(expected);
+  if (reserved !== undefined) {
+    return (
+      `The criterion declares expected exit code ${expected}, which can never prove it: ` +
+      `${reserved}. Declare a different exit code; criterion is unproven.`
+    );
+  }
+
+  if (receipt.exitCode === HOST_TERMINATION_EXIT_CODE) {
+    return (
+      `Host receipt ${receipt.receiptId} exited ${HOST_TERMINATION_EXIT_CODE}, the host's ` +
+      'timeout/output-cap termination code; the command was stopped rather than observed, ' +
+      'so the criterion is unproven.'
+    );
+  }
+
+  if (expected !== 0 && receipt.launchFailed === undefined) {
+    return (
+      `Host receipt ${receipt.receiptId} predates launch-state recording, so it cannot ` +
+      `show whether exit ${receipt.exitCode} came from a run or from a failed launch; a ` +
+      `non-zero declared exit code (${expected}) cannot be proven by it, so the criterion ` +
+      'is unproven.'
+    );
+  }
+
+  if (receipt.exitCode !== expected) {
+    return (
+      `Host receipt ${receipt.receiptId} exited ${receipt.exitCode}, not the declared ` +
+      `${expected}; execution did not prove the criterion, so it is unproven.`
+    );
+  }
+
+  return undefined;
+}
+
+/**
  * Execute every declared command at the post-provisioning verification
  * boundary and persist redacted stdout, stderr, and an immutable receipt body
  * through the same quota-aware CAS sink as narrative evidence.
@@ -163,7 +249,11 @@ export async function executeEvidenceReceipts(
 ): Promise<readonly EvidenceReceipt[]> {
   const receipts: EvidenceReceipt[] = [];
   for (const criterion of input.criteria) {
-    for (const command of criterion.verificationCommands) {
+    for (const declared of criterion.verificationCommands) {
+      // F15: the receipt records the OBSERVATION (what the host ran and saw).
+      // The EXPECTATION stays in the approved spec and is applied by the gate,
+      // so the host never certifies against a number the run supplied itself.
+      const command = verificationCommandText(declared);
       const startedAt = input.clock.nowIso();
       let outcome: VerificationCommandOutcome;
       try {
@@ -189,7 +279,7 @@ export async function executeEvidenceReceipts(
         criterionId: criterion.id,
         content: stderr,
       });
-      const body: Omit<EvidenceReceipt, 'receiptRef'> = {
+      const body: HostEvidenceReceiptBody = {
         receiptId: input.ids.nextId('receipt'),
         runId: input.runId,
         criterionId: criterion.id,
@@ -198,6 +288,7 @@ export async function executeEvidenceReceipts(
         argv: verificationCommandArgv(command),
         cwd: input.cwd,
         exitCode: outcome.exitCode,
+        launchFailed: outcome.launchFailed,
         startedAt,
         endedAt,
         stdoutRef,
@@ -530,13 +621,22 @@ export function buildVerifierPrompt(input: {
     `3. Mark a criterion "passed" ONLY when your OWN evidence proves it. If you cannot gather`,
     `   sufficient evidence, mark it "unproven" (never "passed"). If your evidence disproves it,`,
     `   mark it "failed" and request the fix.`,
+    `4. A receipt proves its command only when its exitCode EQUALS the exit code the criterion`,
+    `   declares. Unannotated commands must exit 0; a command shown as "(expects exit N)" must`,
+    `   exit exactly N — an absence check such as \`grep\` correctly exits 1 when it finds nothing,`,
+    `   and that IS the pass. Do not read a non-zero exit as failure when the criterion declared it,`,
+    `   and do not read a zero exit as success when the criterion declared something else.`,
     ``,
     `ACCEPTANCE CRITERIA:`,
   );
   for (const c of criteria) {
     lines.push(`[${String(c.id)}] ${c.description}`);
     if (c.verificationCommands.length > 0) {
-      lines.push(`     verification commands: ${c.verificationCommands.join(' ; ')}`);
+      lines.push(
+        `     verification commands: ${c.verificationCommands
+          .map(describeVerificationCommand)
+          .join(' ; ')}`,
+      );
     }
     if (c.expectedEvidence !== undefined) {
       lines.push(`     expected evidence: ${c.expectedEvidence}`);
@@ -558,7 +658,9 @@ export function buildVerifierPrompt(input: {
       lines.push(
         `[${String(c.id)}] receipt=${receipt.receiptId} argv=${JSON.stringify(
           receipt.argv,
-        )} cwd=${receipt.cwd} exitCode=${receipt.exitCode} stdoutRef=${String(
+        )} cwd=${receipt.cwd} exitCode=${receipt.exitCode} launchFailed=${
+          receipt.launchFailed === undefined ? 'unknown' : String(receipt.launchFailed)
+        } stdoutRef=${String(
           receipt.stdoutRef,
         )} stderrRef=${String(receipt.stderrRef)} receiptRef=${String(
           receipt.receiptRef,
@@ -688,9 +790,9 @@ export class VerifierRunner implements ReadOnlyRoleRunner<VerifierGathering> {
 
   constructor(config: VerifierRunnerConfig) {
     this.#config = config;
-    this.allowedShellCommands = [
-      ...new Set(config.criteria.flatMap((criterion) => criterion.verificationCommands)),
-    ];
+    this.allowedShellCommands = verificationCommandTexts(
+      config.criteria.flatMap((criterion) => criterion.verificationCommands),
+    );
   }
 
   async run(session: RoleSession): Promise<VerifierGathering> {
@@ -859,8 +961,15 @@ export class VerifierRunner implements ReadOnlyRoleRunner<VerifierGathering> {
     };
   }
 
-  /** Return the fail-closed reason a command-bearing criterion lacks a complete,
-   * current, zero-exit host receipt set; `undefined` means the host proof holds. */
+  /**
+   * Return the fail-closed reason a command-bearing criterion lacks a complete,
+   * current, PROVING host receipt set; `undefined` means the host proof holds.
+   *
+   * F15: "proving" is per-command — each receipt's exit code must equal the code
+   * that command DECLARES (`0` unless the criterion says otherwise), and the
+   * launch state must not contradict it. `hostReceiptProofIssue` owns that
+   * decision; this method owns completeness, currency, and argv matching.
+   */
   #hostReceiptIssue(criterion: AcceptanceCriterion): string | undefined {
     if (criterion.verificationCommands.length === 0) return undefined;
     if (!this.#config.hostVerificationPassed) {
@@ -871,8 +980,8 @@ export class VerifierRunner implements ReadOnlyRoleRunner<VerifierGathering> {
       (receipt) => String(receipt.criterionId) === String(criterion.id),
     );
     const used = new Set<number>();
-    for (const command of criterion.verificationCommands) {
-      const expectedArgv = verificationCommandArgv(command);
+    for (const declared of criterion.verificationCommands) {
+      const expectedArgv = verificationCommandArgv(verificationCommandText(declared));
       const argvCandidates = candidates
         .map((receipt, index) => ({ receipt, index }))
         .filter(
@@ -900,12 +1009,8 @@ export class VerifierRunner implements ReadOnlyRoleRunner<VerifierGathering> {
         return `Missing host receipt for argv ${JSON.stringify(expectedArgv)}; criterion is unproven.`;
       }
       used.add(current.index);
-      if (current.receipt.exitCode !== 0) {
-        return (
-          `Host receipt ${current.receipt.receiptId} exited ${current.receipt.exitCode}; ` +
-          'execution did not prove the criterion, so it is unproven.'
-        );
-      }
+      const proofIssue = hostReceiptProofIssue(current.receipt, declared);
+      if (proofIssue !== undefined) return proofIssue;
     }
     return undefined;
   }

@@ -43,6 +43,7 @@ import {
 } from '../domain/ids.js';
 import * as git from '../worktree/git.js';
 import type { AcceptanceCriterion, MergeReadiness, SpecVersion } from '../domain/entities.js';
+import { normalizeVerificationCommands } from '../domain/verification-command.js';
 import type { RoleName } from '../domain/state.js';
 import type { Clock } from '../lib/clock.js';
 import type { IdFactory } from '../lib/id-factory.js';
@@ -328,7 +329,9 @@ function rebuildPriorVersionFromCompletion(
         criteria = validated.value.acceptanceCriteria.map((c) => ({
           id: criterionId(c.id),
           description: c.description,
-          verificationCommands: c.verificationCommands,
+          // F15: normalized on this read boundary as well — the stored artifact
+          // may have been written by any prior version of the coordinator.
+          verificationCommands: normalizeVerificationCommands(c.verificationCommands),
           expectedEvidence: c.expectedEvidence,
         }));
       }

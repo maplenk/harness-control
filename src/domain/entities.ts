@@ -26,6 +26,7 @@ import type {
   VerificationId,
   WaveId,
 } from './ids.js';
+import type { VerificationCommand } from './verification-command.js';
 import type {
   CheckpointReason,
   DetectionTier,
@@ -72,11 +73,26 @@ export interface Run {
 // ---------------------------------------------------------------------------
 // SpecVersion (immutable, content-hash; §7)
 // ---------------------------------------------------------------------------
+/** Re-exported so a reader of `AcceptanceCriterion` finds the shape here too;
+ * the accessors that make the union safe to read live in the same module. */
+export type { DeclaredVerificationCommand, VerificationCommand } from './verification-command.js';
+
 export interface AcceptanceCriterion {
   /** Stable id referenced by Verification and Checkpoint criterion states. */
   readonly id: CriterionId;
   readonly description: string;
-  readonly verificationCommands: readonly string[];
+  /**
+   * F15: each entry is either a bare command string (proven by exit `0` — the
+   * pre-F15 contract, and the only shape any persisted spec carries) or a
+   * `{ command, expectedExitCode }` declaration for a command whose proving exit
+   * code is not `0` (`grep` exits `1` when it finds nothing, which is the pass
+   * condition of every ABSENCE criterion).
+   *
+   * The union is NOT string-compatible on purpose: read it only through
+   * `verificationCommandText` / `verificationCommandExpectedExitCode`
+   * (`./verification-command.js`), never by destructuring at the call site.
+   */
+  readonly verificationCommands: readonly VerificationCommand[];
   readonly expectedEvidence?: string;
 }
 
@@ -274,6 +290,21 @@ export interface EvidenceReceipt {
   readonly argv: readonly string[];
   readonly cwd: string;
   readonly exitCode: number;
+  /**
+   * F15: TRUE iff the host could not START the process at all (no shell, spawn
+   * error). The runner reports `{ exitCode: 127, launchFailed: true }` for that
+   * case and `/bin/sh -c 'nosuchcmd'` reports `{ exitCode: 127, launchFailed:
+   * false }` — the same number, opposite meanings. Flattening both to `127` was
+   * harmless while any non-zero refused; it is not harmless now that a spec may
+   * declare `127`.
+   *
+   * OPTIONAL because it is optional in the STORE, not in new receipts: every
+   * receipt written before F15 lacks the field, and absence there means
+   * "recorded before launch state existed" — legitimately UNKNOWN, never
+   * `false` (house rule 9). New receipts must always carry it: construct them
+   * through `HostEvidenceReceiptBody`, where it is required.
+   */
+  readonly launchFailed?: boolean;
   readonly startedAt: IsoTimestamp;
   readonly endedAt: IsoTimestamp;
   readonly stdoutRef: ArtifactHash;
@@ -287,6 +318,22 @@ export interface EvidenceReceipt {
     readonly provisioningMarker: string;
   };
 }
+
+/**
+ * The receipt body a HOST must supply when it mints a receipt now — everything
+ * except the CAS ref the sink returns.
+ *
+ * `launchFailed` is REQUIRED here even though it is optional on
+ * `EvidenceReceipt`: absence is a fact about the STORE (a record older than the
+ * field), never a licence for new code to skip recording launch state. Typing
+ * the one construction site with this makes the omission a compile error rather
+ * than something a future contributor must remember (house rule 1); a second
+ * construction site appearing anywhere in `src/` fails
+ * `verification-command.chokepoints.test.ts`.
+ */
+export type HostEvidenceReceiptBody = Omit<EvidenceReceipt, 'receiptRef' | 'launchFailed'> & {
+  readonly launchFailed: boolean;
+};
 
 export interface Verification {
   readonly id: VerificationId;

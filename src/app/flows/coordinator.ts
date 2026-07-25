@@ -48,6 +48,13 @@ import {
   type SpecVersionId,
 } from '../../domain/ids.js';
 import type { AcceptanceCriterion, Artifact, SpecVersion } from '../../domain/entities.js';
+import {
+  describeVerificationCommand,
+  normalizeVerificationCommand,
+  normalizeVerificationCommands,
+  reservedExitCodeReason,
+  verificationCommandText,
+} from '../../domain/verification-command.js';
 import type { SessionUpdate } from '../../adapters/spi.js';
 import type { ArtifactSink } from '../../artifacts/store.js';
 import type { Profile } from '../../config/profile.js';
@@ -66,6 +73,45 @@ import type {
 /** A stable acceptance-criterion id: `AC-1`, `AC-2`, … (§7 "stable IDs"). */
 export const CRITERION_ID_PATTERN = /^AC-\d+$/;
 
+/**
+ * F15 §3.1: a verification command is a bare string (proven by exit `0`) or a
+ * `{ command, expectedExitCode }` declaration for a command whose PASS is a
+ * non-zero exit — `grep` exits `1` when it finds nothing, and "finds nothing" is
+ * the pass condition of every absence/scope/isolation criterion.
+ *
+ * The `.transform` is the hash chokepoint: an object declaring `0` collapses
+ * back to the bare string, so a spec that declares nothing new produces exactly
+ * the pre-F15 canonical bytes and every persisted approval keeps its hash.
+ */
+const verificationCommandSchema = z
+  .union([
+    z.string().min(1, 'a verification command cannot be blank'),
+    z
+      .object({
+        command: z.string().min(1, 'a verification command cannot be blank'),
+        expectedExitCode: z
+          .number()
+          .int('expectedExitCode must be an integer')
+          .min(0, 'expectedExitCode must be in 0..255')
+          .max(255, 'expectedExitCode must be in 0..255'),
+      })
+      .strict()
+      .superRefine((value, ctx) => {
+        // One source of truth with the host gate: a code the gate can never
+        // accept is rejected here, where the coordinator can still fix it,
+        // instead of surfacing as an unprovable criterion at verify time.
+        const reason = reservedExitCodeReason(value.expectedExitCode);
+        if (reason !== undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['expectedExitCode'],
+            message: `expectedExitCode ${value.expectedExitCode} can never prove a criterion: ${reason}`,
+          });
+        }
+      }),
+  ])
+  .transform(normalizeVerificationCommand);
+
 const acceptanceCriterionSchema = z
   .object({
     /** Stable id referenced by verification/checkpoint state (§7, §12.2). */
@@ -73,7 +119,7 @@ const acceptanceCriterionSchema = z
     description: z.string().min(1, 'description is required'),
     /** ≥1 exact command the Verifier runs (§7 "verification commands"). */
     verificationCommands: z
-      .array(z.string().min(1, 'a verification command cannot be blank'))
+      .array(verificationCommandSchema)
       .min(1, 'each acceptance criterion needs at least one verification command'),
     /** §7 "expected evidence" — the concrete, observable outcome to check. */
     expectedEvidence: z.string().min(1, 'expected evidence is required'),
@@ -417,13 +463,18 @@ export function assessSpecSemantics(
     // B2 F4: the STRUCTURAL gate. The commands belong to the run, not to the
     // coordinator, so a criterion cannot be "proven" by a command the
     // coordinator made up (`true`, `echo ok`, `npm test || true`).
+    // B2 × F15: the allowlist pins what may be RUN, so it is matched against
+    // the command TEXT. A declared `expectedExitCode` is a separate statement
+    // about what proves the criterion, not part of the command's identity —
+    // pinning `grep -R x web/` must not be defeatable, nor made unusable, by
+    // the criterion also saying that finding nothing (exit 1) is the pass.
     if (allowedSet.size > 0) {
       for (const [j, command] of criterion.verificationCommands.entries()) {
-        if (!allowedSet.has(command)) {
+        if (!allowedSet.has(verificationCommandText(command))) {
           issues.push({
             path: `acceptanceCriteria.${i}.verificationCommands.${j}`,
             message:
-              `criterion ${criterion.id} cites verification command ${JSON.stringify(command)}, which this ` +
+              `criterion ${criterion.id} cites verification command ${describeVerificationCommand(command)}, which this ` +
               `run does not declare. Verification commands are pinned by the run, not chosen by you: cite one ` +
               `of exactly [${allowed.map((c) => JSON.stringify(c)).join(', ')}]. If none of them can prove this ` +
               `criterion, the criterion is not verifiable here — restate it in terms one of them proves, or drop it.`,
@@ -505,7 +556,12 @@ export function canonicalizeSpec(doc: CoordinatorSpecDocument): string {
     acceptanceCriteria: doc.acceptanceCriteria.map((c) => ({
       id: c.id,
       description: c.description,
-      verificationCommands: c.verificationCommands,
+      // F15 hash stability, belt AND braces: the §7 schema already normalized on
+      // parse, but `canonicalizeSpec` is exported and callable with a
+      // hand-assembled document, and these bytes ARE the approved spec hash. An
+      // `expectedExitCode: 0` object reaching them would silently invalidate
+      // every persisted approval, so the collapse happens here as well.
+      verificationCommands: normalizeVerificationCommands(c.verificationCommands),
       expectedEvidence: c.expectedEvidence,
     })),
     rollback: doc.rollback,
@@ -975,7 +1031,11 @@ export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome>
     const criteria: readonly AcceptanceCriterion[] = doc.acceptanceCriteria.map((c) => ({
       id: criterionId(c.id),
       description: c.description,
-      verificationCommands: c.verificationCommands,
+      // Normalized on the way onto the persisted entity too: these criteria are
+      // written to the spec-draft projection and read back by a later process,
+      // so an `expectedExitCode: 0` object here would outlive the parse that
+      // should have collapsed it.
+      verificationCommands: normalizeVerificationCommands(c.verificationCommands),
       expectedEvidence: c.expectedEvidence,
     }));
 
@@ -1098,7 +1158,7 @@ export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome>
       '  "permissions": ["string"],',
       '  "nonGoals": ["string"],',
       '  "tasks": [{ "id": "T1", "description": "string", "dependsOn": ["T0"] }],',
-      '  "acceptanceCriteria": [{ "id": "AC-1", "description": "string", "verificationCommands": ["cmd"], "expectedEvidence": "concrete, observable outcome" }],',
+      '  "acceptanceCriteria": [{ "id": "AC-1", "description": "string", "verificationCommands": ["cmd", { "command": "cmd", "expectedExitCode": 1 }], "expectedEvidence": "concrete, observable outcome" }],',
       '  "rollback": "string",',
       '  "proposedImplementorProfile": "string",',
       '  "proposedVerifierProfile": "string",',
@@ -1117,6 +1177,11 @@ export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome>
               )}\nChoose WHICH of these proves each criterion. If none can prove a criterion, restate the criterion in terms one of them proves, or drop it.`,
           ]
         : []),
+      // F15: the pinned-command rule above says WHICH commands may be cited;
+      // this says what "passing" means for each. Both are needed — a criterion
+      // can cite an allowed command and still be unprovable if its passing
+      // outcome is a non-zero exit and it does not say so.
+      'A verification command PASSES only when it exits with the code the criterion declares. A bare string means "must exit 0". Use the object form `{ "command": "…", "expectedExitCode": N }` whenever the passing outcome is a NON-ZERO exit — most importantly for every criterion that asserts ABSENCE: `grep`/`rg` exit 1 when they find nothing, so a scope, isolation, or "no such import/key/call exists" check MUST declare `"expectedExitCode": 1` or it can never be proven. Do not wrap the command in `!` or `|| true` to force a 0 — that hides the difference between "found nothing" (exit 1, a pass) and "the search itself errored" (exit 2, not a pass). Exit code 124 is reserved by the host for timeouts and is rejected.',
       'Then STOP. The host decides whether approval is human (T1, the default) or engine-signed; either way you never approve your own spec.',
     ].join('\n');
   }

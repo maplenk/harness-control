@@ -92,6 +92,7 @@ import {
 } from './verifier.js';
 import type { RunId } from '../../domain/ids.js';
 import type { Verification } from '../../domain/entities.js';
+import { verificationCommandText } from '../../domain/verification-command.js';
 import {
   MERGE_READINESS_BLOCKED_PROJECTION,
   type MergeReadinessBlockedState,
@@ -192,9 +193,10 @@ function receiptsFor(
         criterionId: criterion.id,
         specHash: SPEC_HASH,
         implementationCommit: IMPL_COMMIT,
-        argv: verificationCommandArgv(command),
+        argv: verificationCommandArgv(verificationCommandText(command)),
         cwd: '/worktree',
         exitCode: 0,
+        launchFailed: false,
         startedAt: isoTimestamp('2026-07-25T00:00:00.000Z'),
         endedAt: isoTimestamp('2026-07-25T00:00:01.000Z'),
         stdoutRef: artifactHash(`stdout_${index}`),

@@ -47,7 +47,7 @@ Return the spec in this shape (PLAN §7). Your output is untrusted by the host: 
 - **Non-goals** — explicitly out of scope, so the Implementor doesn't drift into it.
 - **Ordered tasks + dependencies** — the Implementor's checklist, in the order it should be done.
 - **Acceptance criteria** — stable IDs (e.g. `AC-1`, `AC-2`, …), specific and testable, no vague language.
-- **Verification commands + expected evidence** — one entry per criterion; exact commands the Verifier will run.
+- **Verification commands + expected evidence** — one entry per criterion; exact commands the Verifier will run. A command proves its criterion only when it exits with the code the criterion DECLARES. A plain command string means "must exit 0"; write `{ "command": "…", "expectedExitCode": N }` whenever the passing outcome is a non-zero exit. This is mandatory for every criterion that asserts ABSENCE — `grep`/`rg` exit 1 when they find nothing, so a scope, isolation, or "no such import/key/call exists" check that does not declare `"expectedExitCode": 1` can never be proven. Never wrap a command in `!` or `|| true` to force a 0: that erases the difference between "found nothing" (exit 1, a pass) and "the search itself errored" (exit 2, not a pass). Exit code 124 is reserved by the host for timeouts and is rejected by the validator.
 - **Rollback/recovery notes** — how to back out safely if something goes wrong.
 - **Proposed Implementor/Verifier profiles** — the default profile names for `harness run`.
 
