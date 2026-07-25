@@ -681,19 +681,23 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
   const existing = lstatSafe(nodeModules);
   const marker = existing?.isDirectory() === true && hasBinDir(nodeModules) ? readMarker(nodeModules) : undefined;
   if (marker !== undefined && marker.fingerprint === fingerprint) {
-    if (marker.smokeAttested) {
+    if (marker.smokeAttested && marker.versionsAttested) {
       return proven('short_circuit', fingerprint, repoRoot, worktreePath, 'existing node_modules matches the committed dependency fingerprint');
     }
-    // Throws `native_toolchain_unproven` when the tree cannot be loaded — a
-    // legacy broken tree is refused instead of silently reused.
+    // ROUND 9 (Blocker 2): a v1/v2 marker is NOT a proof under the current rules,
+    // so run the FULL proof against the tree in place (no rebuild) before reusing
+    // it. Both halves throw rather than degrade: version defects refuse
+    // `primary_tree_stale`, an unloadable toolchain refuses
+    // `native_toolchain_unproven`.
+    assertRootVersionsProven(nodeModules, wtManifests, worktreePath, 'the worktree');
     await runNativeSmoke(nodeModules, warn, timeoutMs);
-    fs.writeFileSync(path.join(nodeModules, PROVISION_MARKER_FILE), markerV2(fingerprint), 'utf8');
+    fs.writeFileSync(path.join(nodeModules, PROVISION_MARKER_FILE), markerV3(fingerprint), 'utf8');
     return proven(
       'short_circuit',
       fingerprint,
       repoRoot,
       worktreePath,
-      'existing node_modules matches the committed dependency fingerprint; its pre-F9 marker was re-proven by the runtime smoke and upgraded',
+      `existing node_modules matches the committed dependency fingerprint; its ${marker.smokeAttested ? 'pre-version-proof (v2)' : 'pre-F9 (v1)'} marker was re-proven in place and upgraded`,
     );
   }
 
@@ -758,7 +762,7 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
     await runNativeSmoke(built.treePath, warn, timeoutMs);
     // Marker LAST (after the tree is fully built AND proven), in the v2 format
     // that attests the smoke as well as the fingerprint (HIGH-3).
-    fs.writeFileSync(path.join(built.treePath, PROVISION_MARKER_FILE), markerV2(fingerprint), 'utf8');
+    fs.writeFileSync(path.join(built.treePath, PROVISION_MARKER_FILE), markerV3(fingerprint), 'utf8');
 
     try {
       swapIntoPlace(nodeModules, built.treePath, stageDir, params.rename);
@@ -1057,33 +1061,7 @@ async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; str
   const declared = declaredRootPackages(args.wtManifests);
   // ROUND 7 (Finding 2): at VERSION granularity — a name check alone let a
   // dependency bumped without reinstalling pass on its OLD directory.
-  const locked = lockedRootVersions(args.wtManifests);
-  if (!locked.ok) {
-    throw failClosed(
-      `the primary checkout's node_modules at ${primaryNodeModules} cannot be proven against the committed ` +
-        `dependency manifests: ${locked.reason}. Refusing rather than cloning a tree whose dependency VERSIONS ` +
-        'nothing can confirm — presence alone is not proof (a package bumped without reinstalling keeps its old ' +
-        'directory). Commit an npm package-lock.json alongside package.json and run `npm install` in the primary.',
-      `unusable lock data: ${locked.reason}`,
-      'primary_tree_stale',
-    );
-  }
-  const defects = proveePrimaryTree(primaryNodeModules, declared, locked.versions);
-  if (defects.length > 0) {
-    const named = defects
-      .slice(0, 8)
-      .map((d) => `${d.name} (${d.detail})`)
-      .join('; ');
-    throw failClosed(
-      `the primary checkout's node_modules at ${primaryNodeModules} is STALE: ${defects.length} manifest-declared ` +
-        `package(s) do not match the lockfile there — ${named}${defects.length > 8 ? '; …' : ''}. ` +
-        'Its manifests match the committed ones, but it was not installed against them — cloning it would hand ' +
-        'verification a tree whose dependencies differ from the lockfile (a missing package exits 127; a stale ' +
-        'VERSION verifies the wrong code silently). Run `npm install` in the primary checkout and re-run.',
-      `primary tree has ${defects.length} package(s) diverging from the lockfile`,
-      'primary_tree_stale',
-    );
-  }
+  assertRootVersionsProven(primaryNodeModules, args.wtManifests, primaryRepoRoot, 'the primary checkout');
 
   const dst = path.join(args.stageDir, 'node_modules');
   try {
@@ -1468,6 +1446,50 @@ interface PrimaryTreeDefect {
   readonly detail: string;
 }
 
+/**
+ * ROUND 9 (Blocker 2) — the ROOT VERSION proof, applied to whichever tree is
+ * about to be trusted. Extracted so the CLONE lane (proving the primary before
+ * copying it) and the SHORT-CIRCUIT lane (proving a worktree tree whose marker
+ * predates this proof) run the identical check rather than one of them silently
+ * skipping it.
+ *
+ * `label`/`root` only shape the operator message; the rule is the same either
+ * way. Throws `provisioning_failed` / `primary_tree_stale`; returns on success.
+ */
+function assertRootVersionsProven(
+  treeNodeModules: string,
+  manifests: ManifestSet,
+  root: string,
+  label: string,
+): void {
+  const locked = lockedRootVersions(manifests);
+  if (!locked.ok) {
+    throw failClosed(
+      `${label}'s node_modules at ${treeNodeModules} cannot be proven against the committed dependency ` +
+        `manifests (repo ${root}): ${locked.reason}. Refusing rather than trusting a tree whose dependency ` +
+        'VERSIONS nothing can confirm — presence alone is not proof (a package bumped without reinstalling keeps ' +
+        'its old directory). Commit an npm package-lock.json alongside package.json and run `npm install`.',
+      `unusable lock data: ${locked.reason}`,
+      'primary_tree_stale',
+    );
+  }
+  const defects = proveePrimaryTree(treeNodeModules, declaredRootPackages(manifests), locked.versions);
+  if (defects.length === 0) return;
+  const named = defects
+    .slice(0, 8)
+    .map((d) => `${d.name} (${d.detail})`)
+    .join('; ');
+  throw failClosed(
+    `${label}'s node_modules at ${treeNodeModules} is STALE: ${defects.length} manifest-declared package(s) do ` +
+      `not match the lockfile — ${named}${defects.length > 8 ? '; …' : ''}. Its manifests match the committed ` +
+      'ones, but it was not installed against them — trusting it would hand verification a tree whose ' +
+      'dependencies differ from the lockfile (a missing package exits 127; a stale VERSION verifies the wrong ' +
+      'code silently). Run `npm install` and re-run.',
+    `${label} tree has ${defects.length} package(s) diverging from the lockfile`,
+    'primary_tree_stale',
+  );
+}
+
 function proveePrimaryTree(
   primaryNodeModules: string,
   declared: readonly string[],
@@ -1525,6 +1547,9 @@ function proveePrimaryTree(
  * `node_modules/<name>` (top-level only — a nested `a/node_modules/b` is not the
  * root copy), and the v1 `dependencies` map.
  */
+/** npm lockfile format versions whose ROOT entries this engine can read. */
+const SUPPORTED_LOCKFILE_VERSIONS: ReadonlySet<number> = new Set([1, 2, 3]);
+
 type LockVersions =
   | { readonly ok: true; readonly versions: ReadonlyMap<string, string> }
   | { readonly ok: false; readonly reason: string };
@@ -1548,7 +1573,22 @@ function lockedRootVersions(manifests: ManifestSet): LockVersions {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { ok: false, reason: 'package-lock.json is not a JSON object' };
   }
-  const record = parsed as { packages?: unknown; dependencies?: unknown };
+  const record = parsed as { packages?: unknown; dependencies?: unknown; lockfileVersion?: unknown };
+  // ROUND 9 (Blocker 3): validate the FORMAT VERSION explicitly. Accepting a
+  // lockfile because its `packages`/`dependencies` merely RESEMBLE a recognised
+  // structure is inference from shape — the same error the F11 classifier made
+  // about operation kind. A future format may key or nest root entries
+  // differently while still looking familiar, so resemblance is not support.
+  const lockfileVersion = record.lockfileVersion;
+  if (typeof lockfileVersion !== 'number' || !SUPPORTED_LOCKFILE_VERSIONS.has(lockfileVersion)) {
+    return {
+      ok: false,
+      reason:
+        `package-lock.json declares lockfileVersion ${JSON.stringify(lockfileVersion)}, which this engine does ` +
+        `not support (recognised: ${[...SUPPORTED_LOCKFILE_VERSIONS].join(', ')}). Its resolved dependency ` +
+        'versions cannot be read, so the tree cannot be proven',
+    };
+  }
   const versions = new Map<string, string>();
   const packages = record.packages;
   if (packages !== null && typeof packages === 'object' && !Array.isArray(packages)) {
@@ -1838,15 +1878,32 @@ function isPrimaryCloneable(primaryNodeModules: string): boolean {
  * failure provisioning refuses `native_toolchain_unproven`.
  */
 const MARKER_V2_PREFIX = 'v2:';
+/**
+ * ROUND 9 (Blocker 2) — v3 = fingerprint + native-smoke attestation + ROOT
+ * VERSION proof.
+ *
+ * v2 attests only that the toolchain LOADS; it says nothing about the installed
+ * dependency VERSIONS matching the lockfile. So a v2 marker written before the
+ * version proof existed short-circuited straight past it — and those are exactly
+ * the trees most likely to already exist, which made "no tree is stamped proven
+ * without the version proof" false where it mattered most.
+ *
+ * Same shape as the v1 -> v2 upgrade: only v3 may short-circuit; a v1/v2 marker
+ * triggers the FULL proof in place (no rebuild) and is rewritten as v3 on
+ * success, refused on failure.
+ */
+const MARKER_V3_PREFIX = 'v3:';
 
-function markerV2(fingerprint: string): string {
-  return `${MARKER_V2_PREFIX}${fingerprint}`;
+function markerV3(fingerprint: string): string {
+  return `${MARKER_V3_PREFIX}${fingerprint}`;
 }
 
 interface MarkerProof {
   readonly fingerprint: string;
-  /** False for a pre-F9 (v1) marker: matching manifests, no toolchain attestation. */
+  /** v2+: the runtime native smoke passed for this tree. */
   readonly smokeAttested: boolean;
+  /** v3 only: root dependency VERSIONS were proven against the lockfile. */
+  readonly versionsAttested: boolean;
 }
 
 function readMarker(nodeModulesDir: string): MarkerProof | undefined {
@@ -1856,12 +1913,15 @@ function readMarker(nodeModulesDir: string): MarkerProof | undefined {
   } catch {
     return undefined;
   }
+  if (raw.startsWith(MARKER_V3_PREFIX)) {
+    return { fingerprint: raw.slice(MARKER_V3_PREFIX.length), smokeAttested: true, versionsAttested: true };
+  }
   if (raw.startsWith(MARKER_V2_PREFIX)) {
-    return { fingerprint: raw.slice(MARKER_V2_PREFIX.length), smokeAttested: true };
+    return { fingerprint: raw.slice(MARKER_V2_PREFIX.length), smokeAttested: true, versionsAttested: false };
   }
   // A bare fingerprint is the v1 format. Anything else unrecognized is treated
   // the same way — as an unattested claim, never as a proof.
-  return { fingerprint: raw, smokeAttested: false };
+  return { fingerprint: raw, smokeAttested: false, versionsAttested: false };
 }
 
 /** Filesystem+git-ref-safe slug (mirrors paths.ts) for naming stage dirs. */

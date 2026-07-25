@@ -710,6 +710,40 @@ describe.each(DRIVER_KINDS)('resume mode — F8 (A) receipt-bound drift acceptan
     expect(await git.resolveSha(worktreePath, 'HEAD')).not.toBe(foreign);
   });
 
+  // -------------------------------------------------------------------------
+  // ROUND 9 (Blocker 1) — the LIVE path used to DISCARD the binding it had just
+  // adjudicated, re-reading mutable HEAD instead. Anything committing in that
+  // gap became the verifier binding despite disagreeing with the receipt.
+  //
+  // This asserts the invariant the fix establishes: the live-path binding IS the
+  // adjudicated head, which the deliverable gate proved equal to the round's
+  // receipt. See the notes for the honest limitation — no reliable in-harness
+  // reproduction of the race window itself was achieved.
+  // -------------------------------------------------------------------------
+  it('the live-path binding is the ADJUDICATED head — identical to the round receipt', async () => {
+    const rig = await openRig(
+      {
+        implementor: [
+          {
+            writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+            turns: [implementorTurn('done')],
+          },
+        ],
+        verifier: [{ turns: [PASS_BOTH] }],
+      },
+      driver,
+    );
+
+    const result = await runImplementVerifyLoop(loopDeps(rig), { ...loopInput(rig), maxRounds: 1 });
+
+    const receipt = rig.service.resolveRoundReceiptHead(rig.runId, 1, assignmentId(`asg_${rig.runId}`));
+    expect(receipt).toBeDefined();
+    // The verifier bound to the receipted commit, and the durable pointer agrees.
+    expect(String(result.implementationCommit)).toBe(String(receipt));
+    const persisted = rig.service.getImplementVerifyLoopState(rig.runId)?.worktree?.lastImplementationCommit;
+    expect(persisted).toBeDefined();
+    expect(String(persisted!.commit)).toBe(String(receipt));
+  });
   it('a COMPLETED round with NEITHER durable source REFUSES (never verifies bare HEAD)', async () => {
     const rig = await openRig({
       implementor: [

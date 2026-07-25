@@ -328,7 +328,7 @@ describe('F7 AC-1 — git-invisibility of the provisioned node_modules', () => {
     expect(fs.lstatSync(nm).isDirectory()).toBe(true);
     expect(readFileSync(path.join(nm, 'left-pad', 'index.js'), 'utf8')).toBe('CLONE_SOURCE\n');
     // HIGH-3: the marker is the v2 PROOF format — fingerprint + smoke attestation.
-    expect(readFileSync(path.join(nm, PROVISION_MARKER_FILE), 'utf8')).toBe(`v2:${outcome.fingerprint}`);
+    expect(readFileSync(path.join(nm, PROVISION_MARKER_FILE), 'utf8')).toBe(`v3:${outcome.fingerprint}`);
 
     // Invisible to git: plain status/diff clean; --ignored shows it; check-ignore
     // asserts the rule matches; clean -fd (no -x) does NOT remove it.
@@ -1756,6 +1756,27 @@ describe('F9 AC-2 — a stale primary tree is never cloned (primary_tree_stale)'
       ['NO lockfile at all (Yarn/pnpm repos land here)', undefined, /no package-lock\.json/i],
       ['a MALFORMED lockfile', '{ not json at all', /could not be parsed/i],
       ['a lockfile that is not an object', '"a string"', /not a JSON object/i],
+      // ROUND 9 (Blocker 3): the FORMAT VERSION is checked, never inferred from a
+      // familiar-looking shape — a future format may key root entries differently
+      // while still resembling one we know.
+      [
+        'a FUTURE lockfileVersion whose shape resembles a known one',
+        `${JSON.stringify(
+          { name: 'x', lockfileVersion: 99, packages: { '': { name: 'x' }, 'node_modules/left-pad': { version: '1.0.0' } } },
+          null,
+          2,
+        )}\n`,
+        /lockfileVersion 99, which this engine does not support/i,
+      ],
+      [
+        'a lockfile with NO lockfileVersion at all',
+        `${JSON.stringify(
+          { name: 'x', packages: { '': { name: 'x' }, 'node_modules/left-pad': { version: '1.0.0' } } },
+          null,
+          2,
+        )}\n`,
+        /does not support/i,
+      ],
       [
         'a lockfile with no entry for a DECLARED package',
         `${JSON.stringify({ name: 'x', lockfileVersion: 3, packages: { '': { name: 'x' } } }, null, 2)}\n`,
@@ -1898,7 +1919,7 @@ describe('F9 AC-5 — an unbuilt native dependency is caught BEFORE the tree is 
 
     expect(outcome.strategy).toBe('clone');
     expect(readFileSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE), 'utf8')).toBe(
-      `v2:${outcome.fingerprint}`,
+      `v3:${outcome.fingerprint}`,
     );
   });
 
@@ -1923,7 +1944,7 @@ describe('F9 AC-5 — an unbuilt native dependency is caught BEFORE the tree is 
 });
 
 describe('F9 HIGH-3 — a pre-F9 (v1) marker never short-circuits past the smoke', () => {
-  it('a v1 marker on a HEALTHY legacy tree is re-proven in place and UPGRADED to v2 (no rebuild)', async () => {
+  it('a v1 marker on a HEALTHY legacy tree is re-proven in place and UPGRADED to v3 (no rebuild)', async () => {
     const repo = track(await makeDepsRepo({ devDeps: { 'fake-native': '1.0.0' } }));
     await writePrimaryNodeModules(repo.dir, { native: { name: 'fake-native', built: true } });
     const fake = fakeRuntime();
@@ -1943,9 +1964,63 @@ describe('F9 HIGH-3 — a pre-F9 (v1) marker never short-circuits past the smoke
     expect(second.strategy).toBe('short_circuit');
     expect(fake.calls.clone).toBe(1); // re-proven IN PLACE, never rebuilt
     expect(second.detail).toMatch(/re-proven/i);
-    expect(readFileSync(markerPath, 'utf8')).toBe(`v2:${first.fingerprint}`); // upgraded
+    expect(readFileSync(markerPath, 'utf8')).toBe(`v3:${first.fingerprint}`); // upgraded
   });
 
+  // ROUND 9 (Blocker 2) — a v2 marker attests only that the toolchain LOADS. It
+  // says nothing about installed VERSIONS matching the lockfile, so a v2 marker
+  // written before the version proof existed short-circuited straight past it —
+  // and those are exactly the trees most likely to already exist on disk.
+  it('a pre-existing v2 marker does NOT short-circuit past the version proof', async () => {
+    const repo = track(await makeTempGitRepo('harness-f9-v2marker-'));
+    await repo.writeFile('.gitignore', 'node_modules/\n');
+    await repo.writeFile(
+      'package.json',
+      `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0' } }, null, 2)}\n`,
+    );
+    await repo.writeFile(
+      'package-lock.json',
+      `${JSON.stringify(
+        {
+          name: 'x',
+          version: '1.0.0',
+          lockfileVersion: 3,
+          requires: true,
+          packages: { '': { name: 'x' }, 'node_modules/left-pad': { version: '1.0.0' } },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await repo.commitAll('deps');
+    await writePrimaryNodeModules(repo.dir);
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_f9_v2_marker');
+    const handle = await createAtHead(repo, manager, asg);
+
+    // A healthy provision first: the tree lands and is stamped v3.
+    const first = await manager.provisionForVerification(asg);
+    expect(fake.calls.clone).toBe(1);
+    const nm = path.join(handle.worktreePath, 'node_modules');
+
+    // Now recreate exactly what a PRE-version-proof build left behind: the same
+    // fingerprint and a smoke-clean tree, stamped v2 — but with left-pad at a
+    // version the lockfile does not resolve. Under v2 semantics this
+    // short-circuited and the stale versions were never noticed.
+    fs.writeFileSync(
+      path.join(nm, 'left-pad', 'package.json'),
+      `${JSON.stringify({ name: 'left-pad', version: '9.9.9', main: 'index.js' }, null, 2)}\n`,
+    );
+    fs.writeFileSync(path.join(nm, PROVISION_MARKER_FILE), `v2:${first.fingerprint}`, 'utf8');
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('primary_tree_stale');
+    expect(error.message).toContain('left-pad');
+    expect(error.message).toContain('9.9.9');
+    expect(fake.calls.clone).toBe(1); // never rebuilt — refused in place
+  });
   it('a v1 marker whose tree cannot be loaded refuses instead of short-circuiting', async () => {
     const repo = track(await makeDepsRepo({ devDeps: { 'fake-native': '1.0.0' } }));
     await writePrimaryNodeModules(repo.dir, { native: { name: 'fake-native', built: true } });

@@ -712,19 +712,35 @@ export async function runImplementVerifyLoop(
         // the verdict ATOMICALLY at round completion (no `completed`-then-overwrite
         // crash window a resume could read as "verify next"). The adjudicator reads
         // the HOST worktree HEAD itself so a claimed commit is checked against it.
+        // ROUND 9 (Blocker 1): the head adjudication ACCEPTED. The verifier binds
+        // to THIS, verbatim — never to a later re-read of mutable HEAD. Re-reading
+        // after adjudication reopened the whole hole: a delayed verification child
+        // committing in the gap became the binding despite disagreeing with the
+        // receipt, and readiness could not see it because both the binding and
+        // current HEAD contained the raced-in commit.
+        let adjudicatedHead: GitSha | undefined;
+        // ROUND 9 (LOW): why a receipt disagreement refused, so the operator is
+        // told the reason rather than a bare "no deliverable adjudicated".
+        let receiptMismatch: string | undefined;
         const runner: RoleRunner<ImplementorResult> = {
           role: flow.role,
           allowedShellCommands: flow.allowedShellCommands,
           run: (session) => flow.run(session),
-          diagnoseRoundOutcome: describeImplementorRoundDiagnostic,
-          adjudicateRoundOutcome: async (result) =>
-            adjudicateImplementorDeliverable(
-              result,
-              round,
-              gitSha(await git.resolveSha(handle.worktreePath, 'HEAD')),
-              // ROUND 8 (Blocker 1a): the round's own receipt is authoritative.
-              service.resolveRoundReceiptHead(input.runId, round, input.assignmentId),
-            ),
+          diagnoseRoundOutcome: (result) => receiptMismatch ?? describeImplementorRoundDiagnostic(result),
+          adjudicateRoundOutcome: async (result) => {
+            const hostHead = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
+            // ROUND 8 (Blocker 1a): the round`s own receipt is authoritative.
+            const receipt = service.resolveRoundReceiptHead(input.runId, round, input.assignmentId);
+            if (receipt !== undefined && String(hostHead) !== String(receipt)) {
+              receiptMismatch =
+                `the round's worktree HEAD (${String(hostHead)}) does not match the pre_verify_handoff receipt ` +
+                `it published (${String(receipt)}). A declared VERIFICATION COMMAND that creates a commit causes ` +
+                'this — verification commands must observe, never author. Fix the spec so no verification command ' +
+                'commits, then re-run.';
+            }
+            adjudicatedHead = hostHead;
+            return adjudicateImplementorDeliverable(result, round, hostHead, receipt);
+          },
         };
         // P4b wave 2 FAILOVER: spawn on the EFFECTIVE spec — the ladder rung a
         // prior limit escalated to (durable desired-model record), else the run
@@ -759,14 +775,15 @@ export async function runImplementVerifyLoop(
         // fresh limit later restarts the ladder from the top).
         service.resetFailoverIncident(input.runId, input.assignmentId);
 
-        // The verifier binds to the EXACT commit — read the worktree HEAD
-        // OURSELVES (§8: never trust the agent's claimed SHA). After a round that
-        // committed nothing new, HEAD is unchanged from the prior round. F2: the
-        // deliverable gate ran INSIDE runRole (the adjudicator above), ATOMIC with
-        // round completion — a no_deliverable round threw `NoDeliverableError` and
-        // never reaches here, so we only get here for a round that delivered (or a
-        // legitimate fresh zero-diff no-op).
-        implementationCommit = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
+        // The verifier binds to the EXACT commit the deliverable gate ADJUDICATED
+        // (§8: never the agent's claimed SHA; ROUND 9: never a re-read either). The
+        // gate ran INSIDE runRole, ATOMIC with round completion — a no_deliverable
+        // round threw `NoDeliverableError` and never reaches here — so this is the
+        // head proven to match the round`s receipt. Re-reading HEAD here discarded
+        // exactly that proof. The fallback is defensive: adjudication always runs
+        // for an implementor round before this point.
+        implementationCommit =
+          adjudicatedHead ?? gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
         // F7 (#1): PERSIST this host-verified implementation commit (ROUND-SCOPED)
         // BEFORE the fail-closed break so a completed implementor round that later
         // RESUMES (re-entering at verification) resets the adopted worktree to EXACTLY
