@@ -1264,10 +1264,94 @@ command that commits, asserting refusal — not a synthetic disagreement.
 
 ---
 
+---
+
+# Round 9 — codex round-8 verdict on `3f47801`
+
+Three HIGH, all closed, plus the LOW. Commit: `71ed5aa`.
+
+## Blocker 1 (F8) — the live path discarded what it had adjudicated
+
+After adjudication succeeded, the live path re-read mutable HEAD. A commit
+landing in that gap became the verifier binding despite disagreeing with the
+receipt — and readiness could not catch it, because by then BOTH the binding and
+current HEAD contained the raced-in commit.
+
+The adjudicator now records the head it accepted; the live path uses it verbatim,
+exactly as completed-resume already used `forcedBinding`. HEAD is not re-read
+after adjudication anywhere.
+
+**Honest limitation.** I could not build a reliable in-harness reproduction of
+the race window. An injected commit at the seam (stubbing the call immediately
+preceding the old re-read) fired — verified by instrumentation — but the
+resulting state did not land deterministically, and I will not ship a test whose
+green I cannot explain. The committed test asserts the invariant the fix
+establishes instead: the live-path binding IS the adjudicated head, identical to
+both the round's receipt and the durable pointer. The defect itself was confirmed
+by inspection against codex's trace, and the fix is four lines.
+
+## LOW — the operator is told why
+
+A receipt disagreement now reports both shas and states that a declared
+VERIFICATION COMMAND creating a commit causes it, rather than a bare "no
+deliverable adjudicated at completion". `adjudicateRoundOutcome` runs before
+`diagnoseRoundOutcome`, so the reason is captured in the same closure — a few
+lines, as hoped.
+
+## Blocker 2 (F9) — marker v3
+
+A matching marker short-circuited BEFORE the root-version proof, so a v2 marker
+(written when only the smoke existed) was trusted without it — and those are
+exactly the trees most likely to already exist, which made "no tree is stamped
+proven without the version proof" false where it mattered most.
+
+v3 = fingerprint + native smoke + VERSION proof. Only v3 short-circuits; v1/v2
+triggers the FULL proof in place (no rebuild), rewritten as v3 on success,
+refused on failure. The proof is extracted as `assertRootVersionsProven` so the
+clone lane and the short-circuit lane run the identical check rather than one
+silently skipping it.
+
+## Blocker 3 (F9) — lockfileVersion validated
+
+Accepted whenever `packages`/`dependencies` merely resembled a known shape. Now
+checked against {1,2,3}; anything else refuses with the unsupported-lockfile
+reason. Structure resemblance is not version support — the same
+inference-from-shape error the F11 classifier had.
+
+## Round-9 regression proofs
+
+| blocker | method | pre-fix |
+| --- | --- | --- |
+| 2, 3 | provision.ts reverted | pass 91 **fail 6** |
+| 1 | see the limitation above | invariant test only |
+
+The 6 are: three v3-marker assertions, the v2 short-circuit, a future
+`lockfileVersion`, and an absent one.
+
+---
+
+# Final residual list for the merge record
+
+| # | residual | disposition |
+| --- | --- | --- |
+| R1 | Veto universality's syntactic defeat — the typed no-op can be combined with an interactive handler by direct generic construction. Production Grok is safe: `buildGrokMediation` overwrites last. | Non-blocking (codex) |
+| R2 | Claude/Codex payload-binding gap — both carry `noPayloadToVerify` though their tool calls carry executable payloads. Typed and greppable, not silent. | Tracked; needs a per-provider classifier |
+| R3 | Quarantine retention — GC runs only from the per-assignment preflight and `gcProvisionStages` (whose caller has no production callers). **A new resource cost vs main**, fail-closed. | Non-blocking (codex) |
+| R4 | `factory.ts` `prepared.dispose()` unguarded — can mask a primary failure. | Non-blocking |
+| R5 | `quarantineStage`'s `warn(...)` can throw from the timeout `finally` — **the new quarantine path can mask its own timeout warning**, fail-closed. | Non-blocking (codex) |
+| R6 | Transitive dependency versions unverified — only root deps/devDeps are proven. | Stated limit |
+| R7 | F13 — role-independent stop-reason adjudication, host-attested evidence receipts. | Out of the LAND window |
+| R8 | **New this round:** no in-harness reproduction of Blocker 1's race window; the invariant is asserted instead. | Documented above |
+
+R3 and R5 are the two codex named as genuine deltas against main; both are
+fail-closed. Everything else is either strictly better than main or unchanged.
+
+---
+
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1898 passed, 0 failed**, 106 files
+- `npx vitest run` (full, from this worktree) → **1903 passed, 0 failed**, 106 files
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
