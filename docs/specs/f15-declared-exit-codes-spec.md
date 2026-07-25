@@ -144,19 +144,14 @@ the prompt, not only in the notes.
   - an all-string criterion set hashes identically to the pinned pre-change hash.
 - Record the exact command and output for each parent failure.
 
-## 6. The operating law this run also produced (not code — land it in the laws doc)
+## 6. The operating laws this run also produced
 
-**L11 — a verification command's success exit must be declared, and inversion is
-not a substitute.** The coordinator must either write commands that exit `0` on
-success, or declare `expectedExitCode`. It must NOT wrap a check in `!` to force
-a zero exit: `! grep -R pattern path` exits `0` both when the pattern is absent
-*and* when grep failed with exit `2` (unreadable path, bad regex). That converts
-"I could not determine X" into "X is false" — the same bug in the opposite
-polarity. Where a distinction is needed, declare the code.
+**Already landed** in `docs/DOGFOOD-FEASIBILITY.md` §1 as **L12** (declare the
+success exit code; `!` is not a substitute, because it swallows grep's exit `2`)
+and **L13** (a command must be executable against the versions actually
+installed). Do not re-add them; they are numbered L12/L13, not L11 — `L11` was
+already taken by "check the machine, not just the code".
 
-**L12 — a verification command must be executable as written, against the
-versions actually installed.** AC-13 declared `npx vite build --root web`; the
-installed Vite 7.3.6 takes a positional root and errors on `--root`. A criterion
-whose command cannot run is unfixable by the implementor, because the command
-lives in the frozen, hash-bound spec — so the run burns remediation rounds it
-cannot possibly clear.
+L13 also names **F16**, a spec-time executability preflight that runs each
+declared command once against the base commit before approval and requires only
+that it *ran*. That is a separate change and is NOT part of F15.
