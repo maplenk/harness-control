@@ -1056,9 +1056,16 @@ export class ImplementorFlow {
           ...(error instanceof WorktreeError && error.provisioningCause !== undefined
             ? { cause: error.provisioningCause }
             : {}),
+          // ROUND 8 (LOW): prefer the operator-facing MESSAGE for a provisioning
+          // refusal. `.detail` is the terse machine hint ("2 package(s) diverging"),
+          // so preferring it threw away the evidence the message carries — which
+          // package, installed version, lockfile version. Other WorktreeError kinds
+          // keep `.detail` first, where it holds raw git stdout/stderr.
           detail: redactText(
             error instanceof WorktreeError
-              ? (error.detail ?? error.message)
+              ? error.kind === 'provisioning_failed'
+                ? error.message
+                : (error.detail ?? error.message)
               : error instanceof Error
                 ? error.message
                 : String(error),
@@ -1291,6 +1298,8 @@ export async function runImplementor(
         result,
         1,
         gitSha(await resolveSha(handle.worktreePath, 'HEAD')),
+        // ROUND 8 (Blocker 1a): the standalone path binds to the receipt too.
+        deps.service.resolveRoundReceiptHead(input.runId, 1, input.assignmentId),
       ),
   };
   try {

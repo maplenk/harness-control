@@ -1353,6 +1353,69 @@ describe.each(DRIVER_KINDS)('ImplementorFlow — F8 (C) pre_verify_handoff check
     await wt.removeWorktree(asg);
   });
 
+  // ---------------------------------------------------------------------------
+  // ROUND 8 (Blocker 1a) — codex's exact path, deterministic rather than racy:
+  //   1. a round-ONE no-op (the agent writes nothing, so the tree is clean);
+  //   2. the receipt and the diff are captured BEFORE verification runs;
+  //   3. a declared verification command CREATES AND COMMITS code;
+  //   4. the tree is clean again, so the no-commit adjudication saw empty
+  //      changedFiles/diff/postVerificationDirty and completed the round;
+  //   5. the command-created commit became both `lastImplementationCommit` and
+  //      the verifier's binding — disagreeing with the receipt.
+  // ---------------------------------------------------------------------------
+  it('BLOCKER-1: a verification command that COMMITS is a hard error, never a silent rebinding', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      driver,
+      writes: [], // round-one no-op: the agent changes nothing
+      turns: [REPORTING_TURN],
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const asg = assignmentId('asg_impl_verify_commits');
+
+    // A declared verification command that creates a file AND commits it, then
+    // leaves the tree clean — exactly the shape that used to slip through.
+    const committingVerify: VerificationRunner = async (command, cwd) => {
+      fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+      execFileSync('git', ['add', '-A'], { cwd });
+      execFileSync('git', ['commit', '--no-verify', '-m', 'committed by a verification command'], {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'verify',
+          GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+          GIT_COMMITTER_NAME: 'verify',
+          GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+        },
+      });
+      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const thrown: unknown = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext({ verificationCommands: ['make-a-commit'] }),
+        options: { runVerification: committingVerify },
+      },
+    ).catch((error: unknown) => error);
+
+    // The round is REFUSED rather than completing with a rebound head.
+    expect(thrown).toBeInstanceOf(NoDeliverableError);
+
+    // The receipt still names the pre-verification head, and the worktree HEAD is
+    // the command's commit — the disagreement the adjudication caught.
+    const receipt = service.resolveRoundReceiptHead(runId, 1, asg);
+    expect(receipt).toBeDefined();
+    const handle = wt.handleFor(asg)!;
+    const head = await runGit(['rev-parse', 'HEAD'], handle.worktreePath);
+    expect(head.stdout.trim()).not.toBe(String(receipt));
+
+    await wt.removeWorktree(asg);
+  });
+
   it('BLOCKER-2: a round whose RECEIPT cannot be recorded FAILS rather than continuing unreceipted', async () => {
     const { service, worktrees: wt, repo: r } = await setup({
       driver,

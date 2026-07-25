@@ -1733,13 +1733,24 @@ describe('F7 round-3 #7 — toProvisioningFailure redacts the surfaced detail', 
   it('scrubs a secret-shaped detail from the verifier-boundary provisioning failure', () => {
     const handle = { repoRoot: '/repo', worktreePath: '/wt' } as WorktreeHandle;
     const secret = 'AKIAIOSFODNN7EXAMPLE'; // a canonical AWS-access-key-id-shaped token
-    const error = new WorktreeError('provisioning_failed', 'dependency install failed', {
-      detail: `npm ci failed: registry auth key ${secret} was rejected`,
+    // ROUND 8 (LOW): a provisioning refusal now surfaces the operator-facing
+    // MESSAGE (it carries the evidence — package, installed vs lockfile version)
+    // rather than the terse `.detail` hint. Redaction is what is under test, so
+    // the secret is planted in the surfaced field.
+    const error = new WorktreeError('provisioning_failed', `npm ci failed: registry auth key ${secret} was rejected`, {
+      detail: 'dependency install failed',
     });
     const pf = toProvisioningFailure(error, handle);
     expect(pf.kind).toBe('provisioning_failed');
     expect(pf.repoRoot).toBe('/repo');
     expect(pf.detail).not.toContain(secret); // the raw secret never reaches the CLI/sink
     expect(pf.detail).toContain('REDACTED'); // replaced by the redaction marker
+
+    // ...and the OTHER field is not a bypass: a secret in `.detail` is simply not
+    // surfaced for a provisioning refusal, so it cannot leak either.
+    const inDetail = new WorktreeError('provisioning_failed', 'dependency install failed', {
+      detail: `npm ci failed: registry auth key ${secret} was rejected`,
+    });
+    expect(toProvisioningFailure(inDetail, handle).detail).not.toContain(secret);
   });
 });

@@ -375,11 +375,18 @@ function completedImplementorBinding(
   return persistedForRound;
 }
 
+/**
+ * ROUND 8 (Blocker 1b): returns the DURABLE BINDING it forced, not just the
+ * handle. The completed-implementor branch used to force the worktree to a
+ * receipt-derived commit and then RE-READ HEAD afterwards — a TOCTOU window in
+ * which anything that moved HEAD between the two became the verifier binding,
+ * defeating the very forcing that had just happened.
+ */
 async function adoptWorktree(
   deps: ImplementVerifyLoopDeps,
   input: ImplementVerifyLoopInput,
   resume: ImplementVerifyResumeInput,
-): Promise<WorktreeHandle> {
+): Promise<{ readonly handle: WorktreeHandle; readonly forcedBinding?: GitSha }> {
   const { service, worktrees } = deps;
   const loopState = service.getImplementVerifyLoopState(input.runId);
   const facts = loopState?.worktree;
@@ -397,6 +404,7 @@ async function adoptWorktree(
     });
   }
 
+  let forcedBinding: GitSha | undefined;
   const recordValidation = (outcome: string, detail: string, wipCommitSha?: GitSha): void => {
     service.saveImplementVerifyLoopState(input.runId, {
       ...loopState,
@@ -458,6 +466,8 @@ async function adoptWorktree(
       );
     }
     await worktrees.discardToCommit(input.assignmentId, forced);
+    // The binding the caller MUST use — never a later re-read of HEAD.
+    forcedBinding = forced;
     recordValidation(
       'clean',
       resume.round.role === 'verifier'
@@ -502,7 +512,8 @@ async function adoptWorktree(
   if (tracked === undefined) {
     throw new WorktreeError('not_found', `Worktree handle vanished during adoption: ${String(input.assignmentId)}`);
   }
-  return tracked.leased ? tracked : worktrees.reacquireLease(input.assignmentId);
+  const adopted = tracked.leased ? tracked : worktrees.reacquireLease(input.assignmentId);
+  return { handle: adopted, ...(forcedBinding !== undefined ? { forcedBinding } : {}) };
 }
 
 /**
@@ -560,6 +571,9 @@ export async function runImplementVerifyLoop(
   // `provisioning_failed` outcome (no `merge_ready` possible).
   let provisioningFailure: ProvisioningFailure | undefined;
   let implementationCommit!: GitSha;
+  // ROUND 8 (Blocker 1b): the commit  FORCED the worktree to, when
+  // it forced one. Used verbatim by the completed-implementor branch below.
+  let adoptedBinding: GitSha | undefined;
   try {
     let destinationLabel: string;
     if (resume === undefined) {
@@ -603,7 +617,9 @@ export async function runImplementVerifyLoop(
         },
       });
     } else {
-      handle = await adoptWorktree(deps, input, resume);
+      const adoption = await adoptWorktree(deps, input, resume);
+      handle = adoption.handle;
+      adoptedBinding = adoption.forcedBinding;
       const persisted = service.getImplementVerifyLoopState(input.runId);
       destinationLabel =
         input.destinationLabel ?? persisted?.destinationLabel ?? (await git.currentBranch(handle.repoRoot)) ?? 'main';
@@ -706,6 +722,8 @@ export async function runImplementVerifyLoop(
               result,
               round,
               gitSha(await git.resolveSha(handle.worktreePath, 'HEAD')),
+              // ROUND 8 (Blocker 1a): the round's own receipt is authoritative.
+              service.resolveRoundReceiptHead(input.runId, round, input.assignmentId),
             ),
         };
         // P4b wave 2 FAILOVER: spawn on the EFFECTIVE spec — the ladder rung a
@@ -806,10 +824,14 @@ export async function runImplementVerifyLoop(
           worktrees.releaseLease(input.assignmentId); // the verifier reads, never writes
         }
       } else {
-        // Implementor round completed before the pause: verify ITS work — the
-        // adopted worktree's host-read HEAD (a WIP reconciliation commit, if
-        // one was taken, is preserved work and part of that HEAD).
-        implementationCommit = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
+        // Implementor round completed before the pause: verify ITS work. ROUND 8
+        // (Blocker 1b): use the binding adoption FORCED — derived from the round's
+        // durable receipt — never a fresh HEAD read. Re-reading here reopened a
+        // TOCTOU window in which anything that moved HEAD after the forcing became
+        // the verifier binding, discarding the guarantee just established. Adoption
+        // always forces on this path, so the fallback is defensive only.
+        implementationCommit =
+          adoptedBinding ?? gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
         if (worktrees.handleFor(input.assignmentId)?.leased === true) {
           worktrees.releaseLease(input.assignmentId);
         }
@@ -1026,8 +1048,17 @@ function outcomeOf(phase: RunPhase): LoopOutcome {
  * already applies, so a secret-shaped install/clone error at the VERIFIER boundary is
  * never surfaced raw. Exported for a focused redaction unit test. */
 export function toProvisioningFailure(error: unknown, handle: WorktreeHandle): ProvisioningFailure {
+  // ROUND 8 (LOW): same as the implementor boundary — the rich message carries
+  // the evidence (package, installed version, lockfile version); `.detail` is the
+  // terse hint.
   const detail =
-    error instanceof WorktreeError ? (error.detail ?? error.message) : error instanceof Error ? error.message : String(error);
+    error instanceof WorktreeError
+      ? error.kind === 'provisioning_failed'
+        ? error.message
+        : (error.detail ?? error.message)
+      : error instanceof Error
+        ? error.message
+        : String(error);
   return {
     kind: 'provisioning_failed',
     repoRoot: handle.repoRoot,
