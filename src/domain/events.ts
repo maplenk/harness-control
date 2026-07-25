@@ -45,6 +45,7 @@ import type {
   OperationKind,
   RoleName,
   RunPhase,
+  SpecApprovalMode,
   StopIntentCause,
   SuccessorIntentSeed,
   SuccessorReason,
@@ -179,11 +180,19 @@ export interface SpecDraftRef {
 // ---------------------------------------------------------------------------
 export interface EventPayloads {
   // ---- Trigger events (one per §6.3 row) ---------------------------------
-  /** T1 — spec approved by human; binds the exact SpecVersion hash. */
+  /**
+   * T1 — spec approved; binds the exact SpecVersion hash.
+   *
+   * B2: `approvedBy` names WHO signed — `human` (an operator ran `harness
+   * approve`) or `auto` (the engine signed it under a run pinned to
+   * `approval: 'auto'`). Both bind the REAL drafted hash through the same
+   * W1-F3/W3-4 validation; the distinction exists so the audit trail can
+   * show, for any run, that no human reviewed the intent.
+   */
   'spec.approved': {
     readonly specVersionId: SpecVersionId;
     readonly specHash: SpecHash;
-    readonly approvedBy: 'human';
+    readonly approvedBy: SpecApprovalMode;
   };
   /** T2 — `spec revise --feedback` during awaiting_approval. */
   'spec.revise.requested': {

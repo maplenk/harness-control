@@ -15,8 +15,10 @@ import {
   BYTES_PER_GB,
   DEFAULT_ENGINE_CONFIG,
   DEFAULT_FAILOVER_POLICY,
+  DEFAULT_SPEC_APPROVAL_MODE,
   FAILOVER_POLICIES,
   RESTART_WINDOW_OFF,
+  SPEC_APPROVAL_MODES,
 } from './schema.js';
 
 function issuePaths(issues: readonly ConfigIssue[]): string[] {
@@ -69,6 +71,9 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
       // the committed fingerprint matches the primary + APFS is available, else
       // `npm ci`).
       worktree: { provision: 'auto' },
+      // B2: approval defaults to the HUMAN gate. Autonomy is opt-in, per run,
+      // and pinned at createRun — never the default a fresh config inherits.
+      approval: 'human',
     });
   });
 
@@ -109,6 +114,27 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
   it('exposes exactly the four failover policies, defaulting to wait', () => {
     expect(FAILOVER_POLICIES).toEqual(['wait', 'switch_model', 'switch_harness', 'ask']);
     expect(DEFAULT_FAILOVER_POLICY).toBe('wait');
+  });
+
+  // B2 — the approval vocabulary is exactly two values, both of which ACT
+  // (W4-1): `human` holds the run at awaiting_approval, `auto` has the engine
+  // sign the drafted hash. Anything else is a LOUD config error, never a
+  // silently-ignored knob. (The behavioural halves live in
+  // ../cli/commands.auto-approval.test.ts.)
+  it('exposes exactly two spec-approval modes, defaulting to human', () => {
+    expect(SPEC_APPROVAL_MODES).toEqual(['human', 'auto']);
+    expect(DEFAULT_SPEC_APPROVAL_MODE).toBe('human');
+    expect(DEFAULT_ENGINE_CONFIG.approval).toBe('human');
+  });
+
+  it("accepts approval:'auto' and REFUSES any other value", () => {
+    expect(unwrap(parseEngineConfig({ approval: 'auto' })).approval).toBe('auto');
+    expect(unwrap(parseEngineConfig({ approval: 'human' })).approval).toBe('human');
+    for (const bogus of ['yes', 'engine', 'always', true, 1, null]) {
+      const result = parseEngineConfig({ approval: bogus });
+      expect(isErr(result), `approval: ${JSON.stringify(bogus)} must be refused`).toBe(true);
+      if (isErr(result)) expect(issuePaths(result.error)).toContain('approval');
+    }
   });
 });
 

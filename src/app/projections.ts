@@ -41,6 +41,7 @@ import type {
   OperationKind,
   RoleName,
   RunPhase,
+  SpecApprovalMode,
   SuspensionKind,
 } from '../domain/state.js';
 import {
@@ -201,6 +202,14 @@ export interface MergeReadinessBlockedState {
   readonly requiredTestsPassed: boolean;
   /** Spec-drift gate input the blocked round checked against. */
   readonly approvedSpecHash?: SpecHash;
+  /**
+   * B2: WHO signed the approval — carried so a LATER `harness recheck`
+   * process rebuilds the §16 report with the same honest attribution instead
+   * of silently downgrading an auto-approved run to `human`. Absent on
+   * records written by a pre-B2 build (only humans could sign then), so
+   * readers treat absent as `'human'`.
+   */
+  readonly specApprovedBy?: SpecApprovalMode;
   /** The latest §16 readiness report (`ready === false` while `blocked`). */
   readonly mergeReadiness: MergeReadiness;
   /** The latest probe's blockers (all user-actionable while `blocked`). */

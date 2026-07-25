@@ -35,6 +35,7 @@ import {
   type RestartCounters,
   type ResumeReentryPending,
   type RunPhase,
+  type SpecApprovalMode,
   type StopIntentCause,
   stopIntentConfirmation,
   type SuccessorIntent,
@@ -214,7 +215,9 @@ export const TRANSITION_TABLE: readonly TransitionRow[] = [
   {
     id: 'T1',
     event: 'spec.approved',
-    description: 'Spec approved (human): bind spec hash; phase=approved.',
+    description:
+      'Spec approved: bind spec hash + signer (human, or the engine under B2 ' +
+      "`approval: 'auto'`); phase=approved.",
     preconditions: [{ kind: 'phase_in', phases: ['awaiting_approval'] }],
     effects: [{ kind: 'bind_spec_hash' }, { kind: 'set_phase', phase: 'approved' }],
     invariants: ['suspension_unchanged'],
@@ -606,6 +609,16 @@ export interface EngineState {
   readonly successorIntent?: SuccessorIntent;
   /** Bound on T1. */
   readonly approvedSpecHash?: SpecHash;
+  /**
+   * B2: WHO signed the T1 that bound `approvedSpecHash` — folded from the
+   * same `spec.approved` payload, in the same effect. Absent exactly when
+   * `approvedSpecHash` is absent (never approved) OR the run was approved by
+   * a pre-B2 build, whose only possible signer was a human; readers treat
+   * absent as `'human'`. Never inferred from config: this records the actual
+   * signature, so a human who approved a run pinned to `approval: 'auto'`
+   * still shows as `human`.
+   */
+  readonly specApprovedBy?: SpecApprovalMode;
   readonly counters: RestartCounters;
   readonly bounds: EngineBounds;
 }
@@ -748,6 +761,7 @@ interface MutableDraft {
   resumeReentryPending: ResumeReentryPending | undefined;
   successorIntent: SuccessorIntent | undefined;
   approvedSpecHash: SpecHash | undefined;
+  specApprovedBy: SpecApprovalMode | undefined;
   counters: RestartCounters;
 }
 
@@ -845,6 +859,7 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
     resumeReentryPending: state.resumeReentryPending,
     successorIntent: state.successorIntent,
     approvedSpecHash: state.approvedSpecHash,
+    specApprovedBy: state.specApprovedBy,
     counters: { ...state.counters },
   };
 
@@ -888,9 +903,14 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
       case 'set_phase_to_return_phase':
         if (initial.suspension.kind !== 'none') draft.phase = initial.suspension.returnPhase;
         break;
-      case 'bind_spec_hash':
-        draft.approvedSpecHash = (event as EventOfType<'spec.approved'>).payload.specHash;
+      case 'bind_spec_hash': {
+        // B2: hash AND signer are bound together from the ONE T1 payload — the
+        // audit answer to "which spec, signed by whom" can never come apart.
+        const approval = (event as EventOfType<'spec.approved'>).payload;
+        draft.approvedSpecHash = approval.specHash;
+        draft.specApprovedBy = approval.approvedBy;
         break;
+      }
       case 'mark_assignments_stale': {
         const payload = (event as EventOfType<'spec.superseded'>).payload;
         emit('assignments.marked_stale', {
@@ -1278,6 +1298,7 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
       : {}),
     ...(draft.successorIntent !== undefined ? { successorIntent: draft.successorIntent } : {}),
     ...(draft.approvedSpecHash !== undefined ? { approvedSpecHash: draft.approvedSpecHash } : {}),
+    ...(draft.specApprovedBy !== undefined ? { specApprovedBy: draft.specApprovedBy } : {}),
   };
 
   return { status: 'applied', transitionId: row.id, next, emitted };

@@ -76,6 +76,7 @@ import type {
   MergeReadiness,
   Verification,
 } from '../../domain/entities.js';
+import type { SpecApprovalMode } from '../../domain/state.js';
 import type { SessionUpdate } from '../../adapters/spi.js';
 import type { ArtifactSink } from '../../artifacts/store.js';
 import * as git from '../../worktree/git.js';
@@ -667,6 +668,16 @@ export interface BuildMergeReadinessInput {
   readonly requiredTestsPassed: boolean;
   /** Current approved spec hash; a mismatch vs the verified hash blocks (§16). */
   readonly approvedSpecHash?: SpecHash;
+  /**
+   * B2: WHO signed the approval this commit implements. Reported on the §16
+   * record, NEVER a blocker — an auto-approved run can be perfectly
+   * merge-ready; the point is that the human reviewing the merge is told
+   * nobody reviewed the INTENT. Absent ⇒ `'human'`: that is the only signer a
+   * pre-B2 run could have, and it is the fail-safe reading (it never invents
+   * an "a human checked this" claim — it withholds the auto WARNING, which is
+   * why the production callers thread it explicitly and a test asserts they do).
+   */
+  readonly specApprovedBy?: SpecApprovalMode;
   /** W3-1: the implementor round's runner-confinement violation — blocks
    * readiness with the agent-actionable `verification-runner violation`
    * blocker (a poisoned round is never merge-ready). */
@@ -828,6 +839,9 @@ export function buildMergeReadiness(input: BuildMergeReadinessInput): MergeReadi
     baseDrifted: gitFacts.baseDrifted,
     conflicts: gitFacts.conflicts,
     requiredTestsPassed,
+    // B2: pure attribution carried onto the report — it never touches
+    // `blockers` and therefore never touches `ready`.
+    specApprovedBy: input.specApprovedBy ?? 'human',
     ready,
     blockers,
     manualIntegrationCommands: manualIntegrationCommands(verification, binding, ready, blockers),
@@ -1021,6 +1035,13 @@ export interface RunVerificationInput {
   /** Current approved spec hash (drift gate); defaults to the bound hash. */
   readonly approvedSpecHash?: SpecHash;
   /**
+   * B2: WHO signed the approval (`EngineState.specApprovedBy`, threaded by the
+   * loop driver from the run's actual T1 event). Reported on the §16 record
+   * and persisted with a blocked readiness so `harness recheck` keeps the same
+   * attribution. Absent ⇒ `'human'`.
+   */
+  readonly specApprovedBy?: SpecApprovalMode;
+  /**
    * W3-1: the implementor round's typed verification-runner confinement
    * violation (primary checkout mutated across its verification commands),
    * threaded by the loop driver. When present, the §16 readiness gate blocks
@@ -1171,6 +1192,8 @@ export async function runVerification(input: RunVerificationInput): Promise<RunV
       ...(input.approvedSpecHash !== undefined
         ? { approvedSpecHash: input.approvedSpecHash }
         : { approvedSpecHash: input.binding.specHash }),
+      // B2: honest signer attribution on the §16 report.
+      ...(input.specApprovedBy !== undefined ? { specApprovedBy: input.specApprovedBy } : {}),
       // W3-1: the implementor round's runner violation blocks readiness.
       ...(input.runnerViolation !== undefined ? { runnerViolation: input.runnerViolation } : {}),
       ids: input.ids,
@@ -1250,6 +1273,9 @@ function blockedReadinessState(
     probeDestinationRef: input.probeDestinationRef ?? 'HEAD',
     requiredTestsPassed: deriveRequiredTestsPassed(input.criteria, gathering.criteria),
     approvedSpecHash,
+    // B2: the signer travels with the blocked read-model so a recheck in a
+    // FRESH process re-reports `auto` instead of quietly reverting to `human`.
+    ...(input.specApprovedBy !== undefined ? { specApprovedBy: input.specApprovedBy } : {}),
     mergeReadiness,
     blockers: mergeReadiness.blockers,
     stage: 'blocked',
@@ -1318,6 +1344,9 @@ export async function recheckMergeReadiness(
     ...(blocked.approvedSpecHash !== undefined
       ? { approvedSpecHash: blocked.approvedSpecHash }
       : { approvedSpecHash: blocked.binding.specHash }),
+    // B2: re-report the SAME signer the blocked round recorded. Absent on a
+    // pre-B2 record ⇒ `'human'`, which was then the only possible signer.
+    ...(blocked.specApprovedBy !== undefined ? { specApprovedBy: blocked.specApprovedBy } : {}),
     ids: input.ids,
     clock: input.clock,
   });

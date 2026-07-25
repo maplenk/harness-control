@@ -26,7 +26,7 @@ import { z } from 'zod';
 import type { FailoverPolicy } from '../domain/entities.js';
 import type { ProvisionStrategy } from '../worktree/provision.js';
 import { HARNESSES, REASONING_EFFORTS } from '../app/model-resolution.js';
-import { DEFAULT_BOUNDS, DEFAULT_PROBE_LADDER_MINUTES } from '../domain/state.js';
+import { DEFAULT_BOUNDS, DEFAULT_PROBE_LADDER_MINUTES, type SpecApprovalMode } from '../domain/state.js';
 import { RSS_GRACEFUL_STOP_DEADLINE_MS } from '../domain/transitions.js';
 import { isSecretKeyName } from '../redaction/patterns.js';
 
@@ -374,6 +374,32 @@ const BUDGET_DEFAULT = budgetSchema.parse({});
 export const PROVISION_STRATEGIES = ['auto', 'clone', 'install', 'none'] as const satisfies readonly ProvisionStrategy[];
 export const DEFAULT_PROVISION_STRATEGY: ProvisionStrategy = 'auto';
 
+// ---------------------------------------------------------------------------
+// B2 (docs/AUTONOMOUS-BASE-PLAN.md §1) — WHO signs the T1 spec approval.
+//
+//   `human` (DEFAULT) = the historical, only path: an operator runs
+//                       `harness approve --spec-version ID --spec-hash HASH`;
+//                       the run WAITS at `awaiting_approval` until they do.
+//   `auto`            = the ENGINE binds the drafted hash itself the moment a
+//                       coordinator drafting round completes, and the run
+//                       proceeds to `approved` with no wait.
+//
+// `auto` is a signature attribution, NOT a bypass: it runs the SAME
+// W1-F3/W3-4 validation `harness approve` runs (a missing/stale draft still
+// REFUSES), binds the REAL drafted hash (never a synthetic one — that is
+// `--test-approve`'s separate, HARNESS_TEST_MODE-gated seam), and leaves the
+// §7 testability gate untouched. Both values genuinely act (W4-1), the choice
+// is PINNED into the run's config at `createRun` (immutable for that run's
+// life), and every auto-approval is evented `approvedBy: 'auto'` so the audit
+// trail shows no human signed it.
+//
+// This deliberately reverses the PLAN §4.1/§7 "explicit human approval —
+// always, no auto-approve path" invariant; the reversal is recorded in
+// PLAN.md rather than left as a silent contradiction.
+// ---------------------------------------------------------------------------
+export const SPEC_APPROVAL_MODES = ['human', 'auto'] as const satisfies readonly SpecApprovalMode[];
+export const DEFAULT_SPEC_APPROVAL_MODE: SpecApprovalMode = 'human';
+
 const worktreeSchema = z
   .object({
     provision: z.enum(PROVISION_STRATEGIES).default(DEFAULT_PROVISION_STRATEGY),
@@ -422,6 +448,13 @@ export const engineConfigSchema = z
     verification: verificationSchema.default(VERIFICATION_DEFAULT),
     /** F7 (§3): worktree dependency provisioning strategy. */
     worktree: worktreeSchema.default(WORKTREE_DEFAULT),
+    /**
+     * B2: who signs the T1 spec approval — `human` (default; the run waits for
+     * `harness approve`) or `auto` (the engine binds the drafted hash itself).
+     * Pinned per run at `createRun`, so a run's approval mode is immutable once
+     * started. See `SPEC_APPROVAL_MODES` above for the full contract.
+     */
+    approval: z.enum(SPEC_APPROVAL_MODES).default(DEFAULT_SPEC_APPROVAL_MODE),
   })
   .strict()
   // P4b wave 2: `switch_model`/`switch_harness` are only meaningful with a

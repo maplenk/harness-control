@@ -110,6 +110,7 @@ import {
   type ResumeReentryPending,
   type RoleName,
   type RunPhase,
+  type SpecApprovalMode,
   type SuccessorIntent,
   type SuccessorIntentSeed,
   type SuccessorReason,
@@ -966,6 +967,12 @@ export interface RunStatus {
   readonly autoRecovering?: { readonly attempt: number };
   readonly counters: RestartCounters;
   readonly approvedSpecHash?: SpecHash;
+  /**
+   * B2: WHO signed the T1 that bound `approvedSpecHash`. Absent iff the run
+   * is unapproved, or was approved by a pre-B2 build (whose only signer could
+   * be a human) — readers treat absent as `'human'`.
+   */
+  readonly specApprovedBy?: SpecApprovalMode;
   readonly cost: CostProjectionState;
   readonly budget: BudgetStatus;
   readonly goal?: string;
@@ -1800,10 +1807,21 @@ export class OrchestrationService {
   }
 
   // ---- CLI command wrappers (each normalizes into `ingest`) ----------------
-  /** T1 — spec approved (human). */
+  /**
+   * T1 — spec approved. `mode` names the SIGNER and defaults to `'human'`
+   * (B2): callers that do not say otherwise are an operator's explicit
+   * approval. `'auto'` is the engine signing under a run pinned to
+   * `approval: 'auto'` — the same event, the same hash binding, an honest
+   * attribution. Both go through this ONE path; there is no second approval
+   * route into the engine.
+   */
   async approve(
     runId: RunId,
-    input: { readonly specVersionId: SpecVersionId; readonly specHash: SpecHash },
+    input: {
+      readonly specVersionId: SpecVersionId;
+      readonly specHash: SpecHash;
+      readonly mode?: SpecApprovalMode;
+    },
     opts?: CommandOptions,
   ): Promise<IngestResult> {
     // Approval is source-sensitive: enforce the immutable pin at the service
@@ -1814,7 +1832,11 @@ export class OrchestrationService {
       this.#trigger(
         runId,
         'spec.approved',
-        { specVersionId: input.specVersionId, specHash: input.specHash, approvedBy: 'human' },
+        {
+          specVersionId: input.specVersionId,
+          specHash: input.specHash,
+          approvedBy: input.mode ?? 'human',
+        },
         opts,
       ) as DomainEvent,
     );
@@ -3278,6 +3300,7 @@ export class OrchestrationService {
         : {}),
       counters: state.counters,
       ...(state.approvedSpecHash !== undefined ? { approvedSpecHash: state.approvedSpecHash } : {}),
+      ...(state.specApprovedBy !== undefined ? { specApprovedBy: state.specApprovedBy } : {}),
       cost,
       budget: {
         spentUsd: cost.totalCostUsd,

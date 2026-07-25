@@ -306,6 +306,19 @@ export const DEFAULT_PROBE_LADDER_MINUTES = [30, 60, 120, 240] as const;
 export type RoleName = 'coordinator' | 'implementor' | 'verifier';
 
 /**
+ * B2 — WHO signed the T1 approval. `human` is an operator running `harness
+ * approve` (the historical only path); `auto` is the ENGINE binding the
+ * drafted hash itself under a run pinned to `approval: 'auto'`. This is a
+ * signature attribution, never a relaxation: both modes bind the exact
+ * drafted SpecVersion hash through the same W1-F3/W3-4 validation, and the
+ * spec stays immutable either way. Carried on the `spec.approved` payload,
+ * folded into `EngineState.specApprovedBy`, and surfaced on the §16
+ * merge-readiness report so a human reviewing a merge can see that nobody
+ * reviewed the intent.
+ */
+export type SpecApprovalMode = 'human' | 'auto';
+
+/**
  * Why a checkpoint-successor generation is required (§11, §12.2): a limit
  * during an unconfirmed model switch (T5), a mid-turn limit, a cross-harness
  * switch, or crash/restart recovery. Shared vocabulary — consumed by both the

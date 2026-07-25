@@ -36,6 +36,7 @@ import type {
   RestartCounters,
   RoleName,
   RunPhase,
+  SpecApprovalMode,
   Suspension,
   WorktreeTaint,
 } from './state.js';
@@ -290,6 +291,14 @@ export interface MergeReadiness {
   readonly baseDrifted: boolean;
   readonly conflicts: boolean;
   readonly requiredTestsPassed: boolean;
+  /**
+   * B2: WHO signed the approval of the spec this commit was built against.
+   * `auto` means the ENGINE bound the drafted hash and NO human reviewed the
+   * INTENT — the merge review is then the first and only human judgement of
+   * whether this was the right work. Never a blocker: an auto-approved run
+   * can be perfectly merge-ready; the reviewer just has to know.
+   */
+  readonly specApprovedBy: SpecApprovalMode;
   readonly ready: boolean;
   /** The §16 blockers when NOT ready (empty iff `ready`); W1-F1 maps these to
    * `integration_blocker` fix-requests and the T23 trigger payload. */

@@ -191,6 +191,7 @@ function readyMergeReadiness(forRunId: Parameters<OrchestrationService['status']
     baseDrifted: false,
     conflicts: false,
     requiredTestsPassed: true,
+    specApprovedBy: 'human', // B2: this fixture models an operator-approved run
     ready: true,
     blockers: [],
     manualIntegrationCommands: [],
