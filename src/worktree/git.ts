@@ -400,7 +400,14 @@ async function pathsIgnoredByRule(worktreePath: string, paths: readonly string[]
   for (let i = 0; i + 3 < fields.length; i += 4) {
     const pattern = fields[i + 2];
     const pathname = fields[i + 3];
-    if (pathname !== undefined && pattern !== undefined && pattern.length > 0) ignored.add(pathname);
+    if (pathname === undefined || pattern === undefined || pattern.length === 0) continue;
+    // ROUND 15: git reports the matching pattern VERBATIM, `!` included, and a
+    // NEGATED match means the path is explicitly NOT ignored — the plain form
+    // exits 1 for it. Reading every non-empty pattern as "ignored" inverted that,
+    // so a vendored tree deliberately re-included through a negation was read as
+    // wholly the engine's and unstaged, where main commits it.
+    if (pattern.startsWith('!')) continue;
+    ignored.add(pathname);
   }
   return ignored;
 }

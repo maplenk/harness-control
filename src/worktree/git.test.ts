@@ -467,6 +467,29 @@ describe('ROUND 13 ITEM 3 — the outer node_modules root is classified once, HE
     expect((await r.statusPorcelain()).trim()).toBe('');
   });
 
+  // ROUND 15 REGRESSION 1 — `check-ignore -v` reports the MATCHING PATTERN with
+  // its leading `!` intact, and a negated match means the path is NOT ignored
+  // (verified on git 2.55: the same path exits 1 from the plain form). Treating
+  // every non-empty pattern as "ignored" therefore read a re-included vendored
+  // tree as wholly ours and unstaged it, where main commits it.
+  it('a tree re-included by a NEGATED rule is not ignored, so the root stays committable', async () => {
+    // The gitignore-documented shape: exclude the CONTENTS (`dir/*`) and re-include
+    // a direct child, since git cannot re-include anything under an excluded
+    // DIRECTORY. The re-included file is then the only staged path under the root,
+    // so it alone decides ownership — which is what makes the `!` reading decisive.
+    const r = await repoWithIgnore('vendor/node_modules/*\n!vendor/node_modules/keep.js\n');
+    plantNodeModules(r.dir, 'vendor/node_modules'); // ignored, so never staged
+    writeFileSync(path.join(r.dir, 'vendor/node_modules/keep.js'), 'module.exports = 1;\n', 'utf8');
+    await r.writeFile('vendor/app.ts', 'export const web = 1;\n');
+
+    await addAllExceptNodeModules(r.dir);
+
+    const staged = await stagedPaths(r.dir);
+    expect(staged).toContain('vendor/app.ts');
+    // git re-included it, so it is user content and it commits — as on main.
+    expect(staged).toContain('vendor/node_modules/keep.js');
+  });
+
   it('a WHOLLY ignored nested root is still excluded (the engine tree case is unweakened)', async () => {
     const r = await repoWithIgnore('node_modules/\n');
     plantNodeModules(r.dir, 'web/node_modules');
