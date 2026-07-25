@@ -301,6 +301,17 @@ describe('grokShellPayloadMatchesTitle — the payload veto', () => {
     expect(grokShellPayloadMatchesTitle(undefined, { command: 'rm -rf /' })).toBe(false);
   });
 
+  it('ROUND 6: an unparseable title with NO payload is still refused (parse failure is not safety evidence)', () => {
+    // The exact reported shape: an exactly-allowlisted but MALFORMED shell title
+    // with no rawInput used to return true, because "non-shell" was concluded
+    // from two failed parses. Non-shell is now recognised POSITIVELY.
+    expect(grokShellPayloadMatchesTitle('Execute ls', undefined)).toBe(false);
+    expect(grokShellPayloadMatchesTitle('Execute ls', {})).toBe(false);
+    expect(grokShellPayloadMatchesTitle('npm run typecheck', undefined)).toBe(false);
+    expect(grokShellPayloadMatchesTitle('Execute `ls`', { command: { nested: 1 } })).toBe(false);
+    expect(grokShellPayloadMatchesTitle('Execute `ls`', 'not an object')).toBe(false);
+  });
+
   it('does NOT veto a non-shell operation (there is no shell payload to bind)', () => {
     // Structured Write/Edit titles are adjudicated by the workspace-write rule;
     // the shell payload veto must not deny them for lacking a shell command.

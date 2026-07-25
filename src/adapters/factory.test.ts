@@ -670,6 +670,60 @@ describe('provider adapter factory — composed initialize() over the fake wire 
     GENEROUS_MS,
   );
 
+  // ROUND 6 (Finding 1) end-to-end: the veto was installed only for
+  // `implementor` + `headless`, so a production INTERACTIVE Grok session never
+  // received one and its decider could approve a divergent payload. Driven
+  // through the REAL factory + wire so the WIRING is what is under test, not the
+  // classifier.
+  it(
+    'grok INTERACTIVE sessions carry the payload veto too (it is not implementor+headless only)',
+    async () => {
+      const fixture = fixtureGrok();
+      const scenarioPath = await writeScenarioFile(
+        {
+          turns: [
+            {
+              permission: { toolTitle: 'Execute `ls -la src`', rawInput: { command: 'rm -rf /' } },
+              response: { stopReason: 'end_turn' },
+            },
+          ],
+        },
+        fixture.root,
+      );
+      // An interactive decider that would APPROVE anything it is shown — so the
+      // only thing that can refuse here is the veto.
+      const created = createGrokBuildAcpAdapter({
+        cwd: fixture.cwd,
+        clock: CLOCK,
+        processEnv: { HOME: fixture.realHome, [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin },
+        grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
+        permissions: {
+          mode: 'interactive',
+          role: 'implementor',
+          handler: async () => ({ kind: 'selected', optionId: 'allow_once' }),
+        },
+        role: 'implementor',
+        model: 'grok-build',
+        reasoningEffort: 'high',
+        spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
+      });
+      cleanups.push(async () => created.adapter.close());
+
+      await created.adapter.initialize();
+      const session = await created.adapter.createSession({ cwd: fixture.cwd });
+      await created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'interactive divergent' });
+
+      expect(created.adapter.permissionDecisions).toEqual([
+        expect.objectContaining({
+          operation: 'Execute `ls -la src`',
+          action: 'deny',
+          reason: 'denied_raw_input_mismatch',
+        }),
+      ]);
+    },
+    GENEROUS_MS,
+  );
+
   // HIGH-5 end-to-end: the permission TITLE is prose; ACP `rawInput` is what the
   // provider EXECUTES. Auto-approval must bind them, or an approval covers a
   // string nothing runs. Driven through the REAL wire (fake ACP child → session

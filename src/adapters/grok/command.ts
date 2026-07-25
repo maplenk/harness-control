@@ -402,21 +402,62 @@ export function grokRawShellCommand(rawInput: unknown): string | undefined {
  * `rawInput`, a non-object, a missing/non-string `command`, or any divergence.
  */
 export function grokShellPayloadMatchesTitle(operation: string | undefined, rawInput: unknown): boolean {
-  const executed = grokRawShellCommand(rawInput);
-  const titled = operation !== undefined ? commandFromPermissionTitle(operation) : undefined;
-  if (titled === undefined) {
-    // ROUND 5 — the default is INVERTED. "Non-shell" used to be inferred from
-    // TITLE SYNTAX alone, which is attacker-shaped input: a malformed but
-    // exactly-allowlisted shell title, or a `Write` title carrying
-    // `{command: …}`, parsed as non-shell and so bound NOTHING — vacuously
-    // valid. A title we cannot parse is only genuinely non-shell when the
-    // PAYLOAD also carries no command; if it does carry one, we are looking at a
-    // shell request whose title we cannot read, which is precisely the case to
-    // refuse. Fail closed on ambiguity.
-    return executed === undefined;
+  const classified = classifyGrokOperation(operation, rawInput);
+  switch (classified.kind) {
+    case 'shell':
+      // The command the provider will EXECUTE must be byte-identical to the one
+      // the title displays.
+      return classified.executed !== undefined && classified.executed === classified.titled;
+    case 'structured_file':
+      // Positively a structured file operation with no shell payload at all —
+      // there is nothing to bind, and the workspace-write rule adjudicates it on
+      // the PATH.
+      return true;
+    case 'unknown':
+      // ROUND 6 — inability to understand something is never evidence of its
+      // safety. Previously "non-shell" was CONCLUDED from two failed parses, so
+      // an exactly-allowlisted but malformed title like `Execute ls` with no
+      // rawInput was vacuously approvable. Anything not POSITIVELY recognised as
+      // non-shell must carry a bound command, and by definition an unrecognised
+      // operation has no title command to bind against — so it is refused.
+      return false;
   }
-  return executed !== undefined && executed === titled;
 }
+
+/** Positively-recognised operation shapes; everything else is `unknown`. */
+type GrokOperationClass =
+  | { readonly kind: 'shell'; readonly titled: string; readonly executed: string | undefined }
+  | { readonly kind: 'structured_file' }
+  | { readonly kind: 'unknown' };
+
+/**
+ * ROUND 6 — determine the operation KIND AFFIRMATIVELY, from the title shape AND
+ * the payload shape together, rather than inferring "not a shell request" from a
+ * parse that failed.
+ *
+ * The distinction matters because this is a fail-closed gate: a title we cannot
+ * parse is not evidence of anything, so it can only ever be `unknown`. A
+ * structured file operation is recognised POSITIVELY — a `Write`/`Edit` title
+ * with a readable path AND a payload carrying no `command` — which is why a
+ * `Write` title smuggling `{command: …}` falls through to `unknown` instead of
+ * being waved past as "not shell".
+ *
+ * `Write`/`Edit` matching mirrors `isWorkspaceWriteOperation`'s own shape, so the
+ * two rules cannot disagree about what a structured file operation looks like.
+ */
+function classifyGrokOperation(operation: string | undefined, rawInput: unknown): GrokOperationClass {
+  const executed = grokRawShellCommand(rawInput);
+  if (operation === undefined) return { kind: 'unknown' };
+  const titled = commandFromPermissionTitle(operation);
+  if (titled !== undefined) return { kind: 'shell', titled, executed };
+  if (executed === undefined && STRUCTURED_FILE_TITLE_RE.test(operation.trim())) {
+    return { kind: 'structured_file' };
+  }
+  return { kind: 'unknown' };
+}
+
+/** Mirrors `isWorkspaceWriteOperation`'s title shape (see `acp/session.ts`). */
+const STRUCTURED_FILE_TITLE_RE = /^(?:Write|Edit) `[^`\r\n]+`$/;
 
 export interface ResolvedGrokCommand {
   readonly command: string;
