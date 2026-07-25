@@ -49,6 +49,21 @@ Until then this law is operating discipline, executed from the runbook in `scrip
 
 Until F15 lands, write commands that exit `0` on success. **Do NOT wrap a check in `!`**: `! grep -R pattern path` exits `0` both when the pattern is absent *and* when grep failed with exit `2` (unreadable path, bad regex) — converting "I could not determine X" into "X is false", the same bug in the opposite polarity. Where the distinction matters, use an explicit form that names the code (`grep …; test $? -eq 1`) rather than an inversion that swallows it.
 
+**Verified working forms** (run under `/bin/sh -c`, exactly as the engine's runner does, 2026-07-26 — each checked in BOTH directions: exit `0` against code that satisfies it, non-zero against a deliberate violation, so none of them is vacuous):
+
+```sh
+# absence of a pattern — the `|| true` swallows grep's exit, `test -z` judges the OUTPUT
+test -z "$(grep -REl "PATTERN" PATH1 PATH2 || true)"
+
+# scope: nothing changed outside web/
+test "$(git diff --name-only BASE HEAD | grep -v '^web/' | wc -l | tr -d ' ')" = "0"
+
+# a build that must produce an artefact — note Vite 7's POSITIONAL root (L13)
+npx vite build web >/dev/null 2>&1 && test -f web/dist/index.html
+```
+
+Why `grep -REl … || true` and not `grep -q`: `grep -q` exits `1` on no-match, which is the trap itself. Routing the *output* into `test -z` moves the judgement off the exit code entirely, so grep's own exit — including the `2` that means it broke — cannot be mistaken for a verdict. A grep that errors prints nothing to stdout, so this form does still read a broken search as "absent"; that residual is why F15 (declare the expected exit code) is the real fix and this is the interim.
+
 **L13 — A verification command must be executable as written, against the versions actually installed.** The same run declared `npx vite build --root web`. The installed Vite 7.3.6 takes a **positional** root and errors with `CACError: Unknown option '--root'`. The coordinator drafts commands without ever executing one, so nothing catches this — and the implementor **cannot** fix it, because the command lives in the frozen, hash-bound spec. The run burns remediation rounds it can never clear, and no engine fix rescues it: `run_60ccbfda` was cancelled for exactly this reason after proving the rest of the loop.
 
 The structural fix is a **spec-time executability preflight**: before the human approves, run each declared command once against the base commit and require only that it *ran* — not that it passed (it should fail at base; the feature does not exist yet). A `127`, a launch failure, or a usage error means the criterion is unapprovable. That makes an unexecutable command impossible to approve rather than something the coordinator must be careful about — guard the state, not the routes. **Not built; filed as F16.** Until then it is drafting discipline: every command in a slice goes through a human eye against the installed versions.
