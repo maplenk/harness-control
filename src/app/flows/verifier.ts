@@ -672,12 +672,16 @@ export interface BuildMergeReadinessInput {
    * B2: WHO signed the approval this commit implements. Reported on the §16
    * record, NEVER a blocker — an auto-approved run can be perfectly
    * merge-ready; the point is that the human reviewing the merge is told
-   * nobody reviewed the INTENT. Absent ⇒ `'human'`: that is the only signer a
-   * pre-B2 run could have, and it is the fail-safe reading (it never invents
-   * an "a human checked this" claim — it withholds the auto WARNING, which is
-   * why the production callers thread it explicitly and a test asserts they do).
+   * nobody reviewed the INTENT.
+   *
+   * REQUIRED (codex F5). It used to be optional and default to `'human'`,
+   * which meant a readiness record could claim a human signed while the event
+   * log said `auto` — a lie in the one field that exists to prevent one. There
+   * is exactly one place a missing signer is resolved (`status()`, for pre-B2
+   * approvals); everything downstream, including this, takes the resolved
+   * event-derived value.
    */
-  readonly specApprovedBy?: SpecApprovalMode;
+  readonly specApprovedBy: SpecApprovalMode;
   /** W3-1: the implementor round's runner-confinement violation — blocks
    * readiness with the agent-actionable `verification-runner violation`
    * blocker (a poisoned round is never merge-ready). */
@@ -841,7 +845,7 @@ export function buildMergeReadiness(input: BuildMergeReadinessInput): MergeReadi
     requiredTestsPassed,
     // B2: pure attribution carried onto the report — it never touches
     // `blockers` and therefore never touches `ready`.
-    specApprovedBy: input.specApprovedBy ?? 'human',
+    specApprovedBy: input.specApprovedBy,
     ready,
     blockers,
     manualIntegrationCommands: manualIntegrationCommands(verification, binding, ready, blockers),
@@ -1036,11 +1040,10 @@ export interface RunVerificationInput {
   readonly approvedSpecHash?: SpecHash;
   /**
    * B2: WHO signed the approval (`EngineState.specApprovedBy`, threaded by the
-   * loop driver from the run's actual T1 event). Reported on the §16 record
-   * and persisted with a blocked readiness so `harness recheck` keeps the same
-   * attribution. Absent ⇒ `'human'`.
+   * loop driver from the run's actual T1 event). REQUIRED (codex F5) — see
+   * `BuildMergeReadinessInput.specApprovedBy`.
    */
-  readonly specApprovedBy?: SpecApprovalMode;
+  readonly specApprovedBy: SpecApprovalMode;
   /**
    * W3-1: the implementor round's typed verification-runner confinement
    * violation (primary checkout mutated across its verification commands),
@@ -1193,7 +1196,7 @@ export async function runVerification(input: RunVerificationInput): Promise<RunV
         ? { approvedSpecHash: input.approvedSpecHash }
         : { approvedSpecHash: input.binding.specHash }),
       // B2: honest signer attribution on the §16 report.
-      ...(input.specApprovedBy !== undefined ? { specApprovedBy: input.specApprovedBy } : {}),
+      specApprovedBy: input.specApprovedBy,
       // W3-1: the implementor round's runner violation blocks readiness.
       ...(input.runnerViolation !== undefined ? { runnerViolation: input.runnerViolation } : {}),
       ids: input.ids,
@@ -1273,9 +1276,6 @@ function blockedReadinessState(
     probeDestinationRef: input.probeDestinationRef ?? 'HEAD',
     requiredTestsPassed: deriveRequiredTestsPassed(input.criteria, gathering.criteria),
     approvedSpecHash,
-    // B2: the signer travels with the blocked read-model so a recheck in a
-    // FRESH process re-reports `auto` instead of quietly reverting to `human`.
-    ...(input.specApprovedBy !== undefined ? { specApprovedBy: input.specApprovedBy } : {}),
     mergeReadiness,
     blockers: mergeReadiness.blockers,
     stage: 'blocked',
@@ -1293,6 +1293,15 @@ export interface RecheckMergeReadinessInput {
   /** The persisted blocked read-model (the SAME immutable Verification/
    * binding + non-git gate inputs; nothing is recomputed). */
   readonly blocked: MergeReadinessBlockedState;
+  /**
+   * B2 (codex F5): WHO signed the approval, re-read from the run's ENGINE
+   * STATE by the caller — deliberately NOT carried on the persisted blocked
+   * record. A recheck runs in a fresh process, possibly against a record
+   * written by an older build; sourcing the signer from the event-derived
+   * state means there is no second place where a missing value could quietly
+   * become `'human'`.
+   */
+  readonly specApprovedBy: SpecApprovalMode;
   /** The §16 git facts source — production rebuilds `gitMergeReadinessProbe`
    * from the persisted geometry; tests inject fixed facts. */
   readonly probe: MergeReadinessProbe;
@@ -1344,9 +1353,9 @@ export async function recheckMergeReadiness(
     ...(blocked.approvedSpecHash !== undefined
       ? { approvedSpecHash: blocked.approvedSpecHash }
       : { approvedSpecHash: blocked.binding.specHash }),
-    // B2: re-report the SAME signer the blocked round recorded. Absent on a
-    // pre-B2 record ⇒ `'human'`, which was then the only possible signer.
-    ...(blocked.specApprovedBy !== undefined ? { specApprovedBy: blocked.specApprovedBy } : {}),
+    // B2: the signer comes from the run's engine state, not the persisted
+    // blocked record (codex F5 — one resolution point, no second default).
+    specApprovedBy: input.specApprovedBy,
     ids: input.ids,
     clock: input.clock,
   });

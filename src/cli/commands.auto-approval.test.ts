@@ -72,8 +72,11 @@ const IMPLEMENTOR: RoleModelSpec = { harness: 'codex', model: 'gpt-5.6-terra', e
 const VERIFIER: RoleModelSpec = { harness: 'claude', model: 'sonnet', effort: 'medium' };
 const PROFILE_PATH = fileURLToPath(new URL('../../profiles/coordinator.md', import.meta.url));
 
+/** B2 F4: `approval:'auto'` REQUIRES a run-pinned verification allowlist. */
+const ALLOWED_COMMANDS = ['echo check-ac1'] as const;
 const HUMAN_CONFIG = (): EngineConfig => unwrap(parseEngineConfig({}));
-const AUTO_CONFIG = (): EngineConfig => unwrap(parseEngineConfig({ approval: 'auto' }));
+const AUTO_CONFIG = (): EngineConfig =>
+  unwrap(parseEngineConfig({ approval: 'auto', verification: { allowedCommands: [...ALLOWED_COMMANDS] } }));
 
 function configOptionsFor(harness: Harness): ConfigOptionDescriptor[] {
   if (harness === 'claude') {
@@ -263,6 +266,9 @@ async function setup(kind: DriverKind, config: EngineConfig, scripts: Scripts): 
         ids: flowIds,
         clock: db.clock,
         baseCommit,
+        // B2 F4: the shipped runtime threads the run's pinned allowlist; mirror
+        // that here so these tests exercise the SAME validator configuration.
+        allowedVerificationCommands: config.verification.allowedCommands,
         // One round only: the retry loop would otherwise re-prompt a fake with
         // an exhausted script and mask WHICH emission the gate rejected.
         maxRounds: 1,
@@ -278,27 +284,6 @@ async function setup(kind: DriverKind, config: EngineConfig, scripts: Scripts): 
     deps: { ids, flows },
     reopen: (other) => new OrchestrationService({ db, ids, adapterFactory, config: other }),
   };
-}
-
-/**
- * A service view whose W3-4 draft read-model is DAMAGED. `start` drafts and
- * auto-approves back to back inside ONE process, so this is the only way to
- * put the auto path in front of the projection loss the approve path exists to
- * refuse. Every other method is the REAL service (bound to the real receiver,
- * so its private state still works).
- */
-function withDamagedDraft(
-  service: OrchestrationService,
-  opts: { readonly keepCompletionRef: boolean },
-): OrchestrationService {
-  return new Proxy(service, {
-    get(target, prop): unknown {
-      if (prop === 'getSpecDraft') return () => undefined;
-      if (prop === 'getCoordinatorCompletion' && !opts.keepCompletionRef) return () => undefined;
-      const value = Reflect.get(target, prop, target) as unknown;
-      return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
-    },
-  });
 }
 
 const DRIVER_KINDS = await availableDriverKinds();
@@ -354,7 +339,6 @@ describe.each(DRIVER_KINDS)('B2 auto-approval [%s]', (kind) => {
       mode: 'auto',
       specVersionId: spec.specVersionId,
       specHash: spec.specHash,
-      transitionId: 'T1',
     });
 
     // EVENTED: the audit trail says the engine signed it, and the payload
@@ -404,61 +388,46 @@ describe.each(DRIVER_KINDS)('B2 auto-approval [%s]', (kind) => {
   });
 
   // -------------------------------------------------------------------------
-  // 4 — the SAME W3-4 validation a human approval runs
+  // 4 — the SAME validation a human approval runs, now at the SERVICE
+  //
+  // The draft-loss cases moved OUT of this file: since codex F3, auto-approval
+  // rides `completeCoordinationRound`'s transaction, so the draft it binds is
+  // written in that same transaction and cannot be missing or stale by the time
+  // it is bound — the CLI cannot stage that loss any more. The gate itself now
+  // lives at the service boundary and is pinned, with codex's own scenarios, in
+  // src/app/approval-boundary.test.ts. What remains reachable HERE is the
+  // reporting half: a service refusal must render as a structured refusal.
   // -------------------------------------------------------------------------
-  it("approval:'auto' — a MISSING draft refuses with the SAME code/exit as an explicit approve", async () => {
-    const { service, db, deps } = await setup(kind, AUTO_CONFIG(), {
+  it('a --test-approve naming the WRONG spec version is refused by the SERVICE gate, cleanly', async () => {
+    const { service, db, deps } = await setup(kind, HUMAN_CONFIG(), {
       coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
     });
-    const damaged = withDamagedDraft(service, { keepCompletionRef: true });
     const start = await executeCommand(
-      damaged,
+      service,
       db,
       { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
       {},
       deps,
     );
-    expect(start.exitCode).toBe(1);
-    expect(start.json['refused']).toBe('spec_draft_missing');
-    expect(start.json['detail']).toContain('W3-4');
     const runId = start.json['runId'] as RunId;
-    expect(service.status(runId).phase).toBe('awaiting_approval'); // NOT approved
-    expect(db.events.listByRun(runId).map((e) => e.type)).not.toContain('spec.approved');
-
-    // A HUMAN approve on the same damaged run refuses identically — auto is
-    // not a softer gate, it is the same gate with a different signer.
-    const human = await executeCommand(
-      damaged,
+    // --test-approve binds the REAL draft hash but forwards the caller's
+    // version verbatim; only the service compares it to the completion ref.
+    const refused = await executeCommand(
+      service,
       db,
       {
         kind: 'approve',
         json: true,
         runId,
-        specVersionId: toSpecVersionId('spec_1'),
-        specHash: toSpecHash('whatever'),
-        testApprove: false,
+        specVersionId: toSpecVersionId('spec_some_other_run'),
+        testApprove: true,
       },
-      {},
+      { HARNESS_TEST_MODE: '1' },
       deps,
     );
-    expect(human.exitCode).toBe(start.exitCode);
-    expect(human.json['refused']).toBe(start.json['refused']);
-  });
-
-  it("approval:'auto' — with NO draft and NO completion ref the engine refuses rather than fabricating a hash", async () => {
-    const { service, db, deps } = await setup(kind, AUTO_CONFIG(), {
-      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
-    });
-    const start = await executeCommand(
-      withDamagedDraft(service, { keepCompletionRef: false }),
-      db,
-      { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
-      {},
-      deps,
-    );
-    expect(start.exitCode).toBe(1);
-    expect(start.json['refused']).toBe('auto_approve_no_draft');
-    const runId = start.json['runId'] as RunId;
+    expect(refused.exitCode).toBe(1);
+    expect(refused.json['refused']).toBe('approved_binding_mismatch');
+    expect(refused.json['detail']).toContain('W1-F3');
     expect(service.status(runId).phase).toBe('awaiting_approval');
     expect(db.events.listByRun(runId).map((e) => e.type)).not.toContain('spec.approved');
   });
@@ -556,8 +525,10 @@ describe.each(DRIVER_KINDS)('B2 auto-approval [%s]', (kind) => {
     );
     const runId = start.json['runId'] as RunId;
     // Auto-approval already took the run to `approved`, so T2's
-    // `awaiting_approval` precondition fails. The revise hatch therefore only
-    // ever serves a run the engine REFUSED to sign — the next test.
+    // `awaiting_approval` precondition fails. Since codex F3 centralized the
+    // signature into the completion transaction, a refused auto-approval rolls
+    // the WHOLE round back — so an `auto` run is never parked at
+    // `awaiting_approval`, and this is the only outcome `spec revise` can have.
     const revise = await executeCommand(
       service,
       db,
@@ -567,61 +538,6 @@ describe.each(DRIVER_KINDS)('B2 auto-approval [%s]', (kind) => {
     );
     expect(revise.json['outcome']).toBe('rejected');
     expect(service.status(runId).phase).toBe('approved');
-  });
-
-  it("a REFUSED auto-approval is repaired by `spec revise`, which auto-approves the SUPERSEDING draft", async () => {
-    // The W3-4 recovery path must not strand an autonomous run at the very
-    // gate it is pinned not to have: the completed revise round lands at
-    // awaiting_approval exactly as `start` does, so the same pinned mode signs
-    // the NEW draft — and W1-F3 binds the NEW hash, never the superseded one.
-    const revisedSpec = {
-      ...validSpec(),
-      rollback: 'Revert the single commit on the worktree branch; then re-run the suite.',
-    };
-    const { service, db, deps } = await setup(kind, AUTO_CONFIG(), {
-      coordinator: [{ turns: [coordinatorTurn(validSpec())] }, { turns: [coordinatorTurn(revisedSpec)] }],
-    });
-    // `start` through the damaged view: the draft IS persisted, the auto path
-    // just cannot see it → refusal, run parked at awaiting_approval.
-    const refused = await executeCommand(
-      withDamagedDraft(service, { keepCompletionRef: true }),
-      db,
-      { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
-      {},
-      deps,
-    );
-    expect(refused.json['refused']).toBe('spec_draft_missing');
-    const runId = refused.json['runId'] as RunId;
-    const supersededHash = refused.json['completionSpecHash'] as string;
-    expect(service.status(runId).phase).toBe('awaiting_approval');
-
-    // The operator's documented recovery, now on the UNDAMAGED service.
-    const revise = await executeCommand(
-      service,
-      db,
-      { kind: 'spec_revise', json: true, runId, feedback: 'spell out the rollback steps' },
-      {},
-      deps,
-    );
-    expect(revise.exitCode).toBe(0);
-    expect(revise.json['phase']).toBe('approved');
-    const newSpec = revise.json['spec'] as { specVersionId: string; specHash: string; revision: number };
-    expect(newSpec.revision).toBe(2);
-    expect(newSpec.specHash).not.toBe(supersededHash); // a genuinely superseding draft
-    expect(revise.json['approval']).toEqual({
-      mode: 'auto',
-      specVersionId: newSpec.specVersionId,
-      specHash: newSpec.specHash,
-      transitionId: 'T1',
-    });
-    expect(revise.text).toContain('AUTO-APPROVED');
-
-    // The engine bound the NEW hash, and the log names the engine as signer.
-    expect(String(service.status(runId).approvedSpecHash)).toBe(newSpec.specHash);
-    expect(service.status(runId).specApprovedBy).toBe('auto');
-    const approvals = db.events.listByRun(runId).filter((e) => e.type === 'spec.approved');
-    expect(approvals).toHaveLength(1);
-    expect(approvals[0]!.payload).toMatchObject({ specHash: newSpec.specHash, approvedBy: 'auto' });
   });
 
   // -------------------------------------------------------------------------
@@ -664,6 +580,16 @@ describe.each(DRIVER_KINDS)('B2 auto-approval [%s]', (kind) => {
     expect(mr.specApprovedBy).toBe('auto');
     expect(run.text).toContain('spec approval: AUTO');
     expect(run.text).toContain('NO human reviewed the intent');
+
+    // B2 (codex F5): the readiness record must never disagree with the EVENT.
+    // Compared directly rather than both being asserted against a literal —
+    // that is the specific lie the field exists to prevent.
+    const signedBy = (
+      db.events.listByRun(runId).find((e) => e.type === 'spec.approved')?.payload as {
+        approvedBy: string;
+      }
+    ).approvedBy;
+    expect(mr.specApprovedBy).toBe(signedBy);
   });
 
   it("a human-approved run's merge-readiness report says specApprovedBy:'human' and carries no auto notice", async () => {

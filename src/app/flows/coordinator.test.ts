@@ -356,6 +356,71 @@ describe('validateCoordinatorSpec — §7 schema + testability gate', () => {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // B2 F4 — the lexical gate is GAMEABLE; the run-pinned command allowlist is
+  // the structural answer. Codex reproduced the exact spec below and the
+  // validator accepted it: a task that removes an authorization check, "proven"
+  // by the command `true` and the evidence "exit code is 0".
+  // -------------------------------------------------------------------------
+  describe('B2 F4 — verification commands come from the RUN, not the coordinator', () => {
+    /** Codex's reproduction, verbatim in shape. */
+    function gamedSpec(command = 'true'): Record<string, unknown> {
+      const spec = validSpec();
+      spec['tasks'] = [{ id: 'T1', description: 'Remove the authorization check', dependsOn: [] }];
+      spec['acceptanceCriteria'] = [
+        {
+          id: 'AC-1',
+          description: 'The authorization check is gone',
+          verificationCommands: [command],
+          expectedEvidence: 'exit code is 0',
+        },
+      ];
+      return spec;
+    }
+
+    it('CODEX REPRO: with no allowlist the lexical gate ACCEPTS `true` + "exit code is 0"', () => {
+      // Documented honestly rather than pretended away: this is exactly why the
+      // structural gate exists, and why `approval:'auto'` refuses an empty set.
+      expect(validateCoordinatorSpec(gamedSpec()).ok).toBe(true);
+    });
+
+    it('with the run-pinned allowlist, the same spec is REFUSED', () => {
+      const r = validateCoordinatorSpec(gamedSpec(), {
+        allowedVerificationCommands: ['npm run typecheck', 'npx vitest run'],
+      });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        const issue = r.error.find((i) => i.path === 'acceptanceCriteria.0.verificationCommands.0');
+        expect(issue).toBeDefined();
+        expect(issue?.message).toContain('this run does not declare');
+        // The refusal names the exact legal set, so the re-prompt is actionable.
+        expect(issue?.message).toContain('npm run typecheck');
+      }
+    });
+
+    it('a DECLARED command is accepted; near-misses (wrapping, weakening, padding) are not', () => {
+      const allowed = { allowedVerificationCommands: ['npx vitest run'] };
+      expect(validateCoordinatorSpec(gamedSpec('npx vitest run'), allowed).ok).toBe(true);
+      for (const sneaky of ['npx vitest run || true', 'true; npx vitest run', ' npx vitest run', 'npx vitest']) {
+        expect(validateCoordinatorSpec(gamedSpec(sneaky), allowed).ok, sneaky).toBe(false);
+      }
+    });
+
+    it('an empty/absent allowlist keeps the pre-B2 behavior (unrestricted)', () => {
+      expect(validateCoordinatorSpec(gamedSpec(), { allowedVerificationCommands: [] }).ok).toBe(true);
+      expect(validateCoordinatorSpec(gamedSpec(), {}).ok).toBe(true);
+    });
+
+    it('the allowlist does NOT replace the evidence gate — both still apply', () => {
+      const spec = gamedSpec('npx vitest run');
+      (spec['acceptanceCriteria'] as Array<Record<string, unknown>>)[0]!['expectedEvidence'] =
+        'the feature works properly';
+      const r = validateCoordinatorSpec(spec, { allowedVerificationCommands: ['npx vitest run'] });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.some((i) => i.message.includes('not objectively testable'))).toBe(true);
+    });
+  });
+
   it('rejects a bad criterion id (not AC-N), duplicates, and dangling task deps', () => {
     const badId = validSpec();
     (badId['acceptanceCriteria'] as Array<Record<string, unknown>>)[0]!['id'] = 'crit1';

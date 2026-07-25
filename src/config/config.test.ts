@@ -65,8 +65,10 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
       checkpoint: { cadenceTurns: 3 },
       budget: { conservativeReservationUsd: 0.5 },
       // W3-1: the verification runner's per-run env additions default EMPTY —
-      // the minimal allowlist is the whole default surface.
-      verification: { envAllowlist: [] },
+      // the minimal allowlist is the whole default surface. B2 F4: the
+      // spec-citable command allowlist likewise defaults EMPTY (unrestricted),
+      // and `approval:'auto'` refuses that combination at parse.
+      verification: { envAllowlist: [], allowedCommands: [] },
       // F7 (§3): worktree dependency provisioning defaults to `auto` (clone when
       // the committed fingerprint matches the primary + APFS is available, else
       // `npm ci`).
@@ -128,13 +130,39 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
   });
 
   it("accepts approval:'auto' and REFUSES any other value", () => {
-    expect(unwrap(parseEngineConfig({ approval: 'auto' })).approval).toBe('auto');
+    const auto = { approval: 'auto', verification: { allowedCommands: ['npm test'] } };
+    expect(unwrap(parseEngineConfig(auto)).approval).toBe('auto');
     expect(unwrap(parseEngineConfig({ approval: 'human' })).approval).toBe('human');
     for (const bogus of ['yes', 'engine', 'always', true, 1, null]) {
-      const result = parseEngineConfig({ approval: bogus });
+      const result = parseEngineConfig({ ...auto, approval: bogus });
       expect(isErr(result), `approval: ${JSON.stringify(bogus)} must be refused`).toBe(true);
       if (isErr(result)) expect(issuePaths(result.error)).toContain('approval');
     }
+  });
+
+  // B2 round 2 (codex F4): the §7 testability gate is LEXICAL and gameable —
+  // `true` + "exit code is 0" passes it. The structural guard is a run-pinned
+  // command allowlist, so autonomy without one is refused at parse: under the
+  // human gate a person reads the spec, under autonomy nobody does.
+  it("approval:'auto' REQUIRES a non-empty verification.allowedCommands", () => {
+    const refused = parseEngineConfig({ approval: 'auto' });
+    expect(isErr(refused)).toBe(true);
+    if (isErr(refused)) {
+      expect(issuePaths(refused.error)).toContain('verification.allowedCommands');
+      expect(refused.error[0]?.message).toContain('the coordinator must not also choose what counts as proof');
+    }
+    expect(isErr(parseEngineConfig({ approval: 'auto', verification: { allowedCommands: [] } }))).toBe(true);
+    expect(
+      isOk(parseEngineConfig({ approval: 'auto', verification: { allowedCommands: ['npm run typecheck'] } })),
+    ).toBe(true);
+  });
+
+  it('allowedCommands defaults empty (unrestricted) and rejects padded entries that could never match', () => {
+    expect(DEFAULT_ENGINE_CONFIG.verification.allowedCommands).toEqual([]);
+    // Matching is exact, so a padded entry is dead config — refuse it (W4-1).
+    const padded = parseEngineConfig({ verification: { allowedCommands: [' npm test '] } });
+    expect(isErr(padded)).toBe(true);
+    if (isErr(padded)) expect(issuePaths(padded.error)).toContain('verification.allowedCommands');
   });
 });
 

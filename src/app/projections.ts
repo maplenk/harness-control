@@ -202,14 +202,10 @@ export interface MergeReadinessBlockedState {
   readonly requiredTestsPassed: boolean;
   /** Spec-drift gate input the blocked round checked against. */
   readonly approvedSpecHash?: SpecHash;
-  /**
-   * B2: WHO signed the approval — carried so a LATER `harness recheck`
-   * process rebuilds the §16 report with the same honest attribution instead
-   * of silently downgrading an auto-approved run to `human`. Absent on
-   * records written by a pre-B2 build (only humans could sign then), so
-   * readers treat absent as `'human'`.
-   */
-  readonly specApprovedBy?: SpecApprovalMode;
+  // B2 (codex F5): the approval SIGNER is deliberately NOT stored here. A
+  // recheck re-reads it from the run's event-derived engine state, so there is
+  // exactly one place a missing signer is resolved and no persisted record —
+  // possibly written by an older build — can quietly report `'human'`.
   /** The latest §16 readiness report (`ready === false` while `blocked`). */
   readonly mergeReadiness: MergeReadiness;
   /** The latest probe's blockers (all user-actionable while `blocked`). */

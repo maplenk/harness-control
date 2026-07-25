@@ -124,6 +124,7 @@ import type {
   WorktreeState,
 } from '../domain/entities.js';
 import { DEFAULT_ENGINE_CONFIG, parseEngineConfig, toEngineBounds } from '../config/loader.js';
+import { DEFAULT_SPEC_APPROVAL_MODE } from '../config/schema.js';
 import type { AutoRespawnMode, EngineConfig } from '../config/schema.js';
 import { isErr, unwrap } from '../lib/result.js';
 import {
@@ -278,6 +279,42 @@ export class WorkflowDispatchIngestError extends Error {
         `call advanceWorkflowPhase(runId, from, to), its only legal producer`,
     );
     this.runId = runId;
+  }
+}
+
+/** Why the SERVICE refused a T1 approval (B2 round 2, codex F1/F2). */
+export type SpecApprovalRefusalReason =
+  /** `mode:'auto'` on a run NOT pinned to `approval:'auto'`. */
+  | 'approval_mode_not_auto'
+  /** The durable completion ref proves a draft existed; the projection is gone. */
+  | 'spec_draft_missing'
+  /** The projection disagrees with the completion ref on hash, version or revision. */
+  | 'spec_draft_stale'
+  /** The caller named a version/hash that is not the completed draft's. */
+  | 'approved_binding_mismatch'
+  /** The T1 that must accompany a durable coordinator completion did not apply. */
+  | 'auto_approve_rejected';
+
+/**
+ * B2 round 2 (codex F1/F2) — the APPROVAL BOUNDARY refused, at the SERVICE.
+ *
+ * Before this, `approve` trusted the caller's `mode`, version and hash, so a
+ * run pinned to `approval:'human'` with NO draft could reach `approved`
+ * carrying a fabricated hash and a durable `approvedBy:'auto'`. The CLI's
+ * pre-checks were the only thing in the way, and the CLI is not the only
+ * caller. The service now enforces the run's PINNED approval mode and
+ * validates the binding against the durable completion ref ITSELF, inside the
+ * same transaction that appends T1 — so nothing observes a half-checked
+ * approval and nothing races between the check and the write.
+ */
+export class SpecApprovalRefusedError extends Error {
+  override readonly name: string = 'SpecApprovalRefusedError';
+  readonly runId: RunId;
+  readonly reason: SpecApprovalRefusalReason;
+  constructor(runId: RunId, reason: SpecApprovalRefusalReason, detail: string) {
+    super(detail);
+    this.runId = runId;
+    this.reason = reason;
   }
 }
 
@@ -968,9 +1005,10 @@ export interface RunStatus {
   readonly counters: RestartCounters;
   readonly approvedSpecHash?: SpecHash;
   /**
-   * B2: WHO signed the T1 that bound `approvedSpecHash`. Absent iff the run
-   * is unapproved, or was approved by a pre-B2 build (whose only signer could
-   * be a human) — readers treat absent as `'human'`.
+   * B2: WHO signed the T1 that bound `approvedSpecHash`. Present exactly when
+   * `approvedSpecHash` is — i.e. absent iff the run is unapproved. A pre-B2
+   * approval (hash bound, no signer folded) resolves to `'human'` HERE, the
+   * single legacy-compat point; downstream consumers require the value.
    */
   readonly specApprovedBy?: SpecApprovalMode;
   readonly cost: CostProjectionState;
@@ -1828,18 +1866,97 @@ export class OrchestrationService {
     // boundary so JavaScript/direct callers cannot bypass the CLI guard. Old
     // persisted runs take the same one-time audited pin path first.
     await this.assertOrPinLegacyCleanWorkspace(runId);
-    return this.ingest(
-      this.#trigger(
+    const mode = input.mode ?? 'human';
+    // The trigger (and its id allocation) is built OUTSIDE the write lock; the
+    // VALIDATION and the append are inside one transaction (codex F2: the old
+    // code validated in the CLI, then appended in a separate transaction, so a
+    // concurrent revision could replace the draft in between).
+    const trigger = this.#trigger(
+      runId,
+      'spec.approved',
+      { specVersionId: input.specVersionId, specHash: input.specHash, approvedBy: mode },
+      opts,
+    ) as DomainEvent;
+    return this.#db.transactionImmediate(() => {
+      this.#assertApprovalBinding(runId, input, mode);
+      return this.ingest(trigger);
+    });
+  }
+
+  /**
+   * B2 round 2 (codex F1/F2) — THE approval gate, at the authoritative
+   * boundary. Called inside the approving transaction by BOTH approval routes
+   * (`approve` and the auto-approval folded into `completeCoordinationRound`),
+   * so no caller — CLI, test, or future in-process component — can reach
+   * `approved` without passing it.
+   *
+   * Two independent checks:
+   *  1. SIGNER. `mode:'auto'` is legal only on a run whose PINNED config
+   *     (W1-F5) says `approval:'auto'`. A `human` run refuses it outright, so
+   *     `approvedBy:'auto'` in the log can never be a lie about a run that
+   *     never opted into autonomy.
+   *  2. BINDING. When the durable completion ref proves a drafting round
+   *     completed, the current draft projection AND the caller's
+   *     version+hash must both equal it — hash, version AND revision (codex
+   *     F2: hash-only detection let a superseded revision carrying the same
+   *     content hash through). A run that never completed a drafting round has
+   *     no ref to check against and keeps the pre-B2 explicit-hash path.
+   */
+  #assertApprovalBinding(
+    runId: RunId,
+    input: { readonly specVersionId: SpecVersionId; readonly specHash: SpecHash },
+    mode: SpecApprovalMode,
+  ): void {
+    const pinned = loadRunConfig(this.#db, runId)?.approval ?? DEFAULT_SPEC_APPROVAL_MODE;
+    if (mode === 'auto' && pinned !== 'auto') {
+      throw new SpecApprovalRefusedError(
         runId,
-        'spec.approved',
-        {
-          specVersionId: input.specVersionId,
-          specHash: input.specHash,
-          approvedBy: input.mode ?? 'human',
-        },
-        opts,
-      ) as DomainEvent,
-    );
+        'approval_mode_not_auto',
+        `refusing approve: run ${runId} is pinned to approval='${pinned}', so the engine may not sign ` +
+          `its spec (mode='auto'). Approval mode binds at createRun and is immutable for the run's life; ` +
+          `approve explicitly, or start a new run under a config with approval='auto'.`,
+      );
+    }
+    const completion = this.getCoordinatorCompletion(runId);
+    if (completion === undefined) return; // never drafted (pure-unit/legacy run)
+
+    const draft = this.getSpecDraft(runId);
+    if (draft === undefined) {
+      throw new SpecApprovalRefusedError(
+        runId,
+        'spec_draft_missing',
+        `refusing approve: run ${runId}'s spec draft is MISSING — the event log records a completed ` +
+          `drafting round (spec ${completion.specVersionId}, hash ${completion.specHash}, revision ` +
+          `${completion.revision}) but the draft projection is gone (W3-4). There is no draft to bind ` +
+          `approval to.`,
+      );
+    }
+    if (
+      String(draft.specHash) !== String(completion.specHash) ||
+      String(draft.specVersionId) !== String(completion.specVersionId) ||
+      draft.revision !== completion.revision
+    ) {
+      throw new SpecApprovalRefusedError(
+        runId,
+        'spec_draft_stale',
+        `refusing approve: run ${runId}'s spec draft is STALE — the latest completed drafting round is ` +
+          `spec ${completion.specVersionId} rev ${completion.revision} (hash ${completion.specHash}) but ` +
+          `the draft projection carries spec ${draft.specVersionId} rev ${draft.revision} (hash ` +
+          `${draft.specHash}) (W3-4). Hash alone is not identity: a superseded revision can share content.`,
+      );
+    }
+    if (
+      String(input.specHash) !== String(completion.specHash) ||
+      String(input.specVersionId) !== String(completion.specVersionId)
+    ) {
+      throw new SpecApprovalRefusedError(
+        runId,
+        'approved_binding_mismatch',
+        `refusing approve: the approval names spec ${input.specVersionId} (hash ${input.specHash}), which ` +
+          `is not run ${runId}'s completed draft ${completion.specVersionId} (hash ${completion.specHash}) ` +
+          `(W1-F3: approval binds the exact SpecVersion the run will implement).`,
+      );
+    }
   }
 
   /** T2 — `spec revise --feedback`. */
@@ -2645,18 +2762,41 @@ export class OrchestrationService {
    * run is `awaiting_approval` WITH the draft and with a durable
    * `SpecDraftRef` replay can check the projection against — never an
    * approval-ready run whose draft is silently gone.
+   *
+   * B2 round 2 (codex F3): AUTO-APPROVAL LIVES HERE, not in the CLI. Under a
+   * run pinned to `approval:'auto'` the T1 rides the SAME transaction as the
+   * draft + advance, so:
+   *  - every durable completion auto-approves — `start`, `spec revise`, the
+   *    W2-5 coordinator re-entry, and any direct caller of this API alike
+   *    (previously a CLI post-step, so the API left an `auto` run parked at
+   *    `awaiting_approval`);
+   *  - there is no crash window: a crash rolls back the whole unit, and after
+   *    commit the run is `approved` — never stranded at a gate it is pinned
+   *    not to have.
+   * The returned `EngineState` is therefore post-T1 when the run is `auto`.
    */
   async completeCoordinationRound(runId: RunId, draft: SpecDraftState): Promise<EngineState> {
     // Keep the completion API public for recovery/tests, but make it a real
     // engine boundary: fabricated/direct callers cannot persist a coordinator
     // result after the primary checkout became dirty or drifted.
     await this.assertOrPinLegacyCleanWorkspace(runId);
+    const pinnedApproval = loadRunConfig(this.#db, runId)?.approval ?? DEFAULT_SPEC_APPROVAL_MODE;
+    // Build the T1 (and allocate its id) OUTSIDE the write lock; it is applied
+    // inside, after the draft it binds is durable in the same transaction.
+    const autoApproval =
+      pinnedApproval === 'auto'
+        ? (this.#trigger(runId, 'spec.approved', {
+            specVersionId: draft.specVersionId,
+            specHash: draft.specHash, // W1-F3: the REAL drafted hash, never synthetic
+            approvedBy: 'auto',
+          }) as DomainEvent)
+        : undefined;
     // F1: `BEGIN IMMEDIATE` so the draft persist + the final advance are one
     // write-locked unit and the inner `advanceWorkflowPhase`
     // `transactionImmediate` nests as a shared no-op (IMMEDIATE outermost).
     return this.#db.transactionImmediate(() => {
       this.saveSpecDraft(runId, draft);
-      return this.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval', {
+      const advanced = this.advanceWorkflowPhase(runId, 'specifying', 'awaiting_approval', {
         draft: {
           // §7: the CAS artifact hash IS the spec content hash, so the
           // artifact ref is derivable from the draft alone (same identity
@@ -2667,6 +2807,30 @@ export class OrchestrationService {
           revision: draft.revision,
         },
       });
+      if (autoApproval === undefined) return advanced;
+      // The same gate `approve` runs — this path is not privileged just
+      // because it is internal (the draft it validates is the one written
+      // three lines up, so it passes; the point is that there is ONE gate).
+      this.#assertApprovalBinding(
+        runId,
+        { specVersionId: draft.specVersionId, specHash: draft.specHash },
+        'auto',
+      );
+      const approved = this.ingest(autoApproval);
+      if (approved.status !== 'applied') {
+        // Roll the WHOLE completion back rather than commit a draft whose
+        // pinned auto-approval did not take: half-applied is exactly the
+        // stranded state this move exists to prevent.
+        throw new SpecApprovalRefusedError(
+          runId,
+          'auto_approve_rejected',
+          `refusing to complete the coordination round for run ${runId}: the run is pinned to ` +
+            `approval='auto' but its T1 did not apply (${
+              approved.status === 'rejected' ? `${approved.reason}: ${approved.detail}` : approved.status
+            }). The draft and the phase advance were rolled back.`,
+        );
+      }
+      return approved.next;
     });
   }
 
@@ -3300,7 +3464,16 @@ export class OrchestrationService {
         : {}),
       counters: state.counters,
       ...(state.approvedSpecHash !== undefined ? { approvedSpecHash: state.approvedSpecHash } : {}),
-      ...(state.specApprovedBy !== undefined ? { specApprovedBy: state.specApprovedBy } : {}),
+      // B2 round 2 (codex F5): THE ONE legacy-compat point for the signer.
+      // Every T1 folded by a B2+ build carries `specApprovedBy`; a run approved
+      // by a PRE-B2 build has the hash bound but no signer, and human was then
+      // the only possible signer. Resolving it here — once, at the read
+      // boundary, tied to `approvedSpecHash` actually being bound — means every
+      // downstream consumer takes a REQUIRED, event-derived value and no other
+      // layer gets to default a missing signer to 'human'.
+      ...(state.approvedSpecHash !== undefined
+        ? { specApprovedBy: state.specApprovedBy ?? 'human' }
+        : {}),
       cost,
       budget: {
         spentUsd: cost.totalCostUsd,

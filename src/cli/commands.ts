@@ -51,6 +51,7 @@ import {
   LimitPausedError,
   RUN_META_PROJECTION,
   ResumeEligibilityError,
+  SpecApprovalRefusedError,
   WorkspaceDriftError,
   resolveRoleModel,
   type DesiredModelRecord,
@@ -367,7 +368,18 @@ function detectDraftLoss(
   const completion = service.getCoordinatorCompletion(runId);
   if (completion === undefined) return undefined;
   if (draft === undefined) return { completion, kind: 'missing' };
-  if (String(draft.specHash) !== String(completion.specHash)) return { completion, kind: 'stale' };
+  // B2 round 2 (codex F2): identity is hash AND version AND revision. Hash
+  // alone let a SUPERSEDED revision carrying the same content hash pass as
+  // current — human approval caught it via its separate --spec-version check,
+  // auto-approval had no such second look. Same comparison the service now
+  // performs authoritatively inside the approving transaction.
+  if (
+    String(draft.specHash) !== String(completion.specHash) ||
+    String(draft.specVersionId) !== String(completion.specVersionId) ||
+    draft.revision !== completion.revision
+  ) {
+    return { completion, kind: 'stale' };
+  }
   return undefined;
 }
 
@@ -396,7 +408,11 @@ function draftLossRefusal(
     `${loss.kind === 'missing' ? 'MISSING' : 'STALE'} — the event log records a completed drafting round ` +
     `(spec ${loss.completion.specVersionId}, hash ${loss.completion.specHash}, revision ` +
     `${loss.completion.revision}) but the draft projection ` +
-    `${loss.kind === 'missing' ? 'is gone' : `carries a different hash (${draft?.specHash})`} (W3-4). ` +
+    `${
+      loss.kind === 'missing'
+        ? 'is gone'
+        : `carries a different identity (spec ${draft?.specVersionId} rev ${draft?.revision}, hash ${draft?.specHash})`
+    } (W3-4). ` +
     'There is no draft to bind approval to. ' +
     draftLossRecoveryHint(runId);
   return finish(
@@ -415,130 +431,71 @@ function draftLossRefusal(
 }
 
 // ---------------------------------------------------------------------------
-// B2 — auto-approval (docs/AUTONOMOUS-BASE-PLAN.md §1)
+// B2 — auto-approval reporting (docs/AUTONOMOUS-BASE-PLAN.md §1)
+//
+// The auto-approval ITSELF is NOT here. Codex F3: it used to be a CLI
+// post-step, so the durable completion API left an `approval:'auto'` run at
+// `awaiting_approval`, the W2-5 coordinator re-entry printed `next: approve`,
+// and a crash between the completion and the post-step stranded the run at a
+// gate it is pinned not to have. It now rides `completeCoordinationRound`'s
+// transaction (src/app/service.ts), so EVERY durable coordinator completion
+// auto-approves atomically. What is left here is rendering: read the resulting
+// engine state and say, on both surfaces, that no human signed.
 // ---------------------------------------------------------------------------
-/**
- * What the engine's own approval attempt did at a drafting-round boundary
- * (`start`, and a completed `spec revise` round).
- */
-type AutoApprovalOutcome =
-  /** The run is pinned to `approval: 'human'` — the input gate stands, untouched. */
-  | { readonly kind: 'human_gate' }
-  | {
-      readonly kind: 'approved';
-      readonly specVersionId: SpecVersionId;
-      readonly specHash: SpecHash;
-      readonly transitionId: string | undefined;
-    }
-  /** Validation (or the T1 ingest) said no; the caller returns this verbatim. */
-  | { readonly kind: 'refused'; readonly output: CommandOutput };
+/** A completed drafting round's approval outcome, as observed after the fact. */
+interface AutoApprovalReport {
+  readonly specVersionId: SpecVersionId;
+  readonly specHash: SpecHash;
+}
 
 /**
- * B2: under a run pinned to `approval: 'auto'`, the ENGINE binds the drafted
- * spec hash itself the moment a drafting round completes, and the run proceeds
- * to `approved` without waiting for a human.
- *
- * This is a SIGNATURE, not a bypass. It runs exactly what `handleApprove`
- * runs before `service.approve`:
- *  - W3-4 draft-loss detection — a missing/stale draft REFUSES here just as it
- *    refuses a human (`draftLossRefusal`, same code/text/exit);
- *  - W1-F3 binding — the hash bound is the REAL persisted draft's hash. The
- *    fabricated `--test-approve` hash is a separate, `HARNESS_TEST_MODE`-gated
- *    CLI seam and is never reachable from here.
- * The §7 testability gate is upstream of this function entirely: an untestable
- * spec never completes a drafting round, so there is nothing here to approve.
- *
- * The decision reads the run's PINNED config (W1-F5), not the ambient one, so
- * the mode is immutable for the run's life — a later invocation under a
- * different `--config` can neither grant nor revoke autonomy. A run with NO
- * persisted config (created before config durability) has no pinned autonomy
- * to honor and falls back to `human` — fail CLOSED, toward the gate. A
- * CORRUPT persisted config is `loadRunConfig`'s existing loud throw, not a
- * silent fallback either way.
+ * Did THIS drafting round end auto-approved? Derived from the run's durable
+ * post-completion state (`approved` + an engine signature bound to the draft
+ * this round produced), never from config — so the report describes what
+ * actually happened, and a human who raced in and signed in person is never
+ * mis-reported as the engine.
  */
-async function autoApproveDraftedSpec(
+function autoApprovalOf(
   service: OrchestrationService,
   runId: RunId,
-  command: string,
-): Promise<AutoApprovalOutcome> {
-  if ((service.getRunConfig(runId)?.approval ?? DEFAULT_SPEC_APPROVAL_MODE) !== 'auto') {
-    return { kind: 'human_gate' };
-  }
-  const draft = service.getSpecDraft(runId);
-  const loss = detectDraftLoss(service, runId, draft);
-  if (loss !== undefined) return { kind: 'refused', output: draftLossRefusal(command, runId, draft, loss) };
-  if (draft === undefined) {
-    // A human `approve` may still fall back to an explicit `--spec-hash` when
-    // no draft exists; the engine has no hash to supply and must not invent
-    // one. Refuse rather than approve something unbound.
-    const text =
-      `refusing ${command}: auto-approval (approval='auto') found no persisted spec draft to bind, and ` +
-      'the engine never fabricates a spec hash (that is --test-approve\'s HARNESS_TEST_MODE-only seam). ' +
-      `Approve explicitly with \`harness approve ${runId} --spec-version ID --spec-hash HASH\`.`;
-    return {
-      kind: 'refused',
-      output: finish(command, { runId, refused: 'auto_approve_no_draft', detail: text }, text, 1),
-    };
-  }
-  const result = await service.approve(runId, {
-    specVersionId: draft.specVersionId,
-    specHash: draft.specHash, // W1-F3: the REAL drafted hash, never a synthetic one
-    mode: 'auto',
-  });
-  if (result.status !== 'applied') {
-    // A T1 trigger with a fresh key yields applied|rejected; anything else is
-    // reported honestly rather than assumed impossible. Never exit 0 here —
-    // the run did NOT reach `approved`.
-    const detail =
-      result.status === 'rejected'
-        ? `${result.reason}: ${result.detail}`
-        : `unexpected ingest outcome '${result.status}'`;
-    const text =
-      `refusing ${command}: auto-approval (approval='auto') could not bind spec ${draft.specVersionId} ` +
-      `[hash ${draft.specHash}] — ${detail}. Approval is legal only while awaiting_approval (T1).`;
-    return {
-      kind: 'refused',
-      output: finish(
-        command,
-        {
-          runId,
-          refused: 'auto_approve_rejected',
-          ...(result.status === 'rejected' ? { reason: result.reason } : {}),
-          specVersionId: String(draft.specVersionId),
-          specHash: String(draft.specHash),
-          detail: text,
-        },
-        text,
-        1,
-      ),
-    };
-  }
-  return {
-    kind: 'approved',
-    specVersionId: draft.specVersionId,
-    specHash: draft.specHash,
-    transitionId: result.transitionId,
-  };
+  version: { readonly id: SpecVersionId; readonly contentHash: SpecHash },
+): AutoApprovalReport | undefined {
+  const st = service.status(runId);
+  if (st.phase !== 'approved' || st.specApprovedBy !== 'auto') return undefined;
+  if (String(st.approvedSpecHash) !== String(version.contentHash)) return undefined;
+  return { specVersionId: version.id, specHash: version.contentHash };
 }
 
 /** The `--json` projection of a completed auto-approval (B2). */
-function autoApprovalView(approved: Extract<AutoApprovalOutcome, { kind: 'approved' }>): Record<string, unknown> {
+function autoApprovalView(approved: AutoApprovalReport): Record<string, unknown> {
   return {
     mode: 'auto',
     specVersionId: String(approved.specVersionId),
     specHash: String(approved.specHash),
-    ...(approved.transitionId !== undefined ? { transitionId: approved.transitionId } : {}),
   };
 }
 
 /** The human-facing lines a completed auto-approval adds (B2). */
-function autoApprovalLines(runId: RunId, approved: Extract<AutoApprovalOutcome, { kind: 'approved' }>): string[] {
+function autoApprovalLines(runId: RunId, approved: AutoApprovalReport): string[] {
   return [
     `AUTO-APPROVED (approval='auto'): the ENGINE bound spec ${approved.specVersionId} ` +
       `[hash ${approved.specHash}] — no human reviewed this spec. Recorded as spec.approved ` +
       `{approvedBy:'auto'}; the merge-readiness report repeats it.`,
     `next: run ${runId}`,
   ];
+}
+
+/**
+ * Render a `SpecApprovalRefusedError` — the SERVICE's approval gate (codex
+ * F1/F2) saying no — as an ordinary structured refusal rather than a crash.
+ * The service is the authority; the CLI only reports its verdict.
+ */
+function approvalRefusalOutput(command: string, error: SpecApprovalRefusedError): CommandOutput {
+  const text =
+    error.reason === 'spec_draft_missing' || error.reason === 'spec_draft_stale'
+      ? `${error.message} ${draftLossRecoveryHint(error.runId)}`
+      : error.message;
+  return finish(command, { runId: error.runId, refused: error.reason, detail: text }, text, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -684,11 +641,16 @@ async function handleStart(
     baseCommit: startBase.baseCommit,
     ...(cmd.enableChat === true ? { enableChat: true } : {}),
   });
+  // B2 (codex F3): `runCoordination` → `completeCoordinationRound` performs the
+  // auto-approval ATOMICALLY with the draft + advance when the run is pinned to
+  // `approval: 'auto'`. Nothing is approved here afterwards; the service is the
+  // gate, and its refusals surface as `SpecApprovalRefusedError`.
   let outcome: CoordinatorOutcome;
   try {
     outcome = await service.runCoordination(runId, runner, (o) => draftFromOutcome(cmd.goal, o));
   } catch (error) {
     if (error instanceof WorkspaceDriftError) return workspaceRefusalOutput('start', error, runId);
+    if (error instanceof SpecApprovalRefusedError) return approvalRefusalOutput('start', error);
     throw error;
   }
 
@@ -711,20 +673,7 @@ async function handleStart(
     );
   }
 
-  // B2: under `approval: 'auto'` the ENGINE signs the drafted spec here —
-  // AFTER the coordinator round completed durably and AFTER the drift check
-  // (so autonomy never approves a spec drafted against a moved tree), running
-  // the same W1-F3/W3-4 validation an explicit `approve` runs. Under the
-  // default `'human'` this is a no-op and the run waits at awaiting_approval.
-  let autoApproval: AutoApprovalOutcome;
-  try {
-    autoApproval = await autoApproveDraftedSpec(service, runId, 'start');
-  } catch (error) {
-    if (error instanceof WorkspaceDriftError) return workspaceRefusalOutput('start', error, runId);
-    throw error;
-  }
-  if (autoApproval.kind === 'refused') return autoApproval.output;
-
+  const autoApproval = autoApprovalOf(service, runId, outcome.specVersion);
   const st = service.status(runId);
   const body = {
     runId,
@@ -732,7 +681,7 @@ async function handleStart(
     uiState: st.uiState,
     goal: cmd.goal,
     workspacePath: startBase.repoRoot,
-    ...(autoApproval.kind === 'approved' ? { approval: autoApprovalView(autoApproval) } : {}),
+    ...(autoApproval !== undefined ? { approval: autoApprovalView(autoApproval) } : {}),
     // F5: the pinned base commit (and any dirty-tree warning) is surfaced so the
     // operator sees exactly which snapshot the run implements against.
     baseCommit: String(startBase.baseCommit),
@@ -760,7 +709,7 @@ async function handleStart(
     '',
     outcome.canonicalSpec,
     '',
-    ...(autoApproval.kind === 'approved'
+    ...(autoApproval !== undefined
       ? autoApprovalLines(runId, autoApproval)
       : [
           `next: approve ${runId} --spec-version ${outcome.specVersion.id} --spec-hash ${outcome.specVersion.contentHash}`,
@@ -897,29 +846,20 @@ async function handleSpecRevise(
 
   // W3-4: the superseding draft (revision N+1) persists BEFORE the final
   // advance — one transaction — so approve/run bind the NEW hash and a crash
-  // can never leave `awaiting_approval` without it.
+  // can never leave `awaiting_approval` without it. B2 (codex F3): under
+  // `approval: 'auto'` the SAME transaction also signs the SUPERSEDING draft
+  // (W1-F3 rebinds the new hash, so the pre-revise approval never carries over).
   try {
     await service.completeCoordinationRound(cmd.runId, draftFromOutcome(goal, outcome));
   } catch (error) {
     if (error instanceof WorkspaceDriftError) {
       return workspaceRefusalOutput('spec_revise', error, cmd.runId);
     }
+    if (error instanceof SpecApprovalRefusedError) return approvalRefusalOutput('spec_revise', error);
     throw error;
   }
 
-  // B2: a completed revise round lands at awaiting_approval exactly like
-  // `start` does, so the SAME pinned mode decides. Under `'auto'` the engine
-  // signs the SUPERSEDING draft (W1-F3 binds the new hash, so the pre-revise
-  // approval could never carry over); under `'human'` the run waits.
-  let autoApproval: AutoApprovalOutcome;
-  try {
-    autoApproval = await autoApproveDraftedSpec(service, cmd.runId, 'spec_revise');
-  } catch (error) {
-    if (error instanceof WorkspaceDriftError) return workspaceRefusalOutput('spec_revise', error, cmd.runId);
-    throw error;
-  }
-  if (autoApproval.kind === 'refused') return autoApproval.output;
-
+  const autoApproval = autoApprovalOf(service, cmd.runId, outcome.specVersion);
   const st = service.status(cmd.runId);
   const body = {
     runId: cmd.runId,
@@ -927,7 +867,7 @@ async function handleSpecRevise(
     transitionId: 'T2',
     phase: st.phase,
     uiState: st.uiState,
-    ...(autoApproval.kind === 'approved' ? { approval: autoApprovalView(autoApproval) } : {}),
+    ...(autoApproval !== undefined ? { approval: autoApprovalView(autoApproval) } : {}),
     ...(recovered ? { draftRecovered: true } : {}),
     ...(outcome.planningChat !== undefined ? { planningChat: outcome.planningChat } : {}),
     spec: {
@@ -958,7 +898,7 @@ async function handleSpecRevise(
     '',
     outcome.canonicalSpec,
     '',
-    ...(autoApproval.kind === 'approved'
+    ...(autoApproval !== undefined
       ? autoApprovalLines(cmd.runId, autoApproval)
       : [
           `next: approve ${cmd.runId} --spec-version ${outcome.specVersion.id} --spec-hash ${outcome.specVersion.contentHash}`,
@@ -995,6 +935,10 @@ async function handleApprove(
       if (error instanceof WorkspaceDriftError) {
         return workspaceRefusalOutput('approve', error, cmd.runId);
       }
+      // The SERVICE is the approval gate (codex F1/F2). Its refusal — including
+      // one that only becomes true between these CLI pre-checks and the T1
+      // transaction — is reported, not crashed on.
+      if (error instanceof SpecApprovalRefusedError) return approvalRefusalOutput('approve', error);
       throw error;
     }
   };
@@ -1002,7 +946,8 @@ async function handleApprove(
   // completed revise round) persisted a draft, the approved hash MUST be that
   // draft's hash — a supplied --spec-hash is validated against it, an omitted
   // one binds it, and the fabricated test-approve hash is dead whenever a
-  // real draft exists.
+  // real draft exists. These are EARLY, friendlier renderings of checks the
+  // service re-runs authoritatively inside the approving transaction.
   const draft = service.getSpecDraft(cmd.runId);
 
   // W3-4: the durable completion ref proves a draft WAS persisted; a
@@ -1162,6 +1107,24 @@ async function handleRun(
       1,
     );
   }
+  // B2 (codex F5): the §16 report must state WHO signed, from the event log.
+  // `status()` resolves a pre-B2 approval to 'human' at the one legacy point,
+  // so an approved run always has a signer; its absence here would mean the
+  // engine bound a hash without folding a signer — an invariant violation, so
+  // refuse loudly rather than pick a value and print a possible lie.
+  const specApprovedBy = st.specApprovedBy;
+  if (specApprovedBy === undefined) {
+    const text =
+      `run ${cmd.runId}: the engine bound approved spec hash ${st.approvedSpecHash} but recorded NO ` +
+      'approval signer. The merge-readiness report could not state whether a human reviewed this spec, ' +
+      'and the harness will not guess. This is an engine invariant violation (B2) — report it.';
+    return finish(
+      'run',
+      { runId: cmd.runId, phase: st.phase, error: 'approval_signer_missing', detail: text },
+      text,
+      1,
+    );
+  }
   // F9: the stable CLI contract (PLAN §18) is that `run`'s implementor/verifier
   // DEFAULT to the approved spec draft's proposed profiles (persisted from the
   // coordinator round). An explicit flag always overrides. We refuse ONLY when a
@@ -1229,10 +1192,12 @@ async function handleRun(
         implementor: implementorSpec,
         verifier: verifierSpec,
         specHash: draft.specHash,
-        // B2: WHO signed the approval this loop implements — read from the
-        // run's ACTUAL T1 fold, not from config, and reported on the §16
-        // merge-readiness record. Absent (pre-B2 approval) ⇒ 'human'.
-        specApprovedBy: st.specApprovedBy ?? 'human',
+        // B2: WHO signed the approval this loop implements — the run's ACTUAL
+        // T1 fold, never config, reported on the §16 merge-readiness record.
+        // `specApprovedBy` is present whenever `approvedSpecHash` is (the
+        // refusal above already proved that), and the value is required all the
+        // way down (codex F5) so it cannot silently become 'human'.
+        specApprovedBy,
         specDocument: draft.canonicalSpec,
         goal: draft.goal,
         taskScope: `Implement the approved specification end to end: ${draft.goal}`,
@@ -1496,6 +1461,21 @@ async function handleRecheck(
     const text = `recheck ${cmd.runId}: no workspace path recorded for this run.`;
     return finish('recheck', { runId: cmd.runId, error: 'workspace_missing', detail: text }, text, 1);
   }
+  // B2 (codex F5): same rule as `run` — the rebuilt §16 report must state the
+  // event-derived signer, and a missing one is refused, never defaulted.
+  const specApprovedBy = st.specApprovedBy;
+  if (specApprovedBy === undefined) {
+    const text =
+      `recheck ${cmd.runId}: the run is verifying but records NO approval signer, so the rebuilt ` +
+      'merge-readiness report could not state whether a human reviewed this spec. This is an engine ' +
+      'invariant violation (B2) — report it.';
+    return finish(
+      'recheck',
+      { runId: cmd.runId, error: 'approval_signer_missing', detail: text },
+      text,
+      1,
+    );
+  }
 
   // §16.3 FIRST: adopt the worktree through the manager (mutex + validation)
   // before any probe — a fresh CLI process reattaches from the persisted
@@ -1547,6 +1527,11 @@ async function handleRecheck(
       runId: cmd.runId,
       blocked,
       probe,
+      // B2 (codex F5): event-derived, re-read here rather than carried on the
+      // persisted blocked record — a fresh process must not be able to report
+      // 'human' just because an older build wrote the record. Guarded above,
+      // never defaulted: there is exactly ONE place a missing signer resolves.
+      specApprovedBy,
       ids: flows.ids,
       clock: flows.clock,
     });
@@ -2062,9 +2047,14 @@ async function reenterCoordinator(
           })();
   } catch (error) {
     if (error instanceof WorkspaceDriftError) return workspaceRefusalOutput(kind, error, runId);
+    if (error instanceof SpecApprovalRefusedError) return approvalRefusalOutput(kind, error);
     throw error;
   }
 
+  // B2 (codex F3): both re-entry branches complete through
+  // `completeCoordinationRound`, so an `approval:'auto'` run is ALREADY
+  // approved here — this surface must not keep telling the operator to approve.
+  const autoApproval = autoApprovalOf(service, runId, outcome.specVersion);
   const st = service.status(runId);
   const body = {
     runId,
@@ -2072,6 +2062,7 @@ async function reenterCoordinator(
     reentry: 'coordinator',
     phase: st.phase,
     uiState: st.uiState,
+    ...(autoApproval !== undefined ? { approval: autoApprovalView(autoApproval) } : {}),
     ...(outcome.planningChat !== undefined ? { planningChat: outcome.planningChat } : {}),
     spec: {
       specVersionId: outcome.specVersion.id,
@@ -2092,7 +2083,11 @@ async function reenterCoordinator(
     '',
     outcome.canonicalSpec,
     '',
-    `next: approve ${runId} --spec-version ${outcome.specVersion.id} --spec-hash ${outcome.specVersion.contentHash}`,
+    ...(autoApproval !== undefined
+      ? autoApprovalLines(runId, autoApproval)
+      : [
+          `next: approve ${runId} --spec-version ${outcome.specVersion.id} --spec-hash ${outcome.specVersion.contentHash}`,
+        ]),
   ].join('\n');
   return finish(kind, body, text, 0);
 }
@@ -2126,6 +2121,16 @@ async function reenterImplementVerify(
     const text = `run ${runId}: no workspace path recorded for this run.`;
     return finish(kind, { runId, error: 'workspace_missing', detail: text }, text, 1);
   }
+  // B2 (codex F5): a resumed loop rebuilds the SAME §16 report, so it needs the
+  // same event-derived signer — refused, never defaulted (see `handleRun`).
+  const specApprovedBy = st.specApprovedBy;
+  if (specApprovedBy === undefined) {
+    const text =
+      `run ${runId}: cannot re-enter the ${round.role} round — the run records NO approval signer, so ` +
+      'the merge-readiness report could not state whether a human reviewed this spec. This is an ' +
+      'engine invariant violation (B2) — report it.';
+    return finish(kind, { runId, error: 'approval_signer_missing', detail: text }, text, 1);
+  }
   // F3 (§5x): DERIVE the checkpoint from the log rather than trusting the
   // separately-saved `round.checkpointRef` pointer — a crash between the
   // atomic `checkpoint.recorded` append and the `checkpointRef` save, or a
@@ -2147,6 +2152,7 @@ async function reenterImplementVerify(
       implementor: loopState.implementor,
       verifier: loopState.verifier,
       specHash: draft.specHash,
+      specApprovedBy,
       specDocument: draft.canonicalSpec,
       goal: draft.goal,
       taskScope: loopState.taskScope,

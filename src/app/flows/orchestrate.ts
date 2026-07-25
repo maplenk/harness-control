@@ -144,9 +144,10 @@ export interface ImplementVerifyLoopCommonInput {
   /**
    * B2: WHO signed that approval (`EngineState.specApprovedBy`). Forwarded
    * verbatim to the §16 readiness report so a merge reviewer sees when the
-   * ENGINE, not a human, approved the intent. Absent ⇒ `'human'`.
+   * ENGINE, not a human, approved the intent. REQUIRED (codex F5) — an
+   * omitted signer must not be able to become `'human'` on its own.
    */
-  readonly specApprovedBy?: SpecApprovalMode;
+  readonly specApprovedBy: SpecApprovalMode;
   /** The approved structured spec, serialized for implementor injection (§7). */
   readonly specDocument: string;
   readonly goal: string;
@@ -920,7 +921,7 @@ export async function runImplementVerifyLoop(
         probeDestinationRef: destinationRef,
         approvedSpecHash: input.specHash,
         // B2: honest signer attribution on the §16 merge-readiness report.
-        ...(input.specApprovedBy !== undefined ? { specApprovedBy: input.specApprovedBy } : {}),
+        specApprovedBy: input.specApprovedBy,
         // W3-1: a runner-confinement violation from THIS round's implementor
         // half blocks the §16 readiness gate.
         ...(implementation?.runnerViolation !== undefined

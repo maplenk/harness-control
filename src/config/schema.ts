@@ -316,6 +316,21 @@ const CHECKPOINT_DEFAULT = checkpointSchema.parse({});
 // knob, and credential-shaped names are rejected at parse time (the runner
 // refuses them again at construction — belt and braces).
 // ---------------------------------------------------------------------------
+// B2 round 2 (codex F4): `allowedCommands` is the STRUCTURAL answer to a
+// gameable testability gate. Codex reproduced the §7 semantic gate accepting a
+// task "Remove the authorization check" with verification command `true` and
+// expected evidence "exit code is 0" — every lexical check passes, and after
+// F13 the host would truthfully attest that a meaningless command passed.
+// Making the regex smarter is an arms race we lose, so the commands move OUT of
+// the coordinator's control: they are declared HERE, pinned per run at `start`
+// like every other engine knob, and spec validation requires every criterion's
+// `verificationCommands` to be drawn from this set. The coordinator then
+// chooses WHICH declared command proves a criterion; it cannot invent `true`,
+// `echo ok`, or `npm test || true`.
+//
+// Empty (the default) = unrestricted, which is why `approval: 'auto'` REFUSES
+// an empty set at parse (cross-field below): under the human gate a person
+// reads the spec, under autonomy nobody does.
 const verificationSchema = z
   .object({
     /** Extra env KEYS the verification runner inherits from the orchestrator
@@ -328,6 +343,20 @@ const verificationSchema = z
         message:
           'verification.envAllowlist must not contain credential-shaped names ' +
           '(§17.1/W3-1: verification commands never see credentials in the MVP)',
+      }),
+    /**
+     * B2 F4: the EXACT verification commands a coordinator may cite on an
+     * acceptance criterion. Empty = unrestricted (legacy/human behavior);
+     * REQUIRED non-empty whenever `approval: 'auto'`.
+     */
+    allowedCommands: z
+      .array(z.string().min(1))
+      .readonly()
+      .default([])
+      .refine((commands) => commands.every((c) => c.trim() === c && c.trim().length > 0), {
+        message:
+          'verification.allowedCommands entries must not have leading/trailing whitespace ' +
+          '(matching is exact, so a padded entry could never be cited)',
       }),
   })
   .strict()
@@ -460,6 +489,24 @@ export const engineConfigSchema = z
   // P4b wave 2: `switch_model`/`switch_harness` are only meaningful with a
   // concrete ladder — refuse them without one (no implicit target), and keep
   // `switch_model` model-only (single harness across all entries).
+  // B2 F4: under autonomy the §7 testability gate is a LEXICAL filter and is
+  // trivially gameable (`true` + "exit code is 0" passes it). The structural
+  // guard is `verification.allowedCommands`, so `approval: 'auto'` without one
+  // is refused at parse rather than silently accepted — same shape as the
+  // `switch_*`-requires-a-ladder rule below (W4-1: accepted config must act).
+  .superRefine((cfg, ctx) => {
+    if (cfg.approval === 'auto' && cfg.verification.allowedCommands.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['verification', 'allowedCommands'],
+        message:
+          "approval 'auto' requires a non-empty verification.allowedCommands: with no human " +
+          'reading the spec, the coordinator must not also choose what counts as proof. Declare ' +
+          'the exact commands a criterion may cite (e.g. ["npm run typecheck", "npx vitest run"]), ' +
+          "or leave approval at 'human'.",
+      });
+    }
+  })
   .superRefine((cfg, ctx) => {
     const policy = cfg.failoverPolicy;
     if (policy !== 'switch_model' && policy !== 'switch_harness') return;
