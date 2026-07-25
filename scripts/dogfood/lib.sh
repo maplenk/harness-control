@@ -2,16 +2,16 @@
 #
 # Shared resolution + digest + containment helpers for the dogfood scripts.
 #
-# WHY THIS FILE EXISTS: the preflight battery and the enforcement gate only mean
-# something if they bind the SAME things the spend paths will actually execute.
-# When `start-slice.sh` resolved its own role defaults and `preflight.sh`
-# hard-coded a different set, an `IMPLEMENTOR=opencode:…` run dispatched an
-# adapter the battery had declared "unused and not gating". Every fact the record
-# binds is resolved here, once, and sourced by all four scripts, so the gate and
-# the run can no longer disagree about what "current" means.
+# WHY THIS FILE EXISTS: the battery only means something if it checks the SAME
+# things the slice scripts will actually execute. When `start-slice.sh` resolved
+# its own role defaults and `preflight.sh` hard-coded a different set, an
+# `IMPLEMENTOR=opencode:…` run dispatched an adapter the battery had declared
+# "unused and not checked". Resolution happens here, once, so the scripts cannot
+# disagree about what "current" means.
 #
-# Sourced by: preflight.sh · require-preflight.sh · start-slice.sh · run-slice.sh
-# Never executed directly.
+# Sourced by: preflight.sh · start-slice.sh · run-slice.sh. Never executed
+# directly. (The gate-only helpers — effective/persisted config identity and the
+# attempt claim — live on the `gate-enforcement` branch with the gate itself.)
 #
 # Helpers that can fail print a message starting with "!" on stdout and exit 1,
 # so callers can surface the reason instead of guessing from an empty string.
@@ -44,69 +44,6 @@ dogfood_config_sha() {
   elif [ -f "$1" ]; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
   else printf 'MISSING'
   fi
-}
-
-# sha256 over the canonical form of the EFFECTIVE EngineConfig a fresh `start`
-# would pin for this env — i.e. the parsed config file, or DEFAULT_ENGINE_CONFIG
-# when CONFIG="". Comparing raw file bytes is not enough: the CLI persists the
-# PARSED config at `start` and ignores $CONFIG afterwards, so file-sha equality
-# says nothing about what an existing run executes on (see
-# dogfood_run_config_sha). $1 = repo root, $2 = resolved config path (may be "").
-dogfood_effective_config_sha() {
-  node - "$1" "${2:-}" <<'NODE'
-const path = require('node:path');
-const { pathToFileURL } = require('node:url');
-const [root, configPath] = process.argv.slice(2);
-const canonical = (v) => {
-  if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null';
-  if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`;
-  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`;
-};
-(async () => {
-  const loader = await import(pathToFileURL(path.join(root, 'dist/config/loader.js')).href);
-  let cfg;
-  if (configPath === '') {
-    cfg = loader.DEFAULT_ENGINE_CONFIG;
-  } else {
-    const r = loader.loadEngineConfigFromFile(configPath);
-    if (r.ok !== true) { process.stdout.write(`!the engine config is invalid: ${configPath}`); process.exit(1); }
-    cfg = r.value;
-  }
-  process.stdout.write(require('node:crypto').createHash('sha256').update(canonical(cfg)).digest('hex'));
-})().catch((e) => { process.stdout.write(`!cannot compute the effective config: ${(e && e.message) || e}`); process.exit(1); });
-NODE
-}
-
-# sha256 over the canonical form of the config a run ACTUALLY executes on: the
-# `run_config` projection persisted at `start`. Read-only, direct SQL — never
-# `openDatabase`, which runs migrations (a write) on open. $1 = root, $2 = store
-# home, $3 = run id.
-dogfood_run_config_sha() {
-  node - "$1" "$2" "$3" <<'NODE'
-const path = require('node:path');
-const [root, home, runId] = process.argv.slice(2);
-const canonical = (v) => {
-  if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null';
-  if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`;
-  return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`;
-};
-let Database;
-try { Database = require(path.join(root, 'node_modules/better-sqlite3')); }
-catch (e) { process.stdout.write(`!cannot load better-sqlite3: ${e.message}`); process.exit(1); }
-let db;
-try { db = new Database(path.join(home, 'harness.db'), { readonly: true, fileMustExist: true }); }
-catch (e) { process.stdout.write(`!cannot open the run store read-only: ${e.message}`); process.exit(1); }
-try {
-  const row = db.prepare(
-    "SELECT state_json FROM run_projections WHERE run_id = ? AND projection_name = 'run_config'",
-  ).get(runId);
-  if (row === undefined) { process.stdout.write(`!run ${runId} has no persisted engine config`); process.exit(1); }
-  process.stdout.write(
-    require('node:crypto').createHash('sha256').update(canonical(JSON.parse(row.state_json))).digest('hex'),
-  );
-} catch (e) { process.stdout.write(`!cannot read the persisted run config: ${e.message}`); process.exit(1); }
-finally { try { db.close(); } catch { /* ignore */ } }
-NODE
 }
 
 # ── dist digest ──────────────────────────────────────────────────────────────
@@ -262,19 +199,3 @@ dogfood_require_containment() {
   return 0
 }
 
-# ── Attempt claim ────────────────────────────────────────────────────────────
-# A durable marker OUTSIDE the log dir, written by preflight and required by the
-# gate. It exists because the provenance log alone is fail-open at its last rung:
-# if the record file AND its directory are both unwritable, a failing preflight
-# cannot overwrite or delete the stale PASS, and the gate would authorise a run
-# the battery had just rejected. The claim is written FIRST, from a different
-# location, and carries the attempt's identity; a stale record's attemptId then
-# no longer matches the current claim, so the gate refuses.
-#
-# RESIDUAL, stated honestly: this REDUCES the surface, it does not eliminate it.
-# If BOTH the claim path and the log dir are unwritable, preflight fails loudly
-# but the stale pair survives and would still authorise. Defeating it requires
-# deliberately making two separate locations immutable, which is operator action,
-# not plausible accident. That is the documented floor.
-dogfood_claim_path()    { printf '%s/.preflight-claim.json' "$1"; }   # $1 = store home
-dogfood_attempts_path() { printf '%s/.preflight-claim.attempts' "$1"; }

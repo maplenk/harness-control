@@ -23,21 +23,21 @@ cd "$ROOT"
 . "$ROOT/scripts/dogfood/lib.sh"
 
 : "${HARNESS_HOME:=$HOME/.harness}"; export HARNESS_HOME
-LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"; mkdir -p "$LOGDIR"
+LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"
+
+# Containment BEFORE creating anything: the store and the log dir must live
+# outside the repo, or the CLI writes harness.db/artifacts (and this script writes
+# its logs) into the working tree and dirties it. Ordering matters — mkdir -p on
+# an unvetted path is what created directories inside the repo before the refusal
+# could fire.
+CONTAINMENT="$(dogfood_require_containment "$ROOT" "$HARNESS_HOME" "$LOGDIR")" || { echo "!! ${CONTAINMENT#!}" >&2; exit 1; }
+mkdir -p "$LOGDIR"
 CLI=(node "$ROOT/dist/cli/index.js")
 
-# Independent containment refusal (also enforced by preflight and the gate): the
-# CLI is about to create the run store, which must not be inside the repo.
-CONTAINMENT="$(dogfood_require_containment "$ROOT" "$HARNESS_HOME" "$LOGDIR")" || { echo "!! ${CONTAINMENT#!}" >&2; exit 1; }
-
-# L11 ENFORCEMENT: never spend a coordinator dollar without a fresh PASSING
-# preflight — same HEAD, same dist digest, same toolchain, same resolved roles,
-# same effective config, same store/log, valid attempt claim, <30 min old. The
-# gate rejects "diagnostic" records, so SKIP_BUILD=1 cannot slip past it. It runs
-# BEFORE the role resolution below deliberately: the gate re-resolves the same
-# values itself from the same env, via the same lib.sh helpers. No RUN_ID here —
-# `start` is what PINS the config, so the ambient CONFIG is the right binding.
-bash "$ROOT/scripts/dogfood/require-preflight.sh" || exit 1
+# REMINDER (advisory, not enforced): run `bash scripts/dogfood/preflight.sh`
+# before this. It is the operator's check that the engine can actually commit on
+# this machine — automated enforcement is deferred to the `gate-enforcement`
+# branch, so it is on you to run it.
 
 SECTION="${SECTION:?set SECTION (e.g. §3A.1)}"
 SLICE="${SLICE:?set SLICE (one-line scope)}"

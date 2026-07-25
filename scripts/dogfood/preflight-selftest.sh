@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 #
-# SELFTEST for the L11 preflight battery and its enforcement gate.
+# SELFTEST for the preflight battery and the lib primitives it depends on.
 #
-# WHY THIS IS CHECKED IN: the gate is the thing standing between a stale/forged
-# record and real spending. Its guarantees were previously demonstrated in an
-# agent session and reported as prose — unauditable and unrepeatable. A gate whose
-# own guarantees cannot be re-run is not a gate. Everything below runs from a
-# clean checkout, builds its own fixtures in a scratch dir OUTSIDE the repo,
-# asserts BOTH the exit code and the specific refusal text, and cleans up.
+# SCOPE: exactly what ships on this branch. It does NOT synthesize provenance
+# records and assert on them — the automated enforcement gate those fixtures
+# existed for is deferred to the `gate-enforcement` branch, and a suite that
+# mostly exercises its own fixtures is theatre. What is left is small and honest:
+# the digest and containment primitives, the wrappers' refusal ordering, and ONE
+# real end-to-end `preflight.sh` run proving its staging drill actually fires.
 #
 # Usage:  npm run test:preflight
 #     or  bash scripts/dogfood/preflight-selftest.sh
-#     env: KEEP=1   leave the scratch store behind for inspection
+#     env: KEEP=1   leave the scratch dir behind for inspection
 #
-# Requires: a built dist/ (run `npm run build` first — the gate binds its digest).
-# Costs nothing: no provider calls, no network, no writes inside the repo, and it
-# never touches the real $HARNESS_HOME.
+# Requires a built dist/ (`npm run build`) — section D runs the real battery,
+# whose staging drill loads the built helper out of dist/.
 #
-# Exit: 0 = every case behaved as specified · 1 = at least one case did not.
+# Costs nothing: no provider calls, no network. Everything lands in a mktemp
+# scratch dir OUTSIDE the repo, and the real $HARNESS_HOME is never touched —
+# section D points HARNESS_HOME and DOGFOOD_LOG_DIR at the scratch, and every
+# case sets both, so a custom log env in the caller cannot false-fail this.
+#
+# Exit: 0 = every case behaved as specified · 1 = at least one did not.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
@@ -25,188 +29,174 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
 . "$ROOT/scripts/dogfood/lib.sh" || { echo "!! cannot source lib.sh" >&2; exit 1; }
 
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/harness-selftest-XXXXXX")" || exit 1
-STORE="$SCRATCH/store"; LOGS="$STORE/logs"
-cleanup() { [ "${KEEP:-0}" = "1" ] && { echo "kept: $SCRATCH"; return; }; chmod -R u+w "$SCRATCH" 2>/dev/null; rm -rf "$SCRATCH"; }
+cleanup() {
+  if [ "${KEEP:-0}" = "1" ]; then echo "kept: $SCRATCH"; return; fi
+  chmod -R u+w "$SCRATCH" 2>/dev/null
+  rm -rf "$SCRATCH"
+}
 trap cleanup EXIT
 
 PASSED=0; FAILED=0
-GATE="$ROOT/scripts/dogfood/require-preflight.sh"
-ATT=11111111-1111-1111-1111-111111111111
+ok()  { PASSED=$((PASSED + 1)); printf '  ok   %s\n' "$1"; }
+bad() { FAILED=$((FAILED + 1)); printf '  FAIL %s\n' "$1"; [ -n "${2:-}" ] && printf '       %s\n' "$2"; return 0; }
+check() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3" "expected [$2], got [$1]"; fi; }
 
-# ── fixture ──────────────────────────────────────────────────────────────────
-# Builds a VALID record + claim pair, then applies `key=value` overrides.
-# Special keys: __age=<min> __drop=<csv> __raw=<text> __empty=1 claim.<field>=<v>
-HEAD_SHA="$(git rev-parse HEAD)"
-GIT_V="$(git --version | awk '{print $3}')"
-NODE_V="$(node --version)"; NPM_V="$(npm --version)"
-dogfood_resolve_roles; dogfood_resolve_config "$ROOT"
-CFG="$(dogfood_effective_config_sha "$ROOT" "${CONFIG:-}")"
-DIST="$(dogfood_dist_digest "$ROOT")"
-case "${DIST:-}" in ''|'!'*) echo "!! cannot digest dist/ — run \`npm run build\` first (${DIST#!})" >&2; exit 1 ;; esac
-
-fixture() {
-  rm -rf "$STORE"; mkdir -p "$LOGS"
-  local home_c log_c
-  home_c="$(dogfood_canonical_path "$STORE")"; log_c="$(dogfood_canonical_path "$LOGS")"
-  node - "$LOGS/preflight.jsonl" "$STORE/.preflight-claim.json" "$HEAD_SHA" "$GIT_V" "$NODE_V" "$NPM_V" \
-       "$COORDINATOR" "$IMPLEMENTOR" "$VERIFIER" "$CFG" "$DIST" "$home_c" "$log_c" "$ATT" "$@" <<'NODE'
-const fs = require('node:fs');
-const [rec, claim, head, git, node, npm, co, im, ve, cfg, dist, home, log, att, ...ov] = process.argv.slice(2);
-const now = (m) => new Date(Date.now() - (m || 0) * 60000).toISOString().replace(/\.\d{3}Z$/, 'Z');
-const r = { at: now(0), attemptId: att, verdict: 'pass', git, node, npm, head, branch: 't',
-  distDigest: dist, coordinator: co, implementor: im, verifier: ve, configSha: cfg,
-  harnessHome: home, logDir: log, doctor: 'ok', skipBuild: false,
-  collectedTestFiles: 103, floor: 103, elapsedS: 2, warnings: 0, failures: 0 };
-const c = { attemptId: att, at: now(0), verdict: 'pass', head, distDigest: dist };
-let drop = [], raw = null, empty = false;
-for (const o of ov) {
-  const i = o.indexOf('='); const k = o.slice(0, i); const v = o.slice(i + 1);
-  if (k === '__age') r.at = now(Number(v));
-  else if (k === '__drop') drop = v.split(',');
-  else if (k === '__raw') raw = v;
-  else if (k === '__empty') empty = true;
-  else if (k.startsWith('claim.')) c[k.slice(6)] = v;
-  else if (k === 'skipBuild') r[k] = v === 'true';
-  else r[k] = v;
-}
-for (const k of drop) delete r[k];
-fs.writeFileSync(claim, JSON.stringify(c) + '\n');
-if (empty) fs.writeFileSync(rec, '');
-else fs.writeFileSync(rec, (raw !== null ? raw : JSON.stringify(r)) + '\n');
-NODE
-}
-
-# ── assertions ───────────────────────────────────────────────────────────────
-# expect <label> <expected-exit> <expected-substring-or-EMPTY> -- <command...>
-expect() {
-  local label="$1" want_rc="$2" want_txt="$3"; shift 4
-  local out rc
-  out="$("$@" 2>&1)"; rc=$?
-  local ok=1
-  [ "$rc" = "$want_rc" ] || ok=0
-  if [ -n "$want_txt" ] && ! printf '%s' "$out" | grep -qF -- "$want_txt"; then ok=0; fi
-  if [ "$ok" = 1 ]; then
-    PASSED=$((PASSED + 1)); printf '  ok   %s\n' "$label"
-  else
-    FAILED=$((FAILED + 1))
-    printf '  FAIL %s\n' "$label"
-    printf '       expected exit %s%s\n' "$want_rc" "${want_txt:+ containing: \"$want_txt\"}"
-    printf '       got      exit %s: %s\n' "$rc" "$(printf '%s' "$out" | head -2 | tr '\n' ' ' | cut -c1-160)"
-  fi
-}
-gate() { HARNESS_HOME="$STORE" bash "$GATE" "$@"; }
-
-echo "── preflight/gate selftest ────────────────────────────────────────────"
+echo "── preflight selftest ─────────────────────────────────────────────────"
 echo " repo    : $ROOT"
-echo " scratch : $SCRATCH   (never the real \$HARNESS_HOME)"
-echo " dist    : ${DIST:0:16}…"
+echo " scratch : $SCRATCH   (the real \$HARNESS_HOME is never touched)"
 echo "───────────────────────────────────────────────────────────────────────"
 
+# ── A. dist digest: every entry must be accounted for ────────────────────────
 echo
-echo "A. accepts a valid record, refuses stale/foreign ones"
-fixture                                   ; expect "valid record + matching claim" 0 "preflight gate: passing record" -- gate
-fixture __age=45                          ; expect "45 minutes old"                1 "minutes old (max 30)" -- gate
-fixture head=deadbeefdeadbeefdeadbeefdead ; expect "different HEAD"                 1 "but the tree is now at" -- gate
-fixture git=2.49.0                        ; expect "git changed underneath"         1 "git changed since the preflight" -- gate
-fixture verdict=diagnostic skipBuild=true ; expect "diagnostic (SKIP_BUILD)"        1 "DIAGNOSTIC run" -- gate
-fixture verdict=fail                      ; expect "failing record"                 1 'verdict is "fail"' -- gate
-fixture __raw='not json'                  ; expect "corrupt record"                 1 "not valid JSON" -- gate
-fixture __empty=1                         ; expect "empty log"                      1 "record is empty" -- gate
-fixture; rm -f "$LOGS/preflight.jsonl"    ; expect "no log at all"                  1 "no preflight record at" -- gate
+echo "A. the dist digest binds what will actually execute"
+DT="$SCRATCH/dtest"
+mkdir -p "$DT/dist/sub" "$SCRATCH/target-a"
+printf 'x\n' > "$DT/dist/sub/a.js"
+printf 'A\n' > "$SCRATCH/target-a/f.js"
 
-echo
-echo "B. an incomplete record must never read as agreement"
-for k in git node npm distDigest implementor configSha attemptId harnessHome logDir; do
-  fixture "__drop=$k"; expect "missing $k" 1 "incomplete — missing/invalid: $k" -- gate
-done
-fixture __drop=git,node,npm ; expect "missing all three versions" 1 "missing/invalid: git, node, npm" -- gate
-
-echo
-echo "C. binds the EXECUTABLE tree, the roles and the config"
-fixture distDigest=0000000000000000         ; expect "recorded digest != current dist" 1 "dist/ CHANGED since the preflight" -- gate
-fixture implementor=opencode:grok-code:high ; expect "record gated another implementor" 1 "implementor role differs" -- gate
-fixture configSha=deadbeef                  ; expect "different engine config"         1 "engine config differs" -- gate
-fixture
-expect "caller overrides IMPLEMENTOR after pf" 1 "implementor role differs" -- \
-  env IMPLEMENTOR=opencode:grok-code:high HARNESS_HOME="$STORE" bash "$GATE"
-
-echo
-echo "D. the attempt claim orphans a record the log could not replace"
-fixture claim.attemptId=22222222-2222-2222-2222-222222222222 claim.verdict=fail
-expect "later attempt FAILED, record kept"  1 "record is ORPHANED" -- gate
-fixture claim.attemptId=22222222-2222-2222-2222-222222222222
-expect "later attempt passed, record stale" 1 "record is ORPHANED" -- gate
-fixture claim.verdict=running               ; expect "attempt still running"     1 'attempt recorded verdict "running"' -- gate
-fixture; rm -f "$STORE/.preflight-claim.json" ; expect "claim missing entirely"  1 "no attempt claim at" -- gate
-fixture; printf 'nope\n' > "$STORE/.preflight-claim.json" ; expect "claim corrupt" 1 "attempt claim is unreadable" -- gate
-fixture claim.head=abc                      ; expect "claim/record disagree on HEAD" 1 "disagree about HEAD/dist" -- gate
-fixture; chmod 555 "$STORE"
-expect "gate cannot write its attempt marker" 1 "cannot write the gate attempt marker" -- gate
-chmod 755 "$STORE"
-
-echo
-echo "E. store/log identity and containment"
-fixture harnessHome=/somewhere/else     ; expect "record bound another store"   1 "store moved since the preflight" -- gate
-fixture logDir=/somewhere/else/logs     ; expect "record bound another log dir" 1 "log dir moved since the preflight" -- gate
-fixture
-expect "HARNESS_HOME repointed into repo" 1 "resolves inside the repo" -- \
-  env HARNESS_HOME="$ROOT/.selftest-store" DOGFOOD_LOG_DIR="$LOGS" bash "$GATE"
-
-echo
-echo "F. ordering: the LAST record is the current truth"
-fixture
-node -e 'const fs=require("node:fs");const f=process.argv[1];const l=JSON.parse(fs.readFileSync(f,"utf8").trim());
-l.verdict="fail";l.failures=1;fs.appendFileSync(f,JSON.stringify(l)+"\n");' "$LOGS/preflight.jsonl"
-expect "pass THEN fail" 1 'verdict is "fail"' -- gate
-
-echo
-echo "G. lib primitives (the holes the digest and containment used to have)"
-mkdir -p "$SCRATCH/dtest/dist/sub" "$SCRATCH/ta" "$SCRATCH/tb"
-printf 'A\n' > "$SCRATCH/ta/f.js"; printf 'B\n' > "$SCRATCH/tb/f.js"
-printf 'x\n' > "$SCRATCH/dtest/dist/sub/a.js"
-D1="$(dogfood_dist_digest "$SCRATCH/dtest")"
-mkdir -p "$SCRATCH/dtest/dist/empty-dir"
-D2="$(dogfood_dist_digest "$SCRATCH/dtest")"
-if [ "$D1" != "$D2" ]; then PASSED=$((PASSED+1)); echo "  ok   an added EMPTY directory moves the digest"
-else FAILED=$((FAILED+1)); echo "  FAIL an added empty directory did not move the digest"; fi
-rmdir "$SCRATCH/dtest/dist/empty-dir"
-ln -sfn "$SCRATCH/ta" "$SCRATCH/dtest/dist/linked"
-OUT="$(dogfood_dist_digest "$SCRATCH/dtest")"
-case "$OUT" in
-  '!'*symlink*) PASSED=$((PASSED+1)); echo "  ok   a symlinked entry inside dist is refused" ;;
-  *) FAILED=$((FAILED+1)); echo "  FAIL symlinked entry not refused: ${OUT:0:60}" ;;
+D1="$(dogfood_dist_digest "$DT")"
+case "$D1" in
+  ''|'!'*) bad "digests a plain tree" "$D1" ;;
+  *)       ok  "digests a plain tree" ;;
 esac
-rm -f "$SCRATCH/dtest/dist/linked"
-mv "$SCRATCH/dtest/dist" "$SCRATCH/dtest/dist-real"; ln -sfn "$SCRATCH/dtest/dist-real" "$SCRATCH/dtest/dist"
-OUT="$(dogfood_dist_digest "$SCRATCH/dtest")"
-case "$OUT" in
-  '!'*symlink*) PASSED=$((PASSED+1)); echo "  ok   a symlinked dist ROOT is refused" ;;
-  *) FAILED=$((FAILED+1)); echo "  FAIL symlinked dist root not refused: ${OUT:0:60}" ;;
-esac
-rm -f "$SCRATCH/dtest/dist"
 
+printf 'y\n' > "$DT/dist/sub/a.js"
+D2="$(dogfood_dist_digest "$DT")"
+if [ "$D1" != "$D2" ]; then ok "changed file content moves the digest"
+else bad "changed file content moves the digest" "both were ${D1:0:16}"; fi
+printf 'x\n' > "$DT/dist/sub/a.js"
+
+mkdir -p "$DT/dist/empty-dir"
+D3="$(dogfood_dist_digest "$DT")"
+if [ "$D1" != "$D3" ]; then ok "an added EMPTY directory moves the digest"
+else bad "an added EMPTY directory moves the digest" "an empty dir was invisible"; fi
+rmdir "$DT/dist/empty-dir"
+
+# A symlinked CHILD: node follows it at require time, so a digest that skipped it
+# would stay identical while the executed bytes changed underneath.
+ln -sfn "$SCRATCH/target-a" "$DT/dist/linked"
+OUT="$(dogfood_dist_digest "$DT")"
+case "$OUT" in
+  '!'*symlink*) ok "a symlinked entry inside dist is refused" ;;
+  *)            bad "a symlinked entry inside dist is refused" "got: ${OUT:0:70}" ;;
+esac
+rm -f "$DT/dist/linked"
+
+# A symlinked ROOT: the same hole, one level up.
+mv "$DT/dist" "$DT/dist-real"
+ln -sfn "$DT/dist-real" "$DT/dist"
+OUT="$(dogfood_dist_digest "$DT")"
+case "$OUT" in
+  '!'*symlink*) ok "a symlinked dist ROOT is refused" ;;
+  *)            bad "a symlinked dist ROOT is refused" "got: ${OUT:0:70}" ;;
+esac
+rm -f "$DT/dist"; mv "$DT/dist-real" "$DT/dist"
+
+rm -rf "$DT/dist"; mkdir -p "$DT/dist"
+OUT="$(dogfood_dist_digest "$DT")"
+case "$OUT" in
+  '!'*) ok "an empty dist is refused, not silently digested" ;;
+  *)    bad "an empty dist is refused" "got: ${OUT:0:70}" ;;
+esac
+
+# ── B. containment: `..` must resolve THROUGH symlinks, not around them ──────
+echo
+echo "B. containment resolves symlinks before .."
 ln -sfn "$ROOT/scripts" "$SCRATCH/link-to-repo"
 if dogfood_path_inside "$SCRATCH/link-to-repo/../docs" "$ROOT"; then
-  PASSED=$((PASSED+1)); echo "  ok   absolute symlink/.. that lands in the repo is INSIDE"
-else FAILED=$((FAILED+1)); echo "  FAIL absolute symlink/.. classified outside the repo"; fi
-if ( cd "$SCRATCH" && dogfood_path_inside "link-to-repo/../docs" "$ROOT" ); then
-  PASSED=$((PASSED+1)); echo "  ok   RELATIVE symlink/.. that lands in the repo is INSIDE"
-else FAILED=$((FAILED+1)); echo "  FAIL relative symlink/.. classified outside the repo"; fi
-rm -f "$SCRATCH/link-to-repo"
+  ok "absolute symlink/.. landing in the repo is INSIDE"
+else bad "absolute symlink/.. landing in the repo is INSIDE" "classified outside"; fi
 
+if ( cd "$SCRATCH" && dogfood_path_inside "link-to-repo/../docs" "$ROOT" ); then
+  ok "RELATIVE symlink/.. landing in the repo is INSIDE"
+else bad "RELATIVE symlink/.. landing in the repo is INSIDE" "classified outside"; fi
+
+if dogfood_path_inside "$SCRATCH/target-a" "$ROOT"; then
+  bad "a genuinely external path is OUTSIDE" "classified inside"
+else ok "a genuinely external path is OUTSIDE"; fi
+
+if dogfood_path_inside "$ROOT/docs" "$ROOT"; then ok "a plain in-repo path is INSIDE"
+else bad "a plain in-repo path is INSIDE" "classified outside"; fi
+
+MSG="$(dogfood_require_containment "$ROOT" "$ROOT/.store" "$SCRATCH/logs")"; RC=$?
+check "$RC" "1" "containment refuses a store inside the repo"
+case "$MSG" in
+  '!HARNESS_HOME resolves inside the repo'*) ok "…naming HARNESS_HOME as the offender" ;;
+  *) bad "…naming HARNESS_HOME as the offender" "got: ${MSG:0:70}" ;;
+esac
+MSG="$(dogfood_require_containment "$ROOT" "$SCRATCH" "$ROOT/logs")"
+case "$MSG" in
+  '!the log dir resolves inside the repo'*) ok "…naming the log dir when that is the offender" ;;
+  *) bad "…naming the log dir when that is the offender" "got: ${MSG:0:70}" ;;
+esac
+dogfood_require_containment "$ROOT" "$SCRATCH" "$SCRATCH/logs" >/dev/null; RC=$?
+check "$RC" "0" "containment accepts an external store + log"
+
+# ── C. the wrappers refuse BEFORE creating anything inside the repo ──────────
 echo
-echo "H. preflight never exits leaving an older PASS authoritative"
-# Seed a store whose last record+claim would authorise a run, then abort a fresh
-# preflight before it can finish, and require the gate to stop authorising.
-fixture
-expect "seeded pair authorises (precondition)" 0 "passing record" -- gate
-HARNESS_HOME="$STORE" DOGFOOD_LOG_DIR="$LOGS" TMPDIR=/nonexistent-selftest-dir \
-  bash "$ROOT/scripts/dogfood/preflight.sh" >/dev/null 2>&1
-expect "aborted preflight orphans the pair" 1 "" -- gate
-CLAIM_VERDICT="$(node -e 'try{process.stdout.write(String(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).verdict))}catch{process.stdout.write("<unreadable>")}' "$STORE/.preflight-claim.json")"
-if [ "$CLAIM_VERDICT" != "pass" ]; then
-  PASSED=$((PASSED+1)); echo "  ok   claim left as \"$CLAIM_VERDICT\" (not pass) after the abort"
-else FAILED=$((FAILED+1)); echo "  FAIL claim still reads \"pass\" after an aborted preflight"; fi
+echo "C. wrappers check containment before creating directories"
+rm -rf "$ROOT/.selftest-store"
+HARNESS_HOME="$ROOT/.selftest-store" DOGFOOD_LOG_DIR="$ROOT/.selftest-store/logs" \
+  SECTION="§x" SLICE="x" PATHS="x" bash "$ROOT/scripts/dogfood/start-slice.sh" >/dev/null 2>&1
+check "$?" "1" "start-slice refuses an in-repo store"
+if [ -e "$ROOT/.selftest-store" ]; then
+  bad "start-slice created nothing in the repo" "it created .selftest-store first"
+  rm -rf "$ROOT/.selftest-store"
+else ok "start-slice created nothing in the repo"; fi
+
+HARNESS_HOME="$ROOT/.selftest-store" DOGFOOD_LOG_DIR="$ROOT/.selftest-store/logs" \
+  bash "$ROOT/scripts/dogfood/run-slice.sh" run spec hash >/dev/null 2>&1
+check "$?" "1" "run-slice refuses an in-repo store"
+if [ -e "$ROOT/.selftest-store" ]; then
+  bad "run-slice created nothing in the repo" "it created .selftest-store first"
+  rm -rf "$ROOT/.selftest-store"
+else ok "run-slice created nothing in the repo"; fi
+
+# ── D. the real battery, end to end ─────────────────────────────────────────
+# The point: preflight.sh actually runs, and section (d) executes the REAL
+# addAllExceptNodeModules out of dist/ and reaches a verdict. WHICH verdict is
+# machine-dependent — it fails while F10 is unlanded — so we assert the drill
+# fired and reported one, never which one.
+echo
+echo "D. a real preflight run exercises the staging drill"
+PF_LOG="$SCRATCH/preflight.out"
+HARNESS_HOME="$SCRATCH/store" DOGFOOD_LOG_DIR="$SCRATCH/store/logs" \
+  bash "$ROOT/scripts/dogfood/preflight.sh" >"$PF_LOG" 2>&1
+PF_RC=$?
+
+if grep -q 'engine staging drill — REAL helper from dist/' "$PF_LOG"; then ok "section (d) ran"
+else bad "section (d) ran" "header missing from the output"; fi
+
+if grep -q 'ran without throwing' "$PF_LOG" || grep -q "staging helper FAILS on this machine" "$PF_LOG"; then
+  ok "the real helper was invoked and reported a verdict"
+else bad "the real helper was invoked and reported a verdict" "neither outcome line present"; fi
+
+if grep -q 'semantics intact' "$PF_LOG"; then
+  ok "the vacuous-pass guard ran (staging asserted, not just absence)"
+else bad "the vacuous-pass guard ran" "guard line missing"; fi
+
+if grep -q 'discovery found [0-9]* test files' "$PF_LOG"; then ok "the discovery floor ran"
+else bad "the discovery floor ran" "floor line missing"; fi
+
+REC="$SCRATCH/store/logs/preflight.jsonl"
+if [ -f "$REC" ]; then
+  ok "a provenance line landed in the SCRATCH log dir"
+  FIELDS="$(node -e '
+const fs = require("node:fs");
+const last = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").pop();
+const r = JSON.parse(last);
+const need = ["at","verdict","git","node","npm","head","distDigest","harnessHome","logDir"];
+process.stdout.write(need.filter((k) => typeof r[k] !== "string" || !r[k]).join(",") || "complete");
+' "$REC" 2>&1)"
+  check "$FIELDS" "complete" "the provenance line carries every expected field"
+else
+  bad "a provenance line landed in the SCRATCH log dir" "no $REC"
+fi
+
+case "$PF_RC" in
+  0|1) ok "preflight exited with a definite verdict (rc=$PF_RC)" ;;
+  *)   bad "preflight exited with a definite verdict" "rc=$PF_RC" ;;
+esac
 
 echo
 echo "───────────────────────────────────────────────────────────────────────"

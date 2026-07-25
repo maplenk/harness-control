@@ -17,24 +17,21 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 : "${HARNESS_HOME:=$HOME/.harness}"; export HARNESS_HOME
-LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"; mkdir -p "$LOGDIR"
-CLI=(node "$ROOT/dist/cli/index.js")
+LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"
 . "$ROOT/scripts/dogfood/lib.sh"
 
-# Independent containment refusal (also enforced by preflight and the gate): the
-# CLI is about to write harness.db and artifacts into $HARNESS_HOME, and that
-# must not be inside the repo.
+# Containment BEFORE creating anything: the CLI is about to write harness.db and
+# artifacts into $HARNESS_HOME, and this script writes logs into $LOGDIR. Neither
+# may be inside the repo, and the check must precede the mkdir — creating the
+# directory first is what put directories inside the working tree before the
+# refusal could fire.
 CONTAINMENT="$(dogfood_require_containment "$ROOT" "$HARNESS_HOME" "$LOGDIR")" || { echo "!! ${CONTAINMENT#!}" >&2; exit 1; }
+mkdir -p "$LOGDIR"
+CLI=(node "$ROOT/dist/cli/index.js")
 
-# L11 ENFORCEMENT: approve+run is where the real money and the real worktree
-# commits happen — refuse without a fresh PASSING preflight: same HEAD, same
-# DIST DIGEST (dist/ is gitignored and mutable, so the commit alone does not
-# identify what we are about to execute), same toolchain, same resolved roles,
-# same store/log, valid attempt claim, <30 min old. "diagnostic" records
-# (SKIP_BUILD=1) are rejected too. The RUN_ID is passed so the gate binds the
-# config the run ACTUALLY executes on (persisted at `start`) rather than whatever
-# $CONFIG happens to say now — the CLI ignores $CONFIG at `run`.
-bash "$ROOT/scripts/dogfood/require-preflight.sh" "${1:-}" || exit 1
+# REMINDER (advisory, not enforced): run `bash scripts/dogfood/preflight.sh`
+# before this — approve+run is where the real money and the real worktree commits
+# happen. Automated enforcement is deferred to the `gate-enforcement` branch.
 
 RUN_ID="${1:?usage: run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH}"
 SPEC_VERSION="${2:?spec version id required}"
@@ -77,10 +74,10 @@ echo
 case "$RC" in
   0) echo "✔ reached a terminal/hand-off state — if merge_ready, MERGE GATE next:";
      echo "   1) human merges the verified commit  2) npm test && npm run typecheck  3) npm run build  4) clean tree  5) record new base SHA";;
-  3) echo "‖ paused on a provider usage limit (--no-wait semantics). Resume with:";
-     echo "   scripts/dogfood/resume-slice.sh $RUN_ID          (gated: re-runs preflight enforcement)";;
-  4) echo "▲ integration_blocked — resolve §16 blockers then:";
-     echo "   scripts/dogfood/resume-slice.sh $RUN_ID recheck";;
+  3) echo "‖ paused on a provider usage limit (--no-wait semantics). Re-run preflight, then:";
+     echo "   node dist/cli/index.js resume $RUN_ID --wait";;
+  4) echo "▲ integration_blocked — resolve §16 blockers, re-run preflight, then:";
+     echo "   node dist/cli/index.js recheck $RUN_ID";;
   *) echo "✗ run exited $RC — inspect $RUN_LOG and status above.";;
 esac
 exit "$RC"

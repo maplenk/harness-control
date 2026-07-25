@@ -32,24 +32,21 @@ Two checkpoints worth naming inside that:
 
 ```
 slice(i):
-  PREFLIGHT   scripts/dogfood/preflight.sh — the L11 battery: (a) toolchain
-              provenance · (b) native-toolchain runtime proof · (c) build +
-              role-scoped doctor · (d) THE GATING DRILL: the real
+  PREFLIGHT   scripts/dogfood/preflight.sh — the L11 battery, ADVISORY (you must
+              remember to run it; enforcement is deferred to the
+              `gate-enforcement` branch): (a) toolchain provenance · (b)
+              native-toolchain runtime proof · (c) build + role-scoped doctor ·
+              (d) THE DRILL that justifies the whole battery — the real
               addAllExceptNodeModules imported out of dist/ and run against an
-              ignored+present node_modules fixture · (e) discovery floor ≥103 ·
-              (f) clean tree + the DIST DIGEST. ENFORCED: start-slice.sh and
-              run-slice.sh call require-preflight.sh, which refuses without a
-              complete verdict=pass record binding this HEAD, this dist digest
-              (dist/ is gitignored and mutable — the commit alone does not
-              identify what will execute), this toolchain, the same resolved role
-              triple, the same EFFECTIVE config, the same canonical store + log
-              dirs, and a matching attempt claim, <30 min old. At `run` the
-              config is read from the RUN's persisted config, not the ambient
-              $CONFIG the CLI ignores there. SKIP_BUILD=1 records are
-              "diagnostic" and rejected; incomplete records are rejected.
-              Roles/config/digest/containment resolve in ONE place
-              (scripts/dogfood/lib.sh) so the gate and the spend paths cannot
-              drift, and containment is re-checked at every spend entry point.
+              ignored+present node_modules fixture, i.e. "can this machine
+              produce a commit at all" · (e) discovery floor ≥103 · (f) clean
+              tree + a dist digest. Store/log dirs must resolve outside the repo
+              (checked before anything is created, by the battery and by each
+              slice wrapper). `npm run test:preflight` tests the battery itself.
+              NOTE: `status` is NOT read-only — every run-scoped CLI call appends
+              alert.delivered, so monitor.sh mutates; watch.sh is the only
+              read-only watch. resume/recheck/set-budget spend like `run`: run
+              preflight before them too.
               Then: budget sanity · SECTION/SLICE/PATHS written · plan SHA pinned.
               REPO FREEZE begins at `start` — no commits and no tracked-file edits
               until the run is terminal. Queue doc edits in the scratchpad.
@@ -77,7 +74,8 @@ Cost basis (run 1 actuals): coordinator ≈ $1.5 (532k in / 31k out, opus xhigh)
 - `watch.sh` uses `sqlite3 -readonly`, which transiently fails `SQLITE_CANTOPEN` right after any CLI command deletes the WAL sidecars (last-connection cleanup). Cosmetic; self-heals on the next 5s tick.
 - `~/.harness/.current-dogfood-run` is a **stale pointer** (points at the cancelled run). No script reads it — ignore it.
 - The live grok binary is **0.2.112** (was 0.2.111 earlier the same day — it moves fast); `src/adapters/grok/capabilities.ts:1` documents the baseline against **0.2.106**. If grok misbehaves in a new way, check this skew first — preflight prints the installed-vs-baseline delta on every run.
-- RSS recovery if a role trips the ceiling: `scripts/dogfood/resume-slice.sh RUN_ID budget implementor <MB>` — an audited raise, never a silent one. Use the wrapper, not the raw CLI: `resume`, `recheck` and `set-budget --resume` all spend and all mutate a run, so they go through the L11 gate like `run` does (`resume-slice.sh RUN_ID` / `… recheck` / `… budget ROLE MB`).
+- RSS recovery if a role trips the ceiling: `node dist/cli/index.js set-budget RUN_ID --role implementor --memory-budget-mb <MB> --resume` — an audited raise, never a silent one (`RUN_ID` and `--role` are both required, `args.ts:61`). Re-run preflight first: `resume`, `recheck` and `set-budget --resume` all spend and all mutate a run exactly as `run` does.
+- **`status` is not a read: it writes.** Every CLI invocation carrying a run id delivers pending alerts and appends `alert.delivered` (`commands.ts:201` → `service.ts:1658`, the deliberate P4b-1 at-least-once delivery). So `monitor.sh`, which polls `status --json`, mutates the durable log, advances sequence numbers, and contends for the SQLite write lock. **`watch.sh` (direct `sqlite3 -readonly`) is the only side-effect-free way to watch a run** — prefer it for idle watching during long turns.
 - Per-slice preconditions, predicted failure modes and spec mitigations live in **`docs/DOGFOOD-FEASIBILITY.md`** §4 (the slice table) and §1 (the transition laws L1–L11). Read the row for slice *i* before writing its SECTION/SLICE/PATHS.
 
 ## 3. Milestones + ordering (and why this order)

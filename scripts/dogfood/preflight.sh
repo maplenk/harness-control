@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 #
 # Dogfood PREFLIGHT (execution-plan law L11) — the <1-minute, zero-spend battery
-# that runs before EVERY dogfood `start`. `start-slice.sh` and `run-slice.sh`
-# refuse to run without a fresh PASSING record from this script
-# (`scripts/dogfood/require-preflight.sh` is the gate).
+# an operator runs before every dogfood `start`.
+#
+# ADVISORY, NOT ENFORCED. Nothing stops you starting a run without it; the slice
+# scripts only remind you. Automated enforcement (a gate binding this record to
+# HEAD, the dist digest, the roles/config and a durable attempt claim) is built
+# and preserved on the `gate-enforcement` branch, deferred deliberately: it is
+# process tooling, and hardening it was blocking the engine fixes that are on
+# the critical path. Run this by hand, from the runbook, every time.
 #
 # Why it exists: both 2026-07-25 misses were invisible to a green suite. F10 (the
 # staging helper dying on git 2.55) lived because no test ever built the
@@ -53,69 +58,15 @@ CONTAINMENT="$(dogfood_require_containment "$ROOT" "$HARNESS_HOME" "$LOGDIR")" |
   echo "!! ${CONTAINMENT#!}" >&2; exit 1; }
 mkdir -p "$LOGDIR" || { echo "!! cannot create log dir $LOGDIR" >&2; exit 1; }
 RECORD="$LOGDIR/preflight.jsonl"
-CLAIM="$(dogfood_claim_path "$HARNESS_HOME")"
-ATTEMPTS="$(dogfood_attempts_path "$HARNESS_HOME")"
-# The claim only adds a rung if it is a DIFFERENT failure domain from the record.
-if dogfood_path_inside "$CLAIM" "$LOGDIR"; then
-  echo "!! the attempt claim ($CLAIM) resolves inside the log dir — it must be a separate location to be worth anything" >&2; exit 1
-fi
 HARNESS_HOME_CANON="$(dogfood_canonical_path "$HARNESS_HOME")"
 LOGDIR_CANON="$(dogfood_canonical_path "$LOGDIR")"
-ATTEMPT_ID="$(node -e "process.stdout.write(require('node:crypto').randomUUID())" 2>/dev/null)"
-[ -n "$ATTEMPT_ID" ] || { echo "!! cannot generate an attempt id" >&2; exit 1; }
-
-# Timing + HEAD identity are resolved here rather than in section (a): the claim
-# below carries them, and the claim must exist before anything expensive runs.
+# Timing + HEAD identity, resolved once here and reported by section (a).
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 T0=$(date +%s)
 HEAD_SHA="$(git rev-parse HEAD 2>/dev/null)"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 [ -n "$HEAD_SHA" ] || { echo "!! cannot resolve HEAD — is this a git repo?" >&2; exit 1; }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# THE INVARIANT: preflight never exits leaving an older PASS authoritative.
-#
-# The claim is written HERE, before any expensive section, carrying verdict
-# "running". From this point on, the previous attempt is already orphaned — a
-# crash, a signal, a `set -u` abort or an early `exit` all leave a claim that is
-# not "pass", and the gate refuses. Writing it late meant an abort in between
-# (mktemp failure, a build that never returned) left the previous PASS+claim pair
-# intact and authoritative, which needed only ONE unwritable location, not two.
-#
-# A claim we cannot write is fatal: it is the rung that survives an immutable
-# log, so without it the battery has established nothing.
-# ─────────────────────────────────────────────────────────────────────────────
-write_claim() { # $1 = verdict, $2 = dist digest (may be empty before section f)
-  node - "$CLAIM" "$ATTEMPT_ID" "$STARTED_AT" "$1" "$HEAD_SHA" "${2:-}" <<'NODE'
-const fs = require('node:fs');
-const [claim, attemptId, at, verdict, head, distDigest] = process.argv.slice(2);
-fs.writeFileSync(claim, JSON.stringify({ attemptId, at, verdict, head, distDigest }) + '\n');
-NODE
-}
-if ! write_claim running "" 2>/dev/null; then
-  echo "!! cannot write the attempt claim to $CLAIM" >&2
-  echo "!! the gate requires a claim it can read AND write — fix the permissions on $HARNESS_HOME" >&2
-  exit 1
-fi
-
-# Any abort after the claim exists must ALSO leave the log non-authoritative:
-# mark the claim aborted and, if the log is writable, append a terminal record.
-ABORTED=0
-abort() { # $1 = message
-  ABORTED=1
-  echo
-  echo "!! $1" >&2
-  write_claim aborted "${DIST_DIGEST:-}" 2>/dev/null \
-    || echo "!! could not mark the claim aborted — it still reads \"running\", which the gate refuses" >&2
-  if declare -f append_record_quiet >/dev/null 2>&1; then
-    append_record_quiet fail >/dev/null 2>&1 || true
-  fi
-  echo "── PREFLIGHT ABORTED — do NOT start a run ──" >&2
-  exit 1
-}
-# Backstop for signals and unexpected exits: the claim already says "running",
-# so the gate refuses regardless; this only makes the intent explicit in the log.
-trap 'exit 130' INT TERM
 BASELINE="$ROOT/scripts/dogfood/preflight-baseline.json"
 HELPER_JS="$ROOT/dist/worktree/git.js"
 
@@ -124,9 +75,8 @@ dogfood_resolve_roles
 dogfood_resolve_config "$ROOT"
 CONFIG_SHA="$(dogfood_config_sha "${CONFIG:-}")"
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/harness-preflight-XXXXXX")" || abort "mktemp failed — cannot stage the battery"
-trap 'rm -rf "$WORK"; if [ "$ABORTED" -eq 0 ] && [ "${COMPLETED:-0}" -eq 0 ]; then write_claim aborted "${DIST_DIGEST:-}" 2>/dev/null || true; fi' EXIT
-COMPLETED=0
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/harness-preflight-XXXXXX")" || { echo "!! mktemp failed" >&2; exit 1; }
+trap 'rm -rf "$WORK"' EXIT
 
 FAILURES=()
 WARNINGS=()
@@ -244,7 +194,7 @@ done
 # ─────────────────────────────────────────────────────────────────────────────
 hdr "c. build + doctor"
 if [ "${SKIP_BUILD:-}" = "1" ]; then
-  warn "SKIP_BUILD=1 — dist/ NOT rebuilt; verdict forced to \"diagnostic\" and the enforcement gate will reject this record"
+  warn "SKIP_BUILD=1 — dist/ NOT rebuilt; the staging drill below proves a STALE binary, so this run is diagnostic only"
 else
   if npm run build >"$WORK/build.log" 2>&1; then
     pass "npm run build (dist rebuilt from ${HEAD_SHA:0:12})"
@@ -350,7 +300,8 @@ NODE
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (d) Engine staging drill — the GATING check, run against the REAL built helper.
+# (d) Engine staging drill — the reason this battery exists, run against the
+#     REAL built helper.
 #     Fixture = exactly what F7 provisioning creates: an ignored AND present
 #     `node_modules`, plus a dirty tracked file and a new untracked file. We
 #     import `addAllExceptNodeModules` out of `dist/worktree/git.js` and run it,
@@ -358,7 +309,7 @@ fi
 #     helper throws (F10 is exactly that failure). Both harness commit paths —
 #     the implementor post-turn commit and the §16.3 WIP commit — go through it.
 # ─────────────────────────────────────────────────────────────────────────────
-hdr "d. engine staging drill — REAL helper from dist/ (gating)"
+hdr "d. engine staging drill — REAL helper from dist/ (the load-bearing check)"
 DRILL="$WORK/drill"
 DRILL_READY=1
 mkdir -p "$DRILL" || DRILL_READY=0
@@ -514,17 +465,8 @@ case "${DIST_DIGEST:-}" in
   *)   pass "dist digest ${DIST_DIGEST:0:16}… (regular files only; symlinks/specials refused)" ;;
 esac
 
-# The EFFECTIVE config, not the file bytes: `start` persists the PARSED config and
-# the CLI ignores $CONFIG thereafter, so file-sha equality proves nothing about
-# what a run executes on. Needs dist/, hence after the build.
-EFFECTIVE_CONFIG_SHA="$(dogfood_effective_config_sha "$ROOT" "${CONFIG:-}")"
-case "${EFFECTIVE_CONFIG_SHA:-}" in
-  ''|'!'*) fail "effective engine config unusable: ${EFFECTIVE_CONFIG_SHA#!}"; EFFECTIVE_CONFIG_SHA="" ;;
-  *)       pass "effective engine config ${EFFECTIVE_CONFIG_SHA:0:16}… (what a fresh \`start\` would pin)" ;;
-esac
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Verdict + provenance record. Only "pass" is accepted by the enforcement gate.
+# Verdict + provenance record (a log for the operator, not an authorisation).
 # ─────────────────────────────────────────────────────────────────────────────
 T1=$(date +%s); ELAPSED=$((T1 - T0))
 if [ "${#FAILURES[@]}" -gt 0 ]; then
@@ -538,14 +480,14 @@ fi
 append_record() { # $1 = verdict to record
   node - "$RECORD" "$STARTED_AT" "$1" "$GIT_V" "$NODE_V" "$NPM_V" "$HEAD_SHA" "$BRANCH" \
     "$DOCTOR_OVERALL" "$COLLECTED" "$FLOOR" "$ELAPSED" "${#WARNINGS[@]}" "${#FAILURES[@]}" "${SKIP_BUILD:-0}" \
-    "$DIST_DIGEST" "$COORDINATOR" "$IMPLEMENTOR" "$VERIFIER" "$EFFECTIVE_CONFIG_SHA" \
-    "$ATTEMPT_ID" "$HARNESS_HOME_CANON" "$LOGDIR_CANON" <<'NODE'
+    "$DIST_DIGEST" "$COORDINATOR" "$IMPLEMENTOR" "$VERIFIER" "$CONFIG_SHA" \
+    "$HARNESS_HOME_CANON" "$LOGDIR_CANON" <<'NODE'
 const fs = require('node:fs');
 const [record, at, verdict, git, node, npm, head, branch, doctor, collected, floor, elapsedS,
   warns, fails, skipBuild, distDigest, coordinator, implementor, verifier, configSha,
-  attemptId, harnessHome, logDir] = process.argv.slice(2);
+  harnessHome, logDir] = process.argv.slice(2);
 const line = JSON.stringify({
-  at, attemptId, verdict, git, node, npm, head, branch,
+  at, verdict, git, node, npm, head, branch,
   distDigest, coordinator, implementor, verifier, configSha, harnessHome, logDir,
   doctor: doctor || null,
   skipBuild: skipBuild === '1',
@@ -560,20 +502,6 @@ NODE
 # Node's stack trace is noise here; the escalation below is the operator message.
 append_record_quiet() { append_record "$1" 2>>"$WORK/record.err"; }
 
-# Seal the claim with the final verdict + digest. It has said "running" since
-# before section (a), so the previous attempt was already orphaned; this is the
-# only point at which it can become "pass".
-if ! write_claim "$VERDICT" "$DIST_DIGEST" 2>>"$WORK/record.err"; then
-  echo
-  echo "!! could not seal the attempt claim at $CLAIM"
-  [ -s "$WORK/record.err" ] && grep -m1 -E 'Error|EACCES|EPERM|ENOENT|ENOSPC|EROFS' "$WORK/record.err" | sed 's/^/     /'
-  echo "!! it still reads \"running\", which the gate refuses — fix the permissions on $HARNESS_HOME"
-  append_record_quiet fail >/dev/null 2>&1 || true
-  echo "── PREFLIGHT FAILED (claim not sealed) — do NOT start a run ──"
-  COMPLETED=1
-  exit 1
-fi
-
 # A failed append is NOT a cosmetic problem. The gate reads the FILE, not this
 # process's memory, so flipping VERDICT here would leave the previous PASS as the
 # last record — and it would authorise the very run this battery just rejected.
@@ -583,18 +511,8 @@ if ! append_record_quiet "$VERDICT"; then
   echo
   echo "!! could not append the provenance record to $RECORD"
   [ -s "$WORK/record.err" ] && grep -m1 -E 'Error|EACCES|EPERM|ENOENT|ENOSPC|EROFS' "$WORK/record.err" | sed 's/^/     /'
-  if append_record_quiet "fail"; then
-    echo "!! wrote a FAIL record instead — the gate will refuse"
-  elif { : 2>/dev/null > "$RECORD"; }; then
-    echo "!! truncated $RECORD — no stale pass remains"
-  elif rm -f "$RECORD" 2>/dev/null; then
-    echo "!! removed $RECORD — no stale pass remains"
-  else
-    echo "!! could not invalidate $RECORD — but the attempt claim above already names THIS attempt,"
-    echo "!! so the stale record no longer matches and the gate will refuse. Fix the log-dir permissions."
-  fi
-  echo "── PREFLIGHT FAILED (record not written) — do NOT start a run ──"
-  COMPLETED=1
+  echo "!! the battery itself ran fine; only the provenance line could not be recorded."
+  echo "── PREFLIGHT FAILED (record not written) — fix the log-dir permissions ──"
   exit 1
 fi
 
@@ -608,9 +526,7 @@ if [ "$POST_DIRT" != "$DIRT" ]; then
   echo
   echo "!! the provenance write dirtied the repo — invalidating the record just written"
   printf '%s\n' "$POST_DIRT" | sed 's/^/     /'
-  append_record_quiet "fail" >/dev/null 2>&1 || { : 2>/dev/null > "$RECORD"; } || rm -f "$RECORD" 2>/dev/null
   echo "── PREFLIGHT FAILED (post-write dirt) — do NOT start a run ──"
-  COMPLETED=1
   exit 1
 fi
 
@@ -624,15 +540,12 @@ if [ "${#FAILURES[@]}" -gt 0 ]; then
   echo " FAILURES (${#FAILURES[@]}):"
   printf '   ✖ %s\n' "${FAILURES[@]+"${FAILURES[@]}"}"
   echo "── PREFLIGHT FAILED in ${ELAPSED}s (verdict=fail) — do NOT start a run ──"
-  COMPLETED=1
   exit 1
 fi
 if [ "$VERDICT" = "diagnostic" ]; then
-  echo "── PREFLIGHT DIAGNOSTIC in ${ELAPSED}s — checks passed but dist was NOT rebuilt."
-  echo "   The enforcement gate REJECTS this record. Re-run without SKIP_BUILD before starting."
-  COMPLETED=1
+  echo "── PREFLIGHT DIAGNOSTIC in ${ELAPSED}s — checks passed but dist was NOT rebuilt,"
+  echo "   so the staging drill proved a stale binary. Re-run without SKIP_BUILD before starting."
   exit 0
 fi
 echo "── PREFLIGHT PASSED in ${ELAPSED}s — cleared to start ──────────"
-COMPLETED=1
 exit 0

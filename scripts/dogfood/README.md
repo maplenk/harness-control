@@ -18,17 +18,41 @@ implementor **grok:grok-build:high** (xAI/Grok Build), verifier
 ## Per slice
 
 ```sh
+# 0. PREFLIGHT — ALWAYS run this first. Advisory, not enforced: nothing stops a
+#    run without it, so it is on you. Its section (d) executes the engine's REAL
+#    staging helper out of dist/ and is the check that the harness can commit at
+#    all on this machine (it fails today: F10 is unlanded).
+bash scripts/dogfood/preflight.sh
+
 # 1. START — coordinator drafts the spec, stops at the approval gate.
 scripts/dogfood/slice-1a.sh                 # Run 1a (§3A.1); or:
 SECTION="§3A.2" SLICE="…" PATHS="…" scripts/dogfood/start-slice.sh
 
-# 2. MONITOR — live event log + status (there is no `serve` daemon yet; reads
-#    the SQLite store directly). Run in a second shell.
+# 2. MONITOR — live event log + status. Run in a second shell.
 scripts/dogfood/monitor.sh                  # newest run; --once for a snapshot
+scripts/dogfood/watch.sh RUN_ID             # the only side-effect-FREE option
 
 # 3. APPROVE + RUN — bind the EXACT hash, drive implement → verify → merge_ready.
 scripts/dogfood/run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH
 ```
+
+## ⚠ `status` is NOT read-only — monitoring mutates the run
+
+Counterintuitive and worth knowing before you "just check on it": **every CLI
+invocation carrying a run id delivers pending alerts and appends `alert.delivered`
+events to the durable log** (`src/cli/commands.ts:201` → `service.ts:1658`). That
+includes plain `status`, and therefore `monitor.sh`, which polls `status --json`.
+Consequences:
+
+- Monitoring a run **writes to the event log** and advances its sequence numbers.
+- It takes the SQLite write lock, so it can contend with the run itself.
+- `watch.sh` is the **only** truly read-only path: it queries the store with
+  `sqlite3 -readonly` and never goes through the CLI. Prefer it for idle watching,
+  especially during long turns.
+
+This is engine behaviour, not a scripting choice — "best-effort at-least-once
+alert delivery on every invocation" is deliberate (P4b-1). Just do not mistake
+observation for a passive act.
 
 ## Memory / engine config
 
@@ -40,7 +64,17 @@ engine defaults. The config path + sha256 are recorded in the run manifest.
 
 If the implementor still trips the RSS ceiling, the safe recovery is an **audited
 raise + resume** (the run stays `resource_exhausted`, spawns no verifier, until it
-succeeds): `node dist/cli/index.js set-budget RUN_ID --role implementor --memory-budget-mb <MB> --resume`.
+succeeds). Re-run preflight first — `resume` spends and mutates exactly like
+`run` does — then:
+
+```sh
+node dist/cli/index.js set-budget RUN_ID --role implementor --memory-budget-mb <MB> --resume
+```
+
+`RUN_ID` and `--role` are both required (`args.ts:61`). The same "preflight
+first" rule applies to `resume` and `recheck`: they drive provider turns and
+mutate the run, and they are what you reach for when a run is *already* in
+trouble — the worst moment to be running an unverified binary.
 
 ## Merge/rebuild gate (between every run — why runs are serial)
 
