@@ -40,6 +40,9 @@ interface Fixture {
    * of `node_modules/.bin/tsx`, which is how the trailing-separator bypass was
    * demonstrated against this repo. */
   readonly fileLink: string;
+  /** A REAL file named `<root>\` — a sibling of the root, OUTSIDE it. On darwin
+   * (`"os": ["darwin"]`) a backslash is an ordinary filename byte. */
+  readonly backslashSibling: string;
 }
 
 function fixture(): Fixture {
@@ -67,7 +70,15 @@ function fixture(): Fixture {
   // outside it.
   const fileLink = path.join(root, 'file-link');
   symlinkSync(path.join(outside, 'secret.txt'), fileLink);
-  return { base, root, sibling, outside, dangling, danglingTarget, fileLink };
+  // A real entry named `<root>\`, living NEXT TO the root. Its last byte is a
+  // backslash — an ordinary filename character here, not a separator.
+  const backslashSibling = `${root}\\`;
+  writeFileSync(backslashSibling, 'outside-secret\n', 'utf8');
+  // ...and two entries INSIDE the root whose NAMES contain backslashes,
+  // including one that spells a traversal in Windows syntax.
+  writeFileSync(path.join(root, 'we\\ird.txt'), 'inside\n', 'utf8');
+  writeFileSync(path.join(root, 'odd\\..\\name.txt'), 'inside\n', 'utf8');
+  return { base, root, sibling, outside, dangling, danglingTarget, fileLink, backslashSibling };
 }
 
 describe('resolvesInsideRoot', () => {
@@ -229,6 +240,74 @@ describe('resolvesInsideRoot', () => {
       expect(resolvesInsideRoot(shaped, outside)).toBe(false);
       expect(resolvesInsideRoot(shaped, `${root}/file-link/`)).toBe(false);
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // The walk's OWN STEP can regenerate a trailing separator.
+  //
+  //     path.dirname('link//missing') === 'link/'
+  //
+  // Normalising only at entry assumed `path.dirname` never emits one. It does,
+  // for any interior doubled separator — so the next probe is un-normalised, the
+  // link component is skipped again, and the bypass closed one round earlier
+  // comes straight back. Verified against this repo: with `.bin` as the root,
+  // `.bin/tsx//missing`, `.bin/tsx//.` and `.bin/tsx//./` all admitted.
+  //
+  // The lesson, and the reason this test states the mechanism rather than just
+  // the verdict: normalise what the ALGORITHM can produce, not the shapes you
+  // happened to see. Each iteration is now independently safe.
+  // -------------------------------------------------------------------------
+  it('DECLINES when the walk itself would regenerate a trailing separator', () => {
+    const { root, fileLink, dangling } = fixture();
+    // The mechanism: dirname hands back a path ending in a separator.
+    expect(path.dirname(`${fileLink}//missing`)).toBe(`${fileLink}/`);
+
+    for (const candidate of [
+      `${fileLink}//missing`, // codex's exact shape
+      `${fileLink}//.`,
+      `${fileLink}//./`,
+      `${fileLink}//missing//deeper`,
+      `${fileLink}///missing`,
+      `${dangling}//missing`,
+      `${root}/escape//missing`,
+    ]) {
+      expect(resolvesInsideRoot(root, candidate)).toBe(false);
+    }
+
+    // ...and a doubled separator over a path that really is inside still admits:
+    // the tightening must not turn `//` itself into a refusal.
+    expect(resolvesInsideRoot(root, `${root}/web//missing`)).toBe(true);
+    expect(resolvesInsideRoot(root, `${root}//web//missing`)).toBe(true);
+    expect(resolvesInsideRoot(root, `${root}/web//`)).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // `\` IS A FILENAME BYTE. This package declares `"os": ["darwin"]`; POSIX has
+  // exactly one separator. Stripping a trailing backslash rewrote `<root>\` —
+  // which names a real SIBLING of the root — into `<root>` itself, and the
+  // helper answered about a directory the caller never asked about. Both
+  // consumers were reachable: the shell classifier admitted `cat '<root>\'`
+  // (single-quoted, so the byte survives tokenisation) and the structured-write
+  // rule returned `allowlisted_workspace_write` for ``Write `<root>\` ``.
+  // -------------------------------------------------------------------------
+  it('treats a backslash as a FILENAME byte, never as a separator', () => {
+    const { root, backslashSibling } = fixture();
+    // It is a real, distinct entry, and it is OUTSIDE the root.
+    expect(lstatSync(backslashSibling).isFile()).toBe(true);
+    expect(isPathInside(realpathSync(root), realpathSync(backslashSibling))).toBe(false);
+
+    expect(resolvesInsideRoot(root, backslashSibling)).toBe(false);
+    expect(resolvesInsideRoot(root, `${root}\\\\`)).toBe(false);
+    expect(resolvesInsideRoot(root, `${root}\\dir`)).toBe(false);
+    // A backslash-bearing ROOT is not silently rewritten either.
+    expect(resolvesInsideRoot(backslashSibling, path.join(root, 'web'))).toBe(false);
+
+    // The other direction: names containing backslashes INSIDE the root stay
+    // admissible, including one that spells a traversal in Windows syntax and
+    // must not be read as one.
+    expect(resolvesInsideRoot(root, path.join(root, 'we\\ird.txt'))).toBe(true);
+    expect(resolvesInsideRoot(root, path.join(root, 'odd\\..\\name.txt'))).toBe(true);
+    expect(resolvesInsideRoot(root, `${root}/we\\ird.txt`)).toBe(true);
   });
 
   it('fails closed on anything it cannot decide', () => {

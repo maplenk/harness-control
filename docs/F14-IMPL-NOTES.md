@@ -47,7 +47,7 @@ worktree root.** Everything else is refused exactly as before.
 
 | file | what changed |
 | --- | --- |
-| `src/lib/path-containment.ts` (new) | `isPathInside` (:66), `withoutTrailingSeparators` (:123), `nearestExistingAncestor` (:141), `resolvesInsideRoot` (:174) — the containment computation, extracted so there is ONE copy. |
+| `src/lib/path-containment.ts` (new) | `isPathInside` (:66), `withoutTrailingSlashes` (:129), `nearestExistingAncestor` (:154), `hasParentSegment` (:183), `resolvesInsideRoot` (:196) — the containment computation, extracted so there is ONE copy. |
 | `src/adapters/grok/command.ts:313` | `hasEscapingPathArgument(argv, worktreeRoot)` — `startsWith('/')` replaced by `worktreeRoot === undefined || !resolvesInsideRoot(worktreeRoot, arg)`. |
 | `src/adapters/grok/command.ts:357` | `isSafeReadOnlyArgv(argv, worktreeRoot)` threads it. |
 | `src/adapters/grok/command.ts:409` | `isGrokReadOnlyShellPermissionTitle(operation, worktreeRoot)` — second parameter REQUIRED (`string \| undefined`). |
@@ -87,9 +87,10 @@ admissible, i.e. exactly today's behaviour, stated rather than assumed.
 1. both sides must be ABSOLUTE (a relative path would silently be resolved against
    `process.cwd()`);
 2. neither may contain a `..` segment (see §4);
-3. trailing separators are stripped from both sides (§4c), then `realpathSync(root)`,
-   then the `lstat`-probed nearest existing ancestor of `candidate` (§4b blocker 1),
-   then `realpathSync` of THAT;
+3. trailing SLASHES are stripped from the root here and from the candidate on EVERY
+   step of the walk (§4c, §4d) — only `/`, never `\`, which is a filename byte on
+   this platform; then `realpathSync(root)`, then the `lstat`-probed nearest existing
+   ancestor of `candidate` (§4b blocker 1), then `realpathSync` of THAT;
 4. `path.relative` containment between those two realpaths;
 5. any throw, an undecidable ancestor walk, or no existing ancestor → `false`.
 
@@ -230,6 +231,69 @@ root `.bin` with candidate `.bin/`                         -> true
 was still probed — and is now pinned, because the difference between `link/` and
 `link/.` is exactly the thing that is easy to get wrong again.
 
+## 4d. Codex round 3 — normalise what the ALGORITHM can produce
+
+Round 3 confirmed the corrected ENOTDIR invariant and every terminal-separator
+shape, and found two more — both instances of one error, which is worth naming
+because it was its third appearance on this branch: **I normalised the shape I had
+seen rather than the shape the algorithm can produce.**
+
+### Blocker 1 — `path.dirname` DOES emit a trailing separator
+
+§4c claimed "every later step comes from `path.dirname`, which never produces a
+trailing separator, so one normalisation at entry covers the whole walk". False:
+
+```
+path.dirname('link//missing')     === 'link/'
+path.dirname('/a/link//missing')  === '/a/link/'
+```
+
+Any interior doubled separator makes the walk's OWN STEP produce exactly the shape
+entry-normalisation existed to remove, so the next probe is un-normalised and skips
+the component again — the §4c bypass, reintroduced by the fix's own loop. Measured
+on `117569b` against this repo's `.bin`:
+
+```
+resolvesInsideRoot(.bin, .bin/tsx//missing) = true   | classifier admits = true
+resolvesInsideRoot(.bin, .bin/tsx//.)       = true   | classifier admits = true
+resolvesInsideRoot(.bin, .bin/tsx//./)      = true   | classifier admits = true
+resolvesInsideRoot(.bin, .bin/tsx/)         = false  (the shape §4c had seen)
+```
+
+**Fix** (`src/lib/path-containment.ts:160-171`, the walk body): normalise on EVERY iteration —
+`current := withoutTrailingSlashes(dirname(current))`. The property is now
+structural rather than argued: no step's OUTPUT can be un-normalised, whatever its
+input was, so there is no reachability argument left to get wrong. Termination is
+documented rather than assumed: both functions are non-lengthening, so `current`
+strictly shrinks until it stops changing at the filesystem root.
+
+### Blocker 2 — `\` is a filename byte, not a separator
+
+The helper stripped trailing `\` as well as `/`. This package declares
+`"os": ["darwin"]`, and POSIX has exactly one separator — so `<root>\` names a real
+SIBLING entry of the root, and stripping rewrote it into `<root>` itself. The
+helper answered about a directory the caller never named. Both consumers were
+reachable, verified on `117569b` with a real file created at `<root>\`:
+
+```
+resolvesInsideRoot(root, `${root}\`)                    -> true
+shell classifier, cat '<root>\'  (single-quoted, so the byte survives F11) -> true
+isWorkspaceWriteOperation(Write `<root>\`, root)        -> true   (allowlisted_workspace_write)
+```
+
+**Fix**: `withoutTrailingSlashes` (renamed from `…Separators`) strips **only `/`**
+(`:129`), and `hasParentSegment` splits on **only `/`** (`:183`) — so `a\..\b` is
+one legitimate filename component, not a traversal. Reading it as three would
+refuse a real in-worktree file, and a false denial ends an agent's turn before its
+work is committed, which is the failure this whole item exists to fix. The only
+remaining `path.sep` in the module is inside `isPathInside`, comparing against what
+`path.relative` itself produced.
+
+Post-fix, every shape above returns `false`, and the both-directions pins are new
+tests: `<root>\`, `<root>\\`, `<root>\dir` and a backslash-bearing ROOT all decline,
+while `<root>/we\ird.txt` and `<root>/odd\..\name.txt` — real files whose NAMES
+contain backslashes — are admitted.
+
 ## 5. Fails-on-parent proof
 
 Tests were written first and run against the untouched parent source (vitest
@@ -300,6 +364,25 @@ assertion (`resolvesInsideRoot('<root>/', '<root>/file-link/')`) — every
 "still admits what it should" assertion above it already passed. The tightening had
 nothing to preserve that it was breaking.
 
+### Round 4 (the walk's own step, and the backslash), same discipline
+
+```
+$ npx vitest run src/lib/path-containment.test.ts src/adapters/grok/command.test.ts src/adapters/acp/session.test.ts
+      Tests  7 failed | 171 passed (178)
+
+FAIL … resolvesInsideRoot > DECLINES when the walk itself would regenerate a trailing separator
+FAIL … resolvesInsideRoot > treats a backslash as a FILENAME byte, never as a separator
+FAIL … session > allows only path-qualified structured writes inside an implementor worktree
+FAIL … F14 … > REFUSES an escaping symlink reached through an INTERIOR doubled separator
+FAIL … F14 … > REFUSES ...the same with a trailing dot
+FAIL … F14 … > REFUSES ...and with a trailing dot-slash
+FAIL … F14 … > REFUSES a SIBLING file whose name ends in a backslash (a filename byte on darwin, not a separator)
+```
+
+Written against `117569b`. Both blockers are pinned at the CONTAINMENT level and at
+each CONSUMER — the shell classifier and the structured-write rule — because both
+consumers were independently reachable.
+
 ## 6. The case table actually pinned
 
 ### ADMITTED (absolute, inside the worktree)
@@ -318,6 +401,8 @@ nothing to preserve that it was breaking.
 | a symlink inside the worktree pointing to another place inside it | `path-containment.test.ts` |
 | **a real inside path named with a TRAILING SEPARATOR** — `<root>/web/`, `<root>/web//`, `<root>/web/.`, `<root>/`, `<root>//`, an inside-pointing `link/`, and a not-yet-created `never-existed/` | `command.test.ts`, `path-containment.test.ts` |
 | **a ROOT supplied with a trailing separator** (`<root>/`, `<root>//`) — identical verdicts in both directions | `path-containment.test.ts` |
+| **an inside path reached through an INTERIOR doubled separator** — `<root>/web//missing`, `<root>//web//missing`, `<root>/web//`, `<root>/src//adapters` | `command.test.ts`, `path-containment.test.ts` |
+| **files whose NAMES contain backslashes** — `<root>/we\ird.txt`, and `<root>/odd\..\name.txt` which must NOT be read as a traversal | `path-containment.test.ts`, `session.test.ts` |
 | relative paths (`.`, `web`, `docs/x.md`) — unchanged | `command.test.ts` |
 | **production wiring**: `decidePermission` → `allowlisted_read_only_operation` for `ls -la <cwd> && ls -la web 2>/dev/null` through `buildGrokMediation` | `permissions.test.ts` |
 
@@ -348,6 +433,9 @@ nothing to preserve that it was breaking.
 | **a DANGLING link with a trailing separator** (`dangling/`, `dangling//`, `dangling/.`) — the ENOENT route to the same skip | `command.test.ts`, `path-containment.test.ts` |
 | **a directory-target escaping symlink with a trailing separator** (`escape/`, `escape//`) — normalising must not flip this to an admit | `command.test.ts`, `path-containment.test.ts` |
 | the filesystem root `/` as the candidate | `path-containment.test.ts` |
+| **an escaping symlink reached through an INTERIOR doubled separator** — `link//missing`, `link//.`, `link//./`, `link//missing//deeper`, `link///missing`, plus the dangling and directory-target variants | `command.test.ts`, `path-containment.test.ts` |
+| **a real SIBLING file named `<root>\`** — at the containment level, through the shell classifier as `cat '<root>\'` (single-quoted, so the byte survives F11's tokeniser), and through the structured-write rule as ``Write `<root>\` `` | `path-containment.test.ts`, `command.test.ts`, `session.test.ts` |
+| `<root>\\`, `<root>\dir`, and a backslash-bearing ROOT | `path-containment.test.ts` |
 | **a component longer than `NAME_MAX`** (ENAMETOOLONG — the other suppressed-error shape) | `path-containment.test.ts` |
 | a NUL-bearing single-quoted argument, with AND without a root (restored F11 pin) | `command.test.ts` |
 | **constructing a Grok implementor adapter with no `cwd`** (role stated, and role inferred from the mediation config) → `invalid_argument`, before any resource is built | `factory.test.ts` |
@@ -359,20 +447,21 @@ nothing to preserve that it was breaking.
 
 ## 7. Green bar
 
-| | parent | round 1 | round 2 | round 3 (now) |
-| --- | --- | --- | --- | --- |
-| `npm run typecheck` | exit 0 | exit 0 | exit 0 | exit 0 |
-| `npx vitest run` | 106 files / 1945 passed | 107 / 1987 | 107 / 1993 | **107 files / 2000 passed**, 0 failed |
-| `npx vitest list --filesOnly` | 106 | 107 | 107 | 107 (floor is 103) |
+| | parent | round 1 | round 2 | round 3 | round 4 (now) |
+| --- | --- | --- | --- | --- | --- |
+| `npm run typecheck` | exit 0 | exit 0 | exit 0 | exit 0 | exit 0 |
+| `npx vitest run` | 106 files / 1945 | 107 / 1987 | 107 / 1993 | 107 / 2000 | **107 files / 2007 passed**, 0 failed |
+| `npx vitest list --filesOnly` | 106 | 107 | 107 | 107 | 107 (floor is 103) |
 
-55 new tests. Each round-1 commit was verified independently green by extracting it
+62 new tests. Each round-1 commit was verified independently green by extracting it
 with `git archive` (read-only) and running typecheck + the suite there: `794b6c5`
 107 files / 1952 passed, `efd0a9c` 107 / 1987, `ee9d133` 107 / 1987, `4281200`
 (docs) 107 / 1987 — all typecheck exit 0.
 
 A green suite is not the gate — codex adversarial review is. Round 1 was green and
 still had two blockers in it; round 2 was green, had passed a blocker review, and
-still had a one-byte bypass in it.
+still had a one-byte bypass in it; round 3 was green, had passed two reviews, and
+its own fix could regenerate the condition it removed.
 
 ## 8. What I could NOT verify, and known residuals
 
@@ -398,6 +487,11 @@ still had a one-byte bypass in it.
   semantics, different question, no filesystem access by design.
 - **Case-insensitive filesystems.** `path.relative` is case-sensitive, so a
   case-variant spelling of the root is refused. Fail-closed direction.
+- **Separator semantics are POSIX, deliberately.** Only `/` separates; `\` is a
+  filename byte (`package.json` declares `"os": ["darwin"]`). On Windows this module
+  would be wrong in the widening direction — `a\..\b` really is a traversal there —
+  so a port must revisit `withoutTrailingSlashes` and `hasParentSegment` together,
+  not one of them.
 - **Relative paths are still not containment-checked** (unchanged by instruction).
   The lexical `..` rejections — `..`, `../`, `/../`, and now a trailing `/..` — are
   what stands between a relative argument and a symlink traversal. Adding the

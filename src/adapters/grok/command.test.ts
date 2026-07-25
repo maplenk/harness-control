@@ -330,6 +330,10 @@ function worktreeFixture(): WorktreeFixture {
   // With a TRAILING SEPARATOR this is the one that lstat-ed ENOTDIR, was called
   // absent, and had its component skipped by the ancestor walk.
   symlinkSync(path.join(outside, 'secret.txt'), path.join(root, 'file-link'));
+  // A real file named `<root>\` — a SIBLING of the worktree. On darwin the
+  // backslash is an ordinary filename byte, so this is not "the worktree with a
+  // trailing separator"; it is a different, outside entry.
+  writeFileSync(`${root}\\`, 'outside-secret\n', 'utf8');
   return { root, sibling, parent, outside };
 }
 
@@ -354,6 +358,7 @@ describe('F14 — absolute paths are judged by CONTAINMENT, not by their first b
     ['the worktree root with a trailing slash', (f: WorktreeFixture) => `ls -la ${f.root}/`],
     ['a subdirectory of the worktree', (f: WorktreeFixture) => `ls -la ${f.root}/web`],
     ['a subdirectory named with a trailing separator', (f: WorktreeFixture) => `ls -la ${f.root}/web/`],
+    ['an inside path reached through a doubled separator', (f: WorktreeFixture) => `ls -la ${f.root}/src//adapters`],
     ['a file inside the worktree', (f: WorktreeFixture) => `head -n 5 ${f.root}/package.json`],
     ['a SINGLE-QUOTED absolute path inside the worktree', (f: WorktreeFixture) => `cat '${f.root}/package.json'`],
     ['several absolute paths inside the worktree', (f: WorktreeFixture) => `ls -la ${f.root}/web ${f.root}/docs`],
@@ -387,6 +392,10 @@ describe('F14 — absolute paths are judged by CONTAINMENT, not by their first b
     ['a DANGLING symlink inside the worktree (an entry that exists and resolves nowhere)', (f: WorktreeFixture) => `ls -la ${f.root}/dangling`],
     ['a path THROUGH a dangling symlink', (f: WorktreeFixture) => `cat ${f.root}/dangling/file.txt`],
     ['an escaping symlink named with a TRAILING SEPARATOR', (f: WorktreeFixture) => `ls -la ${f.root}/file-link/`],
+    ['an escaping symlink reached through an INTERIOR doubled separator', (f: WorktreeFixture) => `ls -la ${f.root}/file-link//missing`],
+    ['...the same with a trailing dot', (f: WorktreeFixture) => `ls -la ${f.root}/file-link//.`],
+    ['...and with a trailing dot-slash', (f: WorktreeFixture) => `ls -la ${f.root}/file-link//./`],
+    ['a SIBLING file whose name ends in a backslash (a filename byte on darwin, not a separator)', (f: WorktreeFixture) => `cat '${f.root}\\'`],
     ['...with a doubled separator', (f: WorktreeFixture) => `ls -la ${f.root}/file-link//`],
     ['a DANGLING symlink with a trailing separator', (f: WorktreeFixture) => `ls -la ${f.root}/dangling/`],
     ['a directory-target escaping symlink with a trailing separator', (f: WorktreeFixture) => `ls -la ${f.root}/escape/`],

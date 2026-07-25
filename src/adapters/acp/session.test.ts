@@ -384,6 +384,17 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     expect(isWorkspaceWriteOperation(lexicalEscapeTitle, root)).toBe(false);
     expect(decidePermission(policy, lexicalEscapeTitle).action).toBe('deny');
 
+    // F14 round 3: `\` is a FILENAME byte on darwin (`"os": ["darwin"]`), so
+    // `<root>\` names a SIBLING of the worktree, not the worktree. A containment
+    // helper that stripped it as a separator answered about `<root>` and this
+    // rule returned `allowlisted_workspace_write` for a write landing outside.
+    await writeFile(`${root}\\`, 'outside\n', 'utf8');
+    const backslashSiblingTitle = `Write \`${root}\\\``;
+    expect(isWorkspaceWriteOperation(backslashSiblingTitle, root)).toBe(false);
+    expect(decidePermission(policy, backslashSiblingTitle).action).toBe('deny');
+    // ...while a backslash INSIDE a name is just a name.
+    expect(isWorkspaceWriteOperation(`Write \`${root}/we\\ird.txt\``, root)).toBe(true);
+
     expect(isWorkspaceWriteOperation(insideTitle, root)).toBe(true);
     expect(decidePermission(policy, insideTitle)).toEqual({
       action: 'allow',

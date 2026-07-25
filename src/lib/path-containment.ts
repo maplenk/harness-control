@@ -117,12 +117,18 @@ function probeComponent(target: string): ComponentProbe {
  * `path.normalize` is NOT usable here: it keeps one trailing separator and it
  * collapses `..` lexically, which is the behaviour this module exists to refuse.
  *
- * The `> 1` floor keeps the filesystem root `/` intact. (POSIX-shaped, like the
- * rest of this module; a Windows drive root would need its own floor.)
+ * ONLY `/`. A backslash is an ordinary FILENAME byte on this platform — the
+ * package declares `"os": ["darwin"]`, and POSIX has exactly one separator. An
+ * earlier version stripped `\` too, which rewrote `<root>\` — a real SIBLING
+ * entry of the root — into `<root>` itself, so the helper answered about a
+ * directory the caller never named and both consumers admitted an outside path.
+ * Treating a byte as structure is how a filename becomes a boundary crossing.
+ *
+ * The `> 1` floor keeps the filesystem root `/` intact.
  */
-function withoutTrailingSeparators(p: string): string {
+function withoutTrailingSlashes(p: string): string {
   let end = p.length;
-  while (end > 1 && (p[end - 1] === '/' || p[end - 1] === '\\')) end -= 1;
+  while (end > 1 && p[end - 1] === '/') end -= 1;
   return p.slice(0, end);
 }
 
@@ -139,28 +145,43 @@ export type AncestorResolution =
  * absence, ends the walk as `undecidable`.
  */
 export function nearestExistingAncestor(candidate: string): AncestorResolution {
-  // Normalised ONCE, here, before the first probe: every later step comes from
-  // `path.dirname`, which never produces a trailing separator (except the
-  // filesystem root, which `withoutTrailingSeparators` preserves anyway). Doing
-  // it inside the walk rather than at the call site means no caller can reach
-  // the probe with an un-normalised path.
-  let current = withoutTrailingSeparators(candidate);
+  // EVERY iteration is normalised, not just the entry. An earlier version
+  // normalised once and argued that `path.dirname` never emits a trailing
+  // separator, so the walk could not regenerate the condition. That is false:
+  //
+  //     path.dirname('link//missing') === 'link/'
+  //
+  // — any interior doubled separator makes the step produce exactly the shape
+  // the entry normalisation existed to remove, and the next probe then skips the
+  // `link` component. Rather than reason about which inputs can reach which
+  // step, each iteration is made independently safe. It is one string scan per
+  // level; the property it buys is that no step's OUTPUT can be un-normalised,
+  // whatever the input was.
+  let current = withoutTrailingSlashes(candidate);
   for (;;) {
     const probe = probeComponent(current);
     if (probe === 'present') return { kind: 'found', path: current };
     if (probe === 'undecidable') return { kind: 'undecidable' };
-    const parent = path.dirname(current);
-    // A filesystem root that does not exist cannot happen on a mounted tree;
-    // reported honestly rather than assumed away.
+    const parent = withoutTrailingSlashes(path.dirname(current));
+    // Terminates: `withoutTrailingSlashes` and `dirname` are both non-lengthening,
+    // so `current` strictly shrinks until it stops changing — at the filesystem
+    // root, whose non-existence cannot happen on a mounted tree but is reported
+    // honestly rather than assumed away.
     if (parent === current) return { kind: 'undecidable' };
     current = parent;
   }
 }
 
-/** True when any component of `p` is `..` (either separator, so a Windows-shaped
- * path cannot smuggle one past a POSIX-only split). */
+/**
+ * True when any component of `p` is `..`.
+ *
+ * Split on `/` ONLY. A backslash is a filename byte here (`"os": ["darwin"]`),
+ * so `a\..\b` is one legitimate component, not a traversal — reading it as three
+ * would refuse a real in-worktree file, and a false denial ends an agent's turn
+ * before its work is committed. That is the failure this whole item is about.
+ */
 function hasParentSegment(p: string): boolean {
-  return p.split(/[/\\]/u).includes('..');
+  return p.split('/').includes('..');
 }
 
 /**
@@ -171,15 +192,16 @@ function hasParentSegment(p: string): boolean {
  * so it is refused instead. A `..` component on either side is refused for the
  * reason in the module header: `realpathSync` cannot be trusted to resolve one.
  *
- * Trailing separators are stripped from BOTH sides — the candidate inside the
- * ancestor walk, the root here — so `<root>/` and `<root>` are the same boundary
- * and `link/` is judged as the `link` it is.
+ * Trailing SLASHES are stripped from BOTH sides — the candidate on every step of
+ * the ancestor walk, the root here — so `<root>/` and `<root>` are the same
+ * boundary and `link/` is judged as the `link` it is. Only `/`: a backslash is a
+ * filename byte on this platform, never structure.
  */
 export function resolvesInsideRoot(root: string, candidate: string): boolean {
   if (!path.isAbsolute(root) || !path.isAbsolute(candidate)) return false;
   if (hasParentSegment(root) || hasParentSegment(candidate)) return false;
   try {
-    const realRoot = realpathSync(withoutTrailingSeparators(root));
+    const realRoot = realpathSync(withoutTrailingSlashes(root));
     const ancestor = nearestExistingAncestor(candidate);
     if (ancestor.kind !== 'found') return false;
     // `realpathSync` on a DANGLING link throws ENOENT and on a LOOP throws
