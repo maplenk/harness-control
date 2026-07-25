@@ -15,18 +15,23 @@ Two checkpoints worth naming inside that:
 - **M-MVP (usable control room):** slices 1a → 1b → 2a → 2b → 2c → 3 → 4 landed. You can open a browser, see the fleet, watch a live run. This is the demoable product.
 - **M-FULL (finish line):** + 5 (write actions), 6a/6b (failure screens + management), 7 (inspection tabs), 8a/8b (terminals), 9a/9b (desktop). ~16 runs total, strictly serial (§6A merge/rebuild gate).
 
-## 1. Verified state of the world (2026-07-25, all checked against the tree/DB — not the docs)
+## 1. Verified state of the world (2026-07-26, all checked against the tree/DB — not the docs)
+
+> The 2026-07-25 version of this table is superseded in full. Everything it
+> listed as blocking (F7–F11 unmerged, the engine unable to commit on git 2.55,
+> the doubled suite) has landed and is proven.
 
 | Fact | Evidence |
 |---|---|
-| F7 is landed and pushed; local `main` has since moved to `481e772`, **two commits ahead of `origin/main` (`5669d22`)** | `b9ca10c` (implementor prompt) + `481e772` (docs + dogfood tooling) are local-only. Push is a human step and is still outstanding. |
-| Grok prompt-steering WIP now committed as `b9ca10c` (implement-and-stop; verifier owns the commands) | Was the preserved uncommitted edit; landing it makes engine-binary provenance clean. Already live in `dist` (rebuilt at `b9ca10c`). |
-| Run 1 (`run_8aa51aea…`, slice 1a) is **unresumable** | `resume` failed closed: §16.3 (`src/worktree/validate.ts:251`) refuses resume-in-place because HEAD (`ef952b1`) drifted past the last cadence checkpoint (`36101cf1`). See F8 below. |
-| Grok's three commits survive on the assignment branch | `77cfd09 → 36101cf → ef952b1`, base `01ff719` (8 commits behind main — salvage would have bought a merge conflict with F7's `commands.ts` rewrite). |
-| Slice-1a run `run_756ce21b…` was **cancelled** (2026-07-25) | Started against §3A.1 at plan SHA `b9ca10c`, then cancelled once round 1 surfaced **F11** (the grok quoting trap → `no_deliverable`) and **F10** (the staging helper is fatal on git 2.55). A fresh 1a run is pending the LAND gate — starting one before F10 lands would just re-buy the same failure. |
-| Engine-fix branches **F8–F11 are under codex review**, none merged to `main` | Until F10 lands, the built `addAllExceptNodeModules` still carries the pre-F10 pathspec, so **the engine cannot produce a commit on git 2.55** — that is the item blocking the LAND window, and it is why nothing else on this branch is worth blocking it. |
-| Run 2 (`run_992e9598…`) is a cancelled opencode-era run | Event tail: limit incident → pause → cancel. Historical only; its worktree is cleanup noise. |
-| Engine suite green at F7 land | **Real suite: 103 files / 1699 tests (~17s), both SQLite drivers**, typecheck 0. The historically reported 206/3398 was exactly **doubled**: the leftover gitignored `.claude/worktrees/agent-ad6b0180db834588b` (an F7 agent worktree) mirrors `src/` with its own `node_modules`, and vitest's default excludes don't cover `.claude/`, so a bare `npm test` discovers the whole suite twice (1699×2 = 3398). Verified via `npx vitest run --exclude '**/.claude/**'`; now fixed permanently by the root `vitest.config.ts` exclude (risk #9). |
+| **The engine drove a full slice through verification for the first time.** `run_60ccbfda` (B0) reached `verifying` with a real implementor commit. | Coordinator drafted → human approved the exact hash → grok wrote `8141a82` (17 files, 824 lines under `web/`, scope respected exactly) → the host committed it → codex verified independently against host receipts → the engine refused to call `unproven` a pass → bounded remediation dispatched and grok responded with a one-line fix (`49ec7f1`). Both commits preserved as tags `dogfood/b0-first-implementor-commit` and `dogfood/b0-remediation-1`. |
+| That run was **cancelled deliberately**, not failed | Its verdict was `failedCriteria: []` with five `unproven`. Independently re-measured: all thirteen criteria were in fact satisfied (16/16 web tests pass; the four absence checks hold; `vite build web` builds in 284 ms). Two engine/authoring defects made a correct slice unprovable — see F15 and L12/L13 — and one of them (`vite build --root web`) is frozen under the approved hash, so no fix could rescue *that* run. |
+| **F15 is the live blocker for the next run.** The engine cannot prove ABSENCE. | `verifier.ts:876` requires every declared command to exit `0`; `grep` exits `1` when it finds nothing, which is the pass condition for every scope/isolation criterion. Spec: `docs/specs/f15-declared-exit-codes-spec.md`. |
+| F13 (host-attested verification) and F14 (real path containment) are **merged** | `49c7e18`, `be5cc49`, `c159a57`. F13 makes verification host-attested rather than model-authored and enforces cross-vendor independence; F14 closed a containment escape that admitted a write into the worktree's **parent** (`fs.realpathSync` collapses `..` lexically before resolving symlinks). |
+| B2 auto-approval is **merged** at `25a9c8c` | Seven rounds. Codex confirmed the core engine-provenance guard correct for every supported persisted shape. `approval: 'auto'` exists but must stay OFF until F16 — see §5A. |
+| Engine suite green | **110 files / 2168 tests / 0 failed**, typecheck 0, build clean, on the merged tree at `25a9c8c`. (108/2063 before the B2 merge; B2 contributed 2 files and 105 tests.) |
+| One flaky test found and fixed | F14's mechanism pin asserted `lstat('<symlink-to-file>/')` throws. On darwin/APFS it does not reliably: **173 of 200** fresh fixtures threw ENOTDIR, 27 succeeded. It was failing ~1 full-suite run in 8 and reading as mystery cross-file interference. The safety property itself is branch-independent — verified over 300 fixtures, 20 of which lstat-ed successfully, `resolvesInsideRoot` declined every time. |
+| The serial merge gate is now **mechanized** | `scripts/dogfood/merge-gate.sh` runs the plan's five steps as one transaction: the merge is staged `--no-commit`, every check runs against the merged tree, and it commits only if all pass — so a failure leaves `main` untouched. It refuses a non-`merge_ready` run, refuses an `unproven` verdict without an explicit override, merges the **verified** commit rather than the branch tip, and re-checks the vitest discovery floor. |
+| Criterion-authoring laws now ride **every** goal | `scripts/dogfood/start-slice.sh` appends them automatically rather than relying on the operator to retype them, prints the goal verbatim, and supports `DRY_RUN=1` to read it without paying for a coordinator turn. |
 
 ## 2. The recurrence — one dogfood slice (run this loop ~16×)
 
@@ -124,14 +129,18 @@ House rules that stay absolute: green ≠ correct (codex diff-review is the merg
 
 ## 5A. Engine-fix queue (land at this LAND gate, codex-gated)
 
-Four fixes, all surfaced by real runs rather than by review, all specced against the current tree. Each lands through the same loop: codex spec-review → implementation on a branch → codex diff-review → merge → suite + typecheck + rebuild.
+Every fix here was surfaced by a real run rather than by review. Each lands through the same loop: spec → implementation on a branch → codex diff-review → merge → suite + typecheck + rebuild.
+
+**Landed:** F8 (resumable rounds), F9 (proven provisioning), F10 (git-2.55 staging — the blocker that meant the engine could not produce *any* commit), F11 (grok shell quoting), F13 (host-attested verification), F14 (real path containment), B2 (auto-approval mode). All merged, suite green at 110 files / 2168 tests.
+
+**Open, in dependency order:**
 
 | Fix | What breaks today | Severity | Spec |
 |---|---|---|---|
-| **F8** | any implementor round that commits and then dies is permanently unresumable | HIGH | `docs/engine-fix-f8-resume-spec.md` |
-| **F9** | provisioning stamps unproven trees as proven — broken script-less installs, sticky broken trees, the false clone | HIGH | `docs/engine-fix-f9-provisioning-spec.md` |
-| **F10** | on git 2.55 the staging helper's `:(exclude)node_modules` pathspec exits 1, so **every** harness commit path dies | BLOCKER | `docs/engine-fix-f10-staging-spec.md` |
-| **F11** | the grok read-only classifier rejects `$`/backslash/backtick even inside quotes — one backslash in a quoted regex killed slice-1a round 1 | HIGH | `docs/engine-fix-f11-grok-shell-quoting-spec.md` |
+| **F15** | the engine **cannot prove ABSENCE** — every declared command must exit `0`, and `grep` exits `1` when it finds nothing, so scope/isolation/containment criteria are structurally unprovable. A slice that satisfied all thirteen of its criteria was rejected. | BLOCKER | `docs/specs/f15-declared-exit-codes-spec.md` |
+| **F16** | a coordinator can declare a command that **cannot execute**, and because commands are frozen under the approved hash the implementor can never repair it — the run burns every remediation round. Only a human reading the spec catches this today. | HIGH (blocks `approval: 'auto'`) | `docs/specs/f16-command-executability-preflight-spec.md` |
+
+**Sequencing note that matters:** `approval: 'auto'` now exists, and F13 — the precondition everyone tracked — is merged. It must nonetheless stay **OFF** until F16 lands. The B0 run exposed a precondition nobody had listed: the only thing standing between an unexecutable command and a wasted slice is a human reading the drafted spec before approving, and auto-approval removes exactly that reader.
 
 F10 and F11 are the two 2026-07-25 misses that a green suite could never have caught. **Neither is gated by anything on this branch.** A preflight battery whose section (d) executed the real `addAllExceptNodeModules` against an ignored+present `node_modules` fixture was built for exactly that purpose and is preserved on the **`gate-enforcement`** branch; it is deliberately not merged here. Its value was proving the engine could commit *before* F10 landed — once F10 merges, its regression suite proves the same thing continuously and on every change, which is the better place for the guarantee. F11 was never covered by it either: the permission-policy lint needs the grok classifier to be invocable from a script, which it is not yet, so the *next* denial-shaped mismatch would still be discovered by a paying run. The durable lesson of this queue stands regardless: **prove the engine against the current machine, not only against itself** — the F10 and F11 regression tests are where that now lives.
 
