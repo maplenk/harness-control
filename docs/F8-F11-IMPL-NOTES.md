@@ -935,10 +935,126 @@ host-attested evidence receipts).
 
 ---
 
+---
+
+# Round 6 — codex round-5 verdict on `fbbc670`
+
+Three confirmed, one residual explicitly accepted, four to fix. Commit map:
+
+| finding | commit |
+| --- | --- |
+| Finding 1 (veto universality), Finding 2 (positive kind) | `88d48ad` |
+| Finding 3 (masking sweep), Finding 4 (JSON cause) | `c11b982` |
+
+## The pattern, and how I broke it
+
+The diagnosis was right and worth restating: three rounds, three fixes, each at
+the layer the previous finding named.
+
+| round | where the veto was | what remained |
+| --- | --- | --- |
+| R4 | inside `allowReadOnlyOperation` | the exact-allowlist match ran first |
+| R5 | on `HeadlessPermissionPolicy` → moved to the config root | the FACTORY installed it only for `implementor` + `headless` |
+| R6 | — | (this round) |
+
+Each fix was correct and each left a different layer uncovered, because I was
+fixing *instances* of "the veto did not run here" rather than establishing "the
+veto always runs". So this round does not add a fourth placement — it makes the
+property unforgeable.
+
+**How veto-universality is now structural, not another point fix:**
+
+1. **It cannot be omitted without failing to compile.**
+   `src/adapters/grok/permissions.ts` defines
+   `VetoedMediation = PermissionMediationConfig & { verifyOperationPayload: VerifyOperationPayload }`
+   — REQUIRED, not optional. A plain `PermissionMediationConfig` is not
+   assignable to it. The factory's local is typed `VetoedMediation`, so a future
+   construction path that forgets the veto is a type error, not a production
+   fail-open. This is the "non-optional constructor parameter" option, scoped to
+   Grok (where the property lives) rather than churning every unrelated
+   `PermissionMediationConfig` construction site in the repo.
+2. **There is exactly one producer, and it cannot branch past the veto.**
+   `buildGrokMediation` stamps `verifyOperationPayload` UNCONDITIONALLY, on the
+   final return, outside every role/mode branch. Role-specific shaping happens on
+   the way in. It also always returns a config (defaulting to
+   headless/default-deny) so there is no "no config, therefore no veto" path.
+3. **The paths are enumerated by test.** `permissions.test.ts` walks 4 roles x 5
+   caller-supplied mediation shapes (absent / headless / headless+allowlist /
+   interactive / interactive+handler) and asserts each result carries a WORKING
+   veto and denies an exactly-allowlisted title with a hostile payload. A new
+   path shows up as a missing case.
+4. **The wiring itself is tested end-to-end.** A factory-level test drives a real
+   INTERACTIVE Grok session whose handler approves anything it is shown — so the
+   only thing that can refuse is the veto. Pre-fix that test fails; it is the
+   direct discriminator for Finding 1.
+
+## Finding 2 — non-shell recognised positively
+
+Confirmed: an unparseable title with an absent/malformed payload returned true,
+because "non-shell" was CONCLUDED from two failed parses. For a fail-closed gate
+that is backwards — inability to understand something is not evidence of its
+safety.
+
+`classifyGrokOperation` now determines kind AFFIRMATIVELY:
+
+- `shell` — a parsed Execute-backtick title; requires a byte-identical
+  `rawInput.command`.
+- `structured_file` — a parsed `Write`/`Edit` title AND a payload carrying no
+  `command`. Matching mirrors `isWorkspaceWriteOperation`'s own shape so the two
+  rules cannot disagree about what a structured file operation looks like.
+- `unknown` — everything else, REFUSED.
+
+So `Execute ls` with no rawInput, a `Write` title smuggling `{command: …}`, and a
+malformed `{command: {nested}}` payload are all refused.
+
+## Finding 3 — the masking sweep
+
+Both named sites fixed: `probe.self()` was called outside `quarantineStage`'s
+try (and that function runs from the timeout `finally`, so a `ps` failure would
+have replaced the refusal); and the clone-failure catch did an unguarded
+`rmSync(dst)` before rethrowing.
+
+**Did I find others?** I swept every changed file for fs mutations reachable
+inside a `catch`/`finally` — a script walking brace depth across `provision.ts`,
+`git.ts`, `validate.ts`, `manager.ts`, `acp/session.ts`, `service.ts`,
+`implementor.ts`, `orchestrate.ts`. **No further in-handler cases.**
+
+One ADJACENT case fixed on the same rule, found by reading rather than by the
+sweep (it is on a success path, not in a handler): `swapIntoPlace` deleted the
+moved-aside backup AFTER the swap had already succeeded, unguarded — so a
+cleanup failure would have turned a completed provisioning into a spurious
+"could not swap into place" refusal. Same principle, opposite direction: cleanup
+must not manufacture a failure any more than it may mask one.
+
+## Finding 4 — cause in the JSON
+
+The projection is extracted as `provisioningFailureView`, sibling of the file's
+existing `mergeReadinessView`, so the stable payload is asserted directly rather
+than through a full loop run. It carries `cause`.
+
+## Finding 5 — retention residual
+
+Accepted as non-blocking. **Not touched.**
+
+## Round-6 regression proofs
+
+| suite | pre-fix | post-fix |
+| --- | --- | --- |
+| `factory.test.ts` + `grok/command.test.ts` + `cli/commands.test.ts` | pass 123 fail 4 | see below |
+
+The 4 pre-fix failures are exactly one per finding: the interactive-veto wiring
+(F1), the two JSON-cause assertions (F4), and the unparseable-title refusal (F2).
+Finding 3's guards are defence-in-depth against a secondary throw and are covered
+by the sweep plus the round-5 masking test.
+
+**Not started, as directed:** F13.
+
+---
+
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1835 passed, 0 failed**, 105 files
+- `npx vitest run` (full, from this worktree) → **1881 passed, 0 failed**, 106 files
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
