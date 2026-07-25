@@ -131,7 +131,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const root = process.argv[2];
-const files = [];
+const entries = [];   // { rel, kind } — kind 'd' for directory, 'f' for file
 let refusal = null;
 const describe = (st) =>
   st.isSymbolicLink() ? 'symlink'
@@ -140,28 +140,47 @@ const describe = (st) =>
   : st.isFIFO() ? 'fifo'
   : st.isSocket() ? 'socket'
   : 'unknown entry type';
+
+// The ROOT itself must be a real directory. Walking straight into it would follow
+// a symlinked `dist` and bind neither the link nor its target.
+let rootStat;
+try { rootStat = fs.lstatSync(root); }
+catch (e) { process.stdout.write(`!cannot lstat dist/: ${e.message}`); process.exit(1); }
+if (!rootStat.isDirectory()) {
+  process.stdout.write(`!dist/ is a ${describe(rootStat)} — it must be a real directory for its bytes to be bound`);
+  process.exit(1);
+}
+
 (function walk(dir) {
   if (refusal !== null) return;
-  let entries;
-  try { entries = fs.readdirSync(dir); } catch (e) { refusal = `cannot read ${dir}: ${e.message}`; return; }
-  for (const name of entries) {
+  let names;
+  try { names = fs.readdirSync(dir); } catch (e) { refusal = `cannot read ${dir}: ${e.message}`; return; }
+  for (const name of names) {
     if (refusal !== null) return;
     const p = path.join(dir, name);
     let st;
     try { st = fs.lstatSync(p); } catch (e) { refusal = `cannot lstat ${path.relative(root, p)}: ${e.message}`; return; }
-    if (st.isDirectory()) walk(p);
-    else if (st.isFile()) files.push(p);
-    else refusal = `dist/${path.relative(root, p)} is a ${describe(st)} — a build never produces one, and its bytes cannot be bound`;
+    if (st.isDirectory()) {
+      // Directories are hashed too, so an added or removed EMPTY directory still
+      // moves the digest.
+      entries.push({ rel: path.relative(root, p), kind: 'd' });
+      walk(p);
+    } else if (st.isFile()) {
+      entries.push({ rel: path.relative(root, p), kind: 'f' });
+    } else {
+      refusal = `dist/${path.relative(root, p)} is a ${describe(st)} — a build never produces one, and its bytes cannot be bound`;
+    }
   }
 })(root);
 if (refusal !== null) { process.stdout.write(`!${refusal}`); process.exit(1); }
-if (files.length === 0) { process.stdout.write('!dist/ is missing or empty — nothing to bind'); process.exit(1); }
-files.sort();
+if (entries.length === 0) { process.stdout.write('!dist/ is missing or empty — nothing to bind'); process.exit(1); }
+entries.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
 const h = crypto.createHash('sha256');
-for (const f of files) {
-  h.update(path.relative(root, f));
+for (const e of entries) {
+  h.update(e.kind);
+  h.update(e.rel);
   h.update('\0');
-  h.update(crypto.createHash('sha256').update(fs.readFileSync(f)).digest());
+  if (e.kind === 'f') h.update(crypto.createHash('sha256').update(fs.readFileSync(path.join(root, e.rel))).digest());
   h.update('\0');
 }
 process.stdout.write(h.digest('hex'));
@@ -180,7 +199,11 @@ dogfood_canonical_path() {
 const fs = require('node:fs');
 const path = require('node:path');
 const input = process.argv[2];
-const abs = path.isAbsolute(input) ? input : path.join(process.cwd(), input);
+// String concatenation, NOT path.join: join() normalises `..` away lexically, so
+// a relative `link/../../store` would collapse before any symlink is followed —
+// the same bug this walker exists to avoid. Every component, including those
+// from cwd, goes through the resolution loop below.
+const abs = path.isAbsolute(input) ? input : process.cwd() + path.sep + input;
 let cur = path.parse(abs).root;
 for (const part of abs.split(path.sep)) {
   if (part === '' || part === '.') continue;
