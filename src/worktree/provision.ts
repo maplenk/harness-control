@@ -1888,6 +1888,51 @@ function loadPlanFor(parsed: Record<string, unknown> | undefined, name: string):
   return { targets, declaresRootEntry, binOnly: !declaresRootEntry && targets.length === 1 && declaresBin };
 }
 
+/** How deep inside a package to look for its compiled artifact (`build/Release/x.node`
+ * is 3), and how many to bother proving. */
+const NATIVE_ARTIFACT_SCAN_DEPTH = 6;
+const MAX_NATIVE_ARTIFACTS = 8;
+
+/**
+ * ROUND 15 — the compiled addon artifacts (`*.node`) a package actually ships.
+ *
+ * THIS is what a script-less install fails to produce, and what `require()` never
+ * proved: better-sqlite3 loads its binding LAZILY, inside the Database
+ * constructor (`lib/database.js:48`), so requiring it succeeds with no artifact
+ * present at all. Confirmed at runtime by hooking `process.dlopen`: requiring the
+ * real package triggers none; `new Database(':memory:')` triggers one.
+ *
+ * Nested `node_modules` are skipped — those artifacts belong to other packages,
+ * which the scan visits in their own right. `complete` is false when a directory
+ * could not be read, which keeps "found nothing" distinguishable from "could not
+ * look" (outcome 3 rather than a refusal).
+ */
+function nativeArtifacts(pkgDir: string): { readonly artifacts: string[]; readonly complete: boolean } {
+  const artifacts: string[] = [];
+  let complete = true;
+  const walk = (dir: string, depth: number): void => {
+    if (depth > NATIVE_ARTIFACT_SCAN_DEPTH || artifacts.length >= MAX_NATIVE_ARTIFACTS) return;
+    let entries: Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      complete = false;
+      return;
+    }
+    for (const entry of entries) {
+      if (artifacts.length >= MAX_NATIVE_ARTIFACTS) return;
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules') continue;
+        walk(path.join(dir, entry.name), depth + 1);
+      } else if (entry.isFile() && entry.name.endsWith('.node')) {
+        artifacts.push(path.join(dir, entry.name));
+      }
+    }
+  };
+  walk(pkgDir, 0);
+  return { artifacts, complete };
+}
+
 /**
  * The manifest of a package we already decided to smoke, read BEST-EFFORT.
  *
@@ -2076,6 +2121,61 @@ async function runNativeSmoke(
   }
   const proven: string[] = [];
   for (const pkg of packages) {
+    // ROUND 15 — THE PROOF. A package that declares a native build must SHIP a
+    // compiled artifact, and that artifact must load. Everything below this point
+    // (require/import of the JS entry) is a secondary check on the wrapper: it
+    // cannot prove the addon, because the addon is loaded lazily by the API the
+    // caller eventually uses, not by `require` of the package.
+    const scan = nativeArtifacts(pkg.dir);
+    if (scan.artifacts.length === 0) {
+      if (!scan.complete) {
+        // Outcome (3): we could not finish looking, which is not evidence of an
+        // unbuilt package.
+        warn({
+          kind: 'proof_indeterminate',
+          subject: pkg.dir,
+          reason:
+            'it declares a native build step, and the scan for its compiled artifact could not read part of the ' +
+            'package, so no conclusion is available. Proceeding as main does.',
+        });
+        continue;
+      }
+      // Outcome (2): positively unbuilt — this is the exact tree F9 exists to
+      // reject, and the one `require()` waved through for fourteen rounds.
+      throw failClosed(
+        `provisioned node_modules for ${treePath} contains NO compiled native artifact (*.node) for '${pkg.dir}', ` +
+          'which declares a native build step — the package was never built (a script-less install cannot build ' +
+          'it). Requiring such a package still succeeds, because the binding is loaded lazily by the API you call ' +
+          '(better-sqlite3 loads it inside `new Database(...)`), so verification would fail only once the code ran. ' +
+          'Refusing to verify against an unproven toolchain.',
+        `no compiled artifact for ${pkg.dir}`,
+        'native_toolchain_unproven',
+      );
+    }
+    try {
+      // `process.dlopen` is exactly what a lazily-loading package does when its
+      // API is first used, without needing to know that API — no constructor to
+      // guess, no arbitrary code to execute beyond the addon's own init.
+      const dlopenScript =
+        `for (const f of ${JSON.stringify(scan.artifacts)}) { process.dlopen({exports:{}}, f); }`;
+      await execFileAsync(process.execPath, ['-e', dlopenScript], {
+        cwd: pkg.dir,
+        env,
+        timeout: Math.min(timeoutMs, NATIVE_SMOKE_TIMEOUT_MS),
+        maxBuffer: 4 * 1024 * 1024,
+      });
+    } catch (error) {
+      const stderr = typeof (error as { stderr?: unknown }).stderr === 'string'
+        ? ((error as { stderr: string }).stderr).trim().split('\n').slice(0, 6).join(' | ')
+        : messageOf(error);
+      throw failClosed(
+        `provisioned node_modules for ${treePath} could not dlopen the compiled artifact of '${pkg.dir}' ` +
+          `(${scan.artifacts.length} found): the build is present but unloadable — a truncated download, a build ` +
+          `for the wrong architecture, or a broken toolchain. Refusing to verify against it: ${stderr}`,
+        `dlopen failed for ${pkg.dir}`,
+        'native_toolchain_unproven',
+      );
+    }
     try {
       // REGRESSION 1: resolve from the package's OWN package.json, so a bare
       // specifier walks up into the directory that actually holds it. Requesting

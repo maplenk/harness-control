@@ -11,11 +11,13 @@
  * fail-closed, isolation + idempotency, transactional rollback + crash recovery,
  * and locking coverage.
  */
+import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import * as fs from 'node:fs';
 import { cp, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ManualClock } from '../lib/clock.js';
 import { assignmentId, gitSha, type AssignmentId } from '../domain/ids.js';
@@ -64,6 +66,8 @@ function findBackups(assignmentStageRoot: string): string[] {
   return found;
 }
 import { makeTempGitRepo, type TempGitRepo } from './test-support.js';
+
+const execFileAsync = promisify(execFile);
 
 const AUTHOR_ENV = {
   GIT_AUTHOR_NAME: 'f7-tests',
@@ -144,10 +148,32 @@ async function makeDepsRepo(opts: {
 }
 
 /**
+ * ROUND 15 — a REAL compiled addon from this repo's own tree, to plant in a
+ * fixture that is supposed to be BUILT. Nothing synthetic can stand in: the proof
+ * `dlopen`s the artifact, so it must be a genuine loadable one. `better-sqlite3`
+ * is a production dependency here, so the second candidate always exists.
+ */
+function realNativeAddon(): string {
+  const candidates = ['fsevents/fsevents.node', 'better-sqlite3/build/Release/better_sqlite3.node'];
+  for (const candidate of candidates) {
+    const full = path.resolve(process.cwd(), 'node_modules', candidate);
+    if (existsSync(full)) return full;
+  }
+  throw new Error('no compiled .node addon found under node_modules to use as a test fixture');
+}
+
+/**
  * F9: writes an INSTALLED package dir under `nm`. `native:true` gives it a
  * `binding.gyp` + an install script (the better-sqlite3 shape the runtime smoke
- * targets); `built:false` leaves its entry point loading a `.node` that was never
- * compiled — the exact P1 breakage a script-less install produces.
+ * targets); `built:false` leaves it with NO compiled artifact — the exact P1
+ * breakage a script-less install produces.
+ *
+ * ROUND 15 — the entry point now models the REAL dependency: better-sqlite3 loads
+ * its addon LAZILY, inside the Database constructor (`lib/database.js:48`), so
+ * `require('better-sqlite3')` succeeds whether or not the binding was ever built.
+ * The old fixture required the missing `.node` at module scope, which no real
+ * native package does — and that is precisely why a smoke built on `require()`
+ * looked like it worked for fourteen rounds.
  */
 function writeInstalledPackage(
   nm: string,
@@ -162,10 +188,20 @@ function writeInstalledPackage(
     fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
     fs.writeFileSync(
       path.join(dir, 'index.js'),
-      opts.built === false
-        ? "module.exports = require('./build/Release/bind.node');\n" // never built -> load fails
-        : 'module.exports = { native: true };\n',
+      "'use strict';\nlet addon;\n" +
+        'class Thing {\n' +
+        "  constructor() { addon = addon || require('./build/Release/bind.node'); }\n" +
+        '}\n' +
+        'module.exports = Thing;\n',
     );
+    if (opts.built === false) {
+      // "Unbuilt" must mean it: strip any artifact a previous write left behind,
+      // so a test that BREAKS a healthy tree in place really breaks it.
+      fs.rmSync(path.join(dir, 'build'), { recursive: true, force: true });
+    } else {
+      fs.mkdirSync(path.join(dir, 'build', 'Release'), { recursive: true });
+      fs.copyFileSync(realNativeAddon(), path.join(dir, 'build', 'Release', 'bind.node'));
+    }
   } else {
     fs.writeFileSync(path.join(dir, 'index.js'), 'CLONE_SOURCE\n');
   }
@@ -2047,6 +2083,143 @@ describe('ROUND 14 REGRESSION 2 — linked (`file:`) dependencies are proven, or
   });
 });
 
+// ---------------------------------------------------------------------------
+// ROUND 15 — F9 DID NOT DETECT THE FAILURE IT WAS BUILT FOR.
+//
+// The smoke `require`d the package and called that a proof. better-sqlite3 loads
+// its binding only when the exported constructor is INVOKED (`lib/database.js:48`,
+// inside `new Database(...)`) — verified at runtime here by hooking
+// `process.dlopen`: requiring the real package triggers NO dlopen; the constructor
+// does. So the proof passed on precisely the tree it exists to reject — the
+// script-less install that left better-sqlite3 with no binding and turned 58 of
+// 122 persistence tests red while typecheck stayed green.
+//
+// The fix does not try to guess a package's API (invoking arbitrary constructors
+// is arbitrary code execution, the same objection as executing a `bin`). It proves
+// the ARTIFACT: a package that declares a native build must HAVE a compiled
+// `.node`, and that artifact must `dlopen`. That is API-independent, and it is the
+// thing a script-less install actually fails to produce.
+// ---------------------------------------------------------------------------
+describe('ROUND 15 — the native proof is the compiled ARTIFACT, not a successful require()', () => {
+  /**
+   * The REAL better-sqlite3: its own manifest, its own `lib/` (which loads the
+   * addon lazily), its own binding.gyp — and NO `build/`, exactly as a
+   * `npm ci --ignore-scripts` leaves it. Copied from this repo's tree rather than
+   * hand-written, so the fixture cannot drift from the dependency it models.
+   */
+  async function repoWithUnbuiltBetterSqlite3(): Promise<{ repo: TempGitRepo; nm: string; version: string }> {
+    const source = path.resolve(process.cwd(), 'node_modules', 'better-sqlite3');
+    expect(existsSync(source)).toBe(true); // a production dependency of this repo
+    const version = (JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8')) as { version: string })
+      .version;
+    const repo = track(await makeTempGitRepo('harness-r15-bs3-'));
+    await repo.writeFile('.gitignore', 'node_modules/\n');
+    await repo.writeFile(
+      'package.json',
+      `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'better-sqlite3': version } }, null, 2)}\n`,
+    );
+    await repo.writeFile(
+      'package-lock.json',
+      `${JSON.stringify(
+        {
+          name: 'x',
+          version: '1.0.0',
+          lockfileVersion: 3,
+          requires: true,
+          packages: { '': { name: 'x' }, 'node_modules/better-sqlite3': { version } },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await repo.commitAll('depends on better-sqlite3');
+    const nm = path.join(repo.dir, 'node_modules');
+    const dst = path.join(nm, 'better-sqlite3');
+    fs.mkdirSync(path.join(nm, '.bin'), { recursive: true });
+    fs.writeFileSync(path.join(nm, '.bin', 'placeholder'), '#!/bin/sh\n');
+    fs.mkdirSync(dst, { recursive: true });
+    fs.cpSync(path.join(source, 'lib'), path.join(dst, 'lib'), { recursive: true });
+    fs.copyFileSync(path.join(source, 'package.json'), path.join(dst, 'package.json'));
+    fs.copyFileSync(path.join(source, 'binding.gyp'), path.join(dst, 'binding.gyp'));
+    // Its own runtime dependency, so `require()` reaches the binding lookup rather
+    // than dying earlier for an unrelated reason.
+    for (const dep of ['bindings', 'file-uri-to-path']) {
+      const depSource = path.resolve(process.cwd(), 'node_modules', dep);
+      if (existsSync(depSource)) fs.cpSync(depSource, path.join(nm, dep), { recursive: true });
+    }
+    return { repo, nm, version };
+  }
+
+  it('DECISIVE (a): the real better-sqlite3 shape with NO binding is REFUSED — though require() succeeds', async () => {
+    const { repo, nm } = await repoWithUnbuiltBetterSqlite3();
+
+    // The old proof's exact mechanism, run against this very tree: it PASSES.
+    // This is what fourteen rounds of hardening were resting on.
+    const requireProbe = await execFileAsync(
+      process.execPath,
+      ['-e', "require('better-sqlite3'); console.log('LOADED');"],
+      { cwd: repo.dir },
+    );
+    expect(String(requireProbe.stdout).trim()).toBe('LOADED');
+    // …while the thing that actually uses it does not.
+    const ctorProbe = await execFileAsync(
+      process.execPath,
+      ['-e', "try { new (require('better-sqlite3'))(':memory:'); console.log('CTOR-OK'); } catch (e) { console.log('CTOR-FAILS'); }"],
+      { cwd: repo.dir },
+    );
+    expect(String(ctorProbe.stdout).trim()).toBe('CTOR-FAILS');
+    expect(fs.readdirSync(path.join(nm, 'better-sqlite3'))).not.toContain('build'); // no artifact at all
+
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_r15_bs3_unbuilt');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('native_toolchain_unproven');
+    expect(error.message).toContain('better-sqlite3');
+    expect(error.message).toMatch(/no compiled/i);
+    // P2: nothing marked, so no later round can short-circuit onto the broken tree.
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
+  });
+
+  it('an artifact that EXISTS and dlopens proves the package (a real compiled addon)', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'fake-native': '1.0.0' } }));
+    await writePrimaryNodeModules(repo.dir, {
+      packages: ['left-pad'],
+      native: { name: 'fake-native', built: true }, // plants a REAL .node
+    });
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r15_artifact_ok');
+    await createAtHead(repo, manager, asg);
+
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    const smoked = warnings.find((w) => w.kind === 'native_smoke_passed');
+    expect((smoked as { packages: readonly string[] }).packages.some((p) => p.endsWith('fake-native'))).toBe(true);
+  });
+
+  it('an artifact that exists but CANNOT be dlopened is refused (a corrupt or wrong-arch build)', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'fake-native': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, {
+      packages: ['left-pad'],
+      native: { name: 'fake-native', built: true },
+    });
+    // Same path, same name, not a Mach-O/ELF object — what a truncated download or
+    // a build for the wrong architecture leaves behind.
+    fs.writeFileSync(path.join(nm, 'fake-native', 'build', 'Release', 'bind.node'), 'not an object file\n');
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_r15_artifact_corrupt');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('native_toolchain_unproven');
+    expect(error.message).toMatch(/dlopen|could not LOAD/i);
+  });
+});
+
 describe('F9 AC-5 — an unbuilt native dependency is caught BEFORE the tree is marked', () => {
   it('a script-bearing package that cannot be loaded → native_toolchain_unproven, no marker (never sticky)', async () => {
     const repo = track(
@@ -2412,6 +2585,10 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     // ERR_REQUIRE_ASYNC_MODULE with a top-level await.)
     fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
     fs.writeFileSync(path.join(dir, 'index.mjs'), 'export const native = true;\n');
+    // ROUND 15: these fixtures are about WHICH SPECIFIER resolves, not about the
+    // build, so they ship a real compiled artifact for the artifact proof.
+    fs.mkdirSync(path.join(dir, 'build', 'Release'), { recursive: true });
+    fs.copyFileSync(realNativeAddon(), path.join(dir, 'build', 'Release', 'bind.node'));
     fs.rmSync(path.join(dir, 'index.js'), { force: true });
     fs.writeFileSync(
       path.join(dir, 'package.json'),
@@ -2453,6 +2630,10 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     const dir = path.join(nm, 'subpath-native');
     fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
     fs.writeFileSync(path.join(dir, 'addon.js'), 'module.exports = { native: true };\n');
+    // ROUND 15: these fixtures are about WHICH SPECIFIER resolves, not about the
+    // build, so they ship a real compiled artifact for the artifact proof.
+    fs.mkdirSync(path.join(dir, 'build', 'Release'), { recursive: true });
+    fs.copyFileSync(realNativeAddon(), path.join(dir, 'build', 'Release', 'bind.node'));
     fs.rmSync(path.join(dir, 'index.js'), { force: true });
     // No `main`, and `exports` declares no '.' — `require('subpath-native')` can
     // only ever throw ERR_PACKAGE_PATH_NOT_EXPORTED.
@@ -2489,6 +2670,10 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     const dir = path.join(nm, 'cli-native');
     fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
     fs.writeFileSync(path.join(dir, 'cli.js'), '#!/usr/bin/env node\nconsole.log("hi");\n');
+    // ROUND 15: these fixtures are about WHICH SPECIFIER resolves, not about the
+    // build, so they ship a real compiled artifact for the artifact proof.
+    fs.mkdirSync(path.join(dir, 'build', 'Release'), { recursive: true });
+    fs.copyFileSync(realNativeAddon(), path.join(dir, 'build', 'Release', 'bind.node'));
     fs.rmSync(path.join(dir, 'index.js'), { force: true });
     // Ships a CLI and nothing importable: no `main`, no `exports`, no index.js.
     fs.writeFileSync(
@@ -2545,6 +2730,10 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
     // Declares the ESM entry point but never built the addon it imports.
     fs.writeFileSync(path.join(dir, 'index.mjs'), "import './build/Release/bind.node';\nexport const native = true;\n");
+    // ROUND 15: these fixtures are about WHICH SPECIFIER resolves, not about the
+    // build, so they ship a real compiled artifact for the artifact proof.
+    fs.mkdirSync(path.join(dir, 'build', 'Release'), { recursive: true });
+    fs.copyFileSync(realNativeAddon(), path.join(dir, 'build', 'Release', 'bind.node'));
     fs.rmSync(path.join(dir, 'index.js'), { force: true });
     fs.writeFileSync(
       path.join(dir, 'package.json'),
