@@ -24,6 +24,11 @@ cd "$ROOT"
 LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"; mkdir -p "$LOGDIR"
 CLI=(node "$ROOT/dist/cli/index.js")
 
+# L11 ENFORCEMENT: never spend a coordinator dollar without a fresh PASSING
+# preflight (verdict=pass, same HEAD, same toolchain, <30 min old). The gate
+# rejects "diagnostic" records, so SKIP_BUILD=1 cannot be used to slip past it.
+bash "$ROOT/scripts/dogfood/require-preflight.sh" || exit 1
+
 SECTION="${SECTION:?set SECTION (e.g. §3A.1)}"
 SLICE="${SLICE:?set SLICE (one-line scope)}"
 PATHS="${PATHS:?set PATHS (files the implementor may touch)}"

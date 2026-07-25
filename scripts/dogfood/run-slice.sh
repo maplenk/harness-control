@@ -20,6 +20,12 @@ cd "$ROOT"
 LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"; mkdir -p "$LOGDIR"
 CLI=(node "$ROOT/dist/cli/index.js")
 
+# L11 ENFORCEMENT: approve+run is where the real money and the real worktree
+# commits happen — refuse without a fresh PASSING preflight (verdict=pass, same
+# HEAD, same toolchain, <30 min old). "diagnostic" records (SKIP_BUILD=1) are
+# rejected too: the staging drill must have run against the CURRENT dist.
+bash "$ROOT/scripts/dogfood/require-preflight.sh" || exit 1
+
 RUN_ID="${1:?usage: run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH}"
 SPEC_VERSION="${2:?spec version id required}"
 SPEC_HASH="${3:?spec hash required (binds the exact drafted spec)}"
