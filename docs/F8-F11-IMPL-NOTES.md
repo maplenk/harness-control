@@ -2177,6 +2177,87 @@ decisive test covers.
 
 ---
 
+---
+
+# Round 18 — the last one: a skipped symlink is a scan that stopped looking
+
+Codex on `c5c4068`: three of four reclassifications confirmed, decisive pair
+confirmed intact, and a full inventory of 22 conceptual refuse sites with exactly
+ONE branch-added indeterminate→refusal path left. This is it.
+
+## The item
+
+`readdirSync(dir, {withFileTypes: true})` reports Dirents with **lstat**
+semantics, so a symlink is neither `isFile()` nor `isDirectory()`. Both symlinked
+`.node` files and symlinked directories therefore fell straight through the
+artifact walk's `if/else if` — skipped **silently, while the scan still reported
+`complete: true`**.
+
+Round 17 fixed the caps and the unreadable directories and left this one standing,
+which makes it the same error a fourth time: the search stopped looking without
+recording that it had. Two consequences, both refusals against trees main
+provisions:
+
+- a package whose loadable artifact IS a link (hoisted and workspace layouts
+  produce exactly this) presents as "zero artifacts over a complete scan" and is
+  refused as never built;
+- or every regular artifact fails to load while a skipped linked one would have
+  loaded, and the zero-loadable branch refuses.
+
+## The fix — the conservative option, deliberately
+
+**A skipped symlink sets `complete = false` and names the path in the reason.**
+The scan does NOT start following links. Following reopens the containment
+question the symlink-escape guard exists to close, and it buys nothing: an
+incomplete scan already means indeterminate, which warns and proceeds. Cheap,
+safe, consistent with the rule.
+
+One narrowing, stated because it is a judgement: an entry named `node_modules` is
+passed over WITHOUT marking the scan incomplete, link or not. A nested tree
+belongs to other packages, which the scan visits in their own right, so skipping
+one was never a gap in THIS package's scan. (Previously that skip was reachable
+only for a real directory; it now covers a linked one too, which is the same
+reasoning.)
+
+Note what this does NOT degrade: the `complete` flag is consulted only where the
+proof is about to refuse on ABSENCE (zero artifacts, or zero loadable). A package
+whose artifact is found and `dlopen`s is still PROVEN even if some unrelated
+symlink sits beside it.
+
+## Round-18 regression proof
+
+Written first, run against `c5c4068`: `-t "ROUND 18"` → PASS 0 FAIL 1, with the
+verbatim false refusal —
+
+```
+contains NO compiled native artifact (*.node) for '…/linked-native', which
+declares a native build step — the package was never built
+```
+
+— for a package whose artifact is present, loadable, and one link away. The
+fixture stores a real compiled addon in a sibling directory and reaches it from
+`linked-native/build/Release/bind.node` through a RELATIVE, in-tree link, so the
+containment guard is satisfied and main clones it verbatim. The test also asserts
+the warning NAMES the skipped link rather than merely saying the scan was short.
+
+**Both decisive tests still green**: `-t "DECISIVE"` → PASS 2 FAIL 0. Checked
+directly rather than assumed: the real `better-sqlite3` package this fixture is
+copied from contains **zero symlinks** (`find node_modules/better-sqlite3 -type l`
+→ empty), so the missing-binding tree still reaches the complete-scan
+zero-artifact branch and still REFUSES. Pure-JS forced install still succeeds.
+
+## The audit table, updated
+
+| site | was | is now |
+| --- | --- | --- |
+| `:2294` / `:2348` via the artifact scan | positive identification over a scan that silently skipped symlinks | genuinely positive: **zero loadable artifacts in a COMPLETE scan** of a package that declares a native build — the state the decisive test exercises |
+
+With this, codex's inventory reports every remaining kept refusal as one of:
+positive identification, an operational failure, a data-preservation stop, a check
+identical to main, or the accepted R10. **The class is closed.**
+
+---
+
 # Final residual list for the merge record
 
 | # | residual | disposition |
@@ -2199,19 +2280,20 @@ decisive test covers.
 | R16 | **New (round 16):** the install environment carries no credential-shaped variable, so a private registry that authenticates ONLY through `NPM_TOKEN`-style env vars (rather than `~/.npmrc`) will fail to install. Reasoning in full above: the round's own committed `.npmrc` chooses the registry host, so an env token is an exfiltration path the on-disk one is not. | Deliberate, reasoning recorded |
 | R17 | **New (round 16):** two converted sites (an unreadable scanned tree root and an unreadable `@scope` directory) are unreachable end-to-end, because the main-era symlink containment scan refuses on an unreadable directory first. Converted for coherence; not covered by a test, and said so. | Stated, uncovered |
 | R18 | **New (round 17):** the native proof is now DELIBERATELY weaker in two cases it used to refuse. (a) A package whose artifact loads but whose wrapper is genuinely broken is no longer caught — indistinguishable, by inspection, from a wrapper that merely needs runtime configuration the smoke env lacks. (b) A package with more artifacts than the 8-artifact cap, ALL of them genuinely unloadable, is now indeterminate rather than refused, because the scan cannot tell "all broken" from "the good one is past the cap". Neither is a regression against main, which runs no proof at all; both are a reduction in proof STRENGTH versus round 16, taken because the alternative refuses valid trees. The decisive case — declares a native build, ships NO artifact, scan complete — still refuses. | Deliberate, cost of not refusing valid trees |
-| R13 note | R13's shape is unchanged but its guard is now stated exactly: the refusal requires a COMPLETE traversal (round 16) over a package with ZERO artifacts anywhere in its own directory. | — |
+| R13 note | R13's shape is unchanged but its guard is now stated exactly: the refusal requires a COMPLETE traversal (rounds 16–18 — no depth or artifact cap hit, no unreadable directory, no skipped symlink) over a package with ZERO artifacts anywhere in its own directory. | — |
+| R19 | **New (round 18):** a package containing ANY symlink other than a nested `node_modules` can no longer be proven by the artifact check if it also has no regular loadable artifact — the scan marks itself incomplete rather than following the link, so such a package warns and proceeds. This is the deliberate cost of not following links (containment). A package whose regular artifact is found and loads is still PROVEN regardless of unrelated symlinks beside it. | Deliberate, containment preferred over proof strength |
 
 ---
 
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1944 passed, 0 failed**, 106
+- `npx vitest run` (full, from this worktree) → **1945 passed, 0 failed**, 106
   files.
 
 Round-by-round: round 16 added 9 tests and deleted 4 that encoded reversed
 behaviour (1934 → 1941); round 17 added 3 regression tests and flipped 1 that
-encoded reclassification 2 (1941 → 1944).
+encoded reclassification 2 (1941 → 1944); round 18 added 1 (1944 → 1945).
 
 The round-16 bar was re-run independently at hand-off and reproduced exactly
 (`Tests 1941 passed`); the round-17 bar above is `Test Files 106 passed (106)`,
