@@ -788,9 +788,64 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
         clock: dbHandle!.db.clock,
       });
     } finally {
-      await wt.removeWorktree(asg);
+      // A test may deliberately destroy the worktree to force a git read to
+      // fail; cleanup must not mask the assertion.
+      await wt.removeWorktree(asg).catch(() => undefined);
     }
   }
+
+  // TOTALITY ON THE EXCEPTIONAL PATH. "Collect everything, decide once" held
+  // for normal control flow but leaked on the exceptional one: the post-command
+  // HEAD read can THROW, and that bypassed the sole return entirely — silently
+  // discarding a primary-checkout violation that had already been observed.
+  it('a post-command HEAD read that THROWS does not discard findings already observed', async () => {
+    const result = await confined((r) => async (command, cwd) => {
+      // Escape into the primary FIRST, so there is a real finding to lose...
+      fs.writeFileSync(path.join(r.dir, 'planted-then-head-unreadable.txt'), 'escaped\n');
+      // ...then make the post-command HEAD read fail.
+      fs.rmSync(path.join(cwd, '.git'), { recursive: true, force: true });
+      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+    });
+
+    // The already-observed escape survives the failed read...
+    expect(
+      result.runnerViolations.some((v) => v.changedPaths.includes('planted-then-head-unreadable.txt')),
+    ).toBe(true);
+    // ...and the unreadable HEAD is itself a finding, not silence. It must not
+    // be read as "HEAD did not move": we could not look, which is not an
+    // observation that nothing happened.
+    expect(result.runnerViolations.some((v) => /could not read the post-command/i.test(v.detail))).toBe(
+      true,
+    );
+    expect(result.headReadFailed).toBe(true);
+    // We cannot claim authorship we were unable to observe.
+    expect(result.authoredCommit).toBeUndefined();
+  });
+
+  it('an evidence write that rejects with UNDEFINED is still a failure, not a silent success', async () => {
+    // `throw undefined` / `Promise.reject(undefined)` is legal. Testing
+    // `executionError !== undefined` treats it as "did not throw" — the same
+    // absence-vs-observation confusion this branch keeps paying for.
+    const result = await confined(
+      () => async (command) => ({
+        exitCode: 0,
+        stdout: `ran: ${command}`,
+        stderr: '',
+        launchFailed: false,
+      }),
+      undefined,
+      {
+        record: async () => {
+          // eslint-disable-next-line @typescript-eslint/no-throw-literal
+          throw undefined;
+        },
+      },
+    );
+
+    expect(result.executionFailed).toBe(true);
+    expect(result.executionError).toBeUndefined();
+    expect(result.receipts).toEqual([]);
+  });
 
   it('an out-of-worktree write into the PRIMARY checkout is a typed violation', async () => {
     // Simulates the proven probe: a declared command (or a script it invokes)

@@ -92,6 +92,10 @@ import {
 } from './verifier.js';
 import type { RunId } from '../../domain/ids.js';
 import type { Verification } from '../../domain/entities.js';
+import {
+  MERGE_READINESS_BLOCKED_PROJECTION,
+  type MergeReadinessBlockedState,
+} from '../projections.js';
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -1201,6 +1205,63 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
       expect(updated.blockers).toEqual(['the base commit drifted (destination advanced)']);
       // SAME immutable verification — recheck re-ran ONLY the git probe.
       expect(updated.verification.id).toBe(blocked.verification.id);
+    });
+
+    // An event-sourced store holds records written by every prior version of
+    // the code. `merge_readiness_blocked` projections created by MAIN carry
+    // neither `Verification.evidenceReceipts` nor
+    // `VerificationBinding.resolvedHarnesses` — both are F13 additions. The read
+    // path returned that JSON unvalidated and `buildMergeReadiness` called
+    // `.map` on the missing array, so a run MAIN could recheck successfully
+    // after its destination was cleaned instead threw and was STRANDED.
+    it('a MAIN-shaped blocked projection rechecks instead of throwing, and never fabricates attestation', async () => {
+      const outcome = await blockedRound();
+      const current = outcome.service.getMergeReadinessBlocked(outcome.runId)!;
+
+      // Rewrite the persisted projection into MAIN's exact shape: strip the two
+      // F13 fields, as a record written before they existed simply would not
+      // have them. `requiredTestsPassed` stays TRUE, which is what main
+      // persisted from model evidence alone.
+      const legacy = JSON.parse(JSON.stringify(current)) as Record<string, unknown>;
+      const legacyVerification = legacy['verification'] as Record<string, unknown>;
+      const legacyBinding = legacy['binding'] as Record<string, unknown>;
+      delete legacyVerification['evidenceReceipts'];
+      delete legacyBinding['resolvedHarnesses'];
+      delete (legacy['mergeReadiness'] as Record<string, unknown>)['evidenceReceiptRefs'];
+      delete (legacy['mergeReadiness'] as Record<string, unknown>)['resolvedHarnesses'];
+      legacy['requiredTestsPassed'] = true;
+      outcome.db.projections.save(
+        outcome.runId,
+        MERGE_READINESS_BLOCKED_PROJECTION,
+        legacy as unknown as MergeReadinessBlockedState,
+      );
+
+      // Read back THROUGH the service boundary — that is where migration must
+      // happen, because every caller goes through it.
+      const blocked = outcome.service.getMergeReadinessBlocked(outcome.runId)!;
+      expect(blocked.verification.evidenceReceipts).toEqual([]);
+
+      // The destination is clean now: on main this recheck succeeded.
+      const recheck = await recheckMergeReadiness({
+        engine: outcome.service,
+        runId: outcome.runId,
+        blocked,
+        probe: fixedProbe(goodFacts()),
+        ids: outcome.ids,
+        clock: outcome.db.clock,
+      });
+
+      // It COMPLETES rather than throwing — the run is no longer stranded...
+      expect(recheck.mergeReadiness.evidenceReceiptRefs).toEqual([]);
+      // ...but an absent receipt set is not a pass. A record that predates
+      // attestation carries no proof, so it cannot be reported as attested.
+      expect(recheck.outcome).toBe('still_blocked');
+      expect(recheck.mergeReadiness.ready).toBe(false);
+      expect(
+        recheck.mergeReadiness.blockers.some((b) => /verification commands were not run\/passed/.test(b)),
+      ).toBe(true);
+      // And it must not claim an independence pair it never recorded.
+      expect(recheck.mergeReadiness.resolvedHarnesses).toBeUndefined();
     });
 
     it('ready → T24 is ingested NOW: run → merge_ready, read-model resolved', async () => {

@@ -317,8 +317,11 @@ export interface MergeReadiness {
   readonly specHash: SpecHash;
   readonly baseCommit: GitSha;
   readonly verifiedCommit: GitSha;
-  /** Resolved runtime harnesses; proves the independence decision in the audit. */
-  readonly resolvedHarnesses: VerificationHarnessPair;
+  /** Resolved runtime harnesses; proves the independence decision in the audit.
+   * ABSENT only on a report rebuilt from a record written before independence
+   * was enforced — such a record never proved a pair, so it must not report
+   * one. Every live round records it. */
+  readonly resolvedHarnesses?: VerificationHarnessPair;
   readonly destinationClean: boolean;
   /** W1-F4: the implementation worktree was clean at probe time (post-commit
    * verification commands can dirty it — that content is in NO commit). */

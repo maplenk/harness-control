@@ -122,6 +122,31 @@ export { NoDeliverableError } from '../service.js';
  * laundering exactly what F8 refused. Verification commands observe the bound
  * implementation commit; they never author one.
  */
+/**
+ * The post-command worktree HEAD could not be read, so whether a declared
+ * verification command authored a commit is INDETERMINATE.
+ *
+ * Fails the round closed rather than proceeding: a read that did not complete
+ * is not an observation that HEAD stayed put, and the alternative — treating it
+ * as "unchanged" — is precisely how the authorship guard would be silently
+ * bypassed by a broken tree. Distinct from `VerificationAuthoredCommitError`
+ * because claiming a commit nobody observed would be its own fabrication.
+ */
+export class VerificationHeadUnreadableError extends Error {
+  override readonly name: string = 'VerificationHeadUnreadableError';
+  constructor(
+    readonly assignmentId: AssignmentId,
+    readonly round: number,
+    readonly worktreePath: string,
+  ) {
+    super(
+      `could not read the post-command worktree HEAD at ${worktreePath} for assignment ` +
+        `${String(assignmentId)} round ${round}. Whether a declared verification command authored ` +
+        'a commit is therefore unproven, and the round is refused rather than assumed clean.',
+    );
+  }
+}
+
 export class VerificationAuthoredCommitError extends Error {
   override readonly name: string = 'VerificationAuthoredCommitError';
   constructor(
@@ -992,7 +1017,13 @@ export async function runImplementVerifyLoop(
       //      through as an ordinary blocked round.
       //   3. Otherwise an EVIDENCE-WRITE failure fails the round on its own
       //      original cause; recording a violation must never replace it.
-      //   4. Otherwise the findings are ordinary blocking violations: they
+      //      Branch on the FLAG, never on the error value — `throw undefined`
+      //      is legal, and `!== undefined` reads it as "did not throw".
+      //   4. Otherwise an UNREADABLE post-command HEAD fails the round closed:
+      //      it makes authorship INDETERMINATE, and "I could not look" is never
+      //      "nothing happened". It cannot use (2), which would claim a commit
+      //      nobody observed.
+      //   5. Otherwise the findings are ordinary blocking violations: they
       //      thread into the §16 readiness gate below so an all-verified round
       //      still blocks (T23, never T24).
       //
@@ -1036,10 +1067,18 @@ export async function runImplementVerifyLoop(
       }
       // (3) The evidence-write path failed. Every finding it might have masked
       // is already durable above, so the round fails on the original cause.
-      if (receiptExecution.executionError !== undefined) {
+      // Branches on the FLAG: `throw undefined` is legal and must not read as
+      // success just because the captured value is `undefined`.
+      if (receiptExecution.executionFailed) {
         throw receiptExecution.executionError;
       }
-      // (4) Ordinary blocking violations thread into the §16 gate below.
+      // (4) The post-command HEAD could not be read, so we cannot say whether a
+      // command authored a commit. Fail closed on the indeterminate answer
+      // rather than proceeding as if the tree were unchanged.
+      if (receiptExecution.headReadFailed) {
+        throw new VerificationHeadUnreadableError(input.assignmentId, round, handle.worktreePath);
+      }
+      // (5) Ordinary blocking violations thread into the §16 gate below.
       const runnerViolation = receiptExecution.runnerViolations[0];
       const probe = gitMergeReadinessProbe({
         repoRoot: handle.repoRoot,

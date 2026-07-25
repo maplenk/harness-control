@@ -237,16 +237,31 @@ export interface ConfinedReceiptExecution {
    * `runImplementVerifyLoop`. */
   readonly authoredCommit?: { readonly before: GitSha; readonly after: GitSha };
   /**
-   * The evidence-write path threw (a §12.1 quota rejection or a CAS failure).
+   * TRUE iff the evidence-write path threw (a §12.1 quota rejection or a CAS
+   * failure). Separate from `executionError` because `throw undefined` and
+   * `Promise.reject(undefined)` are legal: testing `executionError !== undefined`
+   * reads those as "did not throw", which is the same absence-vs-observation
+   * confusion the rest of this module exists to avoid. THIS is the flag callers
+   * must branch on.
+   */
+  readonly executionFailed: boolean;
+  /**
+   * What the evidence-write path threw, when it threw something.
    *
-   * Reported rather than propagated so the confinement guards below CANNOT be
-   * skipped by it. A throw out of the execution path used to jump straight
-   * past drift detection, so a quota failure MASKED a primary-checkout
-   * mutation: no incident recorded, and a later retry would baseline the
-   * already-mutated checkout. The caller records any violation FIRST, then
-   * rethrows this.
+   * Reported rather than propagated so the confinement guards CANNOT be skipped
+   * by it. A throw out of the execution path used to jump straight past drift
+   * detection, so a quota failure MASKED a primary-checkout mutation: no
+   * incident recorded, and a later retry would baseline the already-mutated
+   * checkout. The caller records every finding FIRST, then rethrows this.
    */
   readonly executionError?: unknown;
+  /**
+   * TRUE iff the POST-command HEAD read failed. The read is how authorship is
+   * detected, so a failure means authorship is INDETERMINATE — never "HEAD did
+   * not move". Fails the round closed: we could not look, and a bounded look
+   * that could not complete is not an observation that nothing happened.
+   */
+  readonly headReadFailed: boolean;
 }
 
 /**
@@ -291,12 +306,12 @@ export async function executeEvidenceReceiptsUnderConfinement(
 
   let receipts: readonly EvidenceReceipt[] = [];
   let executionError: unknown;
-  let threw = false;
+  let executionFailed = false;
   try {
     receipts = await executeEvidenceReceipts(input);
   } catch (error) {
     executionError = error;
-    threw = true;
+    executionFailed = true;
   }
 
   const runnerViolations: VerificationRunnerViolation[] = [];
@@ -305,15 +320,37 @@ export async function executeEvidenceReceiptsUnderConfinement(
   const primaryViolation = await detectPrimaryCheckoutDrift(input.repoRoot, primaryBefore);
   if (primaryViolation !== undefined) runnerViolations.push(primaryViolation);
 
-  // CHECK 2 — authorship inside the worktree. Runs whatever check 1 found.
-  const worktreeHeadAfter = await git.resolveSha(input.cwd, 'HEAD');
-  const authored = worktreeHeadAfter !== worktreeHeadBefore;
-  if (authored) {
+  // CHECK 2 — authorship inside the worktree. Runs whatever check 1 found, and
+  // its own read is guarded too: throwing here used to bypass the sole return
+  // and discard everything already observed above.
+  let worktreeHeadAfter: string | undefined;
+  let headReadFailed = false;
+  try {
+    worktreeHeadAfter = await git.resolveSha(input.cwd, 'HEAD');
+  } catch (error) {
+    headReadFailed = true;
     runnerViolations.push({
       kind: 'verification_runner_violation',
       repoRoot: input.repoRoot,
       headBefore: gitSha(worktreeHeadBefore),
-      headAfter: gitSha(worktreeHeadAfter),
+      changedPaths: [],
+      detail: redactText(
+        `could not read the post-command worktree HEAD at ${input.cwd}: ${String(error)}. ` +
+          'Authorship is INDETERMINATE — this is not evidence that HEAD did not move, so the ' +
+          'round fails closed rather than proceeding as if the tree were unchanged.',
+      ),
+    });
+  }
+  const authoredHead =
+    worktreeHeadAfter !== undefined && worktreeHeadAfter !== worktreeHeadBefore
+      ? worktreeHeadAfter
+      : undefined;
+  if (authoredHead !== undefined) {
+    runnerViolations.push({
+      kind: 'verification_runner_violation',
+      repoRoot: input.repoRoot,
+      headBefore: gitSha(worktreeHeadBefore),
+      headAfter: gitSha(authoredHead),
       changedPaths: [],
       detail: redactText(
         `a declared verification command moved the worktree HEAD at ${input.cwd} from ` +
@@ -326,10 +363,17 @@ export async function executeEvidenceReceiptsUnderConfinement(
   return {
     receipts,
     runnerViolations,
-    ...(authored
-      ? { authoredCommit: { before: gitSha(worktreeHeadBefore), after: gitSha(worktreeHeadAfter) } }
+    ...(authoredHead !== undefined
+      ? {
+          authoredCommit: {
+            before: gitSha(worktreeHeadBefore),
+            after: gitSha(authoredHead),
+          },
+        }
       : {}),
-    ...(threw ? { executionError } : {}),
+    executionFailed,
+    ...(executionFailed ? { executionError } : {}),
+    headReadFailed,
   };
 }
 

@@ -237,6 +237,7 @@ import {
   WORKFLOW_DISPATCH_EDGES,
   isEngineFoldedSupportingEvent,
   makeEngineReducer,
+  migrateMergeReadinessBlockedState,
   uiStateOf,
   type ImplementVerifyLoopState,
   type MergeReadinessBlockedState,
@@ -3228,8 +3229,14 @@ export class OrchestrationService {
 
   /** The persisted W2-2 blocked-readiness read-model, if a round recorded one. */
   getMergeReadinessBlocked(runId: RunId): MergeReadinessBlockedState | undefined {
-    return this.#db.projections.get<MergeReadinessBlockedState>(runId, MERGE_READINESS_BLOCKED_PROJECTION)
-      ?.state;
+    // Persisted JSON is untrusted input: it may have been written by any prior
+    // version of this code. Normalize at the READ boundary so every caller —
+    // the CLI recheck path included — gets a current-shape record rather than
+    // crashing on a field that postdates the record.
+    return migrateMergeReadinessBlockedState(
+      this.#db.projections.get<MergeReadinessBlockedState>(runId, MERGE_READINESS_BLOCKED_PROJECTION)
+        ?.state,
+    );
   }
 
   // ---- W2-5 implement→verify loop binding (durable resume input) -----------

@@ -479,6 +479,91 @@ finding rather than merely "defined", which pins the severity split in both
 directions — a primary escape must NOT hard-stop, an authored commit must.
 That split is what caught this class.
 
+## Round 4 — codex round 3 on `8bab44d`: totality edges, and legacy state
+
+The conjunction fix was confirmed. Three items; the third is a class this
+branch had not hit before.
+
+### ITEM 1 — totality leaked on the EXCEPTIONAL path
+
+"Collect everything, decide once" held for normal control flow. But the
+post-command HEAD read (`git.resolveSha`) could THROW, and that bypassed the
+sole `return` entirely — silently discarding a primary-checkout violation that
+had already been observed, along with any captured evidence-write failure.
+
+The read is now guarded like the evidence write. A failure becomes its own
+finding — *"could not read the post-command worktree HEAD … authorship is
+INDETERMINATE"* — and never a path that discards what was already seen.
+
+Crucially it is NOT treated as "HEAD did not move". A read that did not
+complete is not an observation that nothing happened, so the round fails closed
+via the new `VerificationHeadUnreadableError`. That error is deliberately
+distinct from `VerificationAuthoredCommitError`: claiming a commit nobody
+observed would be its own fabrication, in the opposite direction.
+
+### ITEM 2 — the undefined-rejection hole
+
+`throw undefined` and `Promise.reject(undefined)` are legal. The caller tested
+`executionError !== undefined` while the local `threw` flag was never returned,
+so an undefined rejection read as "did not throw" — a silent success. The flag
+is now returned as `executionFailed` and is what every caller branches on;
+`executionError` carries only the value. The same absence-vs-observation
+confusion this module exists to prevent, one level up.
+
+### ITEM 3 — legacy persisted state meeting new code (merge-blocking)
+
+An event-sourced store holds records written by every prior version of the
+code. `merge_readiness_blocked` projections created by MAIN carry neither
+`Verification.evidenceReceipts` nor `VerificationBinding.resolvedHarnesses` —
+both are F13 additions. `getMergeReadinessBlocked` returned that JSON
+unvalidated and `buildMergeReadiness` called `.map` on the missing array.
+
+**Proven, not inferred:** rewriting a real blocked projection into main's exact
+shape and rechecking produced
+`TypeError: Cannot read properties of undefined (reading 'map')`. A run main
+could recheck successfully — after its destination was cleaned — instead threw
+and was STRANDED. There were such runs in the live event store.
+
+Fixed at the READ boundary, where every caller passes:
+`migrateMergeReadinessBlockedState` normalizes the record in
+`getMergeReadinessBlocked`. Absence is given its honest meaning in both
+directions:
+
+- **Never crash on an old shape.** A missing receipt array becomes `[]` —
+  "recorded before receipts existed" is legitimately empty, not an error.
+- **Never fabricate a modern attestation from a record that predates it.** An
+  empty receipt set is not proof of execution, so `requiredTestsPassed` is
+  forced false rather than carried on the model-evidence-only basis main used,
+  and the existing gate emits its blocker. `MergeReadiness.resolvedHarnesses`
+  became optional and stays ABSENT: a run whose independence was never recorded
+  must not report a verified pair.
+
+**Deviation flagged (house rule 3).** This does refuse something main accepted:
+a legacy run whose spec declared NO verification commands would have rechecked
+to READY, and now blocks. A persisted `Verification` carries `CriterionResult`s,
+which record no command information, so a legacy record cannot prove commands
+were absent — the two cases are indistinguishable by inspection. Codex's
+instruction was explicit that an empty receipt set must yield the same
+`unproven` outcome a missing receipt does, so it is taken deliberately. The run
+is NOT stranded: recheck now completes with an actionable blocker instead of
+crashing, and a normal verification round produces real receipts.
+
+### The precedence rule, extended
+
+1. record every finding durably; 2. an authored commit hard-stops; 3. an
+evidence-write failure fails the round on its own cause (**branch on the flag,
+never on the value**); 4. an unreadable post-command HEAD fails the round
+closed; 5. otherwise the findings are ordinary blocking violations.
+
+### Fails-on-parent
+
+Item 3 is the `TypeError` above. Items 1 and 2 were proven by restoring the
+pre-fix shape from a copy (never `git checkout --`) and re-running: both fail.
+The real file was restored from the copy and its symbols re-grepped afterwards
+(`headReadFailed`, `executionFailed`, `runnerViolations`, `authoredCommit`,
+`executeEvidenceReceiptsUnderConfinement`), with the full suite re-run green —
+that exact move silently wiped a real fix twice earlier in this project.
+
 ## Green bar after the merge
 
 ```text
@@ -486,8 +571,9 @@ $ npm run typecheck
 exit 0
 
 $ npx vitest run
-Tests  1997 passed, 0 failed
+Tests  2000 passed, 0 failed
   1991 at 07d4af0 → 1994 (+3, round-2 blockers) → 1997 (+3, the conjunction)
+       → 2000 (+3, totality edges + legacy projection)
 ```
 
 Main alone was 1945; F13 alone was 1743 on its older base. The +46 over main is
