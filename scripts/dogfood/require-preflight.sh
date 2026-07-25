@@ -37,9 +37,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
 [ -n "${ROOT:-}" ] && cd "$ROOT" || { echo "!! cannot resolve/enter repo root" >&2; exit 1; }
 . "$ROOT/scripts/dogfood/lib.sh" || { echo "!! cannot source scripts/dogfood/lib.sh" >&2; exit 1; }
 
+# Optional: the run this gate is guarding. Given one, the config identity is
+# taken from the run's PERSISTED config rather than the ambient env — see below.
+RUN_ID="${1:-}"
+
 : "${HARNESS_HOME:=$HOME/.harness}"
 LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"
 RECORD="$LOGDIR/preflight.jsonl"
+CLAIM="$(dogfood_claim_path "$HARNESS_HOME")"
+ATTEMPTS="$(dogfood_attempts_path "$HARNESS_HOME")"
 MAX_AGE_MIN=30
 
 refuse() {
@@ -47,6 +53,12 @@ refuse() {
   echo "!! run: bash scripts/dogfood/preflight.sh" >&2
   exit 1
 }
+
+# Containment is re-checked HERE, not just in preflight: a perfectly valid record
+# written with an external log dir could otherwise be reused while HARNESS_HOME
+# is repointed into the repo, and the CLI would then write harness.db and
+# artifacts inside the repository.
+CONTAINMENT="$(dogfood_require_containment "$ROOT" "$HARNESS_HOME" "$LOGDIR")" || refuse "${CONTAINMENT#!}"
 
 [ -f "$RECORD" ] || refuse "no preflight record at $RECORD"
 
@@ -60,15 +72,54 @@ NPM_V="$(npm --version 2>/dev/null)"
 # Re-resolve, with the SAME logic preflight used, what this invocation would run.
 dogfood_resolve_roles
 dogfood_resolve_config "$ROOT"
-CONFIG_SHA="$(dogfood_config_sha "${CONFIG:-}")"
 DIST_DIGEST="$(dogfood_dist_digest "$ROOT")"
-[ -n "$DIST_DIGEST" ] || refuse "dist/ is missing or empty — nothing to run (build, then preflight)"
+case "${DIST_DIGEST:-}" in
+  '')   refuse "cannot digest dist/ — nothing to run (build, then preflight)" ;;
+  '!'*) refuse "dist/ cannot be bound: ${DIST_DIGEST#!}" ;;
+esac
+
+# CONFIG IDENTITY. At `start` the ambient $CONFIG is what gets pinned, so the
+# effective config is the right comparison. At `run` the CLI IGNORES $CONFIG and
+# loads the config persisted at `start` — so hashing the caller's env there would
+# authorise a run whose actual config differs (a run created with CONFIG="" being
+# blessed by a preflight that used the dogfood config). With a RUN_ID we
+# therefore bind the run's persisted config instead.
+if [ -n "$RUN_ID" ]; then
+  CONFIG_IDENTITY="$(dogfood_run_config_sha "$ROOT" "$HARNESS_HOME" "$RUN_ID")"
+  CONFIG_SOURCE="run $RUN_ID (persisted at start)"
+else
+  CONFIG_IDENTITY="$(dogfood_effective_config_sha "$ROOT" "${CONFIG:-}")"
+  CONFIG_SOURCE="the resolved CONFIG for a fresh start"
+fi
+case "${CONFIG_IDENTITY:-}" in
+  ''|'!'*) refuse "cannot determine the engine config for ${CONFIG_SOURCE}: ${CONFIG_IDENTITY#!}" ;;
+esac
+
+# The attempt claim: a durable marker in a DIFFERENT failure domain from the log.
+# Reading it closes the fail-open tail where an immutable log dir let a stale PASS
+# outlive the failing preflight that should have replaced it. Writing to it is
+# mandatory too — a gate that cannot record its own attempt cannot claim the
+# store is in a state it understands.
+[ -f "$CLAIM" ] || refuse "no attempt claim at $CLAIM — the preflight that wrote this record predates the claim, or could not write it"
+if ! printf '%s\tgate\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$HEAD_SHA" "${RUN_ID:-<start>}" >> "$ATTEMPTS" 2>/dev/null; then
+  refuse "cannot write the gate attempt marker at $ATTEMPTS — refusing rather than proceeding on a store I cannot write"
+fi
+
+HARNESS_HOME_CANON="$(dogfood_canonical_path "$HARNESS_HOME")"
+LOGDIR_CANON="$(dogfood_canonical_path "$LOGDIR")"
+
+# EDITING THE HEREDOC BELOW: keep single quotes BALANCED on every line — no
+# apostrophes in prose ("the record" not "the record's"). macOS ships bash
+# 3.2.57, whose parser mis-scans a heredoc nested inside $( ) when the body has
+# an odd number of single quotes, and fails with "unexpected EOF while looking
+# for matching" pointing at a line far below the real cause.
 
 REASON="$(node - "$RECORD" "$HEAD_SHA" "$GIT_V" "$NODE_V" "$NPM_V" "$MAX_AGE_MIN" \
-  "$DIST_DIGEST" "$COORDINATOR" "$IMPLEMENTOR" "$VERIFIER" "$CONFIG_SHA" <<'NODE'
+  "$DIST_DIGEST" "$COORDINATOR" "$IMPLEMENTOR" "$VERIFIER" "$CONFIG_IDENTITY" \
+  "$CLAIM" "$HARNESS_HOME_CANON" "$LOGDIR_CANON" "$CONFIG_SOURCE" <<'NODE'
 const fs = require('node:fs');
-const [record, head, git, node, npm, maxAgeMin, distDigest, coordinator, implementor, verifier, configSha] =
-  process.argv.slice(2);
+const [record, head, git, node, npm, maxAgeMin, distDigest, coordinator, implementor, verifier, configSha,
+  claimPath, harnessHome, logDir, configSource] = process.argv.slice(2);
 
 let lines;
 try {
@@ -87,8 +138,8 @@ if (r === null || typeof r !== 'object' || Array.isArray(r)) {
 // means a record that OMITS the field passes the comparison — so an old-format
 // or hand-edited record could authorise a run precisely because it says less.
 // Every bound field must be present and non-empty.
-const REQUIRED = ['at', 'verdict', 'git', 'node', 'npm', 'head',
-  'distDigest', 'coordinator', 'implementor', 'verifier', 'configSha'];
+const REQUIRED = ['at', 'attemptId', 'verdict', 'git', 'node', 'npm', 'head',
+  'distDigest', 'coordinator', 'implementor', 'verifier', 'configSha', 'harnessHome', 'logDir'];
 const missing = REQUIRED.filter((k) => typeof r[k] !== 'string' || r[k].length === 0);
 if (missing.length > 0) {
   process.stdout.write(`the record is incomplete — missing/invalid: ${missing.join(', ')} (regenerate it; the format changed)`);
@@ -133,7 +184,50 @@ for (const [name, seen, was] of [
   }
 }
 if (r.configSha !== configSha) {
-  process.stdout.write(`the engine config differs from the one preflight used (${String(r.configSha).slice(0, 12)}… → ${configSha.slice(0, 12)}…)`);
+  process.stdout.write(
+    `the engine config differs from the one preflight gated: recorded ${String(r.configSha).slice(0, 12)}…, ` +
+    `but ${configSource} is ${configSha.slice(0, 12)}…`,
+  );
+  process.exit(0);
+}
+if (r.harnessHome !== harnessHome) {
+  process.stdout.write(`the store moved since the preflight (${r.harnessHome} → ${harnessHome})`);
+  process.exit(0);
+}
+if (r.logDir !== logDir) {
+  process.stdout.write(`the log dir moved since the preflight (${r.logDir} → ${logDir})`);
+  process.exit(0);
+}
+
+// The claim must name the attempt THIS record came from. That is what survives
+// an immutable log: a failing preflight rewrites the claim even when it cannot
+// touch the record, so a stale PASS is left orphaned rather than authoritative.
+// (Apostrophes are banned in this heredoc — see the note above the block.)
+let claim;
+try { claim = JSON.parse(fs.readFileSync(claimPath, 'utf8')); }
+catch (e) { process.stdout.write(`the attempt claim is unreadable (${e.message})`); process.exit(0); }
+if (claim === null || typeof claim !== 'object' || Array.isArray(claim)) {
+  process.stdout.write('the attempt claim is not a JSON object'); process.exit(0);
+}
+for (const k of ['attemptId', 'verdict', 'head', 'distDigest']) {
+  if (typeof claim[k] !== 'string' || claim[k].length === 0) {
+    process.stdout.write(`the attempt claim is incomplete — missing/invalid: ${k}`); process.exit(0);
+  }
+}
+if (claim.attemptId !== r.attemptId) {
+  process.stdout.write(
+    `the record is ORPHANED: the latest preflight attempt is ${claim.attemptId.slice(0, 8)} ` +
+    `(verdict "${claim.verdict}") but this record is from attempt ${String(r.attemptId).slice(0, 8)} — ` +
+    'a later preflight ran and could not replace the record',
+  );
+  process.exit(0);
+}
+if (claim.verdict !== 'pass') {
+  process.stdout.write(`the latest preflight attempt recorded verdict "${claim.verdict}" in its claim`);
+  process.exit(0);
+}
+if (claim.head !== r.head || claim.distDigest !== r.distDigest) {
+  process.stdout.write('the attempt claim and the record disagree about HEAD/dist — the pair cannot be trusted');
   process.exit(0);
 }
 

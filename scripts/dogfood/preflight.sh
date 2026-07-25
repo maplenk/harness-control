@@ -43,18 +43,26 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
 
 : "${HARNESS_HOME:=$HOME/.harness}"
 LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"
-# The store and the log dir must live OUTSIDE the repo. If they resolve inside
-# it, this battery's own provenance write becomes repo dirt — and since the
-# append happens after the clean-tree check, a PASS could leave behind exactly
-# the dirt that fails the NEXT run's clean-tree check.
-if dogfood_path_inside "$HARNESS_HOME" "$ROOT"; then
-  echo "!! HARNESS_HOME resolves inside the repo ($HARNESS_HOME) — refusing: run artifacts would dirty the tree" >&2; exit 1
-fi
-if dogfood_path_inside "$LOGDIR" "$ROOT"; then
-  echo "!! the log dir resolves inside the repo ($LOGDIR) — refusing: the provenance record would dirty the tree" >&2; exit 1
-fi
+# Shared containment refusal (lib.sh): the store and the log dir must live
+# OUTSIDE the repo, or this battery's own provenance write becomes repo dirt —
+# and since the append happens after the clean-tree check, a PASS could leave
+# behind exactly the dirt that fails the NEXT run's check. The gate and both
+# slice scripts re-run this, because a record written from a safe log dir can be
+# reused later with HARNESS_HOME repointed into the repo.
+CONTAINMENT="$(dogfood_require_containment "$ROOT" "$HARNESS_HOME" "$LOGDIR")" || {
+  echo "!! ${CONTAINMENT#!}" >&2; exit 1; }
 mkdir -p "$LOGDIR" || { echo "!! cannot create log dir $LOGDIR" >&2; exit 1; }
 RECORD="$LOGDIR/preflight.jsonl"
+CLAIM="$(dogfood_claim_path "$HARNESS_HOME")"
+ATTEMPTS="$(dogfood_attempts_path "$HARNESS_HOME")"
+# The claim only adds a rung if it is a DIFFERENT failure domain from the record.
+if dogfood_path_inside "$CLAIM" "$LOGDIR"; then
+  echo "!! the attempt claim ($CLAIM) resolves inside the log dir — it must be a separate location to be worth anything" >&2; exit 1
+fi
+HARNESS_HOME_CANON="$(dogfood_canonical_path "$HARNESS_HOME")"
+LOGDIR_CANON="$(dogfood_canonical_path "$LOGDIR")"
+ATTEMPT_ID="$(node -e "process.stdout.write(require('node:crypto').randomUUID())" 2>/dev/null)"
+[ -n "$ATTEMPT_ID" ] || { echo "!! cannot generate an attempt id" >&2; exit 1; }
 BASELINE="$ROOT/scripts/dogfood/preflight-baseline.json"
 HELPER_JS="$ROOT/dist/worktree/git.js"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -451,11 +459,20 @@ fi
 # and mutable, so a record binding only HEAD authorises whatever bytes are in
 # dist/ when the slice script finally runs. Bind the built tree itself.
 DIST_DIGEST="$(dogfood_dist_digest "$ROOT")"
-if [ -z "$DIST_DIGEST" ]; then
-  fail "could not digest dist/ — the executable tree cannot be bound to this record"
-else
-  pass "dist digest ${DIST_DIGEST:0:16}… (390-odd files, content+paths)"
-fi
+case "${DIST_DIGEST:-}" in
+  '')  fail "could not digest dist/ — the executable tree cannot be bound to this record"; DIST_DIGEST="" ;;
+  '!'*) fail "dist/ cannot be bound: ${DIST_DIGEST#!}"; DIST_DIGEST="" ;;
+  *)   pass "dist digest ${DIST_DIGEST:0:16}… (regular files only; symlinks/specials refused)" ;;
+esac
+
+# The EFFECTIVE config, not the file bytes: `start` persists the PARSED config and
+# the CLI ignores $CONFIG thereafter, so file-sha equality proves nothing about
+# what a run executes on. Needs dist/, hence after the build.
+EFFECTIVE_CONFIG_SHA="$(dogfood_effective_config_sha "$ROOT" "${CONFIG:-}")"
+case "${EFFECTIVE_CONFIG_SHA:-}" in
+  ''|'!'*) fail "effective engine config unusable: ${EFFECTIVE_CONFIG_SHA#!}"; EFFECTIVE_CONFIG_SHA="" ;;
+  *)       pass "effective engine config ${EFFECTIVE_CONFIG_SHA:0:16}… (what a fresh \`start\` would pin)" ;;
+esac
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verdict + provenance record. Only "pass" is accepted by the enforcement gate.
@@ -472,13 +489,15 @@ fi
 append_record() { # $1 = verdict to record
   node - "$RECORD" "$STARTED_AT" "$1" "$GIT_V" "$NODE_V" "$NPM_V" "$HEAD_SHA" "$BRANCH" \
     "$DOCTOR_OVERALL" "$COLLECTED" "$FLOOR" "$ELAPSED" "${#WARNINGS[@]}" "${#FAILURES[@]}" "${SKIP_BUILD:-0}" \
-    "$DIST_DIGEST" "$COORDINATOR" "$IMPLEMENTOR" "$VERIFIER" "$CONFIG_SHA" <<'NODE'
+    "$DIST_DIGEST" "$COORDINATOR" "$IMPLEMENTOR" "$VERIFIER" "$EFFECTIVE_CONFIG_SHA" \
+    "$ATTEMPT_ID" "$HARNESS_HOME_CANON" "$LOGDIR_CANON" <<'NODE'
 const fs = require('node:fs');
 const [record, at, verdict, git, node, npm, head, branch, doctor, collected, floor, elapsedS,
-  warns, fails, skipBuild, distDigest, coordinator, implementor, verifier, configSha] = process.argv.slice(2);
+  warns, fails, skipBuild, distDigest, coordinator, implementor, verifier, configSha,
+  attemptId, harnessHome, logDir] = process.argv.slice(2);
 const line = JSON.stringify({
-  at, verdict, git, node, npm, head, branch,
-  distDigest, coordinator, implementor, verifier, configSha,
+  at, attemptId, verdict, git, node, npm, head, branch,
+  distDigest, coordinator, implementor, verifier, configSha, harnessHome, logDir,
   doctor: doctor || null,
   skipBuild: skipBuild === '1',
   collectedTestFiles: Number(collected) || 0, floor: Number(floor) || 0,
@@ -486,6 +505,17 @@ const line = JSON.stringify({
 });
 fs.appendFileSync(record, line + '\n');
 process.stdout.write(line + '\n');
+NODE
+}
+
+# The claim is written FIRST, and from a different location than the record. If
+# the record append then fails, the claim already names THIS attempt, so the
+# stale PASS that survived in the log no longer matches and the gate refuses.
+write_claim() { # $1 = verdict
+  node - "$CLAIM" "$ATTEMPT_ID" "$STARTED_AT" "$1" "$HEAD_SHA" "$DIST_DIGEST" <<'NODE'
+const fs = require('node:fs');
+const [claim, attemptId, at, verdict, head, distDigest] = process.argv.slice(2);
+fs.writeFileSync(claim, JSON.stringify({ attemptId, at, verdict, head, distDigest }) + '\n');
 NODE
 }
 # Node's stack trace is noise here; the escalation below is the operator message.
@@ -496,6 +526,17 @@ append_record_quiet() { append_record "$1" 2>>"$WORK/record.err"; }
 # last record — and it would authorise the very run this battery just rejected.
 # Escalate: write a fail record; failing that, destroy the log. The gate refuses
 # on missing/empty/unreadable, which is the safe landing state.
+# MANDATORY: no claim, no run. The claim is the rung that survives an immutable
+# log, so a battery that cannot write it has not established anything.
+if ! write_claim "$VERDICT" 2>>"$WORK/record.err"; then
+  echo
+  echo "!! could not write the attempt claim to $CLAIM"
+  [ -s "$WORK/record.err" ] && grep -m1 -E 'Error|EACCES|EPERM|ENOENT|ENOSPC|EROFS' "$WORK/record.err" | sed 's/^/     /'
+  echo "!! the gate requires a claim it can read AND write — fix the permissions on $HARNESS_HOME"
+  echo "── PREFLIGHT FAILED (no claim) — do NOT start a run ──"
+  exit 1
+fi
+
 if ! append_record_quiet "$VERDICT"; then
   echo
   echo "!! could not append the provenance record to $RECORD"
@@ -507,7 +548,8 @@ if ! append_record_quiet "$VERDICT"; then
   elif rm -f "$RECORD" 2>/dev/null; then
     echo "!! removed $RECORD — no stale pass remains"
   else
-    echo "!! COULD NOT INVALIDATE $RECORD — a stale PASS may still authorise a run. Delete it by hand NOW."
+    echo "!! could not invalidate $RECORD — but the attempt claim above already names THIS attempt,"
+    echo "!! so the stale record no longer matches and the gate will refuse. Fix the log-dir permissions."
   fi
   echo "── PREFLIGHT FAILED (record not written) — do NOT start a run ──"
   exit 1

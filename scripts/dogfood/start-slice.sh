@@ -26,12 +26,17 @@ cd "$ROOT"
 LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"; mkdir -p "$LOGDIR"
 CLI=(node "$ROOT/dist/cli/index.js")
 
+# Independent containment refusal (also enforced by preflight and the gate): the
+# CLI is about to create the run store, which must not be inside the repo.
+CONTAINMENT="$(dogfood_require_containment "$ROOT" "$HARNESS_HOME" "$LOGDIR")" || { echo "!! ${CONTAINMENT#!}" >&2; exit 1; }
+
 # L11 ENFORCEMENT: never spend a coordinator dollar without a fresh PASSING
-# preflight — same HEAD, same dist digest, same toolchain, same resolved roles
-# and config, <30 min old. The gate rejects "diagnostic" records, so
-# SKIP_BUILD=1 cannot be used to slip past it. It runs BEFORE the role
-# resolution below deliberately: the gate re-resolves the same values itself
-# from the same env, via the same lib.sh helpers.
+# preflight — same HEAD, same dist digest, same toolchain, same resolved roles,
+# same effective config, same store/log, valid attempt claim, <30 min old. The
+# gate rejects "diagnostic" records, so SKIP_BUILD=1 cannot slip past it. It runs
+# BEFORE the role resolution below deliberately: the gate re-resolves the same
+# values itself from the same env, via the same lib.sh helpers. No RUN_ID here —
+# `start` is what PINS the config, so the ambient CONFIG is the right binding.
 bash "$ROOT/scripts/dogfood/require-preflight.sh" || exit 1
 
 SECTION="${SECTION:?set SECTION (e.g. §3A.1)}"

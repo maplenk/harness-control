@@ -21,12 +21,20 @@ LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"; mkdir -p "$LOGDIR"
 CLI=(node "$ROOT/dist/cli/index.js")
 . "$ROOT/scripts/dogfood/lib.sh"
 
+# Independent containment refusal (also enforced by preflight and the gate): the
+# CLI is about to write harness.db and artifacts into $HARNESS_HOME, and that
+# must not be inside the repo.
+CONTAINMENT="$(dogfood_require_containment "$ROOT" "$HARNESS_HOME" "$LOGDIR")" || { echo "!! ${CONTAINMENT#!}" >&2; exit 1; }
+
 # L11 ENFORCEMENT: approve+run is where the real money and the real worktree
 # commits happen — refuse without a fresh PASSING preflight: same HEAD, same
 # DIST DIGEST (dist/ is gitignored and mutable, so the commit alone does not
-# identify what we are about to execute), same toolchain, same resolved roles
-# and config, <30 min old. "diagnostic" records (SKIP_BUILD=1) are rejected too.
-bash "$ROOT/scripts/dogfood/require-preflight.sh" || exit 1
+# identify what we are about to execute), same toolchain, same resolved roles,
+# same store/log, valid attempt claim, <30 min old. "diagnostic" records
+# (SKIP_BUILD=1) are rejected too. The RUN_ID is passed so the gate binds the
+# config the run ACTUALLY executes on (persisted at `start`) rather than whatever
+# $CONFIG happens to say now — the CLI ignores $CONFIG at `run`.
+bash "$ROOT/scripts/dogfood/require-preflight.sh" "${1:-}" || exit 1
 
 RUN_ID="${1:?usage: run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH}"
 SPEC_VERSION="${2:?spec version id required}"
