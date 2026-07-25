@@ -267,12 +267,9 @@ function tokenizeShellSegment(segment: string): readonly ShellToken[] | undefine
 function stripSafeRedirections(tokens: readonly ShellToken[]): readonly string[] | undefined {
   const argv: string[] = [];
   for (const token of tokens) {
-    if (!token.quoted && !token.unquotedRedirect && SAFE_NULL_REDIRECTIONS.has(token.value)) {
-      // Unreachable in practice (an allowlisted form contains `>`, so the flag is
-      // set) — kept so the "entirely unquoted, exactly allowlisted" reading holds
-      // if the allowlist ever gains a redirection-free entry.
-      continue;
-    }
+    // Q26: only a token that CARRIES a redirection operator is a candidate for
+    // being dropped. A hypothetical redirection-free allowlist entry must reach
+    // `argv` as the ordinary argument it is, never be silently stripped.
     if (token.unquotedRedirect) {
       if (!token.quoted && SAFE_NULL_REDIRECTIONS.has(token.value)) continue;
       return undefined;
@@ -388,25 +385,27 @@ export function grokRawShellCommand(rawInput: unknown): string | undefined {
 }
 
 /**
- * HIGH-5 — the AUTHORIZATION entry point the permission policy wires (as opposed
- * to `isGrokReadOnlyShellPermissionTitle`, which is the pure classifier).
+ * HIGH-5 — the payload VETO the permission policy wires as
+ * `verifyOperationPayload`. It is consulted before EVERY approval the mediator
+ * can grant, which is the whole point: binding the title to the payload INSIDE
+ * the read-only classifier left the exact-allowlist path (checked first)
+ * approving `Execute \`npm run typecheck\`` with a missing or hostile payload.
  *
  * A permission TITLE is human-readable prose the provider composes; ACP
- * `rawInput` is the payload it EXECUTES. Classifying only the title authorizes a
- * string that nothing runs — a provider (or anything able to shape a tool call)
- * could present `Execute \`ls\`` while `rawInput.command` is `rm -rf /`. So the
- * command recovered from `rawInput` must be BYTE-IDENTICAL to the one embedded
- * in the title, and only then is it classified.
+ * `rawInput` is the payload it EXECUTES. A provider — or anything able to shape
+ * a tool call — could present `Execute \`ls\`` while `rawInput.command` is
+ * `rm -rf /`. For a SHELL title the two must be BYTE-IDENTICAL.
  *
- * Fail-closed on every gap: absent `rawInput`, a non-object, a missing/non-string
- * `command`, or any divergence from the title → false.
+ * Returns true for a NON-shell operation (a structured `Write`/`Edit` title):
+ * there is no shell payload to bind, and the workspace-write rule adjudicates
+ * those on the path itself. Fail-closed for shell titles on every gap: absent
+ * `rawInput`, a non-object, a missing/non-string `command`, or any divergence.
  */
-export function isGrokReadOnlyShellToolCall(operation: string, rawInput: unknown): boolean {
+export function grokShellPayloadMatchesTitle(operation: string, rawInput: unknown): boolean {
   const titled = commandFromPermissionTitle(operation);
-  if (titled === undefined) return false;
+  if (titled === undefined) return true; // not a shell operation — nothing to bind
   const executed = grokRawShellCommand(rawInput);
-  if (executed === undefined || executed !== titled) return false;
-  return isGrokReadOnlyShellPermissionTitle(operation);
+  return executed !== undefined && executed === titled;
 }
 
 export interface ResolvedGrokCommand {

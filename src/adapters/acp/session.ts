@@ -107,15 +107,29 @@ export interface HeadlessPermissionPolicy {
    * proven read-only after parsing. The harness supplies this only for Grok's
    * implementor `Execute` requests; a false result or throw is a denial.
    *
-   * HIGH-5: it receives the tool call's `rawInput` as well as the title,
-   * because the TITLE is human-readable prose while `rawInput` is what the
-   * provider actually EXECUTES. Classifying the title alone authorizes a string
-   * nothing runs. The parameter is REQUIRED (not optional) precisely so no
-   * caller can classify without it; an implementation that cannot recover a
-   * command from `rawInput`, or finds one that differs from the title's, must
-   * return false.
+   * Title-only by design: binding the title to the EXECUTED payload is
+   * `verifyOperationPayload`'s job, because that binding must gate every
+   * approval path, not just this one.
    */
-  readonly allowReadOnlyOperation?: (operation: string, rawInput: unknown) => boolean;
+  readonly allowReadOnlyOperation?: (operation: string) => boolean;
+  /**
+   * HIGH-5 — a VETO consulted before EVERY `allow` this function can return.
+   *
+   * A permission TITLE is human-readable prose the provider composes; ACP
+   * `rawInput` is the payload it EXECUTES. Approving on the title alone
+   * authorizes a string nothing runs. The first attempt at this bound the two
+   * INSIDE `allowReadOnlyOperation` — which left the exact-allowlist match,
+   * checked FIRST, approving `Execute \`npm run typecheck\`` with a missing or
+   * hostile payload and never consulting the binding at all. (The verifier
+   * legitimately keeps exact per-criterion allowlisted commands, so that path
+   * has to be sound on its own.)
+   *
+   * Return false to REFUSE an approval that would otherwise be granted; a THROW
+   * is likewise a refusal. Return true for operations with no payload to bind
+   * (structured `Write`/`Edit` titles), so the veto never denies them for
+   * lacking a shell command.
+   */
+  readonly verifyOperationPayload?: (operation: string, rawInput: unknown) => boolean;
   /**
    * Optional canonical workspace boundary for structured path-qualified
    * `Write` / `Edit` operations. Shell-shaped or unparseable operations never
@@ -149,7 +163,10 @@ export type PermissionDecisionReason =
   | 'allowlisted_workspace_write'
   | 'denied_default'
   | 'denied_unknown_operation'
-  | 'denied_role_write';
+  | 'denied_role_write'
+  /** HIGH-5: the operation would otherwise have been approved, but the payload
+   * the provider will actually EXECUTE could not be bound to its title. */
+  | 'denied_raw_input_mismatch';
 
 export interface PermissionDecision {
   readonly action: 'allow' | 'deny' | 'interactive';
@@ -237,12 +254,26 @@ export function decidePermission(
   if (operation === undefined || operation.trim() === '') {
     return { action: 'deny', reason: 'denied_unknown_operation' };
   }
+  // HIGH-5: the payload binding gates EVERY approval below — allowlist included.
+  // Evaluated once, here, so no future approval path can be added that forgets
+  // it. A throw is a refusal: a veto that cannot run must never widen a decision.
+  let payloadVetoed = false;
+  if (config.policy?.verifyOperationPayload !== undefined) {
+    try {
+      payloadVetoed = config.policy.verifyOperationPayload(operation, rawInput) !== true;
+    } catch {
+      payloadVetoed = true;
+    }
+  }
+  const approve = (reason: PermissionDecisionReason): PermissionDecision =>
+    payloadVetoed ? { action: 'deny', reason: 'denied_raw_input_mismatch' } : { action: 'allow', reason };
+
   if ((config.policy?.allow ?? []).includes(operation)) {
-    return { action: 'allow', reason: 'allowlisted' };
+    return approve('allowlisted');
   }
   try {
-    if (config.policy?.allowReadOnlyOperation?.(operation, rawInput) === true) {
-      return { action: 'allow', reason: 'allowlisted_read_only_operation' };
+    if (config.policy?.allowReadOnlyOperation?.(operation) === true) {
+      return approve('allowlisted_read_only_operation');
     }
   } catch {
     // A classifier failure must never widen a headless permission decision.
@@ -252,7 +283,7 @@ export function decidePermission(
     config.policy?.workspaceWriteRoot !== undefined &&
     isWorkspaceWriteOperation(operation, config.policy.workspaceWriteRoot)
   ) {
-    return { action: 'allow', reason: 'allowlisted_workspace_write' };
+    return approve('allowlisted_workspace_write');
   }
   return { action: 'deny', reason: 'denied_default' };
 }

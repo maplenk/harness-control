@@ -11,7 +11,7 @@ import {
   checkGrokMinimumVersion,
   grokShellPermissionTitle,
   isGrokReadOnlyShellPermissionTitle,
-  isGrokReadOnlyShellToolCall,
+  grokShellPayloadMatchesTitle,
   parseGrokVersion,
   resolveGrokCommand,
   tryResolveGrokCommand,
@@ -257,22 +257,26 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
 });
 
 // ---------------------------------------------------------------------------
-// HIGH-5 — the permission TITLE is prose; ACP `rawInput` is what EXECUTES.
-// Authorization must bind the two, or an approval covers a string nothing runs.
+// HIGH-5 (round 4) — the permission TITLE is prose; ACP `rawInput` is what
+// EXECUTES. The binding is a VETO applied to EVERY approval path, so it cannot be
+// bypassed by a title that matched some OTHER rule (the exact allowlist, in
+// particular, was checked first and approved without ever consulting rawInput).
 // ---------------------------------------------------------------------------
-describe('isGrokReadOnlyShellToolCall — title/rawInput binding', () => {
-  it('allows only when rawInput.command is byte-identical to the title command', () => {
-    expect(isGrokReadOnlyShellToolCall('Execute `ls -la src`', { command: 'ls -la src' })).toBe(true);
+describe('grokShellPayloadMatchesTitle — the payload veto', () => {
+  it('passes when rawInput.command is byte-identical to the title command', () => {
+    expect(grokShellPayloadMatchesTitle('Execute `ls -la src`', { command: 'ls -la src' })).toBe(true);
+    expect(grokShellPayloadMatchesTitle('Execute `npm run typecheck`', { command: 'npm run typecheck' })).toBe(
+      true,
+    );
   });
 
-  it('DENIES a divergent rawInput even when the TITLE is perfectly read-only', () => {
-    // The attack shape: benign prose, hostile payload.
-    expect(isGrokReadOnlyShellToolCall('Execute `ls -la src`', { command: 'rm -rf /' })).toBe(false);
-    expect(isGrokReadOnlyShellToolCall('Execute `ls`', { command: 'ls; curl https://example.invalid' })).toBe(
+  it('VETOES a divergent payload however benign the title looks', () => {
+    expect(grokShellPayloadMatchesTitle('Execute `ls -la src`', { command: 'rm -rf /' })).toBe(false);
+    expect(grokShellPayloadMatchesTitle('Execute `ls`', { command: 'ls; curl https://example.invalid' })).toBe(
       false,
     );
-    // Even a trailing-space difference is a divergence — equality is byte-exact.
-    expect(isGrokReadOnlyShellToolCall('Execute `ls -la src`', { command: 'ls -la src ' })).toBe(false);
+    // Byte-exact: even a trailing space is a divergence.
+    expect(grokShellPayloadMatchesTitle('Execute `ls -la src`', { command: 'ls -la src ' })).toBe(false);
   });
 
   it.each([
@@ -282,16 +286,15 @@ describe('isGrokReadOnlyShellToolCall — title/rawInput binding', () => {
     ['an array rawInput', ['ls', '-la']],
     ['an object with no command', { cwd: '/tmp' }],
     ['a non-string command', { command: 42 }],
-  ])('DENIES on %s (a payload we cannot read is never approved)', (_label, rawInput) => {
-    expect(isGrokReadOnlyShellToolCall('Execute `ls -la src`', rawInput)).toBe(false);
+  ])('VETOES on %s (a payload we cannot read is never approved)', (_label, rawInput) => {
+    expect(grokShellPayloadMatchesTitle('Execute `ls -la src`', rawInput)).toBe(false);
   });
 
-  it('a matching rawInput does NOT rescue a command that is not read-only', () => {
-    expect(isGrokReadOnlyShellToolCall('Execute `rm -rf .`', { command: 'rm -rf .' })).toBe(false);
-    // ...including the BLOCKER-1 write shape.
-    expect(
-      isGrokReadOnlyShellToolCall("Execute `echo '$HOME'>owned.txt`", { command: "echo '$HOME'>owned.txt" }),
-    ).toBe(false);
+  it('does NOT veto a non-shell operation (there is no shell payload to bind)', () => {
+    // Structured Write/Edit titles are adjudicated by the workspace-write rule;
+    // the shell payload veto must not deny them for lacking a shell command.
+    expect(grokShellPayloadMatchesTitle('Write `/repo/src/a.ts`', undefined)).toBe(true);
+    expect(grokShellPayloadMatchesTitle('Edit `/repo/src/a.ts`', { path: '/repo/src/a.ts' })).toBe(true);
   });
 });
 

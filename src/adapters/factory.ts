@@ -114,7 +114,8 @@ import {
   buildGrokCapabilityRecord,
   classifyGrokError,
   grokShellPermissionTitle,
-  isGrokReadOnlyShellToolCall,
+  grokShellPayloadMatchesTitle,
+  isGrokReadOnlyShellPermissionTitle,
   prepareGrokHomeIsolation,
   probeGrokAuthReadiness,
   type PreparedGrokHome,
@@ -581,11 +582,12 @@ export function createGrokBuildAcpAdapter(
                 ...(options.allowedShellCommands ?? []).map(grokShellPermissionTitle),
               ]),
             ],
-            // HIGH-5: the AUTHORIZATION entry point, which requires the tool
-            // call's `rawInput.command` to be byte-identical to the command in
-            // the human-readable title before classifying it. Wiring the pure
-            // title classifier here would authorize a string nothing executes.
-            allowReadOnlyOperation: isGrokReadOnlyShellToolCall,
+            allowReadOnlyOperation: isGrokReadOnlyShellPermissionTitle,
+            // HIGH-5: the payload VETO, applied to EVERY approval path (the exact
+            // allowlist included — that is the path the first attempt missed). A
+            // shell title is approved only when `rawInput.command` is
+            // byte-identical to the command the title displays.
+            verifyOperationPayload: grokShellPayloadMatchesTitle,
             workspaceWriteRoot: cwd,
           },
         }

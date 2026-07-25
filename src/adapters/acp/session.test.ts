@@ -188,6 +188,92 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     });
   });
 
+  // -------------------------------------------------------------------------
+  // HIGH-5 (round 4) — the payload veto gates EVERY approval path.
+  //
+  // The exact-allowlist match ran BEFORE the raw-input classifier, so an
+  // allowlisted title was approved with a missing or hostile payload and the
+  // binding never ran at all. The verifier legitimately keeps exact
+  // per-criterion allowlisted commands, so this path has to be sound on its own
+  // — it cannot lean on the implementor's allowlist being empty.
+  // -------------------------------------------------------------------------
+  describe('verifyOperationPayload — the veto applies to every allow', () => {
+    const shellTitle = 'Execute `npm run typecheck`';
+    /** Byte-identity between the title's command and the payload's. */
+    const verifyOperationPayload = (operation: string, rawInput: unknown): boolean => {
+      const match = /^Execute `(.+)`$/.exec(operation);
+      if (match === null) return true; // not a shell operation: nothing to bind
+      const command = (rawInput as { command?: unknown } | null | undefined)?.command;
+      return typeof command === 'string' && command === match[1];
+    };
+
+    it('VETOES an ALLOWLISTED title whose payload is missing or hostile', () => {
+      const policy = { mode: 'headless', policy: { allow: [shellTitle], verifyOperationPayload } } as const;
+      // The regression: allowlisted + no payload used to be `allow/allowlisted`.
+      expect(decidePermission(policy, shellTitle, undefined)).toEqual({
+        action: 'deny',
+        reason: 'denied_raw_input_mismatch',
+      });
+      expect(decidePermission(policy, shellTitle, { command: 'rm -rf /' })).toEqual({
+        action: 'deny',
+        reason: 'denied_raw_input_mismatch',
+      });
+      // ...and the honest call still passes.
+      expect(decidePermission(policy, shellTitle, { command: 'npm run typecheck' })).toEqual({
+        action: 'allow',
+        reason: 'allowlisted',
+      });
+    });
+
+    it('VETOES a READ-ONLY-classified title whose payload diverges', () => {
+      const policy = {
+        mode: 'headless',
+        policy: { allow: [], allowReadOnlyOperation: () => true, verifyOperationPayload },
+      } as const;
+      expect(decidePermission(policy, 'Execute `ls`', { command: 'rm -rf /' })).toEqual({
+        action: 'deny',
+        reason: 'denied_raw_input_mismatch',
+      });
+      expect(decidePermission(policy, 'Execute `ls`', { command: 'ls' })).toEqual({
+        action: 'allow',
+        reason: 'allowlisted_read_only_operation',
+      });
+    });
+
+    it('VETOES a WORKSPACE-WRITE approval too (no approval path is exempt)', () => {
+      const policy = {
+        mode: 'headless',
+        role: 'implementor',
+        policy: { allow: [], workspaceWriteRoot: '/repo', verifyOperationPayload: () => false },
+      } as const;
+      expect(decidePermission(policy, 'Write `/repo/src/a.ts`', undefined).action).toBe('deny');
+    });
+
+    it('a THROWING veto is a denial, never a pass', () => {
+      const policy = {
+        mode: 'headless',
+        policy: {
+          allow: [shellTitle],
+          verifyOperationPayload: (): boolean => {
+            throw new Error('classifier exploded');
+          },
+        },
+      } as const;
+      expect(decidePermission(policy, shellTitle, { command: 'npm run typecheck' })).toEqual({
+        action: 'deny',
+        reason: 'denied_raw_input_mismatch',
+      });
+    });
+
+    it('no veto configured leaves every existing decision untouched', () => {
+      const policy = { mode: 'headless', policy: { allow: [shellTitle] } } as const;
+      expect(decidePermission(policy, shellTitle, undefined)).toEqual({
+        action: 'allow',
+        reason: 'allowlisted',
+      });
+    });
+  });
+
   it('admits only trusted read-only classifier matches and fails closed when it throws', () => {
     const allowReadOnlyOperation = (operation: string): boolean => operation === 'safe inspection';
     const policy = {

@@ -570,7 +570,21 @@ describe('provider adapter factory — composed initialize() over the fake wire 
               response: { stopReason: 'end_turn' },
             },
             {
-              permission: { toolTitle: 'Execute `npm run typecheck`' },
+              // HIGH-5: an ALLOWLISTED title still has to carry the payload it will
+              // execute. This turn used to omit rawInput and be approved anyway —
+              // the exact-allowlist match ran before the binding.
+              permission: {
+                toolTitle: 'Execute `npm run typecheck`',
+                rawInput: { command: 'npm run typecheck' },
+              },
+              response: { stopReason: 'end_turn' },
+            },
+            {
+              // ...and the same allowlisted title with a HOSTILE payload is denied.
+              permission: {
+                toolTitle: 'Execute `npm run typecheck`',
+                rawInput: { command: 'rm -rf /' },
+              },
               response: { stopReason: 'end_turn' },
             },
           ],
@@ -617,6 +631,9 @@ describe('provider adapter factory — composed initialize() over the fake wire 
       await expect(
         created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'self-check' }),
       ).resolves.toMatchObject({ stopReason: 'end_turn' });
+      await expect(
+        created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'self-check, hostile payload' }),
+      ).resolves.toMatchObject({ stopReason: 'end_turn' });
       expect(created.adapter.permissionDecisions).toEqual([
         expect.objectContaining({
           operation: `Write \`${target}\``,
@@ -638,6 +655,12 @@ describe('provider adapter factory — composed initialize() over the fake wire 
           operation: 'Execute `npm run typecheck`',
           action: 'allow',
           reason: 'allowlisted',
+        }),
+        // HIGH-5: the SAME allowlisted title, hostile payload -> denied.
+        expect.objectContaining({
+          operation: 'Execute `npm run typecheck`',
+          action: 'deny',
+          reason: 'denied_raw_input_mismatch',
         }),
       ]);
     },
@@ -694,12 +717,12 @@ describe('provider adapter factory — composed initialize() over the fake wire 
         expect.objectContaining({
           operation: 'Execute `ls -la src`',
           action: 'deny',
-          reason: 'denied_default',
+          reason: 'denied_raw_input_mismatch',
         }),
         expect.objectContaining({
           operation: 'Execute `ls -la src`',
           action: 'deny',
-          reason: 'denied_default',
+          reason: 'denied_raw_input_mismatch',
         }),
       ]);
     },
