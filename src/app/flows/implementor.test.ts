@@ -300,6 +300,31 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
     // that adds/reorders prompt rules cannot break this. It must also stay scoped
     // to INSPECTION: the prompt separately forbids using the shell to change
     // files or self-verify, and this guidance must not read as widening that.
+    // MERGE COHERENCE: no Hard Rule may GRANT what another FORBIDS. The shell
+    // rule once also granted "the exact declared verification commands below",
+    // which contradicts the (main-side) rule reserving verification for the host
+    // — a prompt that both permits and forbids the same act is worse than either
+    // rule alone, because the agent obeys whichever it reads last.
+    //
+    // Written to hold on BOTH sides of the pending rebase: this branch carries
+    // zero such statements, main's b9ca10c adds exactly one (a prohibition), and
+    // the merged prompt must never carry two or contain a grant.
+    const hardRulesSection = prompt.slice(prompt.indexOf('## Hard Rules'));
+    const hardRules = hardRulesSection
+      .slice(0, hardRulesSection.indexOf('\n## '))
+      .split('\n')
+      .filter((line) => line.startsWith('- '));
+    expect(hardRules.length).toBeGreaterThan(0);
+    const verificationRules = hardRules.filter((line) =>
+      /verification command|verification\/build\/test|declared verification/i.test(line),
+    );
+    expect(verificationRules.length).toBeLessThanOrEqual(1);
+    // No rule may GRANT execution of the verification commands, in any wording.
+    for (const rule of hardRules) {
+      expect(rule).not.toMatch(/shell access is limited to[^.]*verification/i);
+      expect(rule).not.toMatch(/(may|can|should|are allowed to) run the (declared )?verification/i);
+    }
+
     const quotingLine = prompt.split('\n').find((line) => line.includes('single-quote pattern/regex arguments'));
     expect(quotingLine).toBeDefined();
     expect(quotingLine).toMatch(/inspecting the repository/i);

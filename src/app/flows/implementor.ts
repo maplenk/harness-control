@@ -831,7 +831,15 @@ export function buildImplementorPrompt(context: ImplementorContext, cwd: string)
     '## Hard Rules (read first)',
     `- You may create, modify, or delete files ONLY inside your assigned worktree: ${cwd}. Never write outside it.`,
     '- Use structured repository tools (Read, Grep/Glob, Write, and Edit) for inspection and file changes. Structured Write can create missing parent directories.',
-    '- Shell access is limited to read-only repository inspection and the exact declared verification commands below. Do NOT use shell commands such as mkdir, cp, mv, rm, touch, network clients, executable preprocessors, or output redirection to scaffold or change files. If structured tools cannot perform a needed action, report that blocker instead of requesting broader shell access.',
+    // MERGE COHERENCE: this rule used to also grant "and the exact declared
+    // verification commands below", which directly contradicts main's separate
+    // rule forbidding the implementor from running verification itself (the host
+    // runs those independently). A prompt that both grants and forbids the same
+    // act is worse than either rule alone — the agent obeys whichever it reads
+    // last. The clause is removed: shell is read-only INSPECTION only, and the
+    // merged rule set carries exactly one statement about executing verification
+    // commands. `buildImplementorPrompt`'s test asserts that invariant.
+    '- Shell access is limited to read-only repository inspection. Do NOT use shell commands such as mkdir, cp, mv, rm, touch, network clients, executable preprocessors, or output redirection to scaffold or change files. If structured tools cannot perform a needed action, report that blocker instead of requesting broader shell access.',
     // F11: the read-only shell classifier can only reason about a command whose
     // expansion-bearing bytes are inside SINGLE quotes (where the shell performs
     // none). Telling the agent the rule up front turns a would-be permission
