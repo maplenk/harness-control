@@ -305,11 +305,18 @@ export interface WorktreeFactsState {
    * (which is exactly that later round's durable commit). Absent until the first
    * implementor round completes.
    */
+  /**
+   * F13: deliberately carries NO host-verification verdict. A provisioning
+   * failure is evidence about the attempt that failed, never about a later
+   * one, and the verify boundary re-provisions unconditionally and fails
+   * closed — so the current attestation is always derivable there. Persisting
+   * a verdict let a superseded negative outlive its attempt and force every
+   * command-bearing criterion `unproven` on a resume whose tree had just been
+   * re-proven.
+   */
   readonly lastImplementationCommit?: {
     readonly round: number;
     readonly commit: GitSha;
-    /** F13 step 1: host-observed command result for this exact round/commit. */
-    readonly verificationPassed: boolean;
   };
 }
 

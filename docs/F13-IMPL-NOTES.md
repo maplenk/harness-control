@@ -327,6 +327,93 @@ longer forwards the runner to the implementor.
   where the §16 readiness probe — which runs after the receipts — catches the
   dirt and names the file.
 
+## Round 2 — codex adversarial review of the merge (`07d4af0`): 3 blockers
+
+The F13 side, the once-per-round execution, and all three claimed interactions
+were confirmed. Three merge-blocking findings, all in code this merge
+introduced, all fixed regression-first.
+
+### BLOCKER 1 — detection was preserved, SEVERITY was not
+
+I correctly saw that F8's command-authorship vector had moved past
+adjudication, and added a worktree-HEAD check. But I reported it as an ordinary
+`runnerViolation`, which means blocked verification — and the loop then advances
+into another same-process implementation round with **no `discardToCommit`**.
+That round's commit descends from the command-authored commit, making it an
+ancestor of the delivered work: exactly the laundering F8 spent a full round
+refusing, downgraded to a soft signal.
+
+On main this threw `NoDeliverableError` immediately. The fix restores that
+severity at the new boundary. `executeEvidenceReceiptsUnderConfinement` now
+reports `authoredCommit` separately from `runnerViolation`, and the loop raises
+the new typed `VerificationAuthoredCommitError` — after the durable incident is
+recorded, so the audit trail survives the throw. No remediation path is kept, so
+the "must `discardToCommit` first" alternative does not arise.
+
+**The severity split is the point** and is asserted in both directions: a
+primary-checkout escape carries no `authoredCommit` and stays a blocking
+violation; only an authored commit hard-stops. Conflating them is what caused
+this.
+
+The hard stop is deliberately a direct HEAD comparison, **not** a §16 readiness
+probe result: that probe only runs on the all-verified path, so it would not
+fire for a round that is already failing.
+
+Regression (`vertical-slice.test.ts`): asserts the loop throws
+`VerificationAuthoredCommitError`, that exactly ONE implementor ran, that HEAD
+still equals the authored commit (nothing descended from it), and that the
+incident was recorded anyway. Proven to discriminate by flipping the assertions
+to the pre-fix expectations (run continues, two implementors, HEAD advanced) and
+confirming they fail.
+
+### BLOCKER 2 — a CAS failure could mask a confinement violation
+
+The commands run BEFORE the three evidence writes (stdout, stderr, receipt
+body). A §12.1 quota rejection or CAS failure threw straight past drift
+detection, so a primary-checkout mutation the command had **already made** went
+unrecorded, and a later retry would baseline the mutated checkout. This is the
+masking family F8 spent four rounds on, reappearing at the boundary this merge
+created.
+
+Fixed by capturing the execution error instead of propagating it: both guards
+now always run, and the caller records any violation FIRST, then fails the round
+on the original cause. Regression drives an evidence recorder that throws while
+the runner escapes into the primary, and asserts the violation still surfaces
+and the original error is reported rather than swallowed.
+
+### BLOCKER 3 — a superseded provisioning failure outlived its attempt
+
+A round whose first provisioning attempt failed persisted
+`verificationPassed:false`. On resume — with the unconditional verify-boundary
+provisioning succeeding AND current receipts passing — that stale negative still
+forced every command-bearing criterion to `unproven`. A negative about a
+superseded attempt is not evidence about the current one; this is the
+indeterminate-becomes-refusal class, in F13's territory.
+
+Fixed at the root rather than by re-scoping the lookup: **the persisted record
+no longer carries a host verdict at all.** `hostVerificationPassed` is now
+derived where the truth is, immediately after the verify boundary's
+unconditional, fail-closed provisioning succeeds — which is reached on every
+entry (fresh, remediation, resume, failover, auto-respawn). There are now
+exactly three assignments: `false` at declaration, `true` on proven
+provisioning, `false` on a confinement violation. `persistedHostVerificationPassed`
+is gone.
+
+The regression asserts the durable record's keys are exactly `{round, commit}` —
+a tripwire if a host verdict is ever persisted there again — and that the resume
+reaches `merge_ready` with every criterion `passed`.
+
+### Noted, not blocking
+
+`runImplementor` invoked directly now runs zero declared commands. There is no
+production callsite that relies on it doing so (the loop is the only caller, and
+it delegates execution to the receipts), but it is a module-level behaviour
+change for anyone driving the flow directly — the flow commits and provisions,
+and command execution belongs to the verify boundary.
+
+Also unchanged and accepted: receipts consume CAS quota per command per round,
+which is F13's intended cost.
+
 ## Green bar after the merge
 
 ```text
@@ -334,7 +421,7 @@ $ npm run typecheck
 exit 0
 
 $ npx vitest run
-Tests  1991 passed, 0 failed
+Tests  1994 passed, 0 failed   (1991 at 07d4af0, +3 blocker regressions)
 ```
 
 Main alone was 1945; F13 alone was 1743 on its older base. The +46 over main is

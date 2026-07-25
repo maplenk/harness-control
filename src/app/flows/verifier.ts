@@ -221,9 +221,25 @@ export async function executeEvidenceReceipts(
 
 export interface ConfinedReceiptExecution {
   readonly receipts: readonly EvidenceReceipt[];
-  /** W3-1: the primary checkout mutated across the declared commands — typed
-   * proof of a confinement violation. */
+  /** W3-1: the primary checkout mutated across the declared commands, or a
+   * command authored a commit in the worktree — typed proof of a violation. */
   readonly runnerViolation?: VerificationRunnerViolation;
+  /** F8 authorship: set when the violation is a command-AUTHORED commit. The
+   * caller must HARD-STOP the round on this rather than treating it as an
+   * ordinary blocked verification — see `authoredCommit` handling in
+   * `runImplementVerifyLoop`. */
+  readonly authoredCommit?: { readonly before: GitSha; readonly after: GitSha };
+  /**
+   * The evidence-write path threw (a §12.1 quota rejection or a CAS failure).
+   *
+   * Reported rather than propagated so the confinement guards below CANNOT be
+   * skipped by it. A throw out of the execution path used to jump straight
+   * past drift detection, so a quota failure MASKED a primary-checkout
+   * mutation: no incident recorded, and a later retry would baseline the
+   * already-mutated checkout. The caller records any violation FIRST, then
+   * rethrows this.
+   */
+  readonly executionError?: unknown;
 }
 
 /**
@@ -243,15 +259,38 @@ export interface ConfinedReceiptExecution {
  *    verifier's binding. That adjudication happens before this point, so it can
  *    no longer see the vector: the commands run HERE now, against an
  *    already-bound commit. Verification commands observe; they do not author.
+ *    Reported as `authoredCommit` so the caller can hard-stop at F8's original
+ *    severity instead of treating it as an ordinary blocked verification.
+ *
+ * Neither guard may be skipped by a failure in the evidence-write path: the
+ * execution error is CAPTURED and returned, not propagated, so a quota
+ * rejection or CAS failure cannot mask a confinement violation the commands
+ * already caused.
  */
 export async function executeEvidenceReceiptsUnderConfinement(
   input: ExecuteEvidenceReceiptsInput & { readonly repoRoot: string },
 ): Promise<ConfinedReceiptExecution> {
   const primaryBefore = await snapshotPrimaryCheckoutState(input.repoRoot);
   const worktreeHeadBefore = await git.resolveSha(input.cwd, 'HEAD');
-  const receipts = await executeEvidenceReceipts(input);
+
+  let receipts: readonly EvidenceReceipt[] = [];
+  let executionError: unknown;
+  let threw = false;
+  try {
+    receipts = await executeEvidenceReceipts(input);
+  } catch (error) {
+    // Captured, NOT rethrown here: the commands may already have run and
+    // mutated something, and the guards below are the only things that would
+    // notice. The caller rethrows this after recording any violation.
+    executionError = error;
+    threw = true;
+  }
+  const failure = threw ? { executionError } : {};
+
   const primaryViolation = await detectPrimaryCheckoutDrift(input.repoRoot, primaryBefore);
-  if (primaryViolation !== undefined) return { receipts, runnerViolation: primaryViolation };
+  if (primaryViolation !== undefined) {
+    return { receipts, runnerViolation: primaryViolation, ...failure };
+  }
 
   // Escaping to the primary is the more severe finding, so it is reported
   // first; this catches the command that stayed inside the worktree but
@@ -272,9 +311,11 @@ export async function executeEvidenceReceiptsUnderConfinement(
             'the bound implementation commit, never author one',
         ),
       },
+      authoredCommit: { before: gitSha(worktreeHeadBefore), after: gitSha(worktreeHeadAfter) },
+      ...failure,
     };
   }
-  return { receipts };
+  return { receipts, ...failure };
 }
 
 /**

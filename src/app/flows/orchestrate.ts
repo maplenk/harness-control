@@ -111,6 +111,35 @@ export class LoopCompositionError extends Error {
 export { NoDeliverableError } from '../service.js';
 
 /**
+ * F8 authorship, enforced at the verify boundary: a declared verification
+ * command created a commit in the worktree.
+ *
+ * A HARD STOP, matching the severity main enforced when these commands still
+ * ran inside the implementor round and its adjudicator threw `NoDeliverableError`
+ * on the receipt/HEAD disagreement. The round must not continue into
+ * remediation: a subsequent implementation round would commit ON TOP of the
+ * command-authored commit, making it an ancestor of the delivered work and
+ * laundering exactly what F8 refused. Verification commands observe the bound
+ * implementation commit; they never author one.
+ */
+export class VerificationAuthoredCommitError extends Error {
+  override readonly name: string = 'VerificationAuthoredCommitError';
+  constructor(
+    readonly assignmentId: AssignmentId,
+    readonly round: number,
+    readonly boundCommit: GitSha,
+    readonly authoredCommit: GitSha,
+  ) {
+    super(
+      `a declared verification command authored a commit in assignment ${String(assignmentId)} ` +
+        `round ${round}: the worktree moved from the bound implementation commit ${String(boundCommit)} ` +
+        `to ${String(authoredCommit)}. Verification commands must observe the bound commit, never ` +
+        'author one; the round is refused rather than remediated so nothing can descend from it.',
+    );
+  }
+}
+
+/**
  * F2: adjudicate an implementor round's deliverable — called by `runRole` at
  * round completion (ATOMIC with the stage write). A round delivers nothing it
  * stands behind when its turn ended ABNORMALLY (any non-`end_turn` stop:
@@ -800,21 +829,18 @@ export async function runImplementVerifyLoop(
         // for an implementor round before this point.
         implementationCommit =
           adjudicatedHead ?? gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
-        // F13: carry the host-observed verification result for THIS round, keyed
-        // below on the adjudicated binding above — so the round/commit pair the
-        // resume path re-matches is the receipt-proven one, not a mutable read.
-        hostVerificationPassed = implementation.verificationPassed;
-        // F7 (#1): PERSIST this host-verified implementation commit (ROUND-SCOPED)
-        // BEFORE the fail-closed break so a completed implementor round that later
-        // RESUMES (re-entering at verification) resets the adopted worktree to EXACTLY
+        // F7 (#1): PERSIST this implementation commit (ROUND-SCOPED) BEFORE the
+        // fail-closed break so a completed implementor round that later RESUMES
+        // (re-entering at verification) resets the adopted worktree to EXACTLY
         // it — never WIP-committing post-commit dirt onto a new, unadjudicated HEAD.
-        recordImplementationCommit(
-          deps,
-          input,
-          round,
-          implementationCommit,
-          hostVerificationPassed,
-        );
+        //
+        // Deliberately NO host verdict travels with it. A provisioning failure is
+        // evidence about the attempt that failed, not about any later one, and
+        // the verify boundary below re-provisions unconditionally and fails
+        // closed. Persisting a negative let a superseded attempt outlive itself
+        // and force every command-bearing criterion `unproven` on a resume whose
+        // tree had just been re-proven.
+        recordImplementationCommit(deps, input, round, implementationCommit);
 
         // F7 (§2.4) FAIL CLOSED: the implementor's post-commit provisioning could
         // not be proven, so its self-check runner was already skipped. HALT the
@@ -845,12 +871,6 @@ export async function runImplementVerifyLoop(
         // cross-process path (`adoptWorktree` already discarded to this commit).
         await worktrees.discardToCommit(input.assignmentId, boundCommit);
         implementationCommit = boundCommit;
-        hostVerificationPassed = persistedHostVerificationPassed(
-          service,
-          input.runId,
-          round,
-          implementationCommit,
-        );
         if (worktrees.handleFor(input.assignmentId)?.leased === true) {
           worktrees.releaseLease(input.assignmentId); // the verifier reads, never writes
         }
@@ -863,16 +883,6 @@ export async function runImplementVerifyLoop(
         // always forces on this path, so the fallback is defensive only.
         implementationCommit =
           adoptedBinding ?? gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
-        // F13: the persisted host result is carried ONLY on an exact round/commit
-        // match. Keying it on the receipt-derived binding above (rather than a
-        // re-read HEAD) is what makes that match deterministic — the same commit
-        // the live path recorded it against.
-        hostVerificationPassed = persistedHostVerificationPassed(
-          service,
-          input.runId,
-          round,
-          implementationCommit,
-        );
         if (worktrees.handleFor(input.assignmentId)?.leased === true) {
           worktrees.releaseLease(input.assignmentId);
         }
@@ -896,6 +906,14 @@ export async function runImplementVerifyLoop(
             ? provisioned.fingerprint
             : 'operator-managed'
         }`;
+        // F13: THIS is the host attestation the §16 gate consumes, and it is
+        // derived from the tree that was just proven — never from a verdict a
+        // previous attempt persisted. Provisioning here is unconditional and
+        // fails closed (the `catch` below halts the round), so reaching this
+        // line IS the proof for this round, on every entry: fresh, remediation,
+        // resume, failover and auto-respawn alike. A confinement violation
+        // detected across the declared commands downgrades it below.
+        hostVerificationPassed = true;
       } catch (error) {
         // M9: implementationCommit is already the host-read HEAD for this round.
         provisioningFailure = { ...toProvisioningFailure(error, handle), round, implementationCommit };
@@ -972,6 +990,29 @@ export async function runImplementVerifyLoop(
         // A poisoned round must never read as host-verified, exactly as the
         // implementor-boundary guard used to force `verificationPassed:false`.
         hostVerificationPassed = false;
+      }
+      // F8 authorship — HARD STOP, at the severity main enforced. A declared
+      // command that COMMITS ends the round here and now. Treating it as an
+      // ordinary blocked verification would let the loop advance into another
+      // same-process implementation round with NO `discardToCommit`, and that
+      // round's commit would descend from — and thereby legitimize — the
+      // command-authored one. The incident above is already durable, so the
+      // audit trail survives the throw. This check is deliberately independent
+      // of the §16 readiness probe, which only runs on the all-verified path
+      // and so would not fire for a round that is already failing.
+      if (receiptExecution.authoredCommit !== undefined) {
+        throw new VerificationAuthoredCommitError(
+          input.assignmentId,
+          round,
+          receiptExecution.authoredCommit.before,
+          receiptExecution.authoredCommit.after,
+        );
+      }
+      // BLOCKER-2: the evidence-write path failed. Any confinement violation it
+      // might have masked has now been recorded above, so the round can fail on
+      // the original cause without losing the incident.
+      if (receiptExecution.executionError !== undefined) {
+        throw receiptExecution.executionError;
       }
       const probe = gitMergeReadinessProbe({
         repoRoot: handle.repoRoot,
@@ -1198,7 +1239,6 @@ function recordImplementationCommit(
   input: ImplementVerifyLoopInput,
   round: number,
   commit: GitSha,
-  verificationPassed: boolean,
 ): void {
   const loopState = deps.service.getImplementVerifyLoopState(input.runId);
   if (loopState?.worktree === undefined) return;
@@ -1208,26 +1248,9 @@ function recordImplementationCommit(
     // a record left stale by an earlier round never resets/verifies the wrong commit.
     worktree: {
       ...loopState.worktree,
-      lastImplementationCommit: { round, commit, verificationPassed },
+      lastImplementationCommit: { round, commit },
     },
   });
-}
-
-/** F13 step 1 resume gate: a host result is reusable only for the exact
- * persisted round/commit. Legacy, missing, or mismatched state fails closed. */
-function persistedHostVerificationPassed(
-  service: OrchestrationService,
-  runId: RunId,
-  round: number,
-  commit: GitSha,
-): boolean {
-  const attestation = service.getImplementVerifyLoopState(runId)?.worktree
-    ?.lastImplementationCommit;
-  return (
-    attestation?.round === round &&
-    String(attestation.commit) === String(commit) &&
-    attestation.verificationPassed === true
-  );
 }
 
 function ensureLeased(worktrees: GitWorktreeManager, assignmentId: AssignmentId): void {

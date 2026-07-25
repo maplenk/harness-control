@@ -65,6 +65,7 @@ import { adjudicateImplementorDeliverable } from './deliverable.js';
 import {
   executeEvidenceReceiptsUnderConfinement,
   type ConfinedReceiptExecution,
+  type EvidenceRecorder,
 } from './verifier.js';
 import { err } from '../../lib/result.js';
 
@@ -752,6 +753,7 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
   async function confined(
     makeRunner: (repo: TempGitRepo) => VerificationRunner,
     prepare?: (repo: TempGitRepo) => Promise<void>,
+    evidence?: EvidenceRecorder,
   ): Promise<ConfinedReceiptExecution> {
     const { worktrees: wt, repo: r } = await setup({
       writes: [{ relPath: 'feature.txt', content: 'work\n' }],
@@ -780,7 +782,7 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
         cwd: handle.worktreePath,
         repoRoot: handle.repoRoot,
         runner: makeRunner(r),
-        evidence: { record: async () => artifactHash('sha256:w3-evidence') },
+        evidence: evidence ?? { record: async () => artifactHash('sha256:w3-evidence') },
         provisioningMarker: 'clone:w3',
         ids: new DeterministicIdFactory(),
         clock: dbHandle!.db.clock,
@@ -807,6 +809,40 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
     expect(result.runnerViolation!.changedPaths).toContain('planted-outside-worktree.txt');
     expect(result.runnerViolation!.detail).toMatch(/primary checkout mutated/);
     expect(String(result.runnerViolation!.headBefore)).toMatch(/^[0-9a-f]{40}$/);
+    // SEVERITY SPLIT: escaping to the primary is a blocking violation, not a
+    // hard stop. Only an AUTHORED commit carries `authoredCommit`, which the
+    // loop turns into `VerificationAuthoredCommitError`. Conflating the two is
+    // what downgraded F8's rule.
+    expect(result.authoredCommit).toBeUndefined();
+  });
+
+  it('a confinement violation is still reported when the EVIDENCE WRITE fails', async () => {
+    // The commands run BEFORE the three evidence writes (stdout, stderr,
+    // receipt body). A §12.1 quota rejection or CAS failure used to throw
+    // straight past drift detection, so the primary-checkout mutation the
+    // command had ALREADY made went unrecorded — and a later retry would
+    // baseline the mutated checkout. The guards must not be skippable by it.
+    const casFailure = new Error('artifact quota exceeded for run');
+    const result = await confined(
+      (r) => async (command) => {
+        fs.writeFileSync(path.join(r.dir, 'planted-despite-cas-failure.txt'), 'escaped\n');
+        return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+      },
+      undefined,
+      {
+        record: async () => {
+          throw casFailure;
+        },
+      },
+    );
+
+    // The violation survives the evidence-write failure...
+    expect(result.runnerViolation).toBeDefined();
+    expect(result.runnerViolation!.changedPaths).toContain('planted-despite-cas-failure.txt');
+    // ...and the original failure is reported rather than swallowed, so the
+    // caller records the incident first and then fails the round on it.
+    expect(result.executionError).toBe(casFailure);
+    expect(result.receipts).toEqual([]);
   });
 
   it('a HEAD move in the primary checkout across the commands is drift (even with a clean porcelain)', async () => {
@@ -899,6 +935,10 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
     expect(String(result.runnerViolation!.headBefore)).not.toBe(
       String(result.runnerViolation!.headAfter),
     );
+    // The HARD-STOP signal — this is what the loop escalates to
+    // `VerificationAuthoredCommitError` instead of remediating.
+    expect(result.authoredCommit).toBeDefined();
+    expect(String(result.authoredCommit!.before)).not.toBe(String(result.authoredCommit!.after));
   });
 
   it('a worktree-cwd command reaching the SHARED common .git/hooks is caught', async () => {

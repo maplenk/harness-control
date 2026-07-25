@@ -25,6 +25,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -92,6 +93,7 @@ import {
   NoDeliverableError,
   runImplementVerifyLoop,
   toProvisioningFailure,
+  VerificationAuthoredCommitError,
 } from './orchestrate.js';
 import type { ImplementorResult } from './implementor.js';
 import {
@@ -1065,6 +1067,108 @@ describe('W1-F1/W1-F4 — a mutating verification command never yields merge_rea
 // checkout: typed violation, durable incident event, §16 readiness blocked
 // (T23), never merge_ready.
 // ===========================================================================
+describe('F8 authorship — a verification command that COMMITS hard-stops the run', () => {
+  // F8 spent a full round establishing that a declared verification command
+  // which COMMITS is a HARD ERROR, never a silent rebinding: on main the
+  // implementor round's adjudicator threw `NoDeliverableError` immediately.
+  // The commands run at the verify boundary now, past that adjudication, so
+  // the rule has to be re-enforced here at the SAME severity. Downgrading it
+  // to an ordinary blocked verification lets the loop advance into another
+  // same-process implementation round WITHOUT `discardToCommit` — and a later
+  // implementor commit then descends from, and thereby legitimizes, the
+  // command-authored commit.
+  it('ends the round immediately and never lets a later commit descend from the authored one', async () => {
+    const allPass = verifierTurn([
+      { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+      { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+    ]);
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+        // A SECOND implementation round must never happen. If it does, its
+        // commit descends from the command-authored one and launders it.
+        {
+          writes: [{ relPath: 'src/cli/round2.ts', content: 'export const round2 = true;\n' }],
+          turns: [implementorTurn('Round 2 must not run.')],
+        },
+      ],
+      verifier: [{ turns: [allPass] }, { turns: [allPass] }],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_slice_authored_commit');
+
+    let authoredCommit: string | undefined;
+    const committingVerify: VerificationRunner = async (command, cwd) => {
+      if (authoredCommit === undefined) {
+        fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+        execFileSync('git', ['add', '-A'], { cwd });
+        execFileSync('git', ['commit', '--no-verify', '-m', 'authored by a verification command'], {
+          cwd,
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'verify',
+            GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+            GIT_COMMITTER_NAME: 'verify',
+            GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+          },
+        });
+        authoredCommit = (await git.resolveSha(cwd, 'HEAD')).trim();
+      }
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const thrown: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: committingVerify,
+        maxRounds: 2,
+      },
+    ).then(() => undefined).catch((caught: unknown) => caught);
+
+    // HARD STOP: the loop does not return a blocked result it can remediate
+    // from — it ends the run, exactly as main's adjudicator did.
+    expect(thrown).toBeInstanceOf(VerificationAuthoredCommitError);
+
+    // Exactly ONE implementor ran. A second implementation round is the whole
+    // danger: its commit would descend from the authored one.
+    expect(slice.created.filter((c) => c.role === 'implementor')).toHaveLength(1);
+
+    // Nothing was built on top of the command-authored commit.
+    expect(authoredCommit).toBeDefined();
+    const head = (await git.resolveSha(slice.worktrees.handleFor(asg)!.worktreePath, 'HEAD')).trim();
+    expect(head).toBe(authoredCommit);
+
+    // The durable incident is still recorded BEFORE the run ends, so the
+    // operator audit trail survives the hard stop.
+    const incidents = dbHandle!.db.events
+      .listByRun(runId)
+      .filter((e) => e.type === 'verification.runner.violation');
+    expect(incidents).toHaveLength(1);
+    expect((incidents[0]!.payload as unknown as { detail: string }).detail).toMatch(
+      /never author one/,
+    );
+
+    await slice.worktrees.removeWorktree(asg);
+  });
+});
+
 describe('W3-1 — a verification command that writes into the PRIMARY checkout never yields merge_ready', () => {
   it('records the typed violation + durable incident and blocks §16 readiness (T23) despite all criteria verifying', async () => {
     const allPass = verifierTurn([
@@ -2096,11 +2200,7 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
       ...state,
       worktree: {
         ...state.worktree!,
-        lastImplementationCommit: {
-          round: 0,
-          commit: slice.baseCommit,
-          verificationPassed: false,
-        },
+        lastImplementationCommit: { round: 0, commit: slice.baseCommit },
       },
     });
 
