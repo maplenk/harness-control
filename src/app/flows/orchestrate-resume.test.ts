@@ -37,7 +37,8 @@ import { buildCheckpointContent } from '../../checkpoint/content.js';
 import { writeCheckpoint } from '../../checkpoint/writer.js';
 import { unwrap } from '../../lib/result.js';
 import { DeterministicIdFactory, RandomIdFactory } from '../../lib/id-factory.js';
-import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
+import { availableDriverKinds, openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
+import type { DriverKind } from '../../persistence/database.js';
 import {
   InProcessFakeAdapter,
   rateLimitErrorEnvelope,
@@ -61,6 +62,10 @@ import { LoopCompositionError, runImplementVerifyLoop } from './orchestrate.js';
 import { RunOwnershipConflictError } from '../run-ownership-store.js';
 import { rebuildFixRequestsFromT23, type EvidenceRecorder } from './verifier.js';
 import type { VerificationRunner } from './implementor.js';
+
+// LOW-10: the F8 receipt tests exercise CAS checkpoint persistence, so they run
+// on every available driver rather than only better-sqlite3.
+const DRIVER_KINDS = await availableDriverKinds();
 
 const IMPLEMENTOR: RoleModelSpec = { harness: 'codex', model: 'gpt-5.6-terra', effort: 'medium' };
 const VERIFIER: RoleModelSpec = { harness: 'claude', model: 'sonnet', effort: 'medium' };
@@ -204,12 +209,16 @@ interface Rig {
 }
 
 /** Open the rig at phase `approved` with the loop's spec hash bound (T1). */
-async function openRig(scripts: {
-  readonly implementor?: readonly AdapterScript[];
-  readonly verifier?: readonly AdapterScript[];
-}): Promise<Rig> {
+async function openRig(
+  scripts: {
+    readonly implementor?: readonly AdapterScript[];
+    readonly verifier?: readonly AdapterScript[];
+  },
+  /** LOW-10: persistence driver under test; defaults to better-sqlite3. */
+  driver: DriverKind = 'better-sqlite3',
+): Promise<Rig> {
   repo = await makeTempGitRepo('harness-resume-');
-  dbHandle = await openTestDatabase({ kind: 'better-sqlite3', file: true });
+  dbHandle = await openTestDatabase({ kind: driver, file: true });
   worktrees = await GitWorktreeManager.open({ primaryRepoRoot: repo.dir, clock: dbHandle.db.clock });
   const ids = new DeterministicIdFactory();
   const { factory, created } = makeFactory(scripts);
@@ -361,7 +370,7 @@ describe('resume mode — interrupted implementor round', () => {
 // HEAD must EQUAL that receipt. Ancestry survives only as an extra sanity check
 // layered on top. No receipt → `refuse_resume`, always.
 // ---------------------------------------------------------------------------
-describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acceptance', () => {
+describe.each(DRIVER_KINDS)('resume mode — F8 (A) receipt-bound drift acceptance (%s)', (driver) => {
   const COMMIT_ENV: Readonly<Record<string, string>> = {
     GIT_AUTHOR_NAME: 'f8-resume-tests',
     GIT_AUTHOR_EMAIL: 'f8@harness.invalid',
@@ -440,7 +449,8 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
   }
 
   it('AC-1: a round that committed AND published its receipt resumes (the crash-after-commit window)', async () => {
-    const rig = await openRig({
+    const rig = await openRig(
+      {
       implementor: [
         // Round-1 attempt 1: writes the work, then the provider limit lands
         // mid-turn → durable pause with a PRE-COMMIT cadence/pause checkpoint.
@@ -452,7 +462,9 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
         { writes: [{ relPath: 'src/more.ts', content: 'export const more = 1;\n' }], turns: [implementorTurn('done')] },
       ],
       verifier: [{ turns: [PASS_BOTH] }],
-    });
+    },
+    driver,
+    );
     const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
 
     // The implementor committed its work and PUBLISHED ITS RECEIPT, then died
@@ -486,7 +498,8 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
   });
 
   it('AC-1b: the round-scoped lastImplementationCommit is an equally valid receipt', async () => {
-    const rig = await openRig({
+    const rig = await openRig(
+      {
       implementor: [
         {
           writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
@@ -495,7 +508,9 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
         { writes: [{ relPath: 'src/more.ts', content: 'export const more = 1;\n' }], turns: [implementorTurn('done')] },
       ],
       verifier: [{ turns: [PASS_BOTH] }],
-    });
+    },
+    driver,
+    );
     const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
     const implementationCommit = await commitInWorktree(worktreePath, 'implementor round 1');
 
@@ -519,7 +534,8 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
   });
 
   it('BLOCKER-2: a FOREIGN descendant appended after the checkpoint is REFUSED (ancestry is not authorship)', async () => {
-    const rig = await openRig({
+    const rig = await openRig(
+      {
       implementor: [
         {
           writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
@@ -527,7 +543,9 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
         },
         { writes: [], turns: [implementorTurn('never reached')] },
       ],
-    });
+    },
+    driver,
+    );
     const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
 
     // The round published a receipt for the commit it actually authored...
@@ -558,7 +576,8 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
   });
 
   it('BLOCKER-2: NO receipt refuses even when HEAD is a clean strict descendant', async () => {
-    const rig = await openRig({
+    const rig = await openRig(
+      {
       implementor: [
         {
           writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
@@ -566,7 +585,9 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
         },
         { writes: [], turns: [implementorTurn('never reached')] },
       ],
-    });
+    },
+    driver,
+    );
     const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
     // Forward motion, nothing else wrong — but nothing proves this round authored it.
     await commitInWorktree(worktreePath, 'an unreceipted commit');
@@ -584,7 +605,8 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
   });
 
   it("BLOCKER-2: a receipt from a DIFFERENT round never authorizes this round's drift", async () => {
-    const rig = await openRig({
+    const rig = await openRig(
+      {
       implementor: [
         {
           writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
@@ -592,7 +614,9 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
         },
         { writes: [], turns: [implementorTurn('never reached')] },
       ],
-    });
+    },
+    driver,
+    );
     const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
     const head = await commitInWorktree(worktreePath, 'implementor round 1');
     await publishReceipt(rig, round.round + 1, head); // right sha, WRONG round
@@ -607,7 +631,8 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
   });
 
   it('BLOCKER-2: taint is NOT cleared when drift acceptance is refused for want of a receipt', async () => {
-    const rig = await openRig({
+    const rig = await openRig(
+      {
       implementor: [
         {
           writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
@@ -615,7 +640,9 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
         },
         { writes: [], turns: [implementorTurn('never reached')] },
       ],
-    });
+    },
+    driver,
+    );
     const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
     await commitInWorktree(worktreePath, 'an unreceipted commit');
     const asg = assignmentId(`asg_${rig.runId}`);
@@ -631,7 +658,8 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
   });
 
   it('AC-2: a TAMPERED worktree whose HEAD is NOT a descendant of the checkpoint still refuses', async () => {
-    const rig = await openRig({
+    const rig = await openRig(
+      {
       implementor: [
         {
           writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
@@ -667,7 +695,8 @@ describe('resume mode — F8 (A) receipt-bound interrupted-implementor drift acc
   });
 
   it('AC-4: an ancestry-probe FAILURE (unknown checkpoint object) refuses — never an acceptance', async () => {
-    const rig = await openRig({
+    const rig = await openRig(
+      {
       implementor: [
         {
           writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],

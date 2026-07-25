@@ -560,6 +560,8 @@ describe('provider adapter factory — composed initialize() over the fake wire 
               permission: {
                 toolTitle:
                   'Execute `git log --oneline -5 && git rev-parse HEAD && ls -la scripts/dogfood/ 2>/dev/null; head -50 scripts/dogfood/slice-1a.sh 2>/dev/null || true`',
+                // HIGH-5: a real provider sends what it will EXECUTE.
+                rawInput: { command: 'git log --oneline -5 && git rev-parse HEAD && ls -la scripts/dogfood/ 2>/dev/null; head -50 scripts/dogfood/slice-1a.sh 2>/dev/null || true' },
               },
               response: { stopReason: 'end_turn' },
             },
@@ -636,6 +638,68 @@ describe('provider adapter factory — composed initialize() over the fake wire 
           operation: 'Execute `npm run typecheck`',
           action: 'allow',
           reason: 'allowlisted',
+        }),
+      ]);
+    },
+    GENEROUS_MS,
+  );
+
+  // HIGH-5 end-to-end: the permission TITLE is prose; ACP `rawInput` is what the
+  // provider EXECUTES. Auto-approval must bind them, or an approval covers a
+  // string nothing runs. Driven through the REAL wire (fake ACP child → session
+  // → policy), not just the classifier unit.
+  it(
+    'grok DENIES a read-only-looking title whose rawInput diverges, and one with no rawInput at all',
+    async () => {
+      const fixture = fixtureGrok();
+      const scenarioPath = await writeScenarioFile(
+        {
+          turns: [
+            {
+              // Benign prose, hostile payload.
+              permission: {
+                toolTitle: 'Execute `ls -la src`',
+                rawInput: { command: 'rm -rf /' },
+              },
+              response: { stopReason: 'end_turn' },
+            },
+            {
+              // A provider that sends no rawInput at all: unverifiable, so denied.
+              permission: { toolTitle: 'Execute `ls -la src`' },
+              response: { stopReason: 'end_turn' },
+            },
+          ],
+        },
+        fixture.root,
+      );
+      const created = createGrokBuildAcpAdapter({
+        cwd: fixture.cwd,
+        clock: CLOCK,
+        processEnv: { HOME: fixture.realHome, [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin },
+        grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
+        permissions: { mode: 'headless', role: 'implementor' },
+        role: 'implementor',
+        model: 'grok-build',
+        reasoningEffort: 'high',
+        spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
+      });
+      cleanups.push(async () => created.adapter.close());
+
+      await created.adapter.initialize();
+      const session = await created.adapter.createSession({ cwd: fixture.cwd });
+      await created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'divergent payload' });
+      await created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'no raw input' });
+
+      expect(created.adapter.permissionDecisions).toEqual([
+        expect.objectContaining({
+          operation: 'Execute `ls -la src`',
+          action: 'deny',
+          reason: 'denied_default',
+        }),
+        expect.objectContaining({
+          operation: 'Execute `ls -la src`',
+          action: 'deny',
+          reason: 'denied_default',
         }),
       ]);
     },

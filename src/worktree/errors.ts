@@ -35,6 +35,14 @@ export const WORKTREE_ERROR_KINDS = [
    * self-check, no verifier dispatch, no `merge_ready`.
    */
   'provisioning_failed',
+  /**
+   * MED-8 (`./git.ts`): after staging, `node_modules` paths REMAINED in the index
+   * and could not be unstaged, so a harness commit would have carried a
+   * provisioned dependency tree. Distinct from `git_command_failed` because no
+   * git command failed — the index simply refused to reach a safe state, which is
+   * an invariant violation the caller must not retry blindly.
+   */
+  'node_modules_still_staged',
 ] as const;
 
 export type WorktreeErrorKind = (typeof WORKTREE_ERROR_KINDS)[number];

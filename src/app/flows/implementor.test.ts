@@ -19,7 +19,8 @@ import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { artifactHash, assignmentId, criterionId, gitSha, specHash, type ArtifactHash } from '../../domain/ids.js';
 import { DeterministicIdFactory } from '../../lib/id-factory.js';
-import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
+import { availableDriverKinds, openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
+import type { DriverKind } from '../../persistence/database.js';
 import { GitWorktreeManager, runGit, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import {
   assertPrimaryCheckoutUntouched,
@@ -58,6 +59,10 @@ import { err } from '../../lib/result.js';
 // ---------------------------------------------------------------------------
 // Fakes
 // ---------------------------------------------------------------------------
+// LOW-10: the F8 (C) receipt tests exercise CAS checkpoint persistence, so they
+// run on every available driver rather than only better-sqlite3.
+const DRIVER_KINDS = await availableDriverKinds();
+
 const CLAUDE_LOW = { harness: 'claude', model: 'opus', effort: 'low' } as const;
 const CODEX_IMPLEMENTOR = { harness: 'codex', model: 'gpt-5.6-terra', effort: 'medium' } as const;
 
@@ -180,6 +185,8 @@ async function setup(opts: {
   readonly provision?: 'auto' | 'clone' | 'install' | 'none';
   /** round-4 #3: the "agent" stages everything it wrote (`git add -A`) during its turn. */
   readonly stageAfterWrite?: boolean;
+  /** LOW-10: persistence driver under test; defaults to better-sqlite3. */
+  readonly driver?: DriverKind;
 }): Promise<{
   service: OrchestrationService;
   worktrees: GitWorktreeManager;
@@ -187,7 +194,7 @@ async function setup(opts: {
   created: CreatedFake[];
 }> {
   repo = await makeTempGitRepo();
-  dbHandle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+  dbHandle = await openTestDatabase({ kind: opts.driver ?? 'better-sqlite3', file: false });
   const db = dbHandle.db;
   worktrees = await GitWorktreeManager.open({
     primaryRepoRoot: repo.dir,
@@ -288,6 +295,16 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
     expect(prompt).toContain(handle!.worktreePath); // confinement path
     expect(prompt).toMatch(/structured repository tools \(Read, Grep\/Glob, Write, and Edit\)/i);
     expect(prompt).toMatch(/Shell access is limited to read-only repository inspection/i);
+    // LOW-11: assert the F11 shell-quoting guidance as a LINE, located by its own
+    // content — never by whole-prompt text or position — so an unrelated rebase
+    // that adds/reorders prompt rules cannot break this. It must also stay scoped
+    // to INSPECTION: the prompt separately forbids using the shell to change
+    // files or self-verify, and this guidance must not read as widening that.
+    const quotingLine = prompt.split('\n').find((line) => line.includes('single-quote pattern/regex arguments'));
+    expect(quotingLine).toBeDefined();
+    expect(quotingLine).toMatch(/inspecting the repository/i);
+    expect(quotingLine).toMatch(/will be denied/i);
+    expect(quotingLine).not.toMatch(/verify|test|build|write|modify/i);
     expect(prompt).toMatch(/Do NOT use shell commands such as mkdir, cp, mv, rm, touch/i);
     expect(prompt).toMatch(/MUST NOT declare the task complete/i); // hard rule: cannot mark complete
     expect(prompt).toMatch(/MUST NOT add, remove, or change any acceptance criterion/i); // cannot change criteria
@@ -1263,7 +1280,7 @@ describe('adjudicateImplementorDeliverable — F7 round-2 #6 provisioning-failur
 // checkpoint at exactly this boundary; the reason existed in the vocabulary
 // (`state.ts`, `cadence.ts`) with NO writer in production code.
 // ---------------------------------------------------------------------------
-describe('ImplementorFlow — F8 (C) pre_verify_handoff checkpoint (§12.2)', () => {
+describe.each(DRIVER_KINDS)('ImplementorFlow — F8 (C) pre_verify_handoff checkpoint (§12.2) (%s)', (driver) => {
   /** Every `checkpoint.recorded` payload for the run, in log order. */
   function checkpointsOf(runId: ReturnType<typeof createRunFixture>['runId']): Array<{
     readonly reason: string;
@@ -1277,6 +1294,7 @@ describe('ImplementorFlow — F8 (C) pre_verify_handoff checkpoint (§12.2)', ()
 
   it('writes exactly ONE pre_verify_handoff checkpoint carrying the COMMITTED head', async () => {
     const { service, worktrees: wt, repo: r } = await setup({
+      driver,
       writes: [{ relPath: 'feature.txt', content: 'the new feature\n' }],
       turns: [REPORTING_TURN],
     });
@@ -1312,6 +1330,7 @@ describe('ImplementorFlow — F8 (C) pre_verify_handoff checkpoint (§12.2)', ()
 
   it('BLOCKER-2: a round whose RECEIPT cannot be recorded FAILS rather than continuing unreceipted', async () => {
     const { service, worktrees: wt, repo: r } = await setup({
+      driver,
       writes: [{ relPath: 'feature.txt', content: 'the new feature\n' }],
       turns: [REPORTING_TURN],
     });
@@ -1368,7 +1387,7 @@ describe('ImplementorFlow — F8 (C) pre_verify_handoff checkpoint (§12.2)', ()
   });
 
   it('a round that commits NOTHING still checkpoints the handoff honestly (HEAD unchanged)', async () => {
-    const { service, worktrees: wt, repo: r } = await setup({ writes: [], turns: [REPORTING_TURN] });
+    const { service, worktrees: wt, repo: r } = await setup({ driver, writes: [], turns: [REPORTING_TURN] });
     const base = await r.headSha();
     const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const asg = assignmentId('asg_impl_handoff_empty');

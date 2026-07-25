@@ -20,7 +20,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { addAllExceptNodeModules, runGit, unstageNodeModules } from './git.js';
+import { addAllExceptNodeModules, assertIndexFreeOfNodeModules, runGit, unstageNodeModules } from './git.js';
 import { isWorktreeError, type WorktreeError } from './errors.js';
 import { makeTempGitRepo, type TempGitRepo } from './test-support.js';
 
@@ -194,21 +194,50 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
     expect(await stagedPaths(r.dir)).toEqual(['src/feature.ts']);
   });
 
-  it('FAILS CLOSED when a node_modules path cannot be removed from the index', async () => {
+  // MED-8: a repo path may legitimately begin with a colon. Git would parse the
+  // leading `:(...)` of an unprefixed pathspec as PATHSPEC MAGIC rather than as
+  // part of the path, so the reset matched nothing, exited 0, and left the
+  // node_modules entries STAGED — the invariant silently broken by a "successful"
+  // command. Verified against real git before the fix.
+  it('unstages a node_modules under a path that LOOKS like pathspec magic', async () => {
+    const r = await repoWithIgnore('');
+    plantNodeModules(r.dir, ':(top)foo/node_modules');
+    await r.writeFile(':(top)foo/app.ts', 'export const app = 1;\n');
+
+    await addAllExceptNodeModules(r.dir);
+
+    const staged = await stagedPaths(r.dir);
+    expect(staged).toContain(':(top)foo/app.ts'); // the real work is staged...
+    expect(staged.some((p) => p.includes('node_modules'))).toBe(false); // ...the tree is not
+  });
+
+  it('FAILS CLOSED with its own error kind when the index cannot be made safe', async () => {
+    // Drives the INVARIANT GUARD directly, so the refusal branch is genuinely
+    // reached rather than short-circuited by an earlier git failure (the previous
+    // shape used a stale index.lock, which made `git add` throw first and never
+    // exercised this at all).
+    const r = await repoWithIgnore('node_modules/\n');
+    plantNodeModules(r.dir, 'node_modules');
+    await r.run(['add', '-f', '--', 'node_modules']);
+    expect((await stagedPaths(r.dir)).some((p) => p.includes('node_modules'))).toBe(true);
+
+    const thrown: unknown = await assertIndexFreeOfNodeModules(r.dir).catch((e: unknown) => e);
+
+    expect(isWorktreeError(thrown)).toBe(true);
+    expect((thrown as WorktreeError).kind).toBe('node_modules_still_staged');
+    expect(String(thrown)).toMatch(/remain STAGED/i);
+  });
+
+  it('the invariant guard PASSES (and the second index read is load-bearing) when nothing is staged', async () => {
     const r = await repoWithIgnore('node_modules/\n');
     plantNodeModules(r.dir, 'node_modules');
     await r.writeFile('src/feature.ts', 'export const feature = true;\n');
-    // A stubborn index the reset cannot clear: simulated by making `git reset`
-    // itself impossible — a stale index.lock blocks every index write.
-    const gitDir = (await runGit(['rev-parse', '--absolute-git-dir'], r.dir)).stdout.trim();
-    await r.run(['add', '-f', '--', 'node_modules']);
-    writeFileSync(path.join(gitDir, 'index.lock'), '', 'utf8');
+    await addAllExceptNodeModules(r.dir);
 
-    const thrown: unknown = await addAllExceptNodeModules(r.dir).catch((e: unknown) => e);
-
-    expect(isWorktreeError(thrown)).toBe(true);
-    // Whatever git refused (add or reset), the helper never returns "staged OK".
-    expect((thrown as WorktreeError).kind).toBe('git_command_failed');
+    // No node_modules entry ever entered the index, so `unstageNodeModules` ran
+    // no reset at all — and the guard still has to confirm it independently.
+    expect(await unstageNodeModules(r.dir)).toEqual([]);
+    await expect(assertIndexFreeOfNodeModules(r.dir)).resolves.toBeUndefined();
   });
 });
 

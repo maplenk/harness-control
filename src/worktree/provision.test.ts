@@ -309,7 +309,8 @@ describe('F7 AC-1 — git-invisibility of the provisioned node_modules', () => {
     expect(fs.lstatSync(nm).isSymbolicLink()).toBe(false);
     expect(fs.lstatSync(nm).isDirectory()).toBe(true);
     expect(readFileSync(path.join(nm, 'left-pad', 'index.js'), 'utf8')).toBe('CLONE_SOURCE\n');
-    expect(readFileSync(path.join(nm, PROVISION_MARKER_FILE), 'utf8')).toBe(outcome.fingerprint);
+    // HIGH-3: the marker is the v2 PROOF format — fingerprint + smoke attestation.
+    expect(readFileSync(path.join(nm, PROVISION_MARKER_FILE), 'utf8')).toBe(`v2:${outcome.fingerprint}`);
 
     // Invisible to git: plain status/diff clean; --ignored shows it; check-ignore
     // asserts the rule matches; clean -fd (no -x) does NOT remove it.
@@ -1688,7 +1689,7 @@ describe('F9 AC-5 — an unbuilt native dependency is caught BEFORE the tree is 
 
     expect(outcome.strategy).toBe('clone');
     expect(readFileSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE), 'utf8')).toBe(
-      outcome.fingerprint,
+      `v2:${outcome.fingerprint}`,
     );
   });
 
@@ -1709,6 +1710,97 @@ describe('F9 AC-5 — an unbuilt native dependency is caught BEFORE the tree is 
 
     expect(fake.calls.clone).toBe(1); // the clone happened...
     expect(error.provisioningCause).toBe('native_toolchain_unproven'); // ...and was then refused
+  });
+});
+
+describe('F9 HIGH-3 — a pre-F9 (v1) marker never short-circuits past the smoke', () => {
+  it('a v1 marker on a HEALTHY legacy tree is re-proven in place and UPGRADED to v2 (no rebuild)', async () => {
+    const repo = track(await makeDepsRepo({ devDeps: { 'fake-native': '1.0.0' } }));
+    await writePrimaryNodeModules(repo.dir, { native: { name: 'fake-native', built: true } });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_legacy_marker_ok');
+    const handle = await createAtHead(repo, manager, asg);
+
+    // Build once so the tree + fingerprint are real, then DOWNGRADE the marker to
+    // the pre-F9 v1 format (a bare fingerprint).
+    const first = await manager.provisionForVerification(asg);
+    expect(fake.calls.clone).toBe(1);
+    const markerPath = path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE);
+    fs.writeFileSync(markerPath, first.fingerprint, 'utf8');
+
+    const second = await manager.provisionForVerification(asg);
+
+    expect(second.strategy).toBe('short_circuit');
+    expect(fake.calls.clone).toBe(1); // re-proven IN PLACE, never rebuilt
+    expect(second.detail).toMatch(/re-proven/i);
+    expect(readFileSync(markerPath, 'utf8')).toBe(`v2:${first.fingerprint}`); // upgraded
+  });
+
+  it('a v1 marker whose tree cannot be loaded refuses instead of short-circuiting', async () => {
+    const repo = track(await makeDepsRepo({ devDeps: { 'fake-native': '1.0.0' } }));
+    await writePrimaryNodeModules(repo.dir, { native: { name: 'fake-native', built: true } });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_legacy_marker_unbuilt');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const first = await manager.provisionForVerification(asg);
+    const nm = path.join(handle.worktreePath, 'node_modules');
+    // BREAK the in-place tree the way a script-less install would have left it,
+    // and stamp the pre-F9 marker that used to make it sticky.
+    writeInstalledPackage(nm, 'fake-native', { native: true, built: false });
+    fs.writeFileSync(path.join(nm, PROVISION_MARKER_FILE), first.fingerprint, 'utf8');
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('native_toolchain_unproven');
+    expect(error.message).toContain('fake-native');
+  });
+});
+
+describe('F9 HIGH-4 — the native filter is independent of the scripts object', () => {
+  it('a package with binding.gyp and NO scripts is still proven (npm supplies the implicit node-gyp rebuild)', async () => {
+    const repo = track(await makeDepsRepo({ devDeps: { 'implicit-gyp': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir);
+    // binding.gyp present, `scripts` absent entirely — npm runs `node-gyp
+    // rebuild` for this package, and the pre-fix filter skipped it because it
+    // required a scripts object first.
+    const dir = path.join(nm, 'implicit-gyp');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
+    fs.writeFileSync(path.join(dir, 'index.js'), "module.exports = require('./build/Release/bind.node');\n");
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      `${JSON.stringify({ name: 'implicit-gyp', version: '1.0.0', main: 'index.js' }, null, 2)}\n`,
+    );
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_implicit_gyp');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('native_toolchain_unproven');
+    expect(error.message).toContain('implicit-gyp');
+  });
+
+  it('a NESTED (non-hoisted) native package is proven too, by its nested specifier', async () => {
+    const repo = track(await makeDepsRepo());
+    const nm = await writePrimaryNodeModules(repo.dir);
+    // `left-pad/node_modules/nested-native` — the shape a version conflict leaves.
+    const nested = path.join(nm, 'left-pad', 'node_modules');
+    fs.mkdirSync(nested, { recursive: true });
+    writeInstalledPackage(nested, 'nested-native', { native: true, built: false });
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_nested_native');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('native_toolchain_unproven');
+    // Named by the NESTED specifier — requiring bare `nested-native` would have
+    // resolved the hoisted copy and proven the wrong artifact.
+    expect(error.message).toContain('left-pad/node_modules/nested-native');
   });
 });
 
@@ -1821,6 +1913,45 @@ describe('F9 AC-6 — a stalled provisioning command fails closed with the locks
     const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
 
     expect(error.provisioningCause).toBe('provisioning_timeout');
+  });
+
+  it('HIGH-6: a timed-out stage is QUARANTINED, not deleted out from under the live producer', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    let releaseProducer: (() => void) | undefined;
+    const hung: ProvisionRuntime = {
+      cloneSupported: true,
+      platformKey: 'test-platform',
+      // Still writing into the stage long after the deadline fires.
+      cloneDir: (_src, dst) =>
+        new Promise<void>((resolve) => {
+          releaseProducer = (): void => {
+            fs.mkdirSync(dst, { recursive: true });
+            fs.writeFileSync(path.join(dst, 'late-write.txt'), 'written after the deadline\n');
+            resolve();
+          };
+        }),
+      install: async () => undefined,
+    };
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: hung, timeoutMs: 60, warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_f9_quarantine');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+    expect(error.provisioningCause).toBe('provisioning_timeout');
+    expect(warnings.some((w) => w.kind === 'stage_quarantined')).toBe(true);
+
+    // The stage survives under a `quarantine-*` name — nothing was deleted while a
+    // writer might still hold it, and it is out of the ACTIVE stage namespace.
+    const stageRoot = path.join(manager.baseDir, PROVISION_STAGE_SUBDIR, String(asg));
+    const entries = fs.readdirSync(stageRoot);
+    expect(entries.some((name) => name.startsWith('quarantine-'))).toBe(true);
+    expect(entries.some((name) => name.startsWith('stage-'))).toBe(false);
+
+    // The producer finishes AFTER the refusal; its late write lands in the
+    // quarantined directory and can never be mistaken for a live stage.
+    releaseProducer?.();
   });
 });
 

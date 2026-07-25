@@ -228,16 +228,25 @@ async function stagedNodeModulesPaths(worktreePath: string): Promise<string[]> {
   return stdout.split('\0').filter((p) => p.length > 0 && NODE_MODULES_PATH_RE.test(p));
 }
 
-/** The OUTERMOST `node_modules` directory each staged path sits under — a tiny,
+/**
+ * The OUTERMOST `node_modules` directory each staged path sits under — a tiny,
  * bounded pathspec set (`node_modules`, `web/node_modules`, …) rather than one
- * argument per file, so a 100k-entry tree cannot blow past ARG_MAX. */
+ * argument per file, so a 100k-entry tree cannot blow past ARG_MAX.
+ *
+ * MED-8: every entry is prefixed `:(literal)`. A repo path can legitimately
+ * begin with a colon (`:(top)foo/node_modules`), and git would then parse the
+ * leading `:(...)` as PATHSPEC MAGIC rather than as part of the path — the reset
+ * silently matches nothing, exits 0, and the node_modules entries stay STAGED.
+ * Verified against real git: without the prefix that exact directory name leaves
+ * `:(top)foo/node_modules/pkg/i.js` in the index after a "successful" reset.
+ */
 function nodeModulesPathspecs(paths: readonly string[]): string[] {
   const roots = new Set<string>();
   for (const p of paths) {
     const segments = p.split('/');
     const index = segments.indexOf('node_modules');
     if (index < 0) continue; // unreachable for NODE_MODULES_PATH_RE matches; defensive
-    roots.add(segments.slice(0, index + 1).join('/'));
+    roots.add(`:(literal)${segments.slice(0, index + 1).join('/')}`);
   }
   return [...roots].sort();
 }
@@ -275,16 +284,30 @@ export async function addAllExceptNodeModules(worktreePath: string): Promise<voi
   // already placed in the index (F7 round-4 #3 — e.g. a verification command or an
   // interrupted implementor that ran `git add -f node_modules`).
   await unstageNodeModules(worktreePath);
+  await assertIndexFreeOfNodeModules(worktreePath);
+}
+
+/**
+ * MED-8 — the INVARIANT, asserted independently of how the index got here: no
+ * `node_modules` path (at any depth) is staged. Exported so the guarantee can be
+ * checked — and tested — on its own, rather than only as a tail of
+ * `addAllExceptNodeModules`.
+ *
+ * Throws the dedicated `node_modules_still_staged` kind, NOT
+ * `git_command_failed`: no git command failed here. The index simply refused to
+ * reach a safe state, which is an invariant violation a caller must not retry
+ * blindly.
+ */
+export async function assertIndexFreeOfNodeModules(worktreePath: string): Promise<void> {
   const remaining = await stagedNodeModulesPaths(worktreePath);
-  if (remaining.length > 0) {
-    throw new WorktreeError(
-      'git_command_failed',
-      `refusing to commit: ${remaining.length} node_modules path(s) remain STAGED after unstaging them ` +
-        `(cwd=${worktreePath}): ${remaining.slice(0, 5).join(', ')}. A provisioned dependency tree must never ` +
-        'enter a harness commit.',
-      { detail: remaining.slice(0, 20).join('\n') },
-    );
-  }
+  if (remaining.length === 0) return;
+  throw new WorktreeError(
+    'node_modules_still_staged',
+    `refusing to commit: ${remaining.length} node_modules path(s) remain STAGED after unstaging them ` +
+      `(cwd=${worktreePath}): ${remaining.slice(0, 5).join(', ')}. A provisioned dependency tree must never ` +
+      'enter a harness commit.',
+    { detail: remaining.slice(0, 20).join('\n') },
+  );
 }
 
 /**

@@ -993,6 +993,15 @@ export function toProvisioningFailure(error: unknown, handle: WorktreeHandle): P
     kind: 'provisioning_failed',
     repoRoot: handle.repoRoot,
     worktreePath: handle.worktreePath,
+    // MED-7: carry the closed-vocabulary CAUSE across this boundary too. Without
+    // it the CLI fell back to the obsolete generic remedy for every VERIFIER-side
+    // provisioning refusal, while the implementor-side adapter reported the
+    // specific one — the same failure printing two different next steps depending
+    // on which boundary happened to raise it. The cause is a constant, never free
+    // text, so it needs no redaction (unlike `detail`).
+    ...(error instanceof WorktreeError && error.provisioningCause !== undefined
+      ? { cause: error.provisioningCause }
+      : {}),
     detail: redactText(detail),
   };
 }

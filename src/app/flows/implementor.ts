@@ -835,8 +835,11 @@ export function buildImplementorPrompt(context: ImplementorContext, cwd: string)
     // F11: the read-only shell classifier can only reason about a command whose
     // expansion-bearing bytes are inside SINGLE quotes (where the shell performs
     // none). Telling the agent the rule up front turns a would-be permission
-    // denial — which kills the turn — into a command it can simply write correctly.
-    "- When you do use the shell for reading, single-quote pattern/regex arguments and avoid $, backslashes, backticks, and parentheses outside single quotes — such commands cannot be classified read-only and will be denied.",
+    // denial — which kills the turn — into a command it can simply write
+    // correctly. Deliberately scoped to repository INSPECTION only: the rule
+    // above already forbids using the shell to change files or self-verify, and
+    // this line must not read as widening that.
+    '- When inspecting the repository with the shell, single-quote pattern/regex arguments and avoid $, backslashes, backticks, and parentheses outside single quotes — such commands cannot be classified read-only and will be denied.',
     '- The acceptance criteria below are FIXED and shown for context only. You MUST NOT add, remove, or change any acceptance criterion.',
     '- You MUST NOT declare the task complete, verified, or passing. An independent verifier decides that — just do the work and report honestly.',
     '- If you cannot satisfy a criterion, state it plainly as a risk in your completion report; never paper over it.',

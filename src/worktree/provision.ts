@@ -137,6 +137,9 @@ export type ProvisionWarnEvent =
   | { readonly kind: 'cache_purged'; readonly cache: string }
   | { readonly kind: 'stage_gc_removed'; readonly stage: string }
   | { readonly kind: 'stage_backup_restored'; readonly stage: string }
+  /** HIGH-6: a stage abandoned on a DEADLINE was renamed aside rather than
+   * deleted, because the producer may still be writing into it. */
+  | { readonly kind: 'stage_quarantined'; readonly stage: string }
   /** F9: the runtime native smoke loaded these packages from the staged tree. */
   | { readonly kind: 'native_smoke_passed'; readonly packages: readonly string[] };
 
@@ -652,9 +655,29 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
 
   // Idempotent short-circuit: a REAL node_modules directory with a populated
   // `.bin/` (B2 — never accept a broken tree) whose marker matches the fingerprint.
+  //
+  // HIGH-3: the marker must also ATTEST the runtime smoke (v2). A pre-F9 (v1)
+  // marker proves only that the manifests match — a tree the old install lane
+  // built carries one and would otherwise short-circuit straight past the smoke,
+  // carrying the P2 stickiness across the upgrade. So a v1 marker re-proves the
+  // tree IN PLACE (no rebuild) and is upgraded to v2 on success.
   const existing = lstatSafe(nodeModules);
-  if (existing?.isDirectory() === true && hasBinDir(nodeModules) && readMarker(nodeModules) === fingerprint) {
-    return proven('short_circuit', fingerprint, repoRoot, worktreePath, 'existing node_modules matches the committed dependency fingerprint');
+  const marker = existing?.isDirectory() === true && hasBinDir(nodeModules) ? readMarker(nodeModules) : undefined;
+  if (marker !== undefined && marker.fingerprint === fingerprint) {
+    if (marker.smokeAttested) {
+      return proven('short_circuit', fingerprint, repoRoot, worktreePath, 'existing node_modules matches the committed dependency fingerprint');
+    }
+    // Throws `native_toolchain_unproven` when the tree cannot be loaded — a
+    // legacy broken tree is refused instead of silently reused.
+    await runNativeSmoke(nodeModules, warn, timeoutMs);
+    fs.writeFileSync(path.join(nodeModules, PROVISION_MARKER_FILE), markerV2(fingerprint), 'utf8');
+    return proven(
+      'short_circuit',
+      fingerprint,
+      repoRoot,
+      worktreePath,
+      'existing node_modules matches the committed dependency fingerprint; its pre-F9 marker was re-proven by the runtime smoke and upgraded',
+    );
   }
 
   // Build a staged tree OUT OF the worktree, scan it, purge caches, mark it, then
@@ -662,6 +685,9 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
   // filesystem as the worktree, so the swap is a rename.
   fs.mkdirSync(assignmentStageRoot, { recursive: true });
   const stageDir = fs.mkdtempSync(path.join(assignmentStageRoot, 'stage-'));
+  // HIGH-6: set when a deadline fired, so the `finally` QUARANTINES the stage
+  // instead of deleting it out from under a producer that may still be writing.
+  let timedOut = false;
   try {
     const built = await buildStagedTree({
       stageDir,
@@ -713,8 +739,9 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
     // a tree that cannot be proven can never become the sticky short-circuit for
     // every later round of the run.
     await runNativeSmoke(built.treePath, warn, timeoutMs);
-    // Marker LAST (after the tree is fully built AND proven).
-    fs.writeFileSync(path.join(built.treePath, PROVISION_MARKER_FILE), fingerprint, 'utf8');
+    // Marker LAST (after the tree is fully built AND proven), in the v2 format
+    // that attests the smoke as well as the fingerprint (HIGH-3).
+    fs.writeFileSync(path.join(built.treePath, PROVISION_MARKER_FILE), markerV2(fingerprint), 'utf8');
 
     try {
       swapIntoPlace(nodeModules, built.treePath, stageDir, params.rename);
@@ -728,15 +755,50 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
       );
     }
     return proven(built.strategyTaken, fingerprint, repoRoot, worktreePath, `provisioned via ${built.strategyTaken}`);
+  } catch (error) {
+    // HIGH-6: remember that this failure was a DEADLINE, so the `finally` below
+    // quarantines rather than deletes (the producer may still be writing here).
+    if (error instanceof WorktreeError && error.provisioningCause === 'provisioning_timeout') timedOut = true;
+    throw error;
   } finally {
     // Best-effort GC of the stage — but PRESERVE it whenever it still holds an `old-*`
     // backup (#2: a swap whose move-in AND rollback both failed left the sole surviving
     // copy of the prior valid tree there). Deleting it would destroy that only backup;
     // leave it for the next call's crash-recovery preflight to RESTORE. On the success
     // path (and the confirmed-rollback path) no `old-*` remains, so the stage is GC'd.
-    if (!stageHoldsBackup(stageDir)) {
+    //
+    // HIGH-6: a stage abandoned because a command TIMED OUT is never deleted.
+    // `withDeadline` stops WAITING; it cannot stop the producer, so a wedged
+    // `cp`/`npm`/git may still be writing into this directory. Deleting it under
+    // a live writer races that writer (and could resurrect a half-tree after the
+    // locks release). Rename it aside to `quarantine-*` instead — an atomic,
+    // same-filesystem move that takes the path out of the assignment's active
+    // namespace — and leave it for a later GC sweep once the writer is gone.
+    if (timedOut) {
+      quarantineStage(stageDir, warn);
+    } else if (!stageHoldsBackup(stageDir)) {
       fs.rmSync(stageDir, { recursive: true, force: true });
     }
+  }
+}
+
+/**
+ * HIGH-6 — move an abandoned stage OUT of the assignment's active namespace
+ * without deleting it, so a still-running producer cannot race a delete and
+ * cannot have its writes mistaken for a live stage. Best-effort: if the rename
+ * fails, the stage is LEFT where it is (never force-deleted) — a leftover
+ * directory is strictly safer than racing an unknown writer.
+ */
+function quarantineStage(stageDir: string, warn: ProvisionWarnSink): void {
+  const quarantined = path.join(
+    path.dirname(stageDir),
+    `quarantine-${Date.now().toString(36)}-${path.basename(stageDir)}`,
+  );
+  try {
+    fs.renameSync(stageDir, quarantined);
+    warn({ kind: 'stage_quarantined', stage: path.basename(quarantined) });
+  } catch {
+    warn({ kind: 'stage_quarantined', stage: path.basename(stageDir) });
   }
 }
 
@@ -1186,8 +1248,18 @@ function proveePrimaryTree(primaryNodeModules: string, declared: readonly string
  */
 function nativeBuildPackages(treePath: string): string[] {
   const found: string[] = [];
-  const consider = (name: string): void => {
-    const dir = path.join(treePath, ...name.split('/'));
+
+  /** `dir` holds a package; `specifier` is how `require()` names it. */
+  const consider = (dir: string, specifier: string): void => {
+    // HIGH-4: `binding.gyp` is decisive ON ITS OWN, checked BEFORE any script
+    // lookup. npm runs an IMPLICIT `node-gyp rebuild` for a package that has a
+    // binding.gyp and declares no `install`/`preinstall` script — so requiring a
+    // `scripts` object first (and returning early without one) skipped exactly
+    // the packages whose build npm supplies for them.
+    if (fs.existsSync(path.join(dir, 'binding.gyp'))) {
+      found.push(specifier);
+      return;
+    }
     let manifestRaw: string;
     try {
       manifestRaw = fs.readFileSync(path.join(dir, 'package.json'), 'utf8');
@@ -1207,36 +1279,58 @@ function nativeBuildPackages(treePath: string): string[] {
     const hooks = ['install', 'preinstall', 'postinstall']
       .map((hook) => (scripts as Record<string, unknown>)[hook])
       .filter((value): value is string => typeof value === 'string');
-    if (hooks.length === 0) return;
-    const nativeScript = hooks.some((script) => /node-gyp|node-pre-gyp|prebuild|cmake-js/i.test(script));
-    if (nativeScript || fs.existsSync(path.join(dir, 'binding.gyp'))) found.push(name);
+    if (hooks.some((script) => /node-gyp|node-pre-gyp|prebuild|cmake-js/i.test(script))) {
+      found.push(specifier);
+    }
   };
 
-  let entries: Dirent[];
-  try {
-    entries = fs.readdirSync(treePath, { withFileTypes: true });
-  } catch (error) {
-    throw failClosed(
-      `could not enumerate the staged node_modules at ${treePath} to derive its native-build packages: ${messageOf(error)}`,
-      'staged tree unreadable',
-      'native_toolchain_unproven',
-    );
-  }
-  for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name === '.bin') continue;
-    if (entry.name.startsWith('@')) {
-      let scoped: Dirent[];
-      try {
-        scoped = fs.readdirSync(path.join(treePath, entry.name), { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const child of scoped) if (child.isDirectory()) consider(`${entry.name}/${child.name}`);
-    } else {
-      consider(entry.name);
+  /**
+   * HIGH-4: walk NESTED `node_modules` too. npm hoists most packages to the top
+   * level, but a version conflict leaves a transitive dependency installed at
+   * `a/node_modules/b` — and a native one there is just as unbuilt-able. The
+   * specifier stays the nested PATH (`a/node_modules/b`), which is what the
+   * smoke must require: bare `b` would resolve to the hoisted copy, proving the
+   * wrong artifact.
+   */
+  const walk = (root: string, specifierPrefix: string, depth: number): void => {
+    if (depth > 8) return; // pathological nesting; the hoisted copies are covered
+    let entries: Dirent[];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch (error) {
+      throw failClosed(
+        `could not enumerate the staged node_modules at ${root} to derive its native-build packages: ${messageOf(error)}`,
+        'staged tree unreadable',
+        'native_toolchain_unproven',
+      );
     }
-  }
-  return found.sort();
+    const visit = (dir: string, specifier: string): void => {
+      consider(dir, specifier);
+      const nested = path.join(dir, 'node_modules');
+      if (lstatSafe(nested)?.isDirectory() === true) walk(nested, `${specifier}/node_modules/`, depth + 1);
+    };
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === '.bin') continue;
+      if (entry.name.startsWith('@')) {
+        let scoped: Dirent[];
+        try {
+          scoped = fs.readdirSync(path.join(root, entry.name), { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const child of scoped) {
+          if (child.isDirectory()) {
+            visit(path.join(root, entry.name, child.name), `${specifierPrefix}${entry.name}/${child.name}`);
+          }
+        }
+      } else {
+        visit(path.join(root, entry.name), `${specifierPrefix}${entry.name}`);
+      }
+    }
+  };
+
+  walk(treePath, '', 0);
+  return [...new Set(found)].sort();
 }
 
 /**
@@ -1342,12 +1436,45 @@ function isPrimaryCloneable(primaryNodeModules: string): boolean {
   }
 }
 
-function readMarker(nodeModulesDir: string): string | undefined {
+/**
+ * HIGH-3 — the marker's PROOF FORMAT, versioned.
+ *
+ * v1 (pre-F9) recorded only the dependency fingerprint, so it attests
+ * "these manifests" and NOTHING about the toolchain having been proven to load.
+ * A tree built by the old install lane carries a v1 marker that still matches its
+ * fingerprint, so it would short-circuit straight past the new runtime smoke —
+ * the exact stickiness (P2) F9 exists to kill, surviving the upgrade.
+ *
+ * v2 = fingerprint + a native-smoke attestation. Only v2 short-circuits. A v1 (or
+ * unrecognized) marker is treated as UNPROVEN: the smoke runs against the tree in
+ * place, and on success the marker is rewritten as v2 (cheap — no rebuild), on
+ * failure provisioning refuses `native_toolchain_unproven`.
+ */
+const MARKER_V2_PREFIX = 'v2:';
+
+function markerV2(fingerprint: string): string {
+  return `${MARKER_V2_PREFIX}${fingerprint}`;
+}
+
+interface MarkerProof {
+  readonly fingerprint: string;
+  /** False for a pre-F9 (v1) marker: matching manifests, no toolchain attestation. */
+  readonly smokeAttested: boolean;
+}
+
+function readMarker(nodeModulesDir: string): MarkerProof | undefined {
+  let raw: string;
   try {
-    return fs.readFileSync(path.join(nodeModulesDir, PROVISION_MARKER_FILE), 'utf8').trim();
+    raw = fs.readFileSync(path.join(nodeModulesDir, PROVISION_MARKER_FILE), 'utf8').trim();
   } catch {
     return undefined;
   }
+  if (raw.startsWith(MARKER_V2_PREFIX)) {
+    return { fingerprint: raw.slice(MARKER_V2_PREFIX.length), smokeAttested: true };
+  }
+  // A bare fingerprint is the v1 format. Anything else unrecognized is treated
+  // the same way — as an unattested claim, never as a proof.
+  return { fingerprint: raw, smokeAttested: false };
 }
 
 /** Filesystem+git-ref-safe slug (mirrors paths.ts) for naming stage dirs. */
