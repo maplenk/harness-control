@@ -733,3 +733,69 @@ describe('isGrokReadOnlyShellPermissionTitle — descriptor duplication', () => 
     ).toBe(true);
   });
 });
+
+// ===========================================================================
+// The git read allowlist, enumerated from what git IS.
+//
+// This list was six entries and grew one at a time, each addition paid for by a
+// dead implementor round: `git tag -l`, then `git ls-tree`. Every individual
+// fix was correct and the class stayed open — guarding the routes instead of
+// the state (house rule 1). These pin the completed set in both directions.
+//
+// Membership rule: no argument form may mutate the repository, index, working
+// tree, or network. Anything whose read and write forms differ only by argument
+// SHAPE stays out — guessing read-from-write by inspecting positionals is the
+// inference that turns a write into an apparently safe read.
+// ===========================================================================
+describe('isGrokReadOnlyShellPermissionTitle — the git read allowlist', () => {
+  const admits = (command: string): boolean =>
+    isGrokReadOnlyShellPermissionTitle(`Execute \`${command}\``, undefined);
+
+  it.each([
+    'git ls-tree -r --name-only HEAD -- web',
+    'git cat-file -p HEAD',
+    'git for-each-ref refs/tags',
+    'git show-ref --tags',
+    'git rev-list --count HEAD',
+    'git describe --tags',
+    'git blame README.md',
+    'git merge-base HEAD main',
+    'git shortlog -sn',
+    'git diff-tree --no-commit-id --name-only -r HEAD',
+    'git check-ignore -v web/dist/x',
+    'git grep -n foo',
+    'git name-rev HEAD',
+    'git count-objects -v',
+  ])('ADMITS the pure read: %s', (command) => {
+    expect(admits(command)).toBe(true);
+  });
+
+  it.each([
+    'git config user.email x', // --get reads; this form WRITES
+    'git symbolic-ref HEAD refs/heads/x', // one arg reads, two WRITE
+    'git hash-object -w f', // -w writes an object
+    'git ls-remote origin', // network
+    'git fetch',
+    'git gc', // may rewrite object storage
+    'git stash', // read is a `list` SUBcommand, not a flag
+    'git worktree add /tmp/x',
+    'git commit -m x',
+    'git push',
+    'git checkout -b x',
+    'git reset --hard',
+    'git clean -fd',
+    'git notes add',
+  ])('REFUSES the writing, network or maintenance form: %s', (command) => {
+    expect(admits(command)).toBe(false);
+  });
+
+  it('admits the exact compound that closed run_c4648778 round 1 on its THIRD resume', () => {
+    expect(
+      admits(
+        'git show --stat dogfood/b0-first-implementor-commit 2>/dev/null | head -n 50; ' +
+          "echo '---'; " +
+          'git ls-tree -r --name-only dogfood/b0-first-implementor-commit -- web 2>/dev/null | head -n 40',
+      ),
+    ).toBe(true);
+  });
+});

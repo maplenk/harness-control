@@ -125,13 +125,65 @@ const SAFE_SIMPLE_READ_COMMANDS = new Set([
   'dirname',
   'basename',
 ]);
+/**
+ * Git subcommands with NO writing form at all.
+ *
+ * This list was previously six entries, extended one at a time as each new
+ * denial killed a paying implementor round — `git tag -l`, then `git ls-tree`.
+ * That is guarding the routes instead of the state (house rule 1): every
+ * individual addition was correct, and the next unlisted-but-harmless read
+ * would have cost another round.
+ *
+ * So it is now enumerated from what git IS, not from what an agent happened to
+ * try. Membership rule: the subcommand must have no argument form that mutates
+ * the repository, the index, the working tree, or the network. Anything whose
+ * READ and WRITE forms are distinguished only by argument shape is deliberately
+ * absent — guessing read-from-write by inspecting positionals is exactly the
+ * inference that turns a write into an "apparently safe" read.
+ *
+ * Deliberately EXCLUDED, with reasons, so nobody adds them casually:
+ *   config      `--get` reads, `config k v` WRITES
+ *   symbolic-ref  reads with one arg, WRITES with two
+ *   hash-object   `-w` writes an object
+ *   stash/worktree/remote/notes/bisect  read via a `list`/`show` SUBcommand,
+ *                 write via others; the shape differs from the `-l` flag gate
+ *                 used for `tag`/`branch` and needs its own handling
+ *   ls-remote, fetch, clone, pull   network
+ *   fsck, gc, repack, prune         maintenance; may rewrite object storage
+ */
 const SAFE_GIT_READ_SUBCOMMANDS = new Set([
+  // history / content inspection
   'diff',
+  'diff-files',
+  'diff-index',
+  'diff-tree',
   'log',
-  'ls-files',
-  'rev-parse',
   'show',
   'status',
+  'shortlog',
+  'whatchanged',
+  'blame',
+  'annotate',
+  'cherry',
+  'grep',
+  // object / ref plumbing
+  'cat-file',
+  'ls-files',
+  'ls-tree',
+  'for-each-ref',
+  'show-ref',
+  'rev-list',
+  'rev-parse',
+  'name-rev',
+  'describe',
+  'merge-base',
+  'count-objects',
+  'var',
+  'patch-id',
+  // attribute / ignore queries
+  'check-ignore',
+  'check-attr',
+  'check-mailmap',
 ]);
 
 interface ShellToken {
