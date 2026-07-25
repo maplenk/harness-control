@@ -251,7 +251,23 @@ const PROVISION_MARKER_BASENAME = '.harness-provisioned';
  * REGRESSION 4 (round 10) — is this staged node_modules path the ENGINE's tree
  * rather than the user's?
  *
- * Two positive signals, either sufficient:
+ * ROUND 13 (ITEM 1) — the ROOT tree is exempt from the question entirely.
+ *
+ * Both callers of this module COMMIT BEFORE provisioning runs (`implementor.ts`'s
+ * post-turn commit, `validate.ts`'s §16.3 WIP reconciliation), so at staging time
+ * an agent-created `node_modules` is necessarily UNIGNORED and UNMARKED —
+ * provisioning is what refuses a missing ignore rule and what writes the marker,
+ * and it has not run yet. Asking for a positive signal therefore COMMITTED it:
+ * a large generated tree, native binaries, or generated secrets added permanently
+ * to the branch and the git object database. A previously provisioned tree whose
+ * marker an `npm ci` removed along with its ignore rule lands in the same place.
+ * Main excluded a ROOT `node_modules` UNCONDITIONALLY, and that is restored here:
+ * while managed provisioning is ACTIVE (the only state in which these helpers are
+ * reached — `provision='none'` uses plain `addAll`) the root tree never enters a
+ * harness commit, whatever its ignore/marker/tracked status.
+ *
+ * NESTED roots keep the round-10 policy, because nested staging is what F10
+ * actually got wrong (main's root-only pathspec never touched them):
  *  - a git IGNORE RULE covers it (rules only, via `--no-index`, so force-adding
  *    cannot launder it), which is what a provisioned tree always has; or
  *  - the tree carries the provisioner's own MARKER file, which proves engine
@@ -264,11 +280,13 @@ const PROVISION_MARKER_BASENAME = '.harness-provisioned';
  * resulting "post-verification dirt".
  */
 async function isEngineOwnedNodeModules(worktreePath: string, candidate: string): Promise<boolean> {
-  if (await isPathInHead(worktreePath, candidate)) return false; // committed user content
-  if (await isPathIgnoredByRule(worktreePath, candidate)) return true;
   const segments = candidate.split('/');
   const index = segments.indexOf('node_modules');
   if (index < 0) return false;
+  // ITEM 1: the ROOT tree — main's unconditional exclusion, asked no questions.
+  if (index === 0) return true;
+  if (await isPathInHead(worktreePath, candidate)) return false; // committed user content
+  if (await isPathIgnoredByRule(worktreePath, candidate)) return true;
   const treeRoot = segments.slice(0, index + 1).join('/');
   return existsSync(path.join(worktreePath, treeRoot, PROVISION_MARKER_BASENAME));
 }

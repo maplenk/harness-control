@@ -1084,16 +1084,18 @@ describe('ImplementorFlow — F7 round-2 #3 node_modules commit semantics follow
     expect(files).toContain('node_modules/tracked.js'); // committed, not excluded
   });
 
-  // ROUND 10 (Regression 4): a TRACKED node_modules is committed user content —
-  // a vendored dependency tree main commits without complaint — so provisioning
-  // being ACTIVE does not make it ours to strip. The exclusion is scoped to the
-  // ENGINE's tree: git-ignored, or carrying the provisioner's marker.
-  it('with provisioning ACTIVE, a TRACKED node_modules edit is still COMMITTED (it is user content)', async () => {
+  // ROUND 13 (ITEM 1): the ROOT tree is main's UNCONDITIONAL exclusion, tracked or
+  // not — `git add -A -- . ':(exclude)node_modules'` excludes it from the add, so
+  // main leaves this edit unstaged rather than committing it. Round 10 read
+  // "tracked = user content" as licence to commit it, which is stricter than main
+  // in the one direction that writes to the branch. A vendored tree main really
+  // does commit is a NESTED one; that case is asserted in `git.test.ts`.
+  it('with provisioning ACTIVE, a TRACKED ROOT node_modules edit is EXCLUDED from the commit (as on main)', async () => {
     const result = await runOnceTrackingNodeModules('auto', 'asg_f7_active_exclude');
     expect(result.committed).toBe(true);
     const files = await committedFiles(result);
     expect(files).toContain('feature.txt');
-    expect(files).toContain('node_modules/tracked.js'); // main commits this; so do we
+    expect(files.every((f) => !f.startsWith('node_modules'))).toBe(true); // never entered HEAD
   });
 });
 

@@ -17,10 +17,10 @@
  * keeps an ignored tree out) and then PROVES the index is free of `node_modules`
  * at ANY depth, failing closed if it cannot make it so.
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { addAllExceptNodeModules, assertIndexFreeOfNodeModules, runGit, unstageNodeModules } from './git.js';
+import { addAll, addAllExceptNodeModules, assertIndexFreeOfNodeModules, runGit, unstageNodeModules } from './git.js';
 import { isWorktreeError, type WorktreeError } from './errors.js';
 import { makeTempGitRepo, type TempGitRepo } from './test-support.js';
 
@@ -104,16 +104,21 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
   // content — a vendored tree main commits without complaint. The guard exists to
   // stop the engine's PROVISIONED tree entering a commit, and a provisioned tree
   // is by definition git-ignored (provisioning fails closed otherwise).
-  it('KEEPS an unignored (vendored) node_modules staged — it is user content, not ours', async () => {
+  //
+  // ROUND 13 (ITEM 1): this holds for NESTED roots only. Main's exclusion was
+  // root-only, so a nested vendored tree is a tree main commits and we must too;
+  // the ROOT tree main excluded unconditionally, and so do we — see the ITEM 1
+  // block below for that case, which this fixture used to assert backwards.
+  it('KEEPS an unignored (vendored) NESTED node_modules staged — it is user content, not ours', async () => {
     const r = await repoWithIgnore(''); // no ignore rule at all
-    plantNodeModules(r.dir, 'node_modules');
+    plantNodeModules(r.dir, 'vendor/node_modules');
     await r.writeFile('src/feature.ts', 'export const feature = true;\n');
 
     await addAllExceptNodeModules(r.dir);
 
     const staged = await stagedPaths(r.dir);
     expect(staged).toContain('src/feature.ts');
-    expect(staged).toContain('node_modules/left-pad/index.js'); // committable, as on main
+    expect(staged).toContain('vendor/node_modules/left-pad/index.js'); // committable, as on main
   });
 
   it('KEEPS a nested vendored node_modules staged when it is not ignored', async () => {
@@ -156,19 +161,21 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
   });
 
   // REGRESSION 4: a TRACKED node_modules is the clearest case of user content —
-  // main commits its changes, and so must this.
-  it('a TRACKED node_modules modification IS staged and commits (main does; so do we)', async () => {
+  // main commits its changes, and so must this. ROUND 13 (ITEM 1): NESTED, because
+  // main's root-only exclusion means a tracked ROOT tree's modifications are left
+  // unstaged on main too (asserted in the ITEM 1 block).
+  it('a TRACKED nested node_modules modification IS staged and commits (main does; so do we)', async () => {
     const r = await repoWithIgnore('');
-    plantNodeModules(r.dir, 'node_modules');
-    await r.commitAll('a repo that (wrongly) tracks node_modules');
-    writeFileSync(path.join(r.dir, 'node_modules', 'left-pad', 'index.js'), 'module.exports = 2;\n', 'utf8');
+    plantNodeModules(r.dir, 'vendor/node_modules');
+    await r.commitAll('a repo that vendors its dependencies');
+    writeFileSync(path.join(r.dir, 'vendor', 'node_modules', 'left-pad', 'index.js'), 'module.exports = 2;\n', 'utf8');
     await r.writeFile('src/feature.ts', 'export const feature = true;\n');
 
     await addAllExceptNodeModules(r.dir);
 
     const staged = await stagedPaths(r.dir);
     expect(staged).toContain('src/feature.ts');
-    expect(staged).toContain('node_modules/left-pad/index.js');
+    expect(staged).toContain('vendor/node_modules/left-pad/index.js');
     const sha = await r.commitAll('vendored dependency update');
     expect(sha).toMatch(/^[0-9a-f]{40}$/);
   });
@@ -277,6 +284,80 @@ describe('F10 exclusion is scoped to the ENGINE tree, not to every node_modules'
     const tree = (await r.run(['ls-tree', '-r', '--name-only', 'HEAD'])).trim().split('\n');
     expect(tree).toContain('src/feature.ts');
     expect(tree.some((f) => f.includes('node_modules'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND 13 ITEM 1 — main's UNCONDITIONAL exclusion of the ROOT tree, restored.
+//
+// Both callers COMMIT BEFORE provisioning runs (`implementor.ts` post-turn,
+// `validate.ts` §16.3 WIP), so at staging time a tree the agent created is
+// necessarily unignored AND unmarked — provisioning has not run yet, and it is
+// provisioning that would refuse the missing ignore rule. Round 10's
+// positive-signal policy therefore committed it: a large generated tree, native
+// binaries, or generated secrets added permanently to the branch and the object
+// database. The same holds for a PREVIOUSLY provisioned tree whose marker an
+// `npm ci` deleted along with the ignore rule.
+//
+// Main excluded a ROOT `node_modules` unconditionally (`:(exclude)node_modules`
+// plus a root-only `git reset -- node_modules`) and never touched a NESTED one.
+// Nested staging was F10's real defect; applying the new policy to the ROOT was
+// an over-correction. So: root = unconditional, nested = positive signal with a
+// HEAD veto. These helpers are reached ONLY while managed provisioning is
+// ACTIVE; under `provision='none'` both callers use plain `addAll`.
+// ---------------------------------------------------------------------------
+describe('ROUND 13 ITEM 1 — the ROOT node_modules is excluded unconditionally while provisioning is active', () => {
+  it('an UNIGNORED, unmarked, agent-created ROOT node_modules never enters the commit (as on main)', async () => {
+    // The shape the ordering bug produces: the agent wrote node_modules during its
+    // turn, the repo has no ignore rule, and provisioning — which would have both
+    // refused the missing rule and written the marker — has not run yet.
+    const r = await repoWithIgnore('');
+    plantNodeModules(r.dir, 'node_modules');
+    await r.writeFile('src/feature.ts', 'export const feature = true;\n');
+
+    await addAllExceptNodeModules(r.dir);
+    // NOT the fixture's `commitAll` — that re-runs `git add -A`, which would
+    // re-stage an unignored tree and hide what the helper decided.
+    await r.run(['commit', '-m', 'the round']);
+
+    const tree = (await r.run(['ls-tree', '-r', '--name-only', 'HEAD'])).trim().split('\n');
+    expect(tree).toContain('src/feature.ts');
+    expect(tree.some((p) => p.startsWith('node_modules'))).toBe(false);
+    // Never deletes: the bytes stay on disk for the verifier, exactly as on main.
+    expect(existsSync(path.join(r.dir, 'node_modules', 'left-pad', 'index.js'))).toBe(true);
+  });
+
+  it('a TRACKED ROOT node_modules modification is excluded too (main excludes it from the add)', async () => {
+    // Main's `git add -A -- . ':(exclude)node_modules'` excludes the root tree
+    // whether or not it is tracked, so its modifications are left UNSTAGED rather
+    // than committed. Round 10 read "tracked = user content" as a reason to commit
+    // it, which is stricter than main in the direction that writes to the branch.
+    const r = await repoWithIgnore('');
+    plantNodeModules(r.dir, 'node_modules');
+    await r.commitAll('a repo that (wrongly) tracks node_modules');
+    writeFileSync(path.join(r.dir, 'node_modules', 'left-pad', 'index.js'), 'module.exports = 2;\n', 'utf8');
+    await r.writeFile('src/feature.ts', 'export const feature = true;\n');
+
+    await addAllExceptNodeModules(r.dir);
+
+    const staged = await stagedPaths(r.dir);
+    expect(staged).toEqual(['src/feature.ts']);
+    // Reset to its HEAD content: no longer a staged CHANGE, and the working-tree
+    // bytes are untouched (what the old exclusion achieved).
+    expect(readFileSync(path.join(r.dir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('module.exports = 2;\n');
+  });
+
+  it("provision='none' keeps unrestricted staging: `addAll` commits the same root tree", async () => {
+    // The other half of the directive. `addAll` is what both callers use when
+    // managed provisioning is OFF (the operator owns node_modules), and it is
+    // untouched — a repo that legitimately tracks node_modules still commits it.
+    const r = await repoWithIgnore('');
+    plantNodeModules(r.dir, 'node_modules');
+    await r.writeFile('src/feature.ts', 'export const feature = true;\n');
+
+    await addAll(r.dir);
+
+    expect(await stagedPaths(r.dir)).toContain('node_modules/left-pad/index.js');
   });
 });
 
