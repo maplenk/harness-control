@@ -19,11 +19,12 @@ Two checkpoints worth naming inside that:
 
 | Fact | Evidence |
 |---|---|
-| F7 landed **and pushed** — `main` == `origin/main` == `5669d22` | `git rev-parse` both refs. ONBOARDING's "user must push" step is already done. |
+| F7 is landed and pushed; local `main` has since moved to `481e772`, **two commits ahead of `origin/main` (`5669d22`)** | `b9ca10c` (implementor prompt) + `481e772` (docs + dogfood tooling) are local-only. Push is a human step and is still outstanding. |
 | Grok prompt-steering WIP now committed as `b9ca10c` (implement-and-stop; verifier owns the commands) | Was the preserved uncommitted edit; landing it makes engine-binary provenance clean. Already live in `dist` (rebuilt at `b9ca10c`). |
 | Run 1 (`run_8aa51aea…`, slice 1a) is **unresumable** | `resume` failed closed: §16.3 (`src/worktree/validate.ts:251`) refuses resume-in-place because HEAD (`ef952b1`) drifted past the last cadence checkpoint (`36101cf1`). See F8 below. |
 | Grok's three commits survive on the assignment branch | `77cfd09 → 36101cf → ef952b1`, base `01ff719` (8 commits behind main — salvage would have bought a merge conflict with F7's `commands.ts` rewrite). |
-| **Fresh slice-1a run started** (2026-07-25) | `start-slice.sh` with §3A.1 scope pinned to plan SHA `b9ca10c`; coordinator `claude:opus:xhigh`; stops at the human-approval gate. |
+| Slice-1a run `run_756ce21b…` was **cancelled** (2026-07-25) | Started against §3A.1 at plan SHA `b9ca10c`, then cancelled once round 1 surfaced **F11** (the grok quoting trap → `no_deliverable`) and **F10** (the staging helper is fatal on git 2.55). A fresh 1a run is pending the LAND gate — starting one before F10 lands would just re-buy the same failure. |
+| Engine-fix branches **F8–F11 are under codex review**, none merged to `main` | The staging drill in `scripts/dogfood/preflight.sh` fails on `main` today for exactly this reason: the built `addAllExceptNodeModules` still carries the pre-F10 pathspec. That failure is the battery working, not the battery breaking. |
 | Run 2 (`run_992e9598…`) is a cancelled opencode-era run | Event tail: limit incident → pause → cancel. Historical only; its worktree is cleanup noise. |
 | Engine suite green at F7 land | **Real suite: 103 files / 1699 tests (~17s), both SQLite drivers**, typecheck 0. The historically reported 206/3398 was exactly **doubled**: the leftover gitignored `.claude/worktrees/agent-ad6b0180db834588b` (an F7 agent worktree) mirrors `src/` with its own `node_modules`, and vitest's default excludes don't cover `.claude/`, so a bare `npm test` discovers the whole suite twice (1699×2 = 3398). Verified via `npx vitest run --exclude '**/.claude/**'`; now fixed permanently by the root `vitest.config.ts` exclude (risk #9). |
 
@@ -31,9 +32,15 @@ Two checkpoints worth naming inside that:
 
 ```
 slice(i):
-  PREFLIGHT   scripts/dogfood/preflight.sh — the L11 battery (toolchain provenance ·
-              engine git-path drill · native-toolchain runtime proof · build + doctor ·
-              collection floor ≥103 · clean tree). Exit 0 or do not start.
+  PREFLIGHT   scripts/dogfood/preflight.sh — the L11 battery: (a) toolchain
+              provenance · (b) native-toolchain runtime proof · (c) build +
+              role-scoped doctor · (d) THE GATING DRILL: the real
+              addAllExceptNodeModules imported out of dist/ and run against an
+              ignored+present node_modules fixture · (e) discovery floor ≥103 ·
+              (f) clean tree. ENFORCED: start-slice.sh and run-slice.sh call
+              require-preflight.sh and refuse without a verdict=pass record at
+              this HEAD, same toolchain, <30 min old (SKIP_BUILD=1 records are
+              "diagnostic" and are rejected).
               Then: budget sanity · SECTION/SLICE/PATHS written · plan SHA pinned.
               REPO FREEZE begins at `start` — no commits and no tracked-file edits
               until the run is terminal. Queue doc edits in the scratchpad.
@@ -60,7 +67,7 @@ Cost basis (run 1 actuals): coordinator ≈ $1.5 (532k in / 31k out, opus xhigh)
 - `run-slice.sh` exit codes: **0** = terminal (check for `merge_ready`) · **3** = provider usage-limit pause (`resume --wait`) · **4** = `integration_blocked` (`recheck` after fixing).
 - `watch.sh` uses `sqlite3 -readonly`, which transiently fails `SQLITE_CANTOPEN` right after any CLI command deletes the WAL sidecars (last-connection cleanup). Cosmetic; self-heals on the next 5s tick.
 - `~/.harness/.current-dogfood-run` is a **stale pointer** (points at the cancelled run). No script reads it — ignore it.
-- The live grok binary is **0.2.111**; `src/adapters/grok/capabilities.ts:1` documents the baseline against **0.2.106**. If grok misbehaves in a new way, check this skew first.
+- The live grok binary is **0.2.112** (was 0.2.111 earlier the same day — it moves fast); `src/adapters/grok/capabilities.ts:1` documents the baseline against **0.2.106**. If grok misbehaves in a new way, check this skew first — preflight prints the installed-vs-baseline delta on every run.
 - RSS recovery if a role trips the ceiling: `node dist/cli/index.js set-budget RUN_ID --role implementor --memory-budget-mb <MB> --resume` — an audited raise, never a silent one.
 - Per-slice preconditions, predicted failure modes and spec mitigations live in **`docs/DOGFOOD-FEASIBILITY.md`** §4 (the slice table) and §1 (the transition laws L1–L11). Read the row for slice *i* before writing its SECTION/SLICE/PATHS.
 
@@ -100,7 +107,7 @@ House rules that stay absolute: green ≠ correct (codex diff-review is the merg
 
 ## 5. Risk register
 
-1. **F8: cadence checkpoints make crashed runs unresumable — and the root cause is structural.** A cadence checkpoint fires at a *turn* boundary and captures the *pre-commit* HEAD; the implementor commits after its turn loop (`implementor.ts:969-978`); §16.3 then refuses on **any** drift (`validate.ts:244-253`). So every round's tail is unresumable, not some edge case. Fix shape locked for spec review: **(A)** forward-containment acceptance (`merge-base --is-ancestor`) + **(C)** write the missing `pre_verify_handoff` checkpoint after `commitAll` — PLAN §12.2 mandates it and the vocabulary exists (`state.ts:349-354`, `src/checkpoint/cadence.ts:27,38`) with **zero production writers**. (B) deferred. Spec: `docs/engine-fix-f8-resume-spec.md`. **Land before the expensive daemon slices (2a+)**; until then the only recovery is a fresh slice.
+1. **F8: cadence checkpoints make crashed runs unresumable — and the root cause is structural.** A cadence checkpoint fires at a *turn* boundary and captures the *pre-commit* HEAD; the implementor commits after its turn loop (`implementor.ts:969-978`); §16.3 then refuses on **any** drift (`validate.ts:244-253`). So every round's tail is unresumable, not some edge case. Fix shape (spec v2, after codex review): write the missing `pre_verify_handoff` checkpoint after `commitAll` — PLAN §12.2 mandates it and the vocabulary exists (`state.ts:349-354`, `src/checkpoint/cadence.ts:27,38`) with **zero production writers** — and accept drift **only against that durable engine receipt** (or the persisted `lastImplementationCommit`). Bare `merge-base --is-ancestor` acceptance was proposed and withdrawn: anyone who can write to the worktree can append a descendant, so containment alone is not tamper evidence. Spec: `docs/engine-fix-f8-resume-spec.md`. **Land before the expensive daemon slices (2a+)**; until then the only recovery is a fresh slice.
 2. **Grok on React/Vite is unproven** — engine slices were backend TS. B0 exists to burn this down early. Watch: file-scope discipline in `web/`, RSS budget (2048MB set), permission denials on new tool shapes.
 3. **Coordinator spec variance** — the approval gate caught a self-contradictory spec once. Mitigation is the gate itself + SECTION/SLICE/PATHS tightness + "mutually satisfiable, machine-checkable" now written into the goal template.
 4. **Codex verifier wall-clock/cost at xhigh** — bounded per-slice contracts (§6A table) keep it tractable; watch the F7 `npm ci` path (slow) vs APFS clone path (fast) in provisioning.
@@ -124,7 +131,7 @@ Four fixes, all surfaced by real runs rather than by review, all specced against
 | **F10** | on git 2.55 the staging helper's `:(exclude)node_modules` pathspec exits 1, so **every** harness commit path dies | BLOCKER | `docs/engine-fix-f10-staging-spec.md` |
 | **F11** | the grok read-only classifier rejects `$`/backslash/backtick even inside quotes — one backslash in a quoted regex killed slice-1a round 1 | HIGH | `docs/engine-fix-f11-grok-shell-quoting-spec.md` |
 
-F10 and F11 are the two 2026-07-25 misses that a green suite could never have caught; both are now permanently drilled by `scripts/dogfood/preflight.sh` (F10 directly, F11 by removing the trap). That battery is the durable lesson of this queue: **prove the engine against the current machine, not only against itself.**
+F10 and F11 are the two 2026-07-25 misses that a green suite could never have caught. **F10 is now permanently gated** by `scripts/dogfood/preflight.sh` section (d), which imports the real `addAllExceptNodeModules` out of `dist/` and runs it against an ignored+present `node_modules` fixture — it fails on `main` today, which is the correct answer until F10 lands. **F11 is NOT covered by preflight:** the permission-policy lint (enumerating the implementor's plausible first tool calls against the live grok allowlist) needs the classifier to be invocable from a script, which it is not yet. That remains a tracked gap; F11 removes the specific trap, but nothing yet catches the *next* denial-shaped mismatch before a run pays for it. The durable lesson of this queue stands: **prove the engine against the current machine, not only against itself.**
 
 ## 6. Operating agreement (who does what)
 
