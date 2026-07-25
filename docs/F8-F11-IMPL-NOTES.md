@@ -1051,10 +1051,138 @@ by the sweep plus the round-5 masking test.
 
 ---
 
+---
+
+# Round 7 — codex round-6 verdict on `e46ecf2`
+
+Four HIGH blockers, one MEDIUM accepted as residual. Commit map:
+
+| finding | commit |
+| --- | --- |
+| Findings 1, 3, 4 (constructor veto + the churn) | `a46f8db` |
+| Finding 2 (version proof) | `21ccecd` |
+
+## Finding 3 + the directive — I stopped scoping
+
+Round 6's note said the required-field type was scoped to Grok "instead of
+churning every `PermissionMediationConfig` site". **That scoping was the bug**,
+and the review was right to name it as such: the publicly exported generic
+`AcpStdioAdapter` still took an optional-veto config, so constructing one
+directly with an approve-all interactive handler bypassed `buildGrokMediation`
+and compiled fine. My 4x5 enumeration covered helper INPUTS; the hole was a
+CONSTRUCTOR.
+
+`verifyOperationPayload` is now **non-optional on both variants of
+`PermissionMediationConfig`** — the type used where sessions are actually
+constructed. Exported `noPayloadToVerify` is the explicit, named no-op, so "this
+surface has nothing to bind" is a decision someone typed rather than an absence.
+
+**The churn, stated plainly: 8 files, 47 construction sites.**
+
+| kind | sites | what the decision was |
+| --- | --- | --- |
+| production | 5 | see below |
+| tests/scripts | 42 | mechanical |
+
+The five production sites are each a real decision, not a rubber stamp:
+
+1. **`toPermissionConfig`** (the orchestrator's provider-AGNOSTIC mapping) passes
+   the explicit no-op, because it does not know what a payload looks like for the
+   harness that will run. Provider factories layer their own veto over it, which
+   `buildGrokMediation` does for every Grok session.
+2. **The ACP session's `?? { mode: 'headless' }` default** — default-deny, so
+   there is no approval path for a veto to gate.
+3. **`buildGrokMediation`'s placeholder base**, replaced unconditionally on
+   return.
+4-5. **Two isolation smoke scripts.**
+
+**A gap this made visible rather than created:** Claude and Codex sessions now
+carry `noPayloadToVerify` — they have no payload-binding classifier. Their ACP
+tool calls *do* carry executable payloads (Claude's `Bash(command)`), so binding
+them is real future work. It was not in scope for these findings and I did not
+invent a classifier for two providers speculatively; what changed is that the
+absence is now a typed, greppable statement instead of a silent hole. Worth
+tracking alongside F13.
+
+## Finding 4 — the same inference, one layer further in
+
+The classifier still concluded kind from failure to read: `undefined` conflated
+ABSENT with MALFORMED, so `{command: 42}` read as "no command here" and a `Write`
+title carrying it was waved through as `structured_file`. `readPayloadField` now
+returns `string` / `absent` / `malformed`, and **only ABSENT is evidence about
+kind**.
+
+It also now **binds the path**. `isWorkspaceWriteOperation` checks the TITLE's
+path, so `Write \`<inside-worktree>\`` carrying `{path: "<outside>"}` passed both
+the veto and the containment check — making that check decorative. A payload path
+that disagrees with the title, or is malformed, is `unknown` and refused.
+
+## Finding 1 — the other resume path
+
+The COMPLETED-implementor path had the identical topology-as-authorization
+defect: with no round-scoped `lastImplementationCommit` it fell back to bare
+current HEAD, so a crash between `runRole` recording completion and the loop
+recording that pointer let any subsequently-appended commit become the
+verification binding.
+
+It now consults the round's `pre_verify_handoff` RECEIPT first, accepts the
+pointer only when it AGREES with the receipt (a disagreement means one record is
+stale, which is not a state to pick a winner in), and never falls back to HEAD.
+
+**What happens when neither durable source exists** — asked explicitly, so
+stated explicitly: it **REFUSES**, throwing `WorktreeError{requires_validation}`
+with a message naming the round and saying that neither a receipt nor a pointer
+was recorded. The run stops. Nothing is discarded: the commit is intact in the
+worktree for an operator to inspect and bind manually. This mirrors the
+interrupted path's "no receipt → refuse_resume, always", and it is the same
+trade accepted in Q24 — an unreceipted round is not auto-resumable.
+
+## Finding 2 — version granularity
+
+Presence proved nothing about correctness: bump a version without reinstalling
+and the OLD directory satisfies a name check, so the wrong tree is cloned,
+stamped v2, and short-circuited onto for the rest of the run. Non-native packages
+evade the smoke entirely.
+
+Each root dependency/devDependency's installed `version` must now EXACTLY equal
+the lockfile's resolved version; an unreadable/malformed manifest, or one with no
+version, is a defect rather than a pass. `lockedRootVersions` reads lockfileVersion
+2/3 `packages` (top-level entries only) with a v1 `dependencies` fallback, and an
+unparseable lockfile degrades to presence-only rather than failing a run — the
+fingerprint already proved that lockfile is byte-identical to the committed one.
+
+## Finding 5 — residuals, noted not fixed (as instructed)
+
+1. **`factory.ts` `prepared.dispose()` is unguarded.** If home-isolation teardown
+   throws while an earlier failure is in flight, it replaces the primary cause.
+   Same masking family as round 5/6; left alone this round by direction.
+2. **`quarantineStage`'s `warn(...)` calls can throw from the timeout `finally`.**
+   The marker write and `probe.self()` are guarded, but a throwing warn sink would
+   still mask the refusal. Same family, same disposition.
+3. **Quarantine retention** (round 5) — unchanged, still accepted.
+4. **Claude/Codex payload binding** — see the note under Finding 3.
+
+## Round-7 regression proofs
+
+| finding | method | pre-fix |
+| --- | --- | --- |
+| 1 | bare-HEAD fallback restored | 4 fail (both new tests x both drivers) |
+| 2 | version comparison neutered to presence-only | pass 86 fail 3 |
+| 3 | the type itself — the round-6 literal cannot compile without a veto | compile error |
+| 4 | `command.ts` reverted | pass 67 fail 2 |
+
+For findings 1 and 4 the tests exercise the CONSTRUCTION/PAYLOAD route rather
+than a helper, as directed: Finding 1 drives a real paused loop whose implementor
+round completed and published a receipt, then drops the pointer and appends a
+foreign commit; Finding 4 drives `grokShellPayloadMatchesTitle` with the exact
+malformed and path-divergent payload shapes.
+
+---
+
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1881 passed, 0 failed**, 106 files
+- `npx vitest run` (full, from this worktree) → **1891 passed, 0 failed**, 106 files
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
