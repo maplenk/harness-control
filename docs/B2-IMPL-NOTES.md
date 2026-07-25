@@ -6,6 +6,12 @@ which is NOT the tip of `main` at the time of writing (`main` is at `5669d22`, F
 numbers below are measured against `a77f3da`.
 Spec: `docs/AUTONOMOUS-BASE-PLAN.md` §1 + B2. Invariant reversal recorded in `PLAN.md` §7.1.
 
+> **ROUND 2 (post-codex review of `c45eccf`).** Codex returned NEEDS-FIX with five findings and
+> REPRODUCED every one. Sections 1–5 below describe round 1; **§6 is the round-2 record and
+> supersedes them wherever they disagree** — in particular the approval gate moved from the CLI to
+> the service, auto-approval moved into the coordinator-completion transaction, the signer became
+> required end to end, and the §7 testability gate acquired a structural companion. Read §6 first.
+
 ---
 
 ## 1. What changed and where
@@ -255,3 +261,172 @@ Enumerated from the code, with what each actually catches.
   worktree — not to what the spec asks for.
 - **Semantic drift across remediation rounds.** Remediation is bounded in count, not in scope; each
   round re-reads the same spec, but nothing re-checks that the accumulated diff still matches intent.
+
+---
+
+## 6. ROUND 2 — the codex review, and what it changed
+
+Codex reviewed `c45eccf` and returned **NEEDS-FIX with five findings, every one reproduced**. It
+found no regression on the default `'human'` path. All five are fixed below; each has a regression
+test that stages codex's own scenario, and each was proven to fail on `c45eccf`.
+
+### F1 (HIGH) — the approval gate was in the CLI, not the engine
+
+**Reproduced:** a run pinned to `approval:'human'`, with **no draft at all**, reached `approved`
+carrying a **fabricated hash** and a durable `approvedBy:'auto'`. `service.approve` trusted the
+caller's `mode`, version and hash outright, so the CLI's pre-checks were the only thing in the way —
+and the CLI is not the only caller. Codex is right that this is not an auto-approval bug: it was a
+hole in the entire approval gate.
+
+**Fix.** `OrchestrationService.#assertApprovalBinding` (`src/app/service.ts:1905`), called inside the
+approving transaction by BOTH approval routes:
+- the run's **PINNED** `approval` (W1-F5) decides whether `mode:'auto'` is even legal — a `'human'`
+  run refuses it, so `approvedBy:'auto'` can never appear on a run that never opted in;
+- the binding is validated against the durable completion ref by the SERVICE.
+
+Refusals are the typed `SpecApprovalRefusedError` (`src/app/service.ts:310`), rendered by the CLI as
+an ordinary structured refusal (`approvalRefusalOutput`, `src/cli/commands.ts:493`) rather than a crash.
+
+### F2 (HIGH) — hash-only identity, and a read outside the write
+
+**Reproduced:** a stale draft projection carrying the **same content hash** under a **superseded
+version/revision** passed draft-loss detection (human approval caught it only via its separate
+`--spec-version` check; the auto path had no second look). And validation ran in the CLI, in a
+different transaction from the T1 append, so a concurrent revision could slip in between.
+
+**Fix.** Identity is now hash **and** version **and** revision — in `detectDraftLoss`
+(`src/cli/commands.ts:362`, the early friendly rendering) and authoritatively in
+`#assertApprovalBinding`. `approve` wraps validation + `ingest` in ONE `transactionImmediate`
+(`src/app/service.ts:1881`), so nothing observes a half-checked approval and nothing races.
+
+### F3 (MEDIUM) — auto-approval was a CLI post-step
+
+**Reproduced:** an `approval:'auto'` run driven through the durable completion API completed and
+**stayed at `awaiting_approval`**; the W2-5 coordinator re-entry likewise printed `next: approve`;
+and a crash between the completion and the post-step stranded the run at a gate it is pinned not to
+have.
+
+**Fix.** The T1 now rides `completeCoordinationRound`'s transaction (`src/app/service.ts:2778`), so
+**every** durable coordinator completion signs atomically — `start`, `spec revise`, W2-5 re-entry,
+and any direct API caller alike — and a refused signature rolls the whole round back. The CLI keeps
+only the *rendering* (`autoApprovalOf`, `src/cli/commands.ts:458`), derived from the resulting engine
+state; the re-entry surface no longer tells an already-approved run to approve.
+
+Codex explicitly endorsed round-1 judgement call (c) — auto-approving a completed `spec revise` is
+correct recovery, not a second route. Centralizing has an interesting consequence: because a refused
+auto-approval now rolls the completion back, an `'auto'` run is **never** parked at
+`awaiting_approval`, so `spec revise` (which requires that phase) is unreachable on such a run. The
+recovery path it existed for cannot arise. That is a strictly better outcome, and the test that used
+to cover the revise-repair case was deleted rather than left asserting a state the engine can no
+longer produce.
+
+### F5 (MEDIUM) — an optional signer that silently became `'human'`
+
+**Reproduced:** a ready readiness record built with no signer input reported
+`specApprovedBy:'human'`. Codex **rejected** round-1 judgement call (a): requiring the field on the
+final entity is worthless while every upstream input is optional and defaults to human. It is right —
+that is a lie in the one field that exists to prevent one.
+
+**Fix.** The signer is REQUIRED through the whole production flow —
+`ImplementVerifyLoopCommonInput`, `RunVerificationInput`, `RecheckMergeReadinessInput`,
+`BuildMergeReadinessInput`, `MergeReadiness` — and legacy compatibility resolves at **exactly one
+point**: `status()` maps a pre-B2 approval (hash bound, no signer folded) to `'human'`
+(`src/app/service.ts:3475`). `MergeReadinessBlockedState.specApprovedBy` was **removed** rather than
+made optional, so a persisted record written by an older build cannot re-introduce a default;
+`recheck` re-reads the signer from engine state. Where the value could still be absent, the CLI
+REFUSES (`approval_signer_missing`, `src/cli/commands.ts:1123`, `:1474`, `:2132`) instead of guessing.
+The compiler found 72 construction sites; every one now states its signer.
+
+### F4 (HIGH) — the testability gate is lexical, and gameable
+
+**Reproduced:** the validator accepted a task **"Remove the authorization check"**, verification
+command **`true`**, expected evidence **"exit code is 0"**. Codex's conclusion is the sharpest line in
+the review: *F13 makes execution evidence honest, but it does not make the criteria meaningful* —
+after F13 the host would truthfully attest that a meaningless command passed. The code comment and
+`profiles/coordinator.md` both still assumed a human always reads the spec, which under `'auto'` is
+false.
+
+**Fix — structural, not a smarter regex.** The verification commands come from the RUN:
+- `verification.allowedCommands` in `EngineConfig` (`src/config/schema.ts:352`), pinned per run at
+  `start` like every other knob;
+- `assessSpecSemantics` requires every cited command to be an exact member of that set
+  (`src/app/flows/coordinator.ts:231`) — near-misses (`… || true`, `true; …`, padding, prefixes) are
+  refused, and the refusal names the legal set so the bounded re-prompt is actionable;
+- `approval: 'auto'` **refuses an empty set at config parse** (`src/config/schema.ts:498`), mirroring
+  the existing `switch_*`-requires-a-ladder rule. Under the human gate a person reads the spec; under
+  autonomy nobody does, so autonomy may not also let the model choose what counts as proof;
+- the coordinator is TOLD the set up front in the emission contract
+  (`src/app/flows/coordinator.ts:846`) so it does not burn a bounded round discovering the rule —
+  but telling it is a courtesy, the host check is the gate;
+- the stale comment at `CONCRETE_EVIDENCE_ANCHOR` and the false "human-only" / "always explicitly
+  human-approved" claims in `profiles/coordinator.md` are corrected, and the profile now states
+  plainly that under `'auto'` **nobody reads the spec before work starts**.
+
+**The residual, stated plainly:** a criterion can still be VACUOUS even when it cites a real command.
+"the suite passes" is satisfied by a no-op change. Neither the testability gate nor the allowlist
+catches that. Two things do, and neither is this gate: the **deliverable adjudicator requires a NEW
+COMMIT**, and the **human reviews the merge**. The allowlist raises the floor from "any string the
+model invents" to "a command you declared"; it does not make criteria meaningful.
+
+### Round-2 fails-on-parent proof
+
+Same method as §2 (extract the parent, symlink node_modules, copy only test files — this worktree is
+never mutated), parent `c45eccf`:
+
+```
+git archive c45eccf | tar -x -C $SCRATCH/pp2
+cp src/app/approval-boundary.test.ts $SCRATCH/pp2/src/app/
+cp src/config/config.test.ts         $SCRATCH/pp2/src/config/
+cp src/app/flows/coordinator.test.ts $SCRATCH/pp2/src/app/flows/
+cd $SCRATCH/pp2 && npx vitest run <those three>
+```
+
+| Finding | Parent failure (verbatim) |
+| --- | --- |
+| F1 | `promise resolved "{ status: 'applied', …(3) }" instead of rejecting` — the `'human'`-pinned, draft-less run WAS auto-approved with a fabricated hash |
+| F2 | `promise resolved "{ status: 'applied', …(3) }" instead of rejecting` — the same-hash/superseded-revision draft passed, as did a version/hash disagreeing with the completion ref |
+| F3 | `expected 'awaiting_approval' to be 'approved'` (with the parent's config gate bypassed by a one-line local patch, exactly as in §2 Run 2) — the durable completion API left the `'auto'` run at the gate |
+| F4 | `expected true to be false` — the validator ACCEPTED codex's `true` + "exit code is 0" spec even with an allowlist supplied |
+| config | 4 failures (`SPEC_APPROVAL_MODES` absent; `allowedCommands` absent; `approval:'auto'` accepted with no allowlist) |
+
+Totals on the parent: `approval-boundary.test.ts` 16/20 failed as committed and 16/20 with the F3
+config bypass (the bypass converts two setup failures into behavioural ones), `config.test.ts` 4/52
+failed, `coordinator.test.ts` 2/19 failed. The tests that PASS on the parent are the ones that must:
+the `approval:'human'` guards, which encode unchanged behavior — consistent with codex finding no
+default-path regression.
+
+**Green bar after round 2:** `npm run typecheck` exit 0; `npx vitest run` → **108 files / 1992 tests,
+0 failed** (round 1: 107 / 1969; original parent baseline: 106 / 1945).
+
+### Round-2 judgement calls
+
+- **`MergeReadinessBlockedState.specApprovedBy` was deleted, not made required.** Persisting it would
+  have created a second place where a missing value could become `'human'` — exactly F5's complaint.
+  `recheck` re-reads the signer from engine state instead.
+- **A missing signer REFUSES rather than defaults, in three CLI paths.** After the single resolution
+  point in `status()`, an approved run always has a signer; its absence means the engine bound a hash
+  without folding a signer. Printing a guess there would be the precise lie F5 is about.
+- **Empty `allowedCommands` stays unrestricted under `approval:'human'`.** Making it mandatory
+  everywhere would have broken every existing run and test for no safety gain — a human reads those
+  specs. The cross-field refusal is what makes the permissive default unreachable under autonomy.
+- **Exact string matching, no normalization.** Any normalization (trimming, shell-splitting,
+  prefix-matching) is a new attack surface: `npm test` and `npm test || true` must never be the same
+  command. Padded allowlist entries are refused at parse so exactness can never be a silent trap.
+- **`--test-approve` is now strictly narrower**: it still binds the real drafted hash, but the service
+  compares the caller's `--spec-version` to the completion ref, so it can no longer approve under a
+  foreign version id. The `HARNESS_TEST_MODE` guard itself is unchanged. This is a deliberate,
+  tested tightening of a test-only seam.
+
+### Still not verified after round 2
+
+Everything in §4 still stands (no live run; no concurrency testing; `--enable-chat` + `'auto'` not
+exercised). Newly relevant:
+- **The transactional atomicity claims are tested by outcome, not by crash injection.** The "rejected
+  T1 rolls the whole completion back" test drives a real rejection and asserts nothing was written;
+  it does not kill the process mid-transaction.
+- **The allowlist is enforced at spec VALIDATION only.** Nothing re-checks, at verification time,
+  that the commands actually executed are the declared ones. Under F13/B1 the host attests what ran;
+  tying that attestation back to the pinned allowlist is not implemented here.
+- **§5's guard analysis is now partly superseded.** Its "criteria that are concrete but trivial"
+  bullet described the hole F4 fixes structurally; the residual (a vacuous criterion citing a real
+  command) is restated above. Its F13/B1 ordering warning still stands unchanged.

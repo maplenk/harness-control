@@ -395,15 +395,29 @@ automation is possible only through `--test-approve` with
 - **Autonomy is opt-in, per run, and never silent.** Setting
   `approval: "auto"` in the config `start` binds (default: `"human"`) has the
   ENGINE sign the drafted spec so an autonomous run does not wait at the input
-  gate. It is a signature, not a bypass: it binds the REAL drafted hash, runs
-  the same draft-loss validation an explicit approval runs (a missing/stale
-  draft still refuses), leaves the testability gate strict, and never touches
-  the `--test-approve` synthetic-hash path. The mode is pinned into the run at
-  creation, so it cannot be granted or revoked mid-run. Every auto-approval is
-  recorded as `spec.approved {approvedBy:"auto"}`, and the merge-readiness
-  report carries `specApprovedBy` plus an explicit warning — when you review a
-  merge, you are told whether anyone reviewed the intent. **The merge gate is
-  unchanged and still human: nothing auto-merges.**
+  gate. It is a signature, not a bypass: the signature is applied inside the
+  same transaction that persists the drafted spec, it binds the REAL drafted
+  hash, and it never touches the `--test-approve` synthetic-hash path. The mode
+  is pinned into the run at creation, so it cannot be granted or revoked
+  mid-run. Every auto-approval is recorded as
+  `spec.approved {approvedBy:"auto"}`, and the merge-readiness report carries
+  `specApprovedBy` plus an explicit warning — when you review a merge, you are
+  told whether anyone reviewed the intent. **The merge gate is unchanged and
+  still human: nothing auto-merges.**
+- **The approval gate lives in the engine, not the CLI.** The service enforces
+  the run's pinned approval mode and validates the approved version, hash and
+  revision against the durable coordinator-completion record, inside the
+  transaction that records the approval. A run configured `"human"` refuses an
+  engine signature outright, whatever calls it.
+- **Under autonomy, the run decides what counts as proof.** The testability
+  gate that rejects vague acceptance criteria is a text filter, and a
+  determined model can satisfy it with a meaningless command. So
+  `approval: "auto"` requires you to declare `verification.allowedCommands`,
+  and every acceptance criterion must cite one of them verbatim — the
+  coordinator picks which of your commands proves a criterion, it cannot invent
+  `true` or weaken one with `|| true`. This does not make a criterion
+  *meaningful* ("the suite passes" is satisfied by a no-op); the guards for
+  that are the requirement of a real new commit and your merge review.
 - **Source pinning is fail-closed.** New runs are not created from non-Git,
   unborn, dirty, unresolvable, or drifting workspaces. Every fresh
   implementation worktree is created from the run's branded full commit SHA;
