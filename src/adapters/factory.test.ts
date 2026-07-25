@@ -193,7 +193,7 @@ describe('provider adapter factory — command resolution + version pin (§3, §
   // move as `NotServiceOwned`: the unsupplied case is unrepresentable in the
   // path that would consume it.
   // -------------------------------------------------------------------------
-  it('grok: REFUSES to construct an implementor adapter without an explicit worktree cwd', () => {
+  it('grok: REFUSES to construct an implementor adapter without an explicit worktree cwd', async () => {
     const fixture = fixtureGrok();
     const base = {
       clock: CLOCK,
@@ -231,7 +231,19 @@ describe('provider adapter factory — command resolution + version pin (§3, §
 
     // NEGATIVE CONTROL: roles that never receive a containment-bound policy are
     // untouched — the refusal is scoped to the role that would consume the root.
-    const verifier = createGrokBuildAcpAdapter({ ...base, role: 'verifier' });
+    //
+    // The cwd here is deliberate, not incidental. A verifier has no cwd
+    // requirement, so construction proceeds to `assertSafeGrokProjectConfig`,
+    // which scans upward from whatever cwd it is given. Without one it scans
+    // `process.cwd()` — and the real checkout carries `.claude/settings.local.json`,
+    // which that guard correctly refuses. This test therefore passed inside an
+    // agent worktree (which has no such file) and failed in the primary checkout:
+    // an environment-dependent green. Pointing it at a clean temp dir asserts the
+    // property under test — the cwd refusal is scoped to the implementor role —
+    // rather than a fact about the directory the suite happens to run in.
+    const cleanCwd = await mkdtemp(path.join(tmpdir(), 'grok-verifier-cwd-'));
+    cleanups.push(async () => rm(cleanCwd, { recursive: true, force: true }));
+    const verifier = createGrokBuildAcpAdapter({ ...base, role: 'verifier', cwd: cleanCwd });
     cleanups.push(async () => verifier.adapter.close());
     expect(verifier.adapter.harnessId).toBe(GROK_HARNESS_ID);
   });
