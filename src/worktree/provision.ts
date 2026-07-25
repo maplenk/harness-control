@@ -1055,15 +1055,21 @@ async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; str
   // F9 (P3) — fingerprints agreeing proves only that the two MANIFESTS match. Prove
   // the primary TREE actually contains what they declare before cloning it.
   const declared = declaredRootPackages(args.wtManifests);
-  const missing = proveePrimaryTree(primaryNodeModules, declared);
-  if (missing.length > 0) {
+  // ROUND 7 (Finding 2): at VERSION granularity — a name check alone let a
+  // dependency bumped without reinstalling pass on its OLD directory.
+  const defects = proveePrimaryTree(primaryNodeModules, declared, lockedRootVersions(args.wtManifests));
+  if (defects.length > 0) {
+    const named = defects
+      .slice(0, 8)
+      .map((d) => `${d.name} (${d.detail})`)
+      .join('; ');
     throw failClosed(
-      `the primary checkout's node_modules at ${primaryNodeModules} is STALE: ${missing.length} manifest-declared ` +
-        `package(s) have no directory there (${missing.slice(0, 8).join(', ')}${missing.length > 8 ? ', …' : ''}). ` +
-        'Its manifests match the committed ones, but it was never installed against them — cloning it would hand ' +
-        'verification a tree missing those dependencies (`command not found`, exit 127). Run `npm install` in the ' +
-        'primary checkout and re-run.',
-      `primary tree missing ${missing.length} declared package(s)`,
+      `the primary checkout's node_modules at ${primaryNodeModules} is STALE: ${defects.length} manifest-declared ` +
+        `package(s) do not match the lockfile there — ${named}${defects.length > 8 ? '; …' : ''}. ` +
+        'Its manifests match the committed ones, but it was not installed against them — cloning it would hand ' +
+        'verification a tree whose dependencies differ from the lockfile (a missing package exits 127; a stale ' +
+        'VERSION verifies the wrong code silently). Run `npm install` in the primary checkout and re-run.',
+      `primary tree has ${defects.length} package(s) diverging from the lockfile`,
       'primary_tree_stale',
     );
   }
@@ -1429,20 +1435,109 @@ function declaredRootPackages(manifests: ManifestSet): string[] {
  * cloned and stamped proven — `vite: not found`, exit 127, the very failure class
  * F7 exists to kill, arriving through the clone lane instead.
  *
- * Minimum sufficient proof: every root-declared dependency + devDependency name
- * resolves to a DIRECTORY under the primary's `node_modules` (scoped names
- * resolve under their scope dir, which is just the path). Transitive dependencies
- * are not enumerated — the root set is what the fingerprint is computed over and
- * what verification commands actually reach for.
+ * ROUND 7 (Finding 2) — the proof is at VERSION granularity, not presence.
+ * Checking only that each declared NAME has a directory left the same defect one
+ * level down: bump a dependency's version without reinstalling and the OLD
+ * directory still satisfies a name check, so the wrong tree is cloned, stamped
+ * v2, and every later round short-circuits onto it — verifying against dependency
+ * versions that differ from the lockfile. Non-native packages evade the runtime
+ * smoke entirely, so nothing downstream would have caught it either.
+ *
+ * Each root-declared dependency + devDependency must therefore have an INSTALLED
+ * `node_modules/<name>/package.json` whose `version` EXACTLY equals the version
+ * the lockfile resolved for it. Exact equality against the lock's own entry is
+ * the simplest sound rule — the lock is what the install was supposed to
+ * reproduce, so any difference means it did not.
+ *
+ * Transitive dependencies are still not enumerated: the root set is what the
+ * fingerprint is computed over and what verification commands reach for.
  */
-function proveePrimaryTree(primaryNodeModules: string, declared: readonly string[]): string[] {
-  const missing: string[] = [];
+interface PrimaryTreeDefect {
+  readonly name: string;
+  readonly detail: string;
+}
+
+function proveePrimaryTree(
+  primaryNodeModules: string,
+  declared: readonly string[],
+  lockedVersions: ReadonlyMap<string, string>,
+): PrimaryTreeDefect[] {
+  const defects: PrimaryTreeDefect[] = [];
   for (const name of declared) {
     // A package name is a posix path fragment ('@scope/pkg'); join it as such.
     const dir = path.join(primaryNodeModules, ...name.split('/'));
-    if (lstatSafe(dir)?.isDirectory() !== true) missing.push(name);
+    if (lstatSafe(dir)?.isDirectory() !== true) {
+      defects.push({ name, detail: 'no directory in the primary node_modules' });
+      continue;
+    }
+    const expected = lockedVersions.get(name);
+    if (expected === undefined) continue; // the lockfile pins no version for it
+    let installed: string | undefined;
+    try {
+      const raw: unknown = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+      if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+        const version = (raw as { version?: unknown }).version;
+        if (typeof version === 'string') installed = version;
+      }
+    } catch {
+      // An unreadable/malformed installed manifest is not evidence of a match.
+      defects.push({ name, detail: `installed package.json is unreadable or malformed (lockfile wants ${expected})` });
+      continue;
+    }
+    if (installed === undefined) {
+      defects.push({ name, detail: `installed package.json declares no version (lockfile wants ${expected})` });
+    } else if (installed !== expected) {
+      defects.push({ name, detail: `installed ${installed}, lockfile resolved ${expected}` });
+    }
   }
-  return missing;
+  return defects;
+}
+
+/**
+ * The version the LOCKFILE resolved for each root-declared package, read from
+ * the fingerprinted `package-lock.json` (npm lockfileVersion 2/3 `packages`
+ * entries keyed `node_modules/<name>`, falling back to v1 `dependencies`).
+ *
+ * A lockfile that cannot be parsed yields an EMPTY map rather than throwing: the
+ * fingerprint already proved the primary's lockfile is byte-identical to the
+ * committed one, so a parse failure here degrades the check to presence-only
+ * rather than failing a run for a lockfile the repo itself is happy with.
+ */
+function lockedRootVersions(manifests: ManifestSet): Map<string, string> {
+  const versions = new Map<string, string>();
+  const raw = manifests.entries.get('package-lock.json');
+  if (typeof raw !== 'string') return versions;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return versions;
+  }
+  if (parsed === null || typeof parsed !== 'object') return versions;
+  const record = parsed as { packages?: unknown; dependencies?: unknown };
+  const packages = record.packages;
+  if (packages !== null && typeof packages === 'object' && !Array.isArray(packages)) {
+    for (const [key, value] of Object.entries(packages as Record<string, unknown>)) {
+      if (!key.startsWith('node_modules/')) continue;
+      // Only TOP-LEVEL entries: a nested `a/node_modules/b` is not the root copy.
+      const name = key.slice('node_modules/'.length);
+      if (name.includes('node_modules/')) continue;
+      if (value !== null && typeof value === 'object') {
+        const version = (value as { version?: unknown }).version;
+        if (typeof version === 'string') versions.set(name, version);
+      }
+    }
+  }
+  const deps = record.dependencies;
+  if (versions.size === 0 && deps !== null && typeof deps === 'object' && !Array.isArray(deps)) {
+    for (const [name, value] of Object.entries(deps as Record<string, unknown>)) {
+      if (value !== null && typeof value === 'object') {
+        const version = (value as { version?: unknown }).version;
+        if (typeof version === 'string') versions.set(name, version);
+      }
+    }
+  }
+  return versions;
 }
 
 /**

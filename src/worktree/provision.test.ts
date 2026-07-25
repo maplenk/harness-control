@@ -1608,6 +1608,112 @@ describe('F9 AC-2 — a stale primary tree is never cloned (primary_tree_stale)'
     expect(existsSync(path.join(handle.worktreePath, 'node_modules'))).toBe(false);
   });
 
+  // ROUND 7 (Finding 2) — the same false-clone defect one level down. Checking
+  // only that each declared NAME has a directory let a dependency bumped without
+  // reinstalling pass on its OLD directory: the wrong tree is cloned, stamped v2,
+  // and every later round short-circuits onto it — verifying against dependency
+  // versions that differ from the lockfile. A non-native package evades the
+  // runtime smoke entirely, so nothing downstream catches it either.
+  it('a package installed at the WRONG VERSION is refused (presence is not proof)', async () => {
+    const repo = track(await makeTempGitRepo('harness-f9-ver-'));
+    await repo.writeFile('.gitignore', 'node_modules/\n');
+    await repo.writeFile(
+      'package.json',
+      `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '2.0.0' } }, null, 2)}\n`,
+    );
+    await repo.writeFile(
+      'package-lock.json',
+      `${JSON.stringify(
+        {
+          name: 'x',
+          version: '1.0.0',
+          lockfileVersion: 3,
+          requires: true,
+          packages: { '': { name: 'x' }, 'node_modules/left-pad': { version: '2.0.0' } },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await repo.commitAll('deps at 2.0.0');
+    // The primary still holds the OLD 1.0.0 directory — present, so the pre-round-7
+    // name check passed it.
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: [] });
+    writeInstalledPackage(nm, 'left-pad');
+    fs.writeFileSync(
+      path.join(nm, 'left-pad', 'package.json'),
+      `${JSON.stringify({ name: 'left-pad', version: '1.0.0', main: 'index.js' }, null, 2)}\n`,
+    );
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_f9_version_drift');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('primary_tree_stale');
+    expect(error.message).toContain('left-pad');
+    expect(error.message).toContain('1.0.0'); // installed
+    expect(error.message).toContain('2.0.0'); // lockfile
+    expect(fake.calls.clone).toBe(0); // never cloned the wrong tree
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
+  });
+
+  it('a package whose installed manifest is unreadable is refused (not assumed to match)', async () => {
+    const repo = track(await makeTempGitRepo('harness-f9-unread-'));
+    await repo.writeFile('.gitignore', 'node_modules/\n');
+    await repo.writeFile(
+      'package.json',
+      `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0' } }, null, 2)}\n`,
+    );
+    await repo.writeFile(
+      'package-lock.json',
+      `${JSON.stringify(
+        {
+          name: 'x',
+          version: '1.0.0',
+          lockfileVersion: 3,
+          requires: true,
+          packages: { '': { name: 'x' }, 'node_modules/left-pad': { version: '1.0.0' } },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await repo.commitAll('deps with a pinned lockfile');
+    const nm = await writePrimaryNodeModules(repo.dir);
+    // The lockfile pins a version, so the installed manifest MUST be readable to
+    // prove it — an unreadable one is not evidence of a match.
+    fs.writeFileSync(path.join(nm, 'left-pad', 'package.json'), '{ not json');
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_f9_version_unreadable');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+    expect(error.provisioningCause).toBe('primary_tree_stale');
+    expect(error.message).toContain('left-pad');
+    expect(fake.calls.clone).toBe(0); // refused BEFORE cloning
+  });
+
+  it('matching versions still clone (the happy path is unchanged)', async () => {
+    const repo = track(await makeDepsRepo());
+    const nm = await writePrimaryNodeModules(repo.dir);
+    // makeDepsRepo's lockfile pins no versions, so presence remains sufficient
+    // there; pin one explicitly and match it to prove the comparison passes.
+    fs.writeFileSync(
+      path.join(nm, 'left-pad', 'package.json'),
+      `${JSON.stringify({ name: 'left-pad', version: '1.0.0', main: 'index.js' }, null, 2)}\n`,
+    );
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_f9_version_ok');
+    await createAtHead(repo, manager, asg);
+
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    expect(fake.calls.clone).toBe(1);
+  });
+
   it('devDependencies are proven too (a missing devDep is just as fatal)', async () => {
     const repo = track(await makeDepsRepo({ devDeps: { vite: '5.0.0' } }));
     await writePrimaryNodeModules(repo.dir, { packages: ['left-pad'] }); // vite missing
