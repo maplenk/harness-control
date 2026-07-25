@@ -95,11 +95,17 @@ export interface RoleSession {
    * belt; this is the suspenders).
    *
    * Written through the SAME assembler + cadence-window reset as every other
-   * checkpoint. NON-FATAL by construction (mirrors the cadence hook and the
-   * graceful-stop path): the deliverable is already committed, so a §12.1 quota
-   * rejection or a checkpoint-write failure must never unwind a completed
-   * round — resume re-probes everything under §16.3 regardless. Returns whether
-   * a checkpoint was actually recorded so a flow can report it honestly.
+   * checkpoint.
+   *
+   * BLOCKER-2 — FATAL on failure, unlike the cadence hook. This checkpoint is
+   * the round's RECEIPT: the durable assertion "this commit is mine" that resume
+   * requires before adopting a drifted worktree. A round that continued
+   * unreceipted would be silently unresumable, and could only be re-adopted on
+   * topology (reachability) — which is authorization by the wrong property. So
+   * a failed or quota-rejected write REJECTS (`RoundReceiptError`) and the round
+   * fails honestly. The commit is already durable in the worktree; only
+   * automatic resume is withheld. The `written` flag is therefore always true
+   * on a resolved call — it stays on the result for honest reporting.
    */
   checkpointVerifyHandoff(): Promise<{ readonly written: boolean }>;
 }

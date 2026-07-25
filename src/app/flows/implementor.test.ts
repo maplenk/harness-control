@@ -17,7 +17,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { assignmentId, criterionId, gitSha, specHash, type ArtifactHash } from '../../domain/ids.js';
+import { artifactHash, assignmentId, criterionId, gitSha, specHash, type ArtifactHash } from '../../domain/ids.js';
 import { DeterministicIdFactory } from '../../lib/id-factory.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
 import { GitWorktreeManager, runGit, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
@@ -53,6 +53,7 @@ import {
   type RunImplementorInput,
 } from './implementor.js';
 import { adjudicateImplementorDeliverable } from './deliverable.js';
+import { err } from '../../lib/result.js';
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -1305,6 +1306,63 @@ describe('ImplementorFlow — F8 (C) pre_verify_handoff checkpoint (§12.2)', ()
     expect(content!.worktree.statusPorcelain).toBe(''); // committed tree, nothing outstanding
     // Honest §12.2 bookkeeping: a completed commit interrupts nothing.
     expect(content!.incompleteOperation).toBeUndefined();
+
+    await wt.removeWorktree(asg);
+  });
+
+  it('BLOCKER-2: a round whose RECEIPT cannot be recorded FAILS rather than continuing unreceipted', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [{ relPath: 'feature.txt', content: 'the new feature\n' }],
+      turns: [REPORTING_TURN],
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const asg = assignmentId('asg_impl_receipt_fatal');
+    // The artifact store REJECTS the receipt write the way §12.1 quota admission
+    // does — an `Err`, not a throw, which is the subtler of the two branches
+    // (`#writeStopCheckpoint` returns no event and the round must still fail).
+    const artifacts = dbHandle!.db.artifacts;
+    const realWrite = artifacts.write.bind(artifacts);
+    let failReceipt = true;
+    (artifacts as unknown as { write: typeof artifacts.write }).write = ((
+      input: Parameters<typeof artifacts.write>[0],
+    ) => {
+      if (!failReceipt) return realWrite(input);
+      return err({
+        attemptedHash: artifactHash('a'.repeat(64)),
+        attemptedSizeBytes: 1,
+        scope: 'per_run' as const,
+        limitBytes: 0,
+        currentUsageBytes: 0,
+        occurredAt: dbHandle!.db.clock.nowIso(),
+      });
+    }) as typeof artifacts.write;
+
+    try {
+      const thrown: unknown = await runImplementor(
+        { service, worktrees: wt },
+        {
+          runId,
+          assignmentId: asg,
+          implementor: CODEX_IMPLEMENTOR,
+          baseCommit: gitSha(await r.headSha()),
+          context: baseContext(),
+          options: { runVerification: PASS_VERIFY },
+        },
+      ).catch((error: unknown) => error);
+
+      expect(thrown).toBeInstanceOf(Error);
+      expect(String(thrown)).toMatch(/receipt could not be recorded/i);
+      // The COMMIT is still durable — nothing was rolled back, only auto-resume
+      // is withheld until the operator resolves the store failure.
+      const handle = wt.handleFor(asg)!;
+      const committed = (await runGit(['log', '--format=%s', '-1'], handle.worktreePath)).stdout;
+      expect(committed.trim().length).toBeGreaterThan(0);
+      // ...and no receipt exists for the round, so resume cannot adopt on topology.
+      expect(service.resolveRoundReceiptHead(runId, 1, asg)).toBeUndefined();
+    } finally {
+      failReceipt = false;
+      (artifacts as unknown as { write: typeof artifacts.write }).write = realWrite;
+    }
 
     await wt.removeWorktree(asg);
   });

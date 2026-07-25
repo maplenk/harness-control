@@ -427,17 +427,28 @@ async function adoptWorktree(
             'post-commit dirt discarded, clean asserted (never WIP-committed)',
     );
   } else {
-    // F8 (A): this is the INTERRUPTED-implementor branch — the ONE place where a
-    // HEAD ahead of the checkpoint is explainable as the round's own commit
-    // (cadence checkpoints fire at prompt-turn boundaries and therefore record
-    // the PRE-commit head; the implementor commits AFTER its turn loop). Accept
-    // that strict forward motion instead of reading it as tamper; every other
-    // divergence — a rewritten/reset history, an unrelated HEAD, an ancestry
-    // probe that cannot be completed — still refuses (fail-closed, in
-    // `validate.ts`). The completed-implementor and verifier branches above are
+    // F8 (A) / BLOCKER-2: this is the INTERRUPTED-implementor branch — the ONE
+    // place where a HEAD ahead of the checkpoint can be explained as the round's
+    // own commit (cadence checkpoints fire at prompt-turn boundaries and record
+    // the PRE-commit head; the implementor commits AFTER its turn loop).
+    //
+    // Acceptance is bound to the round's RECEIPT, never to topology: the
+    // `pre_verify_handoff` checkpoint it published at its commit boundary
+    // (derived from the log), else the round-scoped `lastImplementationCommit`
+    // the loop driver persisted. Both are round-SCOPED, so a receipt from
+    // another round authorizes nothing. With no receipt we pass nothing and
+    // `validate.ts` keeps the strict any-drift-refuses policy — ancestry alone
+    // must never adopt a worktree, because it proves reachability, not
+    // authorship. The completed-implementor and verifier branches above are
     // unaffected: they bind to an exact commit via `discardToCommit`.
+    const persistedForRound =
+      facts.lastImplementationCommit?.round === resume.round.round
+        ? facts.lastImplementationCommit.commit
+        : undefined;
+    const receiptHead =
+      service.resolveRoundReceiptHead(input.runId, resume.round.round, input.assignmentId) ?? persistedForRound;
     const validation = await worktrees.validate(input.assignmentId, resume.checkpoint?.worktree, {
-      acceptForwardContainment: true,
+      ...(receiptHead !== undefined ? { acceptDriftToCommit: receiptHead } : {}),
     });
     recordValidation(validation.outcome, validation.detail, validation.wipCommitSha);
     if (validation.outcome === 'refuse_resume') {

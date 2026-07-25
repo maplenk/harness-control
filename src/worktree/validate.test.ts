@@ -4,12 +4,16 @@
  * same routine through the manager's mutex/taint bookkeeping; this file pins the
  * decision tree itself).
  *
- * F8 (A) adds the forward-containment row: an interrupted IMPLEMENTOR round
- * whose HEAD moved FORWARD from the checkpoint (the implementor's own commit,
- * taken after the last cadence checkpoint) is implementor-authored motion, not
- * tamper — accepted when the caller opts in. Everything that is NOT a strict
- * forward descent (diverge, reset/amend, an ancestry probe that ERRORS) stays
- * `refuse_resume`, fail-closed.
+ * F8 (A) adds the drift-acceptance row: an interrupted IMPLEMENTOR round whose
+ * HEAD moved forward from the checkpoint (the implementor's own commit, taken
+ * after the last cadence checkpoint) is implementor-authored motion, not tamper.
+ *
+ * BLOCKER-2: acceptance is bound to the round's RECEIPT — the exact commit it
+ * published for itself — and NEVER to topology. Ancestry proves REACHABILITY,
+ * not AUTHORSHIP, so a foreign descendant appended to the worktree is refused
+ * even though `merge-base --is-ancestor` says yes. No receipt, a HEAD that is
+ * not the receipt, a receipt that does not descend from the checkpoint, or an
+ * ancestry probe that ERRORS all stay `refuse_resume`, fail-closed.
  */
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import * as path from 'node:path';
@@ -17,7 +21,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { artifactHash, gitSha } from '../domain/ids.js';
 import type { WorktreeState } from '../domain/entities.js';
 import { sha256Hex } from '../artifacts/hash.js';
-import { runGit } from './git.js';
+import { resolveSha, runGit } from './git.js';
 import { validateWorktree } from './validate.js';
 import {
   assertPrimaryCheckoutUntouched,
@@ -224,9 +228,9 @@ describe('validateWorktree — §16.3 reconciliation outcome matrix', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F8 (A) — forward containment
+// F8 (A) / BLOCKER-2 — receipt-bound drift acceptance
 // ---------------------------------------------------------------------------
-describe('validateWorktree — F8 (A) forward-containment acceptance', () => {
+describe('validateWorktree — F8 (A) receipt-bound drift acceptance', () => {
   it('ACCEPTS a checkpoint sha that is a strict ancestor of HEAD (the implementor committed after the last checkpoint)', async () => {
     const r = await makeRepo();
     // The cadence checkpoint fires MID-round: HEAD is the base, the work is
@@ -241,7 +245,7 @@ describe('validateWorktree — F8 (A) forward-containment acceptance', () => {
       worktreePath: r.dir,
       checkpointWorktreeState: checkpoint,
       wipCommitEnv: WIP_ENV,
-      acceptForwardContainment: true,
+      acceptDriftToCommit: gitSha(implementationCommit),
     });
 
     expect(result.outcome).not.toBe('refuse_resume');
@@ -265,7 +269,7 @@ describe('validateWorktree — F8 (A) forward-containment acceptance', () => {
       worktreePath: r.dir,
       checkpointWorktreeState: checkpoint,
       wipCommitEnv: WIP_ENV,
-      acceptForwardContainment: true,
+      acceptDriftToCommit: gitSha(implementationCommit),
     });
 
     expect(result.outcome).toBe('wip_committed');
@@ -286,14 +290,14 @@ describe('validateWorktree — F8 (A) forward-containment acceptance', () => {
     const result = await validateWorktree({
       worktreePath: r.dir,
       checkpointWorktreeState: checkpoint,
-      acceptForwardContainment: true,
+      acceptDriftToCommit: gitSha(second),
     });
 
     expect(result.outcome).not.toBe('refuse_resume');
     expect(String(result.worktreeState.headSha)).toBe(second);
   });
 
-  it('REFUSES a DIVERGED HEAD (a rewritten history is not a descendant) even with forward containment on', async () => {
+  it('REFUSES a DIVERGED HEAD (a rewritten history is not a descendant) even with a receipt supplied', async () => {
     const r = await makeRepo();
     const base = await r.headSha();
     await r.writeFile('feature.ts', 'work\n');
@@ -316,7 +320,8 @@ describe('validateWorktree — F8 (A) forward-containment acceptance', () => {
     const result = await validateWorktree({
       worktreePath: r.dir,
       checkpointWorktreeState: abandoned,
-      acceptForwardContainment: true,
+      // Even with a receipt naming the ABANDONED commit, HEAD is the rewritten one.
+      acceptDriftToCommit: gitSha(round1),
     });
 
     expect(result.outcome).toBe('refuse_resume');
@@ -341,17 +346,17 @@ describe('validateWorktree — F8 (A) forward-containment acceptance', () => {
     const result = await validateWorktree({
       worktreePath: r.dir,
       checkpointWorktreeState: checkpoint,
-      acceptForwardContainment: true,
+      acceptDriftToCommit: gitSha(ahead), // the receipt; HEAD is no longer it
     });
 
     expect(result.outcome).toBe('refuse_resume');
     expect(result.worktreeState.taintFlags).toEqual(['reconcile_mismatch']);
   });
 
-  it('REFUSES when the ancestry probe ERRORS (unknown checkpoint object) — a probe failure is never an acceptance', async () => {
+  it('REFUSES when the ancestry sanity check ERRORS (unknown checkpoint object) — a probe failure is never an acceptance', async () => {
     const r = await makeRepo();
     await r.writeFile('feature.ts', 'work\n');
-    await r.commitAll('implementor round 1');
+    const head = await r.commitAll('implementor round 1');
     const unknownObject: WorktreeState = {
       headSha: gitSha('0000000000000000000000000000000000000001'),
       statusPorcelain: '',
@@ -363,7 +368,9 @@ describe('validateWorktree — F8 (A) forward-containment acceptance', () => {
     const result = await validateWorktree({
       worktreePath: r.dir,
       checkpointWorktreeState: unknownObject,
-      acceptForwardContainment: true,
+      // The receipt MATCHES head, so the receipt gate passes and the ancestry
+      // sanity check is genuinely reached — and it is what refuses.
+      acceptDriftToCommit: gitSha(head),
     });
 
     expect(result.outcome).toBe('refuse_resume');
@@ -374,7 +381,7 @@ describe('validateWorktree — F8 (A) forward-containment acceptance', () => {
   it('REFUSES the empty-sentinel checkpoint sha a non-probed pause records (fail closed, never accepted)', async () => {
     const r = await makeRepo();
     await r.writeFile('feature.ts', 'work\n');
-    await r.commitAll('implementor round 1');
+    const head = await r.commitAll('implementor round 1');
     const unprobed: WorktreeState = {
       headSha: gitSha(''),
       statusPorcelain: '',
@@ -386,10 +393,47 @@ describe('validateWorktree — F8 (A) forward-containment acceptance', () => {
     const result = await validateWorktree({
       worktreePath: r.dir,
       checkpointWorktreeState: unprobed,
-      acceptForwardContainment: true,
+      acceptDriftToCommit: gitSha(head),
     });
 
     expect(result.outcome).toBe('refuse_resume');
+  });
+
+  // -------------------------------------------------------------------------
+  // BLOCKER-2 — the receipt is the authorization; topology never is.
+  // -------------------------------------------------------------------------
+  it('REFUSES a perfect strict-descendant advance when NO receipt is supplied', async () => {
+    const r = await makeRepo();
+    await r.writeFile('feature.ts', 'work in progress\n');
+    const checkpoint = await captureWorktreeState(r.dir);
+    await r.commitAll('implementor round 1'); // clean forward motion, nothing wrong with it
+
+    const result = await validateWorktree({ worktreePath: r.dir, checkpointWorktreeState: checkpoint });
+
+    expect(result.outcome).toBe('refuse_resume');
+    expect(result.worktreeState.taintFlags).toEqual(['reconcile_mismatch']);
+    expect(result.detail).toMatch(/no receipt|published no receipt/i);
+  });
+
+  it('REFUSES a FOREIGN descendant appended on top of the receipted commit (reachable, not authored)', async () => {
+    const r = await makeRepo();
+    await r.writeFile('feature.ts', 'work in progress\n');
+    const checkpoint = await captureWorktreeState(r.dir);
+    const authored = await r.commitAll('implementor round 1');
+    // Someone appends another commit. It descends from the checkpoint perfectly.
+    await r.writeFile('foreign.ts', 'not this round\n');
+    const foreign = await r.commitAll('a foreign commit');
+    expect(foreign).not.toBe(authored);
+
+    const result = await validateWorktree({
+      worktreePath: r.dir,
+      checkpointWorktreeState: checkpoint,
+      acceptDriftToCommit: gitSha(authored), // the round only ever published THIS
+    });
+
+    expect(result.outcome).toBe('refuse_resume');
+    expect(result.detail).toMatch(/receipt/i);
+    expect(result.worktreeState.taintFlags).toEqual(['reconcile_mismatch']);
   });
 
   it('leaves the PRIMARY checkout byte-for-byte untouched while validating a linked worktree', async () => {
@@ -406,7 +450,7 @@ describe('validateWorktree — F8 (A) forward-containment acceptance', () => {
       const result = await validateWorktree({
         worktreePath: wtPath,
         checkpointWorktreeState: checkpoint,
-        acceptForwardContainment: true,
+        acceptDriftToCommit: gitSha(await resolveSha(wtPath, 'HEAD')),
       });
 
       expect(result.outcome).not.toBe('refuse_resume');

@@ -150,16 +150,17 @@ export interface RemoveWorktreeOptions {
 
 export interface ValidateOptions {
   /**
-   * F8 (A): accept a HEAD that moved FORWARD from the checkpoint (the
-   * checkpoint's sha is a strict git ancestor of it) instead of refusing on
-   * drift alone — see `validate.ts`'s decision-tree row 3b. Only the
-   * INTERRUPTED-IMPLEMENTOR adoption path sets this: only there is a HEAD ahead
-   * of the checkpoint explainable as the round's OWN commit (cadence
-   * checkpoints record the PRE-commit head; the implementor commits after its
-   * turn loop). Defaults to false — every other caller keeps the strict policy,
-   * and a non-descendant divergence or a failed ancestry probe still refuses.
+   * F8 (A) / BLOCKER-2: the interrupted round's own RECEIPT — the exact commit
+   * it published for itself at its commit boundary. A drifted HEAD is accepted
+   * only if it EQUALS this sha (with ancestry as a corroborating sanity check);
+   * see `validate.ts`'s decision-tree row 3b. Only the INTERRUPTED-IMPLEMENTOR
+   * adoption path supplies it. Absent — every other caller, and an interrupted
+   * round that published no receipt — keeps the strict any-drift-refuses policy.
+   *
+   * Deliberately NOT a boolean: a boolean would re-admit
+   * topology-as-authorization, where any reachable commit satisfies the gate.
    */
-  readonly acceptForwardContainment?: boolean;
+  readonly acceptDriftToCommit?: GitSha;
 }
 
 /**
@@ -459,10 +460,13 @@ export class GitWorktreeManager {
           worktreePath: handle.worktreePath,
           ...(checkpointWorktreeState !== undefined ? { checkpointWorktreeState } : {}),
           wipCommitMessage: `harness-orchestration: WIP reconciliation (assignment ${String(assignmentId)}, ${this.#clock.nowIso()})`,
-          // F8 (A): opt-in forward containment — set ONLY by the interrupted-
-          // implementor adoption path. Every other caller keeps the strict
-          // any-drift-refuses policy (this manager never decides it for them).
-          acceptForwardContainment: options.acceptForwardContainment ?? false,
+          // F8 (A) / BLOCKER-2: the round's published receipt — set ONLY by the
+          // interrupted-implementor adoption path. Every other caller keeps the
+          // strict any-drift-refuses policy (this manager never decides it for
+          // them), and so does that path when no receipt exists.
+          ...(options.acceptDriftToCommit !== undefined
+            ? { acceptDriftToCommit: options.acceptDriftToCommit }
+            : {}),
           // F7 (#1): a WIP/dirty-recovery commit here must EXCLUDE node_modules whenever
           // managed provisioning is ACTIVE — the SAME exclusion the implementor commit
           // uses — so a provisioned, git-ignored toolchain can never enter a §16.3

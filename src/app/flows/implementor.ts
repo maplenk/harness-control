@@ -1003,9 +1003,12 @@ export class ImplementorFlow {
     // flow-to-loop window in which the commit exists but the loop driver has
     // not yet recorded `lastImplementationCommit`.
     //
-    // Non-fatal by design (the service's seam never throws): the deliverable is
-    // already durably committed, and F8 (A) accepts the forward drift on resume
-    // even when this checkpoint could not be written.
+    // BLOCKER-2: this checkpoint is the round's RECEIPT — resume will not adopt
+    // a drifted worktree without it, because ancestry alone proves reachability
+    // rather than authorship. The seam therefore REJECTS on a failed or
+    // quota-rejected write and the round fails honestly here, rather than
+    // continuing unreceipted and becoming silently unresumable. The commit above
+    // is already durable in the worktree; only auto-resume is withheld.
     const handoffCheckpoint = await session.checkpointVerifyHandoff();
 
     // Capture the base→HEAD delta from the now-clean committed tree, BEFORE

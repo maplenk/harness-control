@@ -563,6 +563,30 @@ export class ResourceExhaustedError extends Error {
 }
 
 /**
+ * BLOCKER-2 — the round's `pre_verify_handoff` RECEIPT could not be recorded
+ * (artifact write failure, or a §12.1 quota admission rejection). The commit is
+ * already durable in the worktree, but without a receipt nothing can later prove
+ * that HEAD is this round's own work, so resume would have to authorize on
+ * topology alone — the hole receipt-binding exists to close. The round therefore
+ * fails HONESTLY here rather than continuing unreceipted.
+ */
+export class RoundReceiptError extends Error {
+  override readonly name: string = 'RoundReceiptError';
+  readonly runId: RunId;
+  readonly round?: number;
+  constructor(runId: RunId, round: number | undefined, cause: unknown) {
+    super(
+      `run ${String(runId)}${round !== undefined ? ` round ${round}` : ''}: the implementor round committed but its ` +
+        'pre_verify_handoff receipt could not be recorded, so the round cannot be proven resumable. The commit is ' +
+        'durable in the worktree; resolve the artifact-store/quota failure and re-run.',
+      cause !== undefined ? { cause } : {},
+    );
+    this.runId = runId;
+    if (round !== undefined) this.round = round;
+  }
+}
+
+/**
  * F2 (§review dogfood) — an implementor round produced no deliverable it stands
  * behind (abnormal turn stop, a claimed commit disagreeing with host HEAD, or a
  * remediation round with no new commit). `runRole` persists the round
@@ -5614,26 +5638,71 @@ export class OrchestrationService {
    * vocabulary (`state.ts`'s `CheckpointReason`, `cadence.ts`'s
    * `BOUNDARY_REASON`) since W4-1 with no writer in production code; this is it.
    *
-   * Mirrors `#maybeCadenceCheckpoint` exactly — same assembler, same
-   * `OPERATION_IDLE` honesty (a completed commit interrupts nothing), same
-   * `ingest` of the resulting `checkpoint.recorded`, same cadence-window reset
-   * (inside `#writeStopCheckpoint`) — and is NON-FATAL for the same reason the
-   * cadence hook and the T22 graceful-stop checkpoint are: the work is already
-   * durably committed, so failing the round because a checkpoint could not be
-   * stored would be strictly worse than resuming without it (F8 (A)'s
-   * forward-containment acceptance covers exactly that case). A failure is
-   * counted on the supervision-error meter rather than swallowed silently.
+   * Mirrors `#maybeCadenceCheckpoint` in assembly — same
+   * `#writeStopCheckpoint`, same `OPERATION_IDLE` honesty (a completed commit
+   * interrupts nothing), same `ingest`, same cadence-window reset.
+   *
+   * BLOCKER-2: it is NOT non-fatal like the cadence hook. This checkpoint is the
+   * round's RECEIPT — the durable assertion "this commit is mine" that resume
+   * requires before it will adopt a drifted worktree. A round that continued
+   * unreceipted would be silently unresumable AND would have to be re-adopted on
+   * topology alone, which is exactly the authorization hole this closes. So a
+   * failed or quota-rejected write THROWS `RoundReceiptError` and the round
+   * fails honestly. The commit itself is already durable and remains in the
+   * worktree for an operator; nothing is lost, only auto-resume is withheld.
    */
   async #writeVerifyHandoffCheckpoint(ctx: SpawnContext): Promise<{ readonly written: boolean }> {
+    let checkpoint: { readonly event?: EventOfType<'checkpoint.recorded'>; readonly hash?: ArtifactHash };
     try {
-      const checkpoint = await this.#writeStopCheckpoint(ctx, 'pre_verify_handoff', OPERATION_IDLE);
-      if (checkpoint.event === undefined) return { written: false }; // §12.1 quota rejection
-      this.ingest(checkpoint.event as DomainEvent);
-      return { written: true };
-    } catch {
+      checkpoint = await this.#writeStopCheckpoint(ctx, 'pre_verify_handoff', OPERATION_IDLE);
+    } catch (error) {
       this.#supervisionIngestErrors += 1;
-      return { written: false };
+      throw new RoundReceiptError(ctx.runId, ctx.dispatch?.round, error);
     }
+    if (checkpoint.event === undefined) {
+      // §12.1 quota admission rejected the artifact: the repository already
+      // appended `artifact.admission.rejected`, but there is no receipt, so the
+      // round cannot be allowed to proceed as if there were one.
+      this.#supervisionIngestErrors += 1;
+      throw new RoundReceiptError(ctx.runId, ctx.dispatch?.round, undefined);
+    }
+    this.ingest(checkpoint.event as DomainEvent);
+    return { written: true };
+  }
+
+  /**
+   * BLOCKER-2 — the ROUND RECEIPT: the commit an implementor round PUBLISHED for
+   * itself at its commit boundary, derived from the LOG (never from a mutable
+   * pointer). The latest `checkpoint.recorded` whose reason is
+   * `pre_verify_handoff` and whose denormalized binding (role + round +
+   * assignment) matches the round being resumed; its content's `worktree.headSha`
+   * is the receipt.
+   *
+   * Round-SCOPED on purpose: a receipt from a different round never authorizes
+   * this one, exactly as `lastImplementationCommit` is round-scoped. Returns
+   * `undefined` when no receipt exists — the caller must then REFUSE to accept
+   * any drift, never fall back to a topology check.
+   */
+  resolveRoundReceiptHead(runId: RunId, round: number, assignmentId?: AssignmentId): GitSha | undefined {
+    let best: { readonly sequence: number; readonly hash: ArtifactHash } | undefined;
+    for (const event of this.#db.events.listByRun(runId)) {
+      if (event.type !== 'checkpoint.recorded') continue;
+      const payload = event.payload;
+      if (payload.reason !== 'pre_verify_handoff') continue;
+      if (payload.role !== 'implementor') continue;
+      if (payload.round !== round) continue;
+      if (assignmentId !== undefined) {
+        if (payload.assignmentId === undefined || String(payload.assignmentId) !== String(assignmentId)) continue;
+      }
+      const sequence = Number(event.sequence);
+      if (best === undefined || sequence > best.sequence) {
+        best = { sequence, hash: payload.artifactHash };
+      }
+    }
+    if (best === undefined) return undefined;
+    const head = this.getCheckpointContent(best.hash)?.worktree.headSha;
+    // A non-probed pause records the empty sentinel; that is not a receipt.
+    return head !== undefined && /^[0-9a-f]{40}$/.test(String(head)) ? head : undefined;
   }
 
   #foldUsageUpdate(
