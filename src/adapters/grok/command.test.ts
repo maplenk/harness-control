@@ -112,6 +112,70 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
   ])('rejects unsafe or undeclared shell operation: %s', (operation) => {
     expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(false);
   });
+
+  // -------------------------------------------------------------------------
+  // F11 — SINGLE-quoted spans are opaque literals.
+  //
+  // The scanners rejected `$`, `\` and a backtick ANYWHERE, because the
+  // character check ran BEFORE the quote-state handling. POSIX single quotes are
+  // expansion-free, so those bytes are inert inside them — and a regex argument
+  // is where they naturally appear. The live consequence: an implementor turn
+  // died because `rg -n '3A\.1|…'` was UNCLASSIFIABLE and therefore denied.
+  //
+  // Outside single quotes (INCLUDING inside double quotes, where the shell does
+  // expand) the conservative rejection is unchanged.
+  // -------------------------------------------------------------------------
+  it('accepts the exact command whose denial killed the implementor turn (single-quoted regex)', () => {
+    expect(
+      isGrokReadOnlyShellPermissionTitle(
+        "Execute `git show 481e772:docs/UI-IMPLEMENTATION-PLAN.md | head -n 5; rg -n '3A\\.1|ApplicationCommand|Phase A0' docs/UI-IMPLEMENTATION-PLAN.md | head -50; ls -la src/cli/ src/app/ 2>/dev/null | head -80`",
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["a backslash escape in a single-quoted regex", "Execute `rg -n '3A\\.1' docs/plan.md`"],
+    ['a literal $ anchor in a single-quoted regex', "Execute `rg -n 'foo$' src`"],
+    ['single-quoted command-substitution TEXT (inert: sh never expands it)', "Execute `rg -n '$(rm -rf /)' src`"],
+    ['single-quoted parentheses/braces', "Execute `rg -n '(a|b){2}' src`"],
+  ])('accepts %s', (_label, operation) => {
+    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(true);
+  });
+
+  it.each([
+    ['the same regex DOUBLE-quoted (the shell WOULD expand it)', 'Execute `rg -n "3A\\.1|ApplicationCommand" docs/plan.md`'],
+    ['a double-quoted $ (parameter expansion is live)', 'Execute `rg -n "$HOME" src`'],
+    ['a double-quoted command substitution', 'Execute `rg -n "$(cat /etc/passwd)" src`'],
+    ['an UNQUOTED command substitution', 'Execute `rg -n $(cat /etc/passwd) src`'],
+    ['an unquoted backslash', 'Execute `rg -n 3A\\.1 docs/plan.md`'],
+    ['an unquoted parenthesis (subshell)', 'Execute `(rg -n foo src)`'],
+    ['an UNTERMINATED single quote', "Execute `rg -n 'unterminated src`"],
+  ])('still rejects %s', (_label, operation) => {
+    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(false);
+  });
+
+  it('a single-quoted span never smuggles a segment separator or a redirection', () => {
+    // `;` / `&&` / `|` / `>` inside single quotes are literal ARGUMENT bytes, so
+    // the command stays ONE segment whose leading token is still an allowlisted
+    // reader — it cannot introduce a second, unclassified command.
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a; rm -rf /' src`")).toBe(true);
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a > out.txt' src`")).toBe(true);
+    // ...while the UNQUOTED forms are classified as what they are.
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `rg -n a src; rm -rf /`')).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `rg -n a src > out.txt`')).toBe(false);
+  });
+
+  it('a single-quoted ESCAPING path argument is still refused (quoting is not a bypass)', () => {
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `cat '/etc/passwd'`")).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `cat '../outside.txt'`")).toBe(false);
+  });
+
+  it('control characters are refused inside single quotes too (a NUL is never a literal)', () => {
+    // CR/LF cannot even reach the scanner (the `Execute ...` wrapper excludes
+    // them), but a NUL can — and single-quoting must not make it acceptable.
+    const nul = String.fromCharCode(0);
+    expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a" + nul + "b' src`")).toBe(false);
+  });
 });
 
 describe('Grok command resolution and minimum version', () => {
