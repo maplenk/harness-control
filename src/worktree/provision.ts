@@ -47,10 +47,121 @@ import { readdir, readFile, readlink } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
+import { isSecretKeyName } from '../redaction/patterns.js';
+import { createPsClient } from '../supervisor/ps.js';
+import { SystemClock } from '../lib/clock.js';
 import { sha256Hex } from '../artifacts/hash.js';
-import { WorktreeError } from './errors.js';
+import { WorktreeError, type ProvisioningCause } from './errors.js';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * F9 (P5) — the deadline every provisioning-path external command and injected
+ * seam call runs under (10 min, matching the verification runner's per-command
+ * cap). An unbounded `npm ci`/`cp`/git probe holds the repo git mutex AND the
+ * cross-process advisory lease forever, wedging the whole run and every peer
+ * process. On expiry provisioning fails closed with `provisioning_timeout` and
+ * the throw unwinds the manager's critical section, releasing both.
+ */
+export const PROVISION_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * F9 — per-package cap for the runtime native smoke. Much tighter than the
+ * command deadline: a `node -e "require(pkg)"` that has not returned in a minute
+ * is not "slow", it is hung.
+ */
+export const NATIVE_SMOKE_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * F9 — the minimal environment the native smoke's `node` runs under. Mirrors the
+ * verification runner's W3-1 posture (§17.1): the orchestrator's environment,
+ * including every provider credential, is NEVER inherited wholesale by a
+ * provisioning-time subprocess. Kept as a local list rather than importing the
+ * transport's `CHILD_ENV_ALLOWLIST` because `src/worktree` must not depend on
+ * `src/adapters`; the two are deliberately identical in spirit.
+ */
+const SMOKE_ENV_ALLOWLIST: readonly string[] = ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL'];
+
+/**
+ * ROUND 16 — the environment `npm ci` runs under, as an ALLOWLIST.
+ *
+ * Two earlier findings, both correct, pull in opposite directions: an install
+ * that inherits the full orchestrator `process.env` hands every credential the
+ * orchestrator holds to npm (an asymmetry against the verification runner's
+ * strict §17.1/W3-1 allowlist), while an install that inherits almost nothing
+ * cannot reach a corporate registry through a proxy or a private CA — a pure-JS
+ * project that provisions fine on main then fails with `install_failed`.
+ *
+ * What is passed, and why:
+ *  - `PATH`/`HOME`/temp/locale (the smoke's own basics). `HOME` is load-bearing
+ *    beyond the obvious: npm reads `~/.npmrc` from it, which is how essentially
+ *    every authenticated corporate setup actually authenticates — the token stays
+ *    on disk, scoped to its registry, and never becomes an env var here.
+ *  - proxy vars in both cases, because npm/node read whichever the platform set.
+ *  - `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` / `SSL_CERT_DIR` for a private CA.
+ *    `NODE_TLS_REJECT_UNAUTHORIZED` is deliberately NOT here: it DISABLES
+ *    verification rather than enabling a legitimate one.
+ *  - `npm_config_registry` / `npm_config_userconfig` / `npm_config_cache`, in
+ *    both spellings npm accepts.
+ *
+ * What is NOT passed, and why:
+ *  - Anything credential-shaped (`isSecretKeyName` — the same predicate the
+ *    verification allowlist is validated against), enforced as a filter so the
+ *    list cannot grow one later. This is a deliberate reading of "the standard
+ *    registry-auth vars": `buildViaInstall` copies the round's COMMITTED manifests
+ *    — `.npmrc` included — into the install directory, so the round's own files
+ *    choose which host npm talks to. Passing `NPM_TOKEN` would let an
+ *    implementor-committed `.npmrc` point the organisation's token at a host of
+ *    its choosing. A per-registry token in `~/.npmrc` does not have that problem,
+ *    and `HOME` already provides it.
+ *  - `npm_config_*` as a WILDCARD. It would readmit credential smuggling
+ *    (`npm_config__authToken`) and, worse, `npm_config_ignore_scripts=false`,
+ *    which would silently undo the one hardening this lane depends on. Per-project
+ *    npm configuration belongs in the committed `.npmrc`, which the install
+ *    already receives.
+ */
+const INSTALL_ENV_ALLOWLIST: readonly string[] = [
+  ...SMOKE_ENV_ALLOWLIST,
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'NPM_CONFIG_REGISTRY',
+  'npm_config_registry',
+  'NPM_CONFIG_USERCONFIG',
+  'npm_config_userconfig',
+  'NPM_CONFIG_CACHE',
+  'npm_config_cache',
+];
+
+/**
+ * Builds that environment. Exported so the policy is asserted directly rather
+ * than through a real `npm ci`. `npm_config_ignore_scripts` is stamped LAST, so
+ * no ambient value can undo the script-less guarantee.
+ */
+export function buildInstallEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of INSTALL_ENV_ALLOWLIST) {
+    if (isSecretKeyName(key)) continue; // belt: the list holds none, and cannot grow one
+    const value = source[key];
+    if (value !== undefined) env[key] = value;
+  }
+  env['npm_config_ignore_scripts'] = 'true';
+  return env;
+}
+
+/**
+ * HIGH-4 — how many `node_modules` levels the native-build scan will descend.
+ * npm hoists, so real trees are 1-2 levels deep and conflicts add a few more; 16
+ * is far beyond anything an install produces. Exceeding it is FATAL, never a
+ * silent truncation: a tree the scan did not finish examining cannot be attested.
+ */
+const MAX_NATIVE_SCAN_DEPTH = 16;
 
 /** Marker file written INSIDE a provisioned `node_modules` (after the tree is
  * built, so `npm ci` cannot wipe it) carrying the dependency fingerprint. It is
@@ -95,18 +206,38 @@ export interface ProvisionOutcome {
 /** Structured provisioning warnings (non-fatal path notes) for the manager's
  * `provisionWarn` sink. */
 export type ProvisionWarnEvent =
-  | { readonly kind: 'clone_source_fingerprint_mismatch'; readonly worktreePath: string }
+  /** F9 (iv): the field carries the PRIMARY checkout root (the clone SOURCE),
+   * which the pre-F9 name `worktreePath` misdescribed. Now emitted only as a
+   * note alongside the fail-closed refusal, never as a fall-through to install. */
+  | { readonly kind: 'clone_source_fingerprint_mismatch'; readonly primaryRepoRoot: string }
   | { readonly kind: 'clone_unsupported'; readonly reason: string }
   | { readonly kind: 'clone_failed'; readonly detail: string }
+  /** F9: no `fallback` field — an unsafe clone is now a refusal, not a lane switch. */
   | {
       readonly kind: 'clone_symlinks_unsafe';
       readonly count: number;
       readonly sample: readonly string[];
-      readonly fallback: 'install';
     }
   | { readonly kind: 'cache_purged'; readonly cache: string }
   | { readonly kind: 'stage_gc_removed'; readonly stage: string }
-  | { readonly kind: 'stage_backup_restored'; readonly stage: string };
+  | { readonly kind: 'stage_backup_restored'; readonly stage: string }
+  /** HIGH-6: a stage abandoned on a DEADLINE was renamed aside rather than
+   * deleted, because the producer may still be writing into it. */
+  | { readonly kind: 'stage_quarantined'; readonly stage: string }
+  /** ROUND 5 (#4): the stage could NOT be marked, so it is not protected — said
+   * plainly rather than reported as a quarantine that did not happen. */
+  | { readonly kind: 'stage_quarantine_failed'; readonly stage: string; readonly detail: string }
+  /** ITEM 2: the assignment is AT the quarantine cap, so no new producer is
+   * started until a stage's TTL releases it. Nothing is deleted. */
+  | { readonly kind: 'quarantine_cap_reached'; readonly retained: number; readonly cap: number }
+  /** F9: the runtime native smoke loaded these packages from the staged tree. */
+  | { readonly kind: 'native_smoke_passed'; readonly packages: readonly string[] }
+  /**
+   * ROUND 14 — outcome (3) of the governing principle: the proof met a shape it
+   * could not interpret and PROCEEDED (main's behaviour) instead of refusing.
+   * Never silent: it names the subject and exactly what was uninterpretable.
+   */
+  | { readonly kind: 'proof_indeterminate'; readonly subject: string; readonly reason: string };
 
 export type ProvisionWarnSink = (event: ProvisionWarnEvent) => void;
 
@@ -126,9 +257,18 @@ export interface ProvisionRuntime {
   /** COW-clone `srcDir` → `dstDir` (which must NOT already exist). Throws on
    * failure. Default: `cp -c -R`. */
   cloneDir(srcDir: string, dstDir: string): Promise<void>;
-  /** Offline install in `cwd` (seeded with the committed manifests), producing
-   * `cwd/node_modules`. Throws on failure. Default:
-   * `npm ci --prefer-offline --no-audit --fund=false --ignore-scripts`. */
+  /**
+   * Offline install in `cwd` (seeded with the committed manifests), producing
+   * `cwd/node_modules`.
+   *
+   * F9: THIS SEAM HAS NO PRODUCTION CALLER. The install lane is gone — `npm ci
+   * --ignore-scripts` cannot build a script-installed native dependency, so a
+   * tree it produces can never be PROVEN (P1), and stamping it "proven" made the
+   * breakage sticky (P2). `provision:'install'` is refused at config parse and at
+   * this module's entry; `'auto'`/`'clone'` are clone-or-fail-closed. The member
+   * is retained for the transition (the manager's runtime option, the F7 test
+   * fakes) and still bounded by the provisioning deadline wherever it is called.
+   */
   install(cwd: string): Promise<void>;
 }
 
@@ -156,6 +296,11 @@ export interface ProvisionParams {
    * `fs.renameSync`); production leaves it undefined so `swapIntoPlace` uses the real
    * rename. Lets a test drive the #2 double-fault through the PRODUCTION catch/finally. */
   readonly rename?: (from: string, to: string) => void;
+  /** F9 (P5): deadline for every external command / injected seam call on the
+   * provisioning path. Defaults to `PROVISION_COMMAND_TIMEOUT_MS`; shrunk in tests. */
+  readonly commandTimeoutMs?: number;
+  /** ROUND 5 (#6): §14 owner-liveness probe for quarantine GC; injectable in tests. */
+  readonly ownerProbe?: QuarantineOwnerProbe;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,19 +314,76 @@ export function defaultProvisionRuntime(): ProvisionRuntime {
     async cloneDir(srcDir, dstDir) {
       // `-c` = clonefile(2) (APFS copy-on-write, instant, zero extra space until
       // divergence); `-R` recursive, preserving symlinks. `dstDir` must not exist
-      // (cp then creates it as a clone of srcDir).
-      await execFileAsync('cp', ['-c', '-R', srcDir, dstDir]);
+      // (cp then creates it as a clone of srcDir). F9 (P5): `timeout` makes
+      // execFile KILL a wedged `cp` rather than merely stop waiting on it.
+      await execFileAsync('cp', ['-c', '-R', srcDir, dstDir], { timeout: PROVISION_COMMAND_TIMEOUT_MS });
     },
     async install(cwd) {
       // `--ignore-scripts` is the MVP install-script mitigation (spec §2.2/§5): a
       // manifest the implementor edited cannot run arbitrary lifecycle scripts on
-      // the host during provisioning.
+      // the host during provisioning. ROUND 16: the env is an ALLOWLIST — enough
+      // to reach a proxied/private registry, never a credential (see
+      // `INSTALL_ENV_ALLOWLIST`). Bounded like `cp`.
+      const env = buildInstallEnv();
       await execFileAsync(
         'npm',
         ['ci', '--prefer-offline', '--no-audit', '--fund=false', '--ignore-scripts'],
-        { cwd, env: { ...process.env, npm_config_ignore_scripts: 'true' }, maxBuffer: 64 * 1024 * 1024 },
+        { cwd, env, maxBuffer: 64 * 1024 * 1024, timeout: PROVISION_COMMAND_TIMEOUT_MS },
       );
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// F9 (P5) — bounded seam calls
+// ---------------------------------------------------------------------------
+/**
+ * Race an injected seam call (a runtime op, a git probe) against a deadline and
+ * FAIL CLOSED on expiry. The default runtime's own `execFile` calls carry a
+ * `timeout` too — that KILLS the child; this bounds the PROMISE, so a hung
+ * injected seam (or one whose kill did not take) can never hold the caller's
+ * mutex + advisory lease open indefinitely. Both are needed: neither subsumes
+ * the other.
+ */
+async function withDeadline<T>(
+  operation: () => Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              failClosed(
+                `provisioning step '${label}' timed out after ${timeoutMs}ms; refusing (the git mutex and advisory lease are released).`,
+                `timeout: ${label} (${timeoutMs}ms)`,
+                'provisioning_timeout',
+              ),
+            ),
+          timeoutMs,
+        );
+        // Never keep the process alive for a deadline that no longer matters.
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** The `ProvisionGit` seam with every call bounded (F9 P5). */
+function boundedGit(git: ProvisionGit, timeoutMs: number): ProvisionGit {
+  return {
+    isPathIgnored: (worktreePath, pathspec) =>
+      withDeadline(() => git.isPathIgnored(worktreePath, pathspec), timeoutMs, `git check-ignore ${pathspec}`),
+    isPathTracked: (worktreePath, pathspec) =>
+      withDeadline(() => git.isPathTracked(worktreePath, pathspec), timeoutMs, `git ls-files ${pathspec}`),
+    readFileAtHead: (worktreePath, relpath) =>
+      withDeadline(() => git.readFileAtHead(worktreePath, relpath), timeoutMs, `git show HEAD:${relpath}`),
   };
 }
 
@@ -427,8 +629,13 @@ async function assertNodeModulesSafe(a: {
  * `WorktreeError{kind:'provisioning_failed'}` (the caller fails closed).
  */
 export async function provisionWorktreeDeps(params: ProvisionParams): Promise<ProvisionOutcome> {
-  const { worktreePath, primaryRepoRoot: repoRoot, baseDir, strategy, runtime, git } = params;
+  const { worktreePath, primaryRepoRoot: repoRoot, baseDir, strategy, runtime } = params;
   const warn: ProvisionWarnSink = params.warn ?? (() => undefined);
+  const timeoutMs = params.commandTimeoutMs ?? PROVISION_COMMAND_TIMEOUT_MS;
+  // ROUND 5 (#6): the §14 owner-liveness probe quarantine GC consults.
+  const ownerProbe = params.ownerProbe ?? defaultOwnerProbe();
+  // F9 (P5): every git probe below runs under the deadline.
+  const git = boundedGit(params.git, timeoutMs);
   const nodeModules = path.join(worktreePath, 'node_modules');
   // #5: every assignment gets its OWN stage NAMESPACE dir `<.provision>/<slug>/`, so
   // GC is an EXACT per-assignment match (enumerate exactly that dir) — never a bare
@@ -441,7 +648,7 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
   // worktree's node_modules is MISSING but a stage holds an `old-*` backup (a crash
   // after move-aside, before move-in), the backup is RESTORED before deletion — it
   // is the only surviving copy of the prior valid tree.
-  gcAbandonedStages(assignmentStageRoot, worktreePath, warn);
+  const quarantined = gcAbandonedStages(assignmentStageRoot, worktreePath, warn, ownerProbe);
 
   // Explicit opt-out: `none` disables managed provisioning (the operator owns
   // node_modules). Proven-skip so the fail-closed gate never halts a deliberately
@@ -527,9 +734,55 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
 
   // Idempotent short-circuit: a REAL node_modules directory with a populated
   // `.bin/` (B2 — never accept a broken tree) whose marker matches the fingerprint.
+  //
+  // HIGH-3: the marker must also ATTEST the runtime smoke (v2). A pre-F9 (v1)
+  // marker proves only that the manifests match — a tree the old install lane
+  // built carries one and would otherwise short-circuit straight past the smoke,
+  // carrying the P2 stickiness across the upgrade. So a v1 marker re-proves the
+  // tree IN PLACE (no rebuild) and is upgraded to v2 on success.
   const existing = lstatSafe(nodeModules);
-  if (existing?.isDirectory() === true && hasBinDir(nodeModules) && readMarker(nodeModules) === fingerprint) {
-    return proven('short_circuit', fingerprint, repoRoot, worktreePath, 'existing node_modules matches the committed dependency fingerprint');
+  const marker = existing?.isDirectory() === true && hasBinDir(nodeModules) ? readMarker(nodeModules) : undefined;
+  if (marker !== undefined && marker.fingerprint === fingerprint) {
+    if (marker.smokeAttested && marker.versionsAttested) {
+      return proven('short_circuit', fingerprint, repoRoot, worktreePath, 'existing node_modules matches the committed dependency fingerprint');
+    }
+    // ROUND 9 (Blocker 2): a v1/v2 marker is NOT a proof under the current rules,
+    // so run the FULL proof against the tree in place (no rebuild) before reusing
+    // it. Both halves throw rather than degrade: version defects refuse
+    // `primary_tree_stale`, an unloadable toolchain refuses
+    // `native_toolchain_unproven`.
+    assertRootVersionsProven(nodeModules, wtManifests, worktreePath, 'the worktree', warn);
+    await runNativeSmoke(nodeModules, warn, timeoutMs);
+    fs.writeFileSync(path.join(nodeModules, PROVISION_MARKER_FILE), markerV3(fingerprint), 'utf8');
+    return proven(
+      'short_circuit',
+      fingerprint,
+      repoRoot,
+      worktreePath,
+      `existing node_modules matches the committed dependency fingerprint; its ${marker.smokeAttested ? 'pre-version-proof (v2)' : 'pre-F9 (v1)'} marker was re-proven in place and upgraded`,
+    );
+  }
+
+  // ITEM 2 (round 13) — BACK PRESSURE at the quarantine cap, applied here because
+  // here is where a PRODUCER would be started. A quarantined stage is protected
+  // precisely because a producer that outlived its deadline may still be writing
+  // into it; `withDeadline` stops waiting without stopping the writer. Deleting
+  // one to make room (the round-10 eviction) raced that writer — the exact hazard
+  // quarantining exists to prevent — so the cap is enforced by NOT starting
+  // another producer instead. Retention stays bounded (the cap is now a real
+  // ceiling: no new stage can be created above it) and no live tree is destroyed.
+  // Everything above this point — `'none'`, no-deps, and the proven short-circuit
+  // — starts no producer and is deliberately unaffected.
+  if (quarantined.length >= MAX_QUARANTINED_STAGES) {
+    warn({ kind: 'quarantine_cap_reached', retained: quarantined.length, cap: MAX_QUARANTINED_STAGES });
+    throw failClosed(
+      `assignment ${params.assignmentId} already holds ${quarantined.length} quarantined provisioning stage(s) ` +
+        `under ${assignmentStageRoot} (cap ${MAX_QUARANTINED_STAGES}) — each may still be written by a provisioning ` +
+        'command that outlived its deadline. Refusing to start another rather than deleting one of theirs. They are ' +
+        `released automatically ${QUARANTINE_TTL_MS / (60 * 60 * 1000)}h after quarantine.`,
+      `fingerprint=${fingerprint}; quarantined=${quarantined.length}`,
+      'quarantine_cap_reached',
+    );
   }
 
   // Build a staged tree OUT OF the worktree, scan it, purge caches, mark it, then
@@ -537,8 +790,11 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
   // filesystem as the worktree, so the swap is a rename.
   fs.mkdirSync(assignmentStageRoot, { recursive: true });
   const stageDir = fs.mkdtempSync(path.join(assignmentStageRoot, 'stage-'));
+  // HIGH-6: set when a deadline fired, so the `finally` QUARANTINES the stage
+  // instead of deleting it out from under a producer that may still be writing.
+  let timedOut = false;
   try {
-    const built = await buildStagedTree({
+    const buildArgs: BuildArgs = {
       stageDir,
       strategy,
       runtime,
@@ -546,37 +802,54 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
       worktreeFingerprint: fingerprint,
       wtManifests,
       warn,
-    });
+      git,
+      timeoutMs,
+    };
+    let built = await buildStagedTree(buildArgs);
 
-    // Symlink containment scan against the EVENTUAL worktree boundary (H7). An
-    // unsafe link from a CLONE → discard and install fresh (unless clone was
-    // forced); an unsafe link that survives install → fail closed. A scan that
-    // cannot fully complete THROWS (B6) → fail closed.
-    const scanFor = (treeRoot: string): SymlinkContainmentScan => ({
-      stageTreeRoot: treeRoot,
+    // Symlink containment scan against the EVENTUAL worktree boundary (H7). A scan
+    // that cannot fully complete THROWS (B6) → fail closed.
+    const containment = (treePath: string): SymlinkContainmentScan => ({
+      stageTreeRoot: treePath,
       eventualTreeRoot: nodeModules,
       containmentRoot: worktreePath,
     });
-    let bad = await scanSymlinkContainment(scanFor(built.treePath));
-    if (bad.length > 0 && built.strategyTaken === 'clone' && strategy !== 'clone') {
-      warn({ kind: 'clone_symlinks_unsafe', count: bad.length, sample: bad.slice(0, 5), fallback: 'install' });
-      fs.rmSync(built.treePath, { recursive: true, force: true });
-      built.treePath = await buildViaInstall({ stageDir, runtime, wtManifests });
-      built.strategyTaken = 'install';
-      bad = await scanSymlinkContainment(scanFor(built.treePath));
+    let bad = await scanSymlinkContainment(containment(built.treePath));
+
+    // ROUND 16 — an unsafe CLONE under `auto` is discarded and installed instead,
+    // which is what main did. F9 removed the retry along with the install lane, so
+    // a project whose fresh install is perfectly safe was refused because the
+    // PRIMARY's tree happened to hold an escaping link. The hazard that removal
+    // was protecting against — an unprovable tree — is now closed by the artifact
+    // proof, which runs on the install lane too. The re-scan below is what keeps
+    // this from being an escape hatch: if the INSTALL's own tree is unsafe, the
+    // refusal stands.
+    if (bad.length > 0 && strategy === 'auto' && built.strategyTaken === 'clone') {
+      warn({ kind: 'clone_symlinks_unsafe', count: bad.length, sample: bad.slice(0, 5) });
+      try {
+        fs.rmSync(built.treePath, { recursive: true, force: true });
+      } catch {
+        /* the install lane writes to its own subdirectory; a leftover clone is GC'd */
+      }
+      built = { treePath: await buildViaInstall(buildArgs), strategyTaken: 'install' };
+      bad = await scanSymlinkContainment(containment(built.treePath));
     }
     if (bad.length > 0) {
+      warn({ kind: 'clone_symlinks_unsafe', count: bad.length, sample: bad.slice(0, 5) });
       throw failClosed(
-        `provisioned node_modules for ${worktreePath} contains ${bad.length} unsafe symlink(s) ` +
-          `(absolute or worktree-escaping): ${bad.slice(0, 5).join(', ')}`,
+        `provisioned node_modules for ${worktreePath} (repo ${repoRoot}) contains ${bad.length} unsafe symlink(s) ` +
+          `(absolute or worktree-escaping): ${bad.slice(0, 5).join(', ')}. Refusing — a write through such a link ` +
+          'escapes the worktree. Repair the primary checkout\'s node_modules (reinstall it) and re-run.',
         `fingerprint=${fingerprint}; strategy=${built.strategyTaken}`,
+        'unsafe_clone_symlinks',
       );
     }
 
     purgeTransientCaches(built.treePath, warn);
-    // B2: never accept/mark a tree without a real `.bin/` — a populated-but-broken
-    // tree (only `.package-lock.json`, or `.bin` vanished) would let the verifier
-    // resolve a GLOBAL tsc/vitest and falsely green the run.
+    // B2: never accept/mark a tree without a real `.bin/`. NOTE (F9 P1): this is a
+    // NECESSARY condition, never a sufficient one — `.bin` is populated at unpack
+    // time from `bin` fields and says nothing about lifecycle scripts having run.
+    // The real toolchain proof is the runtime smoke below.
     if (!hasBinDir(built.treePath)) {
       throw failClosed(
         `provisioned node_modules for ${worktreePath} has no node_modules/.bin directory (strategy=${built.strategyTaken}) — ` +
@@ -584,9 +857,13 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
         `fingerprint=${fingerprint}; strategy=${built.strategyTaken}; missing .bin`,
       );
     }
-    // Marker LAST (after the tree is fully built): npm ci wipes node_modules before
-    // installing, so a marker written earlier would be lost.
-    fs.writeFileSync(path.join(built.treePath, PROVISION_MARKER_FILE), fingerprint, 'utf8');
+    // F9 (P1/P2): PROVE the toolchain by LOADING it, BEFORE the marker exists — so
+    // a tree that cannot be proven can never become the sticky short-circuit for
+    // every later round of the run.
+    await runNativeSmoke(built.treePath, warn, timeoutMs);
+    // Marker LAST (after the tree is fully built AND proven), in the v2 format
+    // that attests the smoke as well as the fingerprint (HIGH-3).
+    fs.writeFileSync(path.join(built.treePath, PROVISION_MARKER_FILE), markerV3(fingerprint), 'utf8');
 
     try {
       swapIntoPlace(nodeModules, built.treePath, stageDir, params.rename);
@@ -600,15 +877,233 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
       );
     }
     return proven(built.strategyTaken, fingerprint, repoRoot, worktreePath, `provisioned via ${built.strategyTaken}`);
+  } catch (error) {
+    // HIGH-6: remember that this failure was a DEADLINE, so the `finally` below
+    // quarantines rather than deletes (the producer may still be writing here).
+    if (error instanceof WorktreeError && error.provisioningCause === 'provisioning_timeout') timedOut = true;
+    throw error;
   } finally {
     // Best-effort GC of the stage — but PRESERVE it whenever it still holds an `old-*`
     // backup (#2: a swap whose move-in AND rollback both failed left the sole surviving
     // copy of the prior valid tree there). Deleting it would destroy that only backup;
     // leave it for the next call's crash-recovery preflight to RESTORE. On the success
     // path (and the confirmed-rollback path) no `old-*` remains, so the stage is GC'd.
-    if (!stageHoldsBackup(stageDir)) {
-      fs.rmSync(stageDir, { recursive: true, force: true });
+    //
+    // HIGH-6: a stage abandoned because a command TIMED OUT is never deleted.
+    // `withDeadline` stops WAITING; it cannot stop the producer, so a wedged
+    // `cp`/`npm`/git may still be writing into this directory. Deleting it under
+    // a live writer races that writer (and could resurrect a half-tree after the
+    // locks release). Rename it aside to `quarantine-*` instead — an atomic,
+    // same-filesystem move that takes the path out of the assignment's active
+    // namespace — and leave it for a later GC sweep once the writer is gone.
+    if (timedOut) {
+      quarantineStage(stageDir, warn, ownerProbe);
+    } else if (!stageHoldsBackup(stageDir)) {
+      try {
+        fs.rmSync(stageDir, { recursive: true, force: true });
+      } catch {
+        // ROUND 5: a CLEANUP failure must never MASK the outcome. `rmSync` on a
+        // tree containing an unreadable directory throws, and thrown from this
+        // `finally` it REPLACED the real fail-closed refusal with a bare EACCES —
+        // turning a precise, cause-coded refusal into an untyped error. A stage
+        // we could not delete is a leftover temp directory, which the next call's
+        // GC preflight sweeps; the refusal is what the caller must see.
+      }
     }
+  }
+}
+
+/**
+ * HIGH-6 (round 4) — MARK an abandoned stage in place; move and delete NOTHING.
+ *
+ * The round-3 shape renamed the stage aside, which does not work: a producer
+ * that timed out is still writing to the ORIGINAL absolute pathname, so renaming
+ * the parent simply lets it recreate `stage-*` underneath — and the tree it is
+ * filling ends up split across two directories, with the renamed copy then swept
+ * by an indiscriminate GC. Since the writer cannot be redirected, the only sound
+ * move is to leave the tree exactly where the writer expects it and record that
+ * this stage is off-limits.
+ *
+ * The marker carries the writing process's pid and the time, so GC can
+ * distinguish "a producer may still own this" from "old enough that nothing
+ * can" (`QUARANTINE_TTL_MS`). Stage directory names are unique per attempt
+ * (`mkdtemp`), so a recreated `stage-*` is always THIS attempt's own directory
+ * and can never collide with a future provisioning run's.
+ */
+export const QUARANTINE_MARKER_FILE = '.harness-quarantined';
+/** How long a quarantined stage is presumed to have a live writer, when the
+ * owner's liveness cannot be positively disproven. */
+export const QUARANTINE_TTL_MS = 24 * 60 * 60 * 1000;
+/**
+ * REGRESSION 2 (round 10) — the hard cap on retained quarantine stages per
+ * assignment. Bounds the cost even inside a TTL window, so repeated timeouts
+ * cannot accumulate trees without limit.
+ *
+ * ITEM 2 (round 13): it is a real ceiling rather than an eviction trigger. At the
+ * cap, provisioning refuses to start another PRODUCER (`quarantine_cap_reached`)
+ * — so no further stage can be created — instead of deleting a protected stage a
+ * timed-out producer may still be writing into.
+ */
+export const MAX_QUARANTINED_STAGES = 8;
+
+/** The recorded §14 identity of the process that abandoned a stage. */
+export interface QuarantineOwner {
+  readonly pid: number;
+  /** Opaque `ps lstart` token — compared for exact equality only. */
+  readonly startedAt?: string;
+}
+
+/**
+ * ROUND 5 (#6) — the §14 liveness/identity probe quarantine GC consults. A
+ * post-TTL delete must PROVE the owner is gone, because a producer with no
+ * bound (a hung `npm`, an NFS stall) can outlive any timeout: deleting its
+ * stage on a timestamp alone recreates the original race a day later.
+ * Injectable so tests can script a live/dead owner without racing real pids.
+ */
+export interface QuarantineOwnerProbe {
+  /** This process's own identity, to stamp into a marker it writes. */
+  self(): QuarantineOwner;
+  /** Is `owner` still the EXACT live process it claims to be? `false` for a gone
+   * pid OR a recycled one (start-time mismatch) — either way the stage is free. */
+  isOwnerAlive(owner: QuarantineOwner): boolean;
+}
+
+let cachedOwnerProbe: QuarantineOwnerProbe | undefined;
+function defaultOwnerProbe(): QuarantineOwnerProbe {
+  if (cachedOwnerProbe !== undefined) return cachedOwnerProbe;
+  // Only sampleIdentity/isAlive are used here; the clock stamps tree samples we
+  // never take.
+  const ps = createPsClient(new SystemClock());
+  cachedOwnerProbe = {
+    self() {
+      const startedAt = ps.sampleIdentity(process.pid)?.startedAt;
+      return { pid: process.pid, ...(startedAt !== undefined ? { startedAt } : {}) };
+    },
+    isOwnerAlive(owner) {
+      if (!ps.isAlive(owner.pid)) return false;
+      if (owner.startedAt === undefined) return true; // bare liveness, best effort
+      return ps.sampleIdentity(owner.pid)?.startedAt === owner.startedAt;
+    },
+  };
+  return cachedOwnerProbe;
+}
+
+/**
+ * ROUND 5 (#4) — mark a stage quarantined, and report HONESTLY whether it
+ * worked. The round-4 shape wrote the marker best-effort yet emitted
+ * `stage_quarantined` unconditionally, so a failed write left an UNMARKED live
+ * stage that GC would then treat as ordinary and delete — the exact race
+ * quarantining exists to prevent, now invisible because we had claimed success.
+ */
+function quarantineStage(stageDir: string, warn: ProvisionWarnSink, probe: QuarantineOwnerProbe): void {
+  // ROUND 6 (Finding 3): this runs from the timeout `finally`, so ANYTHING it
+  // throws would REPLACE the in-flight cause-coded refusal with an unrelated
+  // error. `probe.self()` shells out to `ps` and can fail. A missing owner
+  // identity only weakens the marker (GC falls back to the TTL clock); losing
+  // the refusal would be far worse.
+  let owner: QuarantineOwner;
+  try {
+    owner = probe.self();
+  } catch {
+    owner = { pid: process.pid };
+  }
+  try {
+    fs.mkdirSync(stageDir, { recursive: true }); // the producer may have removed it
+    fs.writeFileSync(
+      path.join(stageDir, QUARANTINE_MARKER_FILE),
+      JSON.stringify({
+        quarantinedAtMs: Date.now(),
+        ownerPid: owner.pid,
+        ...(owner.startedAt !== undefined ? { ownerStartedAt: owner.startedAt } : {}),
+      }),
+      'utf8',
+    );
+  } catch (error) {
+    // REGRESSION 3 (round 10): this runs from the timeout `finally`, so a throwing
+    // warn SINK would replace the primary cause-coded refusal. Same masking family
+    // guarded three times elsewhere; guarded identically here.
+    safeWarn(warn, { kind: 'stage_quarantine_failed', stage: path.basename(stageDir), detail: messageOf(error) });
+    return;
+  }
+  safeWarn(warn, { kind: 'stage_quarantined', stage: path.basename(stageDir) });
+}
+
+/** REGRESSION 3: a warning must never replace the failure it is describing. */
+function safeWarn(warn: ProvisionWarnSink, event: ProvisionWarnEvent): void {
+  try {
+    warn(event);
+  } catch {
+    /* an observability sink can never be allowed to mask a refusal */
+  }
+}
+
+/**
+ * True when a stage must be left alone by GC.
+ *
+ * ROUND 5 (#5/#6) — two corrections. A marker that EXISTS but cannot be READ is
+ * LIVE, not "ordinary": round 4 classified every read failure as no-marker, so
+ * the very next sweep deleted it — the exact opposite of the documented rule.
+ * Only a genuine absence (ENOENT/ENOTDIR) means "an ordinary stage".
+ *
+ * And a post-TTL stage is released only once its OWNER is proven gone. The TTL
+ * alone is not a liveness proof: an unbounded producer still holds the path a
+ * day later. A live owner EXTENDS the quarantine rather than expiring it.
+ * MED-6: retention stays BOUNDED because the moment the owner dies (or its pid
+ * is recycled) the next sweep collects the stage, and a marker with no usable
+ * timestamp falls back to the directory's own mtime rather than being protected
+ * forever.
+ */
+function isQuarantineProtected(stageDir: string, nowMs: number, probe: QuarantineOwnerProbe): boolean {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(stageDir, QUARANTINE_MARKER_FILE), 'utf8');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false; // no marker — ordinary stage
+    return true; // present but unreadable — liveness unknown, so do not touch
+  }
+
+  let owner: QuarantineOwner | undefined;
+  let quarantinedAtMs: number | undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed !== null && typeof parsed === 'object') {
+      const record = parsed as { quarantinedAtMs?: unknown; ownerPid?: unknown; ownerStartedAt?: unknown };
+      if (typeof record.quarantinedAtMs === 'number' && Number.isFinite(record.quarantinedAtMs)) {
+        quarantinedAtMs = record.quarantinedAtMs;
+      }
+      if (typeof record.ownerPid === 'number' && Number.isInteger(record.ownerPid)) {
+        owner = {
+          pid: record.ownerPid,
+          ...(typeof record.ownerStartedAt === 'string' ? { startedAt: record.ownerStartedAt } : {}),
+        };
+      }
+    }
+  } catch {
+    /* malformed — fall through to the mtime clock below (bounded, not forever) */
+  }
+
+  // A still-live owner extends the quarantine for as long as it lives.
+  // REGRESSION 2 (round 10): the TTL runs from the QUARANTINE TIMESTAMP and is
+  // NOT extended by owner liveness. The recorded pid is the ORCHESTRATOR's, not
+  // the producer's, so "owner still alive" was true for the entire life of a
+  // long-running orchestrator — every timed-out stage was retained indefinitely
+  // even after its producer had long settled. That is a new, unbounded resource
+  // cost against main. The pid is still recorded, for diagnostics only.
+  void owner;
+
+  // Owner gone (or never recorded): hold only until the TTL elapses. A marker
+  // with no usable timestamp uses the stage's own mtime, so a malformed marker
+  // is bounded rather than protected forever (MED-6).
+  const since = quarantinedAtMs ?? mtimeMsOf(stageDir) ?? nowMs;
+  return nowMs - since < QUARANTINE_TTL_MS;
+}
+
+function mtimeMsOf(target: string): number | undefined {
+  try {
+    return fs.statSync(target).mtimeMs;
+  } catch {
+    return undefined;
   }
 }
 
@@ -620,59 +1115,127 @@ interface BuildArgs {
   readonly worktreeFingerprint: string;
   readonly wtManifests: ManifestSet;
   readonly warn: ProvisionWarnSink;
+  /** Already deadline-bounded (`boundedGit`). Used to classify a manifest divergence. */
+  readonly git: ProvisionGit;
+  readonly timeoutMs: number;
 }
 
-/** Produce a staged `node_modules` via clone (fingerprint-matched primary, APFS)
- * or install (everything else). Never clones an unproven source. */
-async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; strategyTaken: 'clone' | 'install' }> {
+/**
+ * Produce a staged `node_modules` by CLONING a primary tree that has been proven
+ * to match the committed manifests — or FAIL CLOSED.
+ *
+ * F9: there is no second lane. Everything that used to "fall back to install"
+ * (fingerprint mismatch, an unreadable primary manifest, a non-APFS host, a
+ * hollow primary tree, a runtime clone failure) is now a cause-coded refusal,
+ * because the install lane could not produce a PROVABLE tree and silently
+ * stamping its output "proven" is how a broken toolchain became sticky for a
+ * whole run. `auto` and `clone` are both clone-or-fail-closed; they differ only
+ * in that neither retries anything any more.
+ */
+async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; strategyTaken: ProvisionStrategyTaken }> {
   const { strategy, runtime, primaryRepoRoot, worktreeFingerprint, warn } = args;
   const primaryNodeModules = path.join(primaryRepoRoot, 'node_modules');
-  // A real directory (never a symlinked root) with a real `.bin/` — B2: a
-  // hollow/empty or toolchain-less primary node_modules is never cloned (it would
-  // clone a broken tree and reintroduce the exit-127 false-negative); install. #3:
-  // a real FS error reading the non-authoritative clone source is "not cloneable →
-  // install", never a fail-closed halt (isolated in `isPrimaryCloneable`).
-  const primaryIsCloneable = isPrimaryCloneable(primaryNodeModules);
-  const wantsClone = strategy === 'auto' || strategy === 'clone';
 
-  let cloneEligible = false;
-  if (wantsClone && runtime.cloneSupported && primaryIsCloneable) {
+  // ROUND 15 (REGRESSION 3) — the CLONE is an optimisation over the install, and
+  // it is eligible only when the primary really is the right tree. Every way of
+  // being ineligible now falls through to the install lane, as main did, instead
+  // of refusing: no copy-on-write on this host, no cloneable primary, an
+  // unreadable clone source, or a primary whose dependency set is not this
+  // round's. What made the old install lane dangerous was stamping its output
+  // PROVEN; the artifact proof downstream is what fixes that, and it applies to
+  // both lanes.
+  const wantsClone = strategy === 'auto' || strategy === 'clone';
+  let cloneEligible = wantsClone;
+
+  if (cloneEligible && !runtime.cloneSupported) {
+    warn({ kind: 'clone_unsupported', reason: 'APFS copy-on-write (cp -c) is not available on this platform' });
+    cloneEligible = false;
+  }
+  // B2: a hollow or toolchain-less primary is never CLONED — that is how the
+  // exit-127 false negative got in. It is a reason to install, not to refuse.
+  if (cloneEligible && !isPrimaryCloneable(primaryNodeModules)) {
+    warn({ kind: 'clone_source_fingerprint_mismatch', primaryRepoRoot });
+    cloneEligible = false;
+  }
+
+  let primaryManifests: ManifestSet | undefined;
+  if (cloneEligible) {
     // Clone ONLY when the primary's INSTALLED (working-tree) manifests fingerprint
-    // matches the worktree's committed one — otherwise the primary tree is the
-    // wrong dependency set (an unproven source, never cloned). A failure reading
-    // the primary's own manifests is NOT fatal (the primary is only the clone
-    // SOURCE, not the authority) — fall back to install.
+    // matches the worktree's COMMITTED one. The primary is only the clone SOURCE,
+    // never the authority, so a failure reading its manifests means "not a usable
+    // source" — install — rather than a run-ending refusal.
     try {
-      const primaryManifests = await collectManifests(diskSource(primaryRepoRoot), runtime.platformKey);
-      cloneEligible = computeDependencyFingerprint(primaryManifests, runtime.platformKey) === worktreeFingerprint;
+      primaryManifests = await collectManifests(diskSource(primaryRepoRoot), runtime.platformKey);
     } catch (error) {
       warn({ kind: 'clone_failed', detail: `primary manifest read failed: ${messageOf(error)}` });
       cloneEligible = false;
     }
-    if (!cloneEligible) warn({ kind: 'clone_source_fingerprint_mismatch', worktreePath: primaryRepoRoot });
-  } else if (wantsClone && !runtime.cloneSupported) {
-    warn({ kind: 'clone_unsupported', reason: 'APFS copy-on-write (cp -c) is not available on this platform' });
   }
-
-  if (cloneEligible) {
-    const dst = path.join(args.stageDir, 'node_modules');
-    try {
-      await runtime.cloneDir(primaryNodeModules, dst);
-      return { treePath: dst, strategyTaken: 'clone' };
-    } catch (error) {
-      // A runtime clone failure (e.g. a cross-volume base dir, non-APFS at runtime)
-      // falls back to install — never fails the run on the clone optimization.
-      warn({ kind: 'clone_failed', detail: messageOf(error) });
-      fs.rmSync(dst, { recursive: true, force: true });
+  if (cloneEligible && primaryManifests !== undefined) {
+    if (computeDependencyFingerprint(primaryManifests, runtime.platformKey) !== worktreeFingerprint) {
+      // The commonest case by far: the implementor added a dependency, so the
+      // primary's tree is the WRONG dependency set. That is exactly what the
+      // install lane exists for — it builds from the round's OWN manifests.
+      warn({ kind: 'clone_source_fingerprint_mismatch', primaryRepoRoot });
+      cloneEligible = false;
     }
   }
-  return { treePath: await buildViaInstall(args), strategyTaken: 'install' };
+
+  if (!cloneEligible) {
+    return { treePath: await buildViaInstall(args), strategyTaken: 'install' };
+  }
+
+  // F9 (P3) — fingerprints agreeing proves only that the two MANIFESTS match. Prove
+  // the primary TREE actually contains what they declare before cloning it.
+  const declared = declaredRootPackages(args.wtManifests);
+  // ROUND 7 (Finding 2): at VERSION granularity — a name check alone let a
+  // dependency bumped without reinstalling pass on its OLD directory.
+  assertRootVersionsProven(primaryNodeModules, args.wtManifests, primaryRepoRoot, 'the primary checkout', args.warn);
+
+  const dst = path.join(args.stageDir, 'node_modules');
+  try {
+    await withDeadline(() => runtime.cloneDir(primaryNodeModules, dst), args.timeoutMs, 'clone node_modules');
+  } catch (error) {
+    // HIGH-6 (round 4): on a DEADLINE, delete NOTHING. `withDeadline` stops
+    // waiting; it does not stop the producer, which is still writing to this
+    // exact pathname — removing the tree here just lets it recreate the
+    // directory behind us, and no later rename can redirect a writer that holds
+    // the original path. The stage is quarantined IN PLACE by the caller
+    // instead. A non-deadline clone failure is a settled producer, so cleaning
+    // up its partial output is safe.
+    if (error instanceof WorktreeError && error.provisioningCause === 'provisioning_timeout') throw error;
+    // ROUND 6 (Finding 3): guarded for the same reason as the stage `finally` —
+    // `rmSync` over a partial tree containing an unreadable entry throws, and
+    // thrown from this catch it would REPLACE the clone's own cause-coded
+    // refusal with a bare FS error. A stage we could not clean is a leftover
+    // temp directory the next GC preflight sweeps; the refusal is what matters.
+    try {
+      fs.rmSync(dst, { recursive: true, force: true });
+    } catch {
+      /* cleanup must never mask the primary failure */
+    }
+    if (error instanceof WorktreeError && error.kind === 'provisioning_failed') throw error;
+    // ROUND 15: a clone that fails at RUNTIME (a cross-volume stage, a non-APFS
+    // filesystem under an APFS-capable host) is the optimisation failing, not the
+    // run. Install instead — the proof downstream is the same either way.
+    warn({ kind: 'clone_failed', detail: messageOf(error) });
+    return { treePath: await buildViaInstall(args), strategyTaken: 'install' };
+  }
+  return { treePath: dst, strategyTaken: 'clone' };
 }
 
-/** Seed a checkout-free stage with the committed manifests and run `npm ci`
- * there, producing `<stage>/install/node_modules`. Throws `provisioning_failed`
- * on install failure. */
-async function buildViaInstall(args: { stageDir: string; runtime: ProvisionRuntime; wtManifests: ManifestSet }): Promise<string> {
+/**
+ * ROUND 15 (REGRESSION 3) — build the tree from the round's OWN committed
+ * manifests, restored from main.
+ *
+ * The manifests are written into a scratch directory and `npm ci` runs there, so
+ * the install never sees the worktree (no lifecycle script can touch the round's
+ * checkout) and the resulting `node_modules` is swapped in like any other staged
+ * tree. `runtime.install` pins `--ignore-scripts` and a minimal env, which is why
+ * a NATIVE dependency comes out unbuilt — and why the artifact proof, not the
+ * absence of this lane, is what must catch that.
+ */
+async function buildViaInstall(args: BuildArgs): Promise<string> {
   const cwd = path.join(args.stageDir, 'install');
   fs.rmSync(cwd, { recursive: true, force: true });
   fs.mkdirSync(cwd, { recursive: true });
@@ -683,16 +1246,33 @@ async function buildViaInstall(args: { stageDir: string; runtime: ProvisionRunti
     fs.writeFileSync(dst, content, 'utf8');
   }
   try {
-    await args.runtime.install(cwd);
+    await withDeadline(() => args.runtime.install(cwd), args.timeoutMs, 'install node_modules');
   } catch (error) {
-    throw failClosed(`dependency install (npm ci) failed in ${cwd}: ${messageOf(error)}`, messageOf(error));
+    if (error instanceof WorktreeError && error.provisioningCause === 'provisioning_timeout') throw error;
+    throw failClosed(
+      `dependency install (npm ci) failed in ${cwd}: ${messageOf(error)}`,
+      messageOf(error),
+      'install_failed',
+    );
   }
   const treePath = path.join(cwd, 'node_modules');
   if (lstatSafe(treePath)?.isDirectory() !== true) {
-    throw failClosed(`dependency install produced no node_modules directory in ${cwd}`, 'npm ci left no node_modules');
+    throw failClosed(
+      `dependency install produced no node_modules directory in ${cwd}`,
+      'npm ci left no node_modules',
+      'install_failed',
+    );
   }
   return treePath;
 }
+
+// ROUND 15 (REGRESSION 3): `manifestDivergenceFailure` and `divergedManifestNames`
+// were DELETED here. They existed to explain a refusal that no longer happens: a
+// primary whose manifests are not this round's is simply not a usable clone
+// SOURCE, so the round installs from its own manifests (which is what main did).
+// The three causes they raised — `deps_changed_in_worktree`,
+// `primary_manifests_diverged`, `manifest_divergence_unclassified` — are gone from
+// the vocabulary too, rather than left unreachable.
 
 /**
  * Two-step move-aside / move-in swap (§2.3), all under the caller's lock. POSIX
@@ -731,7 +1311,18 @@ export function swapIntoPlace(
     }
     throw moveInError;
   }
-  if (hadPrior) fs.rmSync(backup, { recursive: true, force: true });
+  // ROUND 6 (Finding 3, same family): the swap has SUCCEEDED — the new tree is in
+  // place. Freeing the moved-aside copy is pure cleanup, so letting it throw
+  // would turn a completed provisioning into a spurious "could not swap into
+  // place" failure. A surviving backup is harmless: the caller's `finally`
+  // preserves the stage and a later GC sweep collects it.
+  if (hadPrior) {
+    try {
+      fs.rmSync(backup, { recursive: true, force: true });
+    } catch {
+      /* the swap already succeeded; cleanup never fails it */
+    }
+  }
 }
 
 /**
@@ -765,20 +1356,35 @@ export function gcProvisionStages(
   assignmentId: string,
   worktreePath?: string,
   warn?: ProvisionWarnSink,
+  ownerProbe?: QuarantineOwnerProbe,
 ): void {
   gcAbandonedStages(
     // #5: the per-assignment namespace dir — an EXACT match, never a prefix scan.
     path.join(baseDir, PROVISION_STAGE_SUBDIR, sanitizeSlug(assignmentId)),
     worktreePath,
     warn ?? (() => undefined),
+    ownerProbe ?? defaultOwnerProbe(),
   );
 }
 
+/**
+ * Sweeps this assignment's stage namespace and returns the names of the stages it
+ * left alone because they are QUARANTINE-PROTECTED.
+ *
+ * ITEM 2 (round 13): the returned list is what the caller applies BACK PRESSURE
+ * from. The cap used to be enforced here by deleting the oldest protected stages,
+ * which is the exact race quarantine exists to prevent — they are protected
+ * precisely because a producer that outlived its deadline may still be writing
+ * into them, and the eviction counted stages it merely TRIED to delete as
+ * evicted. Removal is reported (`stage_gc_removed`) only after an `rmSync` that
+ * actually returned.
+ */
 function gcAbandonedStages(
   assignmentStageRoot: string,
   worktreePath: string | undefined,
   warn: ProvisionWarnSink,
-): void {
+  ownerProbe: QuarantineOwnerProbe,
+): string[] {
   // #5: `assignmentStageRoot` is THIS assignment's own namespace dir — every child is
   // one of its stage dirs, so no slug prefix filter is needed (which is what caused
   // `asg-x` to also match `asg-x-y-*`). A distinct assignment has a distinct dir.
@@ -792,8 +1398,8 @@ function gcAbandonedStages(
     // defined) FAIL CLOSED (preserve + throw) rather than continue as if empty. On the
     // removeWorktree cleanup path (`worktreePath` undefined) the assignment is being
     // torn down — there is no future provision to protect — so best-effort return.
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    if (worktreePath === undefined) return;
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if (worktreePath === undefined) return [];
     throw failClosed(
       `crash-recovery could not enumerate the provisioning stage namespace ${assignmentStageRoot}: ` +
         `${messageOf(error)}. It may hold the only node_modules backup; preserving it and failing closed.`,
@@ -848,14 +1454,26 @@ function gcAbandonedStages(
     }
   }
 
+  const nowMs = Date.now();
+  const retained: string[] = [];
   for (const name of entries) {
+    const stageDir = path.join(assignmentStageRoot, name);
+    // HIGH-6: never sweep a QUARANTINED stage while a producer abandoned on a
+    // deadline may still be writing into it. Deleting it would race that writer
+    // — the very hazard quarantining exists to avoid. Past the TTL no writer can
+    // plausibly remain, so it collects like anything else.
+    if (isQuarantineProtected(stageDir, nowMs, ownerProbe)) {
+      retained.push(name);
+      continue;
+    }
     try {
-      fs.rmSync(path.join(assignmentStageRoot, name), { recursive: true, force: true });
+      fs.rmSync(stageDir, { recursive: true, force: true });
       warn({ kind: 'stage_gc_removed', stage: name });
     } catch {
       /* best effort */
     }
   }
+
   // Best-effort: drop the now-empty per-assignment namespace dir. `rmdirSync` removes
   // it ONLY when empty, so a preserved `old-*` backup (fail-closed above threw before
   // here) or a stage the sweep could not remove keeps it — never a recursive force.
@@ -864,6 +1482,7 @@ function gcAbandonedStages(
   } catch {
     /* non-empty or already gone — leave it */
   }
+  return retained;
 }
 
 function purgeTransientCaches(treePath: string, warn: ProvisionWarnSink): void {
@@ -889,8 +1508,932 @@ function proven(
   return { provisioned: true, strategy, fingerprint, repoRoot, worktreePath, detail };
 }
 
-function failClosed(message: string, detail: string): WorktreeError {
-  return new WorktreeError('provisioning_failed', message, { detail });
+/** F9: every refusal may carry a machine-readable `cause` the CLI turns into a
+ * SPECIFIC remedy. Pre-F9 refusals pass none and keep the generic hint. */
+function failClosed(message: string, detail: string, cause?: ProvisioningCause): WorktreeError {
+  return new WorktreeError('provisioning_failed', message, {
+    detail,
+    ...(cause !== undefined ? { provisioningCause: cause } : {}),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// F9 — proving the tree
+//
+// THE GOVERNING PRINCIPLE (round 14) — READ THIS BEFORE MAKING THE PROOF STRICTER
+//
+//   The proof may never refuse something MAIN accepts.
+//
+// Its job is to strengthen confidence where it CAN prove something, not to
+// require that every project match a layout we anticipated. So every check here
+// has exactly three outcomes, and the third is the one that keeps being
+// forgotten:
+//
+//   1. PROVEN            — the check passed. Proceed.
+//   2. POSITIVELY STALE  — the check can SHOW the tree is wrong (a declared
+//                          package with no directory at all, an installed
+//                          version that disagrees with the lockfile, a declared
+//                          entry point that fails to load). REFUSE. This is
+//                          F9's whole reason to exist and must keep working.
+//   3. INDETERMINATE     — the check met a SHAPE IT DOES NOT UNDERSTAND: an
+//                          unrecognised lock descriptor, an installed entry that
+//                          is a symlink, a package with no loadable root entry,
+//                          or whatever npm does next. Degrade to main's
+//                          behaviour — PROCEED — and `warn` with
+//                          `proof_indeterminate`, naming the package and exactly
+//                          what could not be interpreted.
+//
+// (3) is NOT the silent degradation earlier rounds rejected: it is explicit,
+// logged, per-package, and provably no worse than the status quo. Rounds 10-14
+// each found another legitimate npm shape a stricter proof falsely refused —
+// `file:` dependencies installed as symlinks, v2/v3 lockfile `link` descriptors
+// that omit the usual fields, packages exporting only a subpath. npm's surface is
+// wider than any enumeration we write, so the next unfamiliar shape must land in
+// (3) by construction rather than becoming the next regression.
+// ---------------------------------------------------------------------------
+/** The root-level `dependencies` + `devDependencies` NAMES a manifest declares. */
+function declaredRootPackages(manifests: ManifestSet): string[] {
+  const raw = manifests.entries.get('package.json');
+  if (typeof raw !== 'string') return [];
+  const parsed = parsePackageJson(raw, 'package.json');
+  const names = new Set<string>();
+  for (const field of ['dependencies', 'devDependencies'] as const) {
+    const value = parsed[field];
+    if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      for (const name of Object.keys(value as object)) names.add(name);
+    }
+  }
+  return [...names].sort();
+}
+
+/**
+ * F9 (P3) — PROVE the primary tree before cloning it. Fingerprints only prove
+ * that the primary's MANIFESTS say what the worktree's committed manifests say;
+ * they say nothing about whether anyone ever ran `npm install` against them. The
+ * false clone is exactly that gap: merge a dep-adding commit, start a run before
+ * installing in the primary, and a stale tree missing the new dependency is
+ * cloned and stamped proven — `vite: not found`, exit 127, the very failure class
+ * F7 exists to kill, arriving through the clone lane instead.
+ *
+ * ROUND 7 (Finding 2) — the proof is at VERSION granularity, not presence.
+ * Checking only that each declared NAME has a directory left the same defect one
+ * level down: bump a dependency's version without reinstalling and the OLD
+ * directory still satisfies a name check, so the wrong tree is cloned, stamped
+ * v2, and every later round short-circuits onto it — verifying against dependency
+ * versions that differ from the lockfile. Non-native packages evade the runtime
+ * smoke entirely, so nothing downstream would have caught it either.
+ *
+ * Each root-declared dependency + devDependency must therefore have an INSTALLED
+ * `node_modules/<name>/package.json` whose `version` EXACTLY equals the version
+ * the lockfile resolved for it. Exact equality against the lock's own entry is
+ * the simplest sound rule — the lock is what the install was supposed to
+ * reproduce, so any difference means it did not.
+ *
+ * Transitive dependencies are still not enumerated: the root set is what the
+ * fingerprint is computed over and what verification commands reach for.
+ */
+interface PrimaryTreeDefect {
+  readonly name: string;
+  readonly detail: string;
+}
+
+/**
+ * ROUND 9 (Blocker 2) — the ROOT VERSION proof, applied to whichever tree is
+ * about to be trusted. Extracted so the CLONE lane (proving the primary before
+ * copying it) and the SHORT-CIRCUIT lane (proving a worktree tree whose marker
+ * predates this proof) run the identical check rather than one of them silently
+ * skipping it.
+ *
+ * `label`/`root` only shape the operator message; the rule is the same either
+ * way. Throws `provisioning_failed` / `primary_tree_stale`; returns on success.
+ */
+function assertRootVersionsProven(
+  treeNodeModules: string,
+  manifests: ManifestSet,
+  root: string,
+  label: string,
+  warn: ProvisionWarnSink,
+): void {
+  const declared = declaredRootPackages(manifests);
+  const locked = lockedRootVersions(manifests);
+  // ROUND 15 (REGRESSION 2) — a lockfile this engine cannot read is outcome (3),
+  // not a refusal. Round 8 made it fatal because it had been a SILENT downgrade to
+  // presence-only; the defect there was the silence, and refusing was a heavier
+  // remedy than the disease. Yarn, pnpm, and any future npm format are trees MAIN
+  // clones and verifies — so warn once, loudly, naming what could not be read, and
+  // fall back to the PRESENCE proof, which still refuses a genuinely missing
+  // package (asserted by test).
+  const { defects, indeterminate } = proveePrimaryTree(
+    treeNodeModules,
+    declared,
+    locked.ok ? locked.versions : new Map<string, string>(),
+    locked.ok ? locked.indeterminate : new Map(declared.map((name) => [name, locked.reason])),
+  );
+  if (!locked.ok) {
+    warn({
+      kind: 'proof_indeterminate',
+      subject: 'package-lock.json',
+      reason:
+        `${locked.reason}, so NO root dependency version can be proven for ${label}'s node_modules at ` +
+        `${treeNodeModules}. Presence is still proven. Proceeding as main does; commit an npm package-lock.json ` +
+        'and run `npm install` if you want version-level proof.',
+    });
+  } else {
+    // Outcome (3), reported per package before any refusal decision: these are
+    // installed but unproven, and the run PROCEEDS exactly as main would.
+    for (const item of indeterminate) {
+      warn({
+        kind: 'proof_indeterminate',
+        subject: item.name,
+        reason:
+          `${item.detail}; its version is therefore NOT proven against the lockfile. Proceeding as main does ` +
+          `(${label}'s node_modules at ${treeNodeModules}).`,
+      });
+    }
+  }
+  if (defects.length === 0) return;
+  const named = defects
+    .slice(0, 8)
+    .map((d) => `${d.name} (${d.detail})`)
+    .join('; ');
+  throw failClosed(
+    `${label}'s node_modules at ${treeNodeModules} is STALE: ${defects.length} manifest-declared package(s) do ` +
+      `not match the lockfile — ${named}${defects.length > 8 ? '; …' : ''}. Its manifests match the committed ` +
+      'ones, but it was not installed against them — trusting it would hand verification a tree whose ' +
+      'dependencies differ from the lockfile (a missing package exits 127; a stale VERSION verifies the wrong ' +
+      'code silently). Run `npm install` and re-run.',
+    `${label} tree has ${defects.length} package(s) diverging from the lockfile`,
+    'primary_tree_stale',
+  );
+}
+
+function proveePrimaryTree(
+  primaryNodeModules: string,
+  declared: readonly string[],
+  lockedVersions: ReadonlyMap<string, string>,
+  uninterpretable: ReadonlyMap<string, string>,
+): { readonly defects: PrimaryTreeDefect[]; readonly indeterminate: PrimaryTreeDefect[] } {
+  const defects: PrimaryTreeDefect[] = [];
+  const indeterminate: PrimaryTreeDefect[] = [];
+  for (const name of declared) {
+    // A package name is a posix path fragment ('@scope/pkg'); join it as such.
+    const dir = path.join(primaryNodeModules, ...name.split('/'));
+    // ROUND 17 — an inspection FAILURE is not an observation about the tree.
+    // `lstatSafe` fails closed for its pre-existing callers, which is right: they
+    // are main-era safety preflights, and main makes those same checks. This proof
+    // does not exist on main, so an EACCES/EIO here (a restrictively-permissioned
+    // scope directory, a flaky mount) turned "we could not look at this package"
+    // into a hard refusal AHEAD of main's own clone-then-install fallback. Only
+    // THIS call site degrades; `lstatSafe` itself is untouched.
+    let entry: fs.Stats | undefined;
+    try {
+      entry = lstatSafe(dir);
+    } catch (error) {
+      indeterminate.push({ name, detail: `it could not be inspected (${messageOf(error)})` });
+      continue;
+    }
+    if (entry === undefined) {
+      // Positively stale (outcome 2): nothing is installed under this name.
+      defects.push({ name, detail: 'no directory in the primary node_modules' });
+      continue;
+    }
+    if (entry.isSymbolicLink()) {
+      // ROUND 14 (REGRESSION 2): npm installs a `file:` dependency as a SYMLINK
+      // to its target directory — a normal layout, not a defect. Resolve through
+      // it (the manifest read below follows the link too). A target we cannot
+      // examine is outcome (3), not evidence of staleness: the link may be
+      // satisfied by a checkout step outside this tree's view, and main proceeds.
+      if (statFollowingSafe(dir)?.isDirectory() !== true) {
+        indeterminate.push({
+          name,
+          detail: 'it is installed as a SYMLINK (a file:/link dependency) whose target is not a directory we can examine',
+        });
+        continue;
+      }
+    } else if (!entry.isDirectory()) {
+      defects.push({ name, detail: 'no directory in the primary node_modules' });
+      continue;
+    }
+    const uninterpretableReason = uninterpretable.get(name);
+    if (uninterpretableReason !== undefined) {
+      // Outcome (3): the package is installed, but the LOCKFILE says nothing this
+      // engine can compare against. Proceed as main does, loudly.
+      indeterminate.push({ name, detail: uninterpretableReason });
+      continue;
+    }
+    const expected = lockedVersions.get(name);
+    if (expected === undefined) {
+      // ROUND 15 (REGRESSION 2) — indeterminate, not a defect. The package IS
+      // installed; the lockfile simply records no version we can compare against,
+      // which says nothing about the tree being stale. Round 8 made this fatal to
+      // end a SILENT skip — the warning below keeps that honesty without refusing
+      // a tree main verifies. Refusing here was also incoherent: a wholly
+      // unreadable lockfile now proceeds, so a readable one missing a single entry
+      // must not be treated more harshly.
+      indeterminate.push({ name, detail: 'the lockfile resolves no version for it (unrecognised or absent entry)' });
+      continue;
+    }
+    let installed: string | undefined;
+    try {
+      const raw: unknown = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+      if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+        const version = (raw as { version?: unknown }).version;
+        if (typeof version === 'string') installed = version;
+      }
+    } catch (error) {
+      // ROUND 16 (the sweep): an unreadable or malformed installed manifest is not
+      // evidence of a match — and it is not evidence of a MISMATCH either. The
+      // package is present; we simply cannot read its version. Refusing here made
+      // one unreadable file inside node_modules end a run that main completes.
+      indeterminate.push({
+        name,
+        detail: `its installed package.json could not be read or parsed (${messageOf(error)}), so its version cannot be compared with the lockfile's ${expected}`,
+      });
+      continue;
+    }
+    if (installed === undefined) {
+      // Readable, but it declares no `version`. npm tolerates that; we simply have
+      // nothing to compare.
+      indeterminate.push({
+        name,
+        detail: `its installed package.json declares no version, so nothing can be compared with the lockfile's ${expected}`,
+      });
+    } else if (installed !== expected) {
+      defects.push({ name, detail: `installed ${installed}, lockfile resolved ${expected}` });
+    }
+  }
+  return { defects, indeterminate };
+}
+
+/**
+ * The version the LOCKFILE resolved for each root-declared package, read from
+ * the fingerprinted `package-lock.json`.
+ *
+ * ROUND 8 (Blocker 2) — returns a REASON instead of an empty map when the data
+ * is unusable. Degrading to presence-only was the F9 defect reintroduced through
+ * its own precondition: a missing, malformed, or non-npm lockfile (Yarn, pnpm)
+ * silently skipped every version comparison, cloned a stale tree, stamped it v2,
+ * and short-circuited onto it for the rest of the run. Absence of proof is not
+ * proof; the caller REFUSES.
+ *
+ * Recognised: npm lockfileVersion 2/3 `packages` entries keyed
+ * `node_modules/<name>` (top-level only — a nested `a/node_modules/b` is not the
+ * root copy), and the v1 `dependencies` map.
+ */
+/** npm lockfile format versions whose ROOT entries this engine can read. */
+const SUPPORTED_LOCKFILE_VERSIONS: ReadonlySet<number> = new Set([1, 2, 3]);
+
+type LockVersions =
+  | {
+      readonly ok: true;
+      readonly versions: ReadonlyMap<string, string>;
+      /**
+       * ROUND 14 — outcome (3): entries that EXIST but whose version this engine
+       * cannot read, mapped to why. Distinct from a name with NO entry at all,
+       * which stays a defect (round 8's Blocker 2): an uninterpretable descriptor
+       * is a shape we do not understand, while a missing one is the lockfile
+       * positively disagreeing with the manifest.
+       */
+      readonly indeterminate: ReadonlyMap<string, string>;
+    }
+  | { readonly ok: false; readonly reason: string };
+
+function lockedRootVersions(manifests: ManifestSet): LockVersions {
+  const raw = manifests.entries.get('package-lock.json');
+  if (raw === null || raw === undefined) {
+    return {
+      ok: false,
+      reason:
+        'the committed manifests contain no package-lock.json, so no resolved dependency versions exist to prove ' +
+        'the primary tree against (a Yarn/pnpm lockfile is not read by this engine)',
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return { ok: false, reason: `package-lock.json could not be parsed: ${messageOf(error)}` };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, reason: 'package-lock.json is not a JSON object' };
+  }
+  const record = parsed as { packages?: unknown; dependencies?: unknown; lockfileVersion?: unknown };
+  // ROUND 9 (Blocker 3): validate the FORMAT VERSION explicitly. Accepting a
+  // lockfile because its `packages`/`dependencies` merely RESEMBLE a recognised
+  // structure is inference from shape — the same error the F11 classifier made
+  // about operation kind. A future format may key or nest root entries
+  // differently while still looking familiar, so resemblance is not support.
+  const lockfileVersion = record.lockfileVersion;
+  if (typeof lockfileVersion !== 'number' || !SUPPORTED_LOCKFILE_VERSIONS.has(lockfileVersion)) {
+    return {
+      ok: false,
+      reason:
+        `package-lock.json declares lockfileVersion ${JSON.stringify(lockfileVersion)}, which this engine does ` +
+        `not support (recognised: ${[...SUPPORTED_LOCKFILE_VERSIONS].join(', ')}). Its resolved dependency ` +
+        'versions cannot be read, so the tree cannot be proven',
+    };
+  }
+  const versions = new Map<string, string>();
+  const indeterminate = new Map<string, string>();
+  const packages = record.packages;
+  if (packages !== null && typeof packages === 'object' && !Array.isArray(packages)) {
+    const entries = packages as Record<string, unknown>;
+    for (const [key, value] of Object.entries(entries)) {
+      if (!key.startsWith('node_modules/')) continue;
+      const name = key.slice('node_modules/'.length);
+      if (name.includes('node_modules/')) continue;
+      if (value === null || typeof value !== 'object') {
+        // ROUND 15: a null/primitive descriptor is a shape we cannot read, not a
+        // defect — skipping it silently made it one further down.
+        indeterminate.set(name, 'its lockfile entry is not an object, so no version can be read from it');
+        continue;
+      }
+      const entry = value as { version?: unknown; link?: unknown; resolved?: unknown };
+      if (typeof entry.version === 'string') {
+        versions.set(name, entry.version);
+        continue;
+      }
+      // ROUND 14 (REGRESSION 2): a `file:` dependency is recorded as a LINK
+      // descriptor — no version of its own, `resolved` naming a SEPARATE entry
+      // keyed by the target's path, which carries the version. Interpreting that
+      // is two lookups, so the linked package is PROVEN like any other rather
+      // than merely tolerated.
+      if (entry.link === true) {
+        const target = typeof entry.resolved === 'string' ? entries[entry.resolved] : undefined;
+        const targetVersion =
+          target !== null && typeof target === 'object' ? (target as { version?: unknown }).version : undefined;
+        if (typeof targetVersion === 'string') {
+          versions.set(name, targetVersion);
+          continue;
+        }
+        indeterminate.set(
+          name,
+          typeof entry.resolved === 'string'
+            ? `the lockfile records it as a LINK to '${entry.resolved}', and that entry declares no version this engine can read`
+            : 'the lockfile records it as a LINK with no `resolved` target path',
+        );
+        continue;
+      }
+      // Outcome (3): an entry we do not recognise is not evidence of a defect.
+      indeterminate.set(
+        name,
+        'its lockfile entry declares no version and is not a link descriptor this engine recognises',
+      );
+    }
+  }
+  const deps = record.dependencies;
+  if (versions.size === 0 && deps !== null && typeof deps === 'object' && !Array.isArray(deps)) {
+    for (const [name, value] of Object.entries(deps as Record<string, unknown>)) {
+      if (value !== null && typeof value === 'object') {
+        const version = (value as { version?: unknown }).version;
+        if (typeof version === 'string') versions.set(name, version);
+      }
+    }
+  }
+  return { ok: true, versions, indeterminate };
+}
+
+/**
+ * F9 (P1) — the packages in an INSTALLED tree whose correctness depends on a
+ * lifecycle BUILD step: they declare an install/preinstall/postinstall script AND
+ * look like a native addon (a `binding.gyp`, or a script invoking node-gyp /
+ * prebuild / node-pre-gyp / cmake-js). `better-sqlite3` is the canonical member.
+ *
+ * Deliberately narrower than "every script-bearing package": plenty of packages
+ * run a postinstall that has nothing to do with loadability (`esbuild` fetches a
+ * platform binary, CLI packages run setup scripts, some are not `require`-able at
+ * all), and `require`ing those would fail the smoke for reasons that are not
+ * breakage. The native-addon set is exactly the set whose `require()` genuinely
+ * dlopens a built artifact — a real proof, with no false positives.
+ *
+ * Enumerates the tree's TOP LEVEL (npm hoists, so that is the installed set),
+ * including one level under `@scope/`. Unreadable/malformed package manifests are
+ * skipped, not fatal: they are not evidence of a missing BUILD.
+ */
+/**
+ * REGRESSION 1 (round 10) — a package the smoke must load, identified by its
+ * absolute DIRECTORY and its BARE name.
+ *
+ * The nested case used to be requested as `parent/node_modules/child`, which
+ * Node resolves as a SUBPATH OF `parent` — so a parent declaring `exports`
+ * threw ERR_PACKAGE_PATH_NOT_EXPORTED and a perfectly valid tree (one main
+ * clones and uses) was falsely refused. The smoke must prove the addon LOADS,
+ * not that one specifier spelling resolves.
+ */
+interface NativePackage {
+  readonly dir: string;
+  readonly name: string;
+  /**
+   * ROUND 14 (REGRESSION 3) — every specifier this package DECLARES as a way in:
+   * the bare name, plus each concrete `exports` subpath. The smoke proves the
+   * addon LOADS by any of them.
+   */
+  readonly targets: readonly string[];
+  /**
+   * Whether the manifest declares a ROOT entry (`main`, or an `exports` that
+   * resolves `.`). This is what separates outcome (2) from outcome (3): a
+   * declared root entry that fails to load is a package positively shown to be
+   * broken (better-sqlite3 unbuilt) and REFUSES; a package that declares no way
+   * in we can load is a shape we cannot prove, which warns and proceeds.
+   */
+  readonly declaresRootEntry: boolean;
+  /** Only for the operator message: it ships a CLI and nothing importable. */
+  readonly binOnly: boolean;
+}
+
+/**
+ * ROUND 14 (REGRESSION 3) — derive the declared ways INTO a package. Node lets a
+ * package define exported subpaths with no root entry at all, and lets a package
+ * ship only a `bin`; asking solely for the bare name made both unprovable by
+ * construction and therefore refused, though main clones and uses them.
+ *
+ * A wildcard subpath (`./*`) is skipped: it needs a concrete match to resolve, so
+ * it is not a specifier we can try. A `bin` is NOT executed — running an
+ * arbitrary CLI inside the orchestrator is not a smoke, it is arbitrary
+ * side effects — so a bin-only package lands in outcome (3) instead.
+ */
+function loadPlanFor(parsed: Record<string, unknown> | undefined, name: string): Omit<NativePackage, 'dir' | 'name'> {
+  const targets = [name];
+  if (parsed === undefined) return { targets, declaresRootEntry: false, binOnly: false };
+  let declaresRootEntry = typeof parsed['main'] === 'string';
+  const exported = parsed['exports'];
+  if (typeof exported === 'string') {
+    declaresRootEntry = true;
+  } else if (exported !== null && typeof exported === 'object' && !Array.isArray(exported)) {
+    const keys = Object.keys(exported as Record<string, unknown>);
+    // `.` names the root explicitly; a map with NO subpath keys is a CONDITIONS
+    // object, which IS the root entry ({"import": …, "require": …}).
+    if (keys.includes('.') || (keys.length > 0 && !keys.some((key) => key.startsWith('.')))) {
+      declaresRootEntry = true;
+    }
+    for (const key of keys) {
+      if (!key.startsWith('./') || key.includes('*')) continue;
+      targets.push(`${name}${key.slice(1)}`);
+    }
+  }
+  const bin = parsed['bin'];
+  const declaresBin = typeof bin === 'string' || (bin !== null && typeof bin === 'object');
+  return { targets, declaresRootEntry, binOnly: !declaresRootEntry && targets.length === 1 && declaresBin };
+}
+
+/** How deep inside a package to look for its compiled artifact (`build/Release/x.node`
+ * is 3), and how many to bother proving. */
+const NATIVE_ARTIFACT_SCAN_DEPTH = 6;
+const MAX_NATIVE_ARTIFACTS = 8;
+
+/**
+ * ROUND 15 — the compiled addon artifacts (`*.node`) a package actually ships.
+ *
+ * THIS is what a script-less install fails to produce, and what `require()` never
+ * proved: better-sqlite3 loads its binding LAZILY, inside the Database
+ * constructor (`lib/database.js:48`), so requiring it succeeds with no artifact
+ * present at all. Confirmed at runtime by hooking `process.dlopen`: requiring the
+ * real package triggers none; `new Database(':memory:')` triggers one.
+ *
+ * Nested `node_modules` are skipped — those artifacts belong to other packages,
+ * which the scan visits in their own right.
+ *
+ * ROUND 17 — `complete` is false whenever the traversal STOPPED EARLY for any
+ * reason, and `incompleteReason` says which. Every limit here is OURS, not the
+ * tree's, so hitting one means "we stopped looking", never "there is nothing
+ * there" — and the caller may only conclude from a scan that ran to the end.
+ */
+function nativeArtifacts(pkgDir: string): {
+  readonly artifacts: string[];
+  readonly complete: boolean;
+  readonly incompleteReason: string | undefined;
+} {
+  const artifacts: string[] = [];
+  // The FIRST reason the walk stopped short; also the flag that it did.
+  let stoppedBecause: string | undefined;
+  const capReason = `the scan stopped at its ${MAX_NATIVE_ARTIFACTS}-artifact cap, so any further artifact was never examined`;
+  const walk = (dir: string, depth: number): void => {
+    if (artifacts.length >= MAX_NATIVE_ARTIFACTS) {
+      // ROUND 17: this cap is exactly the depth cap's mistake by another route. A
+      // `prebuildify` package ships one artifact per platform/ABI and only one is
+      // loadable HERE; if the cap is reached before the scan meets it, the visible
+      // foreign variants are all we judge — and "none of these load" was reported
+      // as "nothing it produced loads here". Truncation is indeterminate.
+      stoppedBecause ??= capReason;
+      return;
+    }
+    if (depth > NATIVE_ARTIFACT_SCAN_DEPTH) {
+      // ROUND 16: stopping is NOT looking. Round 15 returned here silently and
+      // then declared "no artifact", so a valid addon stored deeper than the
+      // traversal goes — `node-gyp-build` layouts nest by runtime/ABI/platform —
+      // was reported as never built. The same rule the native-package scan's own
+      // depth cap follows: exhaustion is indeterminate, never absence.
+      stoppedBecause ??= `the scan stopped at its ${NATIVE_ARTIFACT_SCAN_DEPTH}-directory depth limit under ${dir}`;
+      return;
+    }
+    let entries: Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (error) {
+      stoppedBecause ??= `${dir} could not be read (${messageOf(error)})`;
+      return;
+    }
+    for (const entry of entries) {
+      if (artifacts.length >= MAX_NATIVE_ARTIFACTS) {
+        stoppedBecause ??= capReason;
+        return;
+      }
+      // A nested tree belongs to OTHER packages, which the scan visits in their
+      // own right, so passing over one is not a gap in THIS package's scan —
+      // whether it is a real directory or a link to one.
+      if (entry.name === 'node_modules') continue;
+      const full = path.join(dir, entry.name);
+      // ROUND 18 — `readdirSync` reports Dirents with lstat semantics, so a
+      // SYMLINK is neither `isFile()` nor `isDirectory()` and used to fall
+      // through this loop silently while the scan still called itself COMPLETE.
+      // A package whose artifact — or the directory holding it — is a link then
+      // presented as "zero artifacts, nothing skipped" and was refused as never
+      // built. We deliberately do NOT follow the link: that reopens the
+      // containment question the symlink-escape guard exists to close, and we do
+      // not need it, because an incomplete scan already means indeterminate.
+      // Skipping is not looking, so record it.
+      if (entry.isSymbolicLink()) {
+        stoppedBecause ??=
+          `${full} is a symlink, and the scan does not follow links (one may point outside the worktree), ` +
+          'so whatever it points at was never examined';
+        continue;
+      }
+      if (entry.isDirectory()) {
+        walk(full, depth + 1);
+      } else if (entry.isFile() && entry.name.endsWith('.node')) {
+        artifacts.push(full);
+      }
+    }
+  };
+  walk(pkgDir, 0);
+  return { artifacts, complete: stoppedBecause === undefined, incompleteReason: stoppedBecause };
+}
+
+/**
+ * The manifest of a package we already decided to smoke, read BEST-EFFORT.
+ *
+ * Deliberately not fail-closed: the `binding.gyp` branch of the scan admits a
+ * package without ever reading its manifest, so making this strict would refuse
+ * trees the scan already accepted. An unreadable manifest here simply yields no
+ * declared targets beyond the bare name, and the load attempt decides.
+ */
+function readManifestBestEffort(dir: string): Record<string, unknown> | undefined {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    return value as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+function nativeBuildPackages(treePath: string, warn: ProvisionWarnSink): NativePackage[] {
+  const found: NativePackage[] = [];
+
+  /** `dir` holds a package; `specifier` is how `require()` names it. */
+  const consider = (dir: string, specifier: string, name: string): void => {
+    // HIGH-4: `binding.gyp` is decisive ON ITS OWN, checked BEFORE any script
+    // lookup. npm runs an IMPLICIT `node-gyp rebuild` for a package that has a
+    // binding.gyp and declares no `install`/`preinstall` script — so requiring a
+    // `scripts` object first (and returning early without one) skipped exactly
+    // the packages whose build npm supplies for them.
+    if (fs.existsSync(path.join(dir, 'binding.gyp'))) {
+      found.push({ dir, name, ...loadPlanFor(readManifestBestEffort(dir), name) });
+      void specifier;
+      return;
+    }
+    let manifestRaw: string;
+    try {
+      manifestRaw = fs.readFileSync(path.join(dir, 'package.json'), 'utf8');
+    } catch (error) {
+      // Only a GENUINE absence is a silent skip — a cache dir, a stray file, `.bin`.
+      //
+      // ROUND 16 (the sweep): any OTHER read error (EACCES, EIO) used to REFUSE,
+      // on the reasoning that "a package we could not examine cannot be attested".
+      // That inverts the rule: not being able to look is not a finding. Main never
+      // opens these manifests at all, so a tree it clones and verifies was refused
+      // because ONE file inside node_modules was unreadable. Outcome (3).
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return;
+      warn({
+        kind: 'proof_indeterminate',
+        subject: dir,
+        reason:
+          `its package.json could not be read (${messageOf(error)}), so this package was not examined for a native ` +
+          'build step and is NOT proven. Proceeding as main does.',
+      });
+      return;
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      const value: unknown = JSON.parse(manifestRaw);
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('not a JSON object');
+      }
+      parsed = value as Record<string, unknown>;
+    } catch (error) {
+      // ROUND 16 (the sweep): a malformed manifest INSIDE node_modules used to be
+      // treated as a corrupt tree. It is not evidence about this round: main never
+      // parses these files, and a half-written manifest for some package the round
+      // may not even load cannot be shown to break anything. (The committed
+      // manifests at HEAD are different — those are this round's INPUT, and
+      // `parsePackageJson`'s B3 refusal for them is untouched.)
+      warn({
+        kind: 'proof_indeterminate',
+        subject: dir,
+        reason:
+          `its package.json could not be parsed (${messageOf(error)}), so this package was not examined for a ` +
+          'native build step and is NOT proven. Proceeding as main does.',
+      });
+      return;
+    }
+    const scripts = parsed['scripts'];
+    if (scripts === null || typeof scripts !== 'object') return;
+    const hooks = ['install', 'preinstall', 'postinstall']
+      .map((hook) => (scripts as Record<string, unknown>)[hook])
+      .filter((value): value is string => typeof value === 'string');
+    if (hooks.some((script) => /node-gyp|node-pre-gyp|prebuild|cmake-js/i.test(script))) {
+      found.push({ dir, name, ...loadPlanFor(parsed, name) });
+      void specifier;
+    }
+  };
+
+  /**
+   * HIGH-4: walk NESTED `node_modules` too. npm hoists most packages to the top
+   * level, but a version conflict leaves a transitive dependency installed at
+   * `a/node_modules/b` — and a native one there is just as unbuilt-able. The
+   * specifier stays the nested PATH (`a/node_modules/b`), which is what the
+   * smoke must require: bare `b` would resolve to the hoisted copy, proving the
+   * wrong artifact.
+   */
+  const walk = (root: string, specifierPrefix: string, depth: number): void => {
+    // HIGH-4 (round 4): the depth guard FAILS CLOSED. Returning silently meant a
+    // native package nested deeper than the limit was never smoked, yet the tree
+    // still received a v2 (smoke-attested) marker — an UNPROVEN tree stamped
+    // proven, and sticky from then on. Refusing is the only honest option: a tree
+    // we did not finish examining is a tree we cannot attest.
+    if (depth > MAX_NATIVE_SCAN_DEPTH) {
+      // ROUND 15 (REGRESSION 4) — REVERSES round 4's fail-closed cap. That cap was
+      // right when this proof was the only guard: a silent truncation still
+      // produced a smoke-attested marker, so an unexamined subtree was stamped
+      // proven. It is wrong under the governing principle — a tree nested past OUR
+      // limit is one main clones and verifies, so refusing lets the scan's limit,
+      // rather than the tree, decide the run. Outcome (3): say plainly what was
+      // not examined, and proceed. The silence round 4 objected to is still gone.
+      warn({
+        kind: 'proof_indeterminate',
+        subject: root,
+        reason:
+          `the staged node_modules nests deeper than ${MAX_NATIVE_SCAN_DEPTH} levels here, so the native-build ` +
+          'scan stopped descending and any package below this point is NOT proven. Proceeding as main does.',
+      });
+      return;
+    }
+    let entries: Dirent[];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch (error) {
+      // ROUND 16 (the sweep): a directory we cannot enumerate is a directory we
+      // did not examine, not a broken tree. (Reachability note: the main-era
+      // symlink containment scan walks these same directories and refuses first
+      // on an unreadable one — as it does on main — so this is defence in depth
+      // for the race where a directory becomes unreadable between the two walks.)
+      warn({
+        kind: 'proof_indeterminate',
+        subject: root,
+        reason:
+          `it could not be enumerated (${messageOf(error)}), so no package under it was examined for a native ` +
+          'build step. Proceeding as main does.',
+      });
+      return;
+    }
+    const visit = (dir: string, specifier: string, name: string): void => {
+      consider(dir, specifier, name);
+      const nested = path.join(dir, 'node_modules');
+      if (lstatSafe(nested)?.isDirectory() === true) walk(nested, `${specifier}/node_modules/`, depth + 1);
+    };
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === '.bin') continue;
+      if (entry.name.startsWith('@')) {
+        let scoped: Dirent[];
+        try {
+          scoped = fs.readdirSync(path.join(root, entry.name), { withFileTypes: true });
+        } catch (error) {
+          // ROUND 5 (#3): FAIL CLOSED, exactly as the depth cap does. Swallowing
+          // this with `continue` omitted every native package under the scope
+          // while the tree still received a v2 (smoke-attested) marker — an
+          // unexamined subtree stamped proven. Enumeration and depth must have
+          // the same posture: a scan that could not complete attests nothing.
+          // ROUND 16 (the sweep): same rule, same reachability note as above.
+          warn({
+            kind: 'proof_indeterminate',
+            subject: path.join(root, entry.name),
+            reason:
+              `this scope directory could not be enumerated (${messageOf(error)}), so the packages under it were ` +
+              'not examined for a native build step. Proceeding as main does.',
+          });
+          continue;
+        }
+        for (const child of scoped) {
+          if (child.isDirectory()) {
+            visit(
+              path.join(root, entry.name, child.name),
+              `${specifierPrefix}${entry.name}/${child.name}`,
+              `${entry.name}/${child.name}`,
+            );
+          }
+        }
+      } else {
+        visit(path.join(root, entry.name), `${specifierPrefix}${entry.name}`, entry.name);
+      }
+    }
+  };
+
+  walk(treePath, '', 0);
+  const unique = new Map<string, NativePackage>();
+  for (const pkg of found) unique.set(pkg.dir, pkg);
+  return [...unique.values()].sort((a, b) => (a.dir < b.dir ? -1 : a.dir > b.dir ? 1 : 0));
+}
+
+/**
+ * F9 (P1/P2) — the RUNTIME toolchain proof, run on the STAGED tree BEFORE the
+ * marker is written, on BOTH lanes.
+ *
+ * `hasBinDir` never could have worked: `node_modules/.bin/` is populated from
+ * package `bin` fields at UNPACK time, wholly independent of lifecycle scripts,
+ * so a `--ignore-scripts` install yields a fully-populated `.bin` and zero built
+ * `.node` artifacts — which is precisely how a better-sqlite3 with no binding was
+ * stamped "proven" and then, because the marker matched, reused by every
+ * subsequent round until the run burned to terminal.
+ *
+ * The replacement actually LOADS each native-build package in a child node,
+ * resolved from the package's own directory, under a minimal env and a
+ * per-package deadline: `require` first, falling back to a dynamic `import()` for
+ * a package that declares itself ESM-only (ITEM 4). A load failure by BOTH
+ * mechanisms is `native_toolchain_unproven` naming the package. The CLONE lane
+ * runs it too: the clone is CHEAP, not SAFE — its correctness is inherited from
+ * whenever the primary was last really installed.
+ */
+async function runNativeSmoke(
+  treePath: string,
+  warn: ProvisionWarnSink,
+  timeoutMs: number,
+): Promise<void> {
+  const packages = nativeBuildPackages(treePath, warn);
+  if (packages.length === 0) return;
+  const env: Record<string, string> = {};
+  for (const key of SMOKE_ENV_ALLOWLIST) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  const proven: string[] = [];
+  for (const pkg of packages) {
+    // ROUND 15 — THE PROOF. A package that declares a native build must SHIP a
+    // compiled artifact, and that artifact must load. Everything below this point
+    // (require/import of the JS entry) is a secondary check on the wrapper: it
+    // cannot prove the addon, because the addon is loaded lazily by the API the
+    // caller eventually uses, not by `require` of the package.
+    const scan = nativeArtifacts(pkg.dir);
+    if (scan.artifacts.length === 0) {
+      if (!scan.complete) {
+        // Outcome (3): we could not finish looking, which is not evidence of an
+        // unbuilt package. ROUND 17 — name the limit that stopped the search; a
+        // warning the operator cannot act on is barely better than silence.
+        warn({
+          kind: 'proof_indeterminate',
+          subject: pkg.dir,
+          reason:
+            'it declares a native build step and no compiled artifact was found, but the search did not finish: ' +
+            `${scan.incompleteReason ?? 'the scan did not complete'}. No conclusion is available. Proceeding as main does.`,
+        });
+        continue;
+      }
+      // Outcome (2): positively unbuilt — this is the exact tree F9 exists to
+      // reject, and the one `require()` waved through for fourteen rounds.
+      throw failClosed(
+        `provisioned node_modules for ${treePath} contains NO compiled native artifact (*.node) for '${pkg.dir}', ` +
+          'which declares a native build step — the package was never built (a script-less install cannot build ' +
+          'it). Requiring such a package still succeeds, because the binding is loaded lazily by the API you call ' +
+          '(better-sqlite3 loads it inside `new Database(...)`), so verification would fail only once the code ran. ' +
+          'Refusing to verify against an unproven toolchain.',
+        `no compiled artifact for ${pkg.dir}`,
+        'native_toolchain_unproven',
+      );
+    }
+    try {
+      // `process.dlopen` is exactly what a lazily-loading package does when its
+      // API is first used, without needing to know that API — no constructor to
+      // guess, no arbitrary code to execute beyond the addon's own init.
+      //
+      // ROUND 16: ONE artifact loading is the proof. Requiring EVERY one to load
+      // refused a package shipping per-platform/per-ABI prebuilds (`prebuildify`,
+      // `node-gyp-build`), where by construction only one variant is loadable on
+      // this host and the wrapper selects it — a package main installs and uses.
+      // Since we cannot know which variant the wrapper picks, a single successful
+      // load is sufficient evidence that the build step produced something this
+      // host can load; only ZERO loadable artifacts is positive evidence of
+      // breakage.
+      const dlopenScript =
+        `const files=${JSON.stringify(scan.artifacts)};const errs=[];` +
+        'for (const f of files) { try { process.dlopen({exports:{}}, f); process.exit(0); } ' +
+        'catch (err) { errs.push(f + ": " + ((err && err.message) || String(err))); } }' +
+        'console.error(errs.join("\\n"));process.exit(1);';
+      await execFileAsync(process.execPath, ['-e', dlopenScript], {
+        cwd: pkg.dir,
+        env,
+        timeout: Math.min(timeoutMs, NATIVE_SMOKE_TIMEOUT_MS),
+        maxBuffer: 4 * 1024 * 1024,
+      });
+    } catch (error) {
+      const stderr = typeof (error as { stderr?: unknown }).stderr === 'string'
+        ? ((error as { stderr: string }).stderr).trim().split('\n').slice(0, 6).join(' | ')
+        : messageOf(error);
+      if (!scan.complete) {
+        // ROUND 17 — "none of these load" is positive evidence of breakage ONLY
+        // over a COMPLETE scan. Truncated, the artifacts we judged are merely the
+        // ones we happened to see first, and the variant this host loads may sit
+        // beyond the limit that stopped us. Refusing here rejected exactly the
+        // multi-platform layouts the one-artifact-is-enough rule exists to admit.
+        warn({
+          kind: 'proof_indeterminate',
+          subject: pkg.dir,
+          reason:
+            `none of the ${scan.artifacts.length} compiled artifact(s) the scan SAW load here, but the search did ` +
+            `not finish: ${scan.incompleteReason ?? 'the scan did not complete'}. An artifact this host can load ` +
+            `may never have been examined, so its build is NOT proven. Proceeding as main does. Attempts: ${stderr}`,
+        });
+        continue;
+      }
+      throw failClosed(
+        `provisioned node_modules for ${treePath} could not dlopen ANY of the ${scan.artifacts.length} compiled ` +
+          `artifact(s) of '${pkg.dir}': the build is present but nothing it produced loads here — a truncated ` +
+          `download, a build for the wrong architecture, or a broken toolchain. Refusing to verify against it: ${stderr}`,
+        `dlopen failed for ${pkg.dir}`,
+        'native_toolchain_unproven',
+      );
+    }
+    try {
+      // REGRESSION 1: resolve from the package's OWN package.json, so a bare
+      // specifier walks up into the directory that actually holds it. Requesting
+      // `parent/node_modules/child` instead asked Node for a SUBPATH of the
+      // parent, which a parent declaring `exports` rejects outright.
+      //
+      // ROUND 13 (ITEM 4) and ROUND 14 (REGRESSION 3): prove the addon LOADS by
+      // whichever mechanism the PACKAGE declares, not by one specifier form.
+      // `require` of the bare name alone refused a valid ESM-only package
+      // (ERR_PACKAGE_PATH_NOT_EXPORTED / ERR_REQUIRE_ESM) and any package whose
+      // `exports` names only subpaths — trees main clones and uses. Each declared
+      // target is tried with require and then dynamic import; the FIRST success
+      // proves the package. None of this can launder a broken addon: importing a
+      // CJS package evaluates it through the same CommonJS loader, so a missing
+      // `.node` binding fails identically (a test drives exactly that), and every
+      // attempted error is reported.
+      const script =
+        'const {createRequire}=require("node:module");' +
+        `const req=createRequire(${JSON.stringify(path.join(pkg.dir, 'package.json'))});` +
+        `const targets=${JSON.stringify(pkg.targets)};` +
+        '(async()=>{const errs=[];for(const t of targets){' +
+        'try{req(t);process.exit(0);}catch(err){errs.push("require "+t+": "+((err&&err.message)||String(err)));}' +
+        'try{await import(t);process.exit(0);}catch(err){errs.push("import "+t+": "+((err&&err.message)||String(err)));}' +
+        '}console.error(errs.join("\\n"));process.exit(1);})();';
+      await execFileAsync(process.execPath, ['-e', script], {
+        // The package's OWN directory: a bare `import()` from the eval module
+        // resolves against cwd, and Node's node_modules walk from here reaches the
+        // directory that actually holds this package (the NESTED copy for a nested
+        // one, never the hoisted namesake) — the same base `createRequire` uses
+        // above, so both mechanisms prove the same artifact.
+        cwd: pkg.dir,
+        env,
+        timeout: Math.min(timeoutMs, NATIVE_SMOKE_TIMEOUT_MS),
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      proven.push(pkg.dir);
+    } catch (error) {
+      const stderr = typeof (error as { stderr?: unknown }).stderr === 'string'
+        ? ((error as { stderr: string }).stderr).trim().split('\n').slice(0, 6).join(' | ')
+        : messageOf(error);
+      // ROUND 17 — outcome (3) in BOTH shapes now. Control only reaches here after
+      // an artifact of this package ALREADY dlopened, so the build demonstrably
+      // produced something this host loads. A wrapper that then refuses to
+      // initialise is telling us about the smoke ENVIRONMENT — absent runtime
+      // configuration, an unmet precondition, a conditional export that resolves
+      // differently here — not about whether the package was built. The case this
+      // refusal was written for, a genuinely missing binding, is caught above by
+      // the artifact check (a tree with NO artifact and a COMPLETE scan), which is
+      // where the decisive better-sqlite3 row lands and stays a refusal.
+      warn({
+        kind: 'proof_indeterminate',
+        subject: pkg.dir,
+        reason: pkg.declaresRootEntry
+          ? 'its compiled artifact LOADED, but the root entry it declares did not load in the minimal smoke ' +
+            'environment, so the package is not fully proven — this says nothing about whether it was built. ' +
+            `Proceeding as main does. Attempts: ${stderr}`
+          : `it declares a native build step but ${pkg.binOnly ? 'ships only a CLI `bin`' : 'no root entry'} this ` +
+            `engine can load, so its build is NOT proven. Proceeding as main does. Attempts: ${stderr}`,
+      });
+    }
+  }
+  if (proven.length > 0) warn({ kind: 'native_smoke_passed', packages: proven });
 }
 
 /**
@@ -911,6 +2454,25 @@ export function lstatSafe(target: string): fs.Stats | undefined {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ENOTDIR') return undefined;
     throw failClosed(`could not lstat ${target}: ${messageOf(error)}`, `lstat ${target} failed (${code ?? 'unknown'})`);
+  }
+}
+
+/**
+ * ROUND 14 — `lstatSafe`'s exact contract, but FOLLOWING symlinks. npm installs a
+ * `file:` dependency as a symlink to its target directory, so the installed-entry
+ * check must be able to look through one; a dangling link reports `undefined`
+ * (the caller treats that as indeterminate, never as staleness) while a real FS
+ * error still fails closed.
+ */
+function statFollowingSafe(target: string): fs.Stats | undefined {
+  try {
+    return fs.statSync(target);
+  } catch {
+    // ROUND 16 (the sweep): EVERY failure here — a dangling link, a permission
+    // error, a loop — means the same thing, "we could not examine the target",
+    // and the sole caller already reports that as indeterminate. Throwing turned
+    // an unexaminable SYMLINK TARGET into a refusal main never makes.
+    return undefined;
   }
 }
 
@@ -938,12 +2500,65 @@ function isPrimaryCloneable(primaryNodeModules: string): boolean {
   }
 }
 
-function readMarker(nodeModulesDir: string): string | undefined {
+/**
+ * HIGH-3 — the marker's PROOF FORMAT, versioned.
+ *
+ * v1 (pre-F9) recorded only the dependency fingerprint, so it attests
+ * "these manifests" and NOTHING about the toolchain having been proven to load.
+ * A tree built by the old install lane carries a v1 marker that still matches its
+ * fingerprint, so it would short-circuit straight past the new runtime smoke —
+ * the exact stickiness (P2) F9 exists to kill, surviving the upgrade.
+ *
+ * v2 = fingerprint + a native-smoke attestation. Only v2 short-circuits. A v1 (or
+ * unrecognized) marker is treated as UNPROVEN: the smoke runs against the tree in
+ * place, and on success the marker is rewritten as v2 (cheap — no rebuild), on
+ * failure provisioning refuses `native_toolchain_unproven`.
+ */
+const MARKER_V2_PREFIX = 'v2:';
+/**
+ * ROUND 9 (Blocker 2) — v3 = fingerprint + native-smoke attestation + ROOT
+ * VERSION proof.
+ *
+ * v2 attests only that the toolchain LOADS; it says nothing about the installed
+ * dependency VERSIONS matching the lockfile. So a v2 marker written before the
+ * version proof existed short-circuited straight past it — and those are exactly
+ * the trees most likely to already exist, which made "no tree is stamped proven
+ * without the version proof" false where it mattered most.
+ *
+ * Same shape as the v1 -> v2 upgrade: only v3 may short-circuit; a v1/v2 marker
+ * triggers the FULL proof in place (no rebuild) and is rewritten as v3 on
+ * success, refused on failure.
+ */
+const MARKER_V3_PREFIX = 'v3:';
+
+function markerV3(fingerprint: string): string {
+  return `${MARKER_V3_PREFIX}${fingerprint}`;
+}
+
+interface MarkerProof {
+  readonly fingerprint: string;
+  /** v2+: the runtime native smoke passed for this tree. */
+  readonly smokeAttested: boolean;
+  /** v3 only: root dependency VERSIONS were proven against the lockfile. */
+  readonly versionsAttested: boolean;
+}
+
+function readMarker(nodeModulesDir: string): MarkerProof | undefined {
+  let raw: string;
   try {
-    return fs.readFileSync(path.join(nodeModulesDir, PROVISION_MARKER_FILE), 'utf8').trim();
+    raw = fs.readFileSync(path.join(nodeModulesDir, PROVISION_MARKER_FILE), 'utf8').trim();
   } catch {
     return undefined;
   }
+  if (raw.startsWith(MARKER_V3_PREFIX)) {
+    return { fingerprint: raw.slice(MARKER_V3_PREFIX.length), smokeAttested: true, versionsAttested: true };
+  }
+  if (raw.startsWith(MARKER_V2_PREFIX)) {
+    return { fingerprint: raw.slice(MARKER_V2_PREFIX.length), smokeAttested: true, versionsAttested: false };
+  }
+  // A bare fingerprint is the v1 format. Anything else unrecognized is treated
+  // the same way — as an unattested claim, never as a proof.
+  return { fingerprint: raw, smokeAttested: false, versionsAttested: false };
 }
 
 /** Filesystem+git-ref-safe slug (mirrors paths.ts) for naming stage dirs. */

@@ -106,6 +106,10 @@ export interface HeadlessPermissionPolicy {
    * Optional fail-closed classifier for provider operation titles that can be
    * proven read-only after parsing. The harness supplies this only for Grok's
    * implementor `Execute` requests; a false result or throw is a denial.
+   *
+   * Title-only by design: binding the title to the EXECUTED payload is
+   * `verifyOperationPayload`'s job, because that binding must gate every
+   * approval path, not just this one.
    */
   readonly allowReadOnlyOperation?: (operation: string) => boolean;
   /**
@@ -116,10 +120,45 @@ export interface HeadlessPermissionPolicy {
   readonly workspaceWriteRoot?: string;
 }
 
+/**
+ * HIGH-5 — a VETO consulted before EVERY approval, in EVERY mediation mode.
+ *
+ * A permission TITLE is human-readable prose the provider composes; ACP
+ * `rawInput` is the payload it EXECUTES. Approving on the title alone authorizes
+ * a string nothing runs. This lives on the config ROOT, not on the headless
+ * policy, because it is not an allowlist concern: it is a precondition of any
+ * approval. Round 4 placed it on the headless policy and evaluated it after the
+ * interactive branch had already returned, so an interactive decider could
+ * forward a `selected` option for an unbound payload.
+ *
+ * Return false to REFUSE an approval that would otherwise be granted; a THROW is
+ * likewise a refusal. Return true only when there is genuinely nothing to bind.
+ */
+export type VerifyOperationPayload = (operation: string | undefined, rawInput: unknown) => boolean;
+
+/**
+ * ROUND 7 — the EXPLICIT no-op veto, for an approval surface that genuinely has
+ * no payload to bind (a provider whose tool calls carry no executable command).
+ *
+ * It exists so that "this path has nothing to verify" is a DECISION someone
+ * typed at the construction site, never an absence that nobody noticed. Four
+ * consecutive review rounds found a different construction path with no veto,
+ * each time because the field was optional somewhere; making it required and
+ * supplying this for the honest exceptions is what ends that.
+ *
+ * Never use it to silence a path that DOES carry a payload — that is precisely
+ * the fail-open this vocabulary was introduced to prevent.
+ */
+export const noPayloadToVerify: VerifyOperationPayload = () => true;
+
 export type PermissionMediationConfig =
   | {
       readonly mode: 'interactive';
       readonly role?: RoleName;
+      /** REQUIRED (round 7): pass `noPayloadToVerify` to state that this surface
+       * has no payload to bind. Optionality here is what let four separate
+       * construction paths reach an approval with no veto at all. */
+      readonly verifyOperationPayload: VerifyOperationPayload;
       /**
        * Interactive surface. When present, invoked per request (the outcome
        * is forwarded to the agent). When absent, the request is surfaced via
@@ -130,6 +169,8 @@ export type PermissionMediationConfig =
   | {
       readonly mode: 'headless';
       readonly role?: RoleName;
+      /** REQUIRED (round 7) — see the interactive variant. */
+      readonly verifyOperationPayload: VerifyOperationPayload;
       /** Omitted policy = empty allowlist = default DENY everything. */
       readonly policy?: HeadlessPermissionPolicy;
     };
@@ -141,7 +182,10 @@ export type PermissionDecisionReason =
   | 'allowlisted_workspace_write'
   | 'denied_default'
   | 'denied_unknown_operation'
-  | 'denied_role_write';
+  | 'denied_role_write'
+  /** HIGH-5: the operation would otherwise have been approved, but the payload
+   * the provider will actually EXECUTE could not be bound to its title. */
+  | 'denied_raw_input_mismatch';
 
 export interface PermissionDecision {
   readonly action: 'allow' | 'deny' | 'interactive';
@@ -215,11 +259,32 @@ export function isWorkspaceWriteOperation(
 export function decidePermission(
   config: PermissionMediationConfig,
   operation: string | undefined,
+  /** HIGH-5: the tool call's `rawInput` — what the provider will actually
+   * execute. The read-only classifier is never consulted without it. */
+  rawInput?: unknown,
 ): PermissionDecision {
   const role = config.role;
   if ((role === 'coordinator' || role === 'verifier') && isWriteOperation(operation)) {
     return { action: 'deny', reason: 'denied_role_write' };
   }
+  // HIGH-5 (round 5): the payload binding runs BEFORE ANY MEDIATION BRANCH.
+  // Round 4 evaluated it only after the interactive branch had returned, so an
+  // interactive decider — or a configured handler — could forward a `selected`
+  // option for a payload never bound to its title. Every path that can end in an
+  // approval now passes through here first, headless and interactive alike. A
+  // throw is a refusal: a veto that cannot run must never widen a decision.
+  //
+  // The operation is passed through even when undefined/empty: deciding whether
+  // an unreadable title is "not a shell request" or "a shell request we cannot
+  // read" is the veto's job, not this function's (see
+  // `grokShellPayloadMatchesTitle`).
+  let vetoed: boolean;
+  try {
+    vetoed = config.verifyOperationPayload(operation, rawInput) !== true;
+  } catch {
+    vetoed = true;
+  }
+  if (vetoed) return { action: 'deny', reason: 'denied_raw_input_mismatch' };
   if (config.mode === 'interactive') {
     return { action: 'interactive', reason: 'interactive' };
   }
@@ -1082,6 +1147,9 @@ export class AcpStdioAdapter implements HarnessAdapter {
       sessionId: acpSessionId(sessionKey),
       description: title ?? 'Permission requested',
       ...(title !== undefined ? { toolTitle: title } : {}),
+      // HIGH-5: an interactive decider must see what will EXECUTE, not only the
+      // title describing it.
+      ...(toolCall?.['rawInput'] !== undefined ? { rawInput: toolCall['rawInput'] } : {}),
       options,
     };
     const pending: PendingPermission = { jsonrpcId: id, sessionId: sessionKey, request, operation: title };
@@ -1089,8 +1157,13 @@ export class AcpStdioAdapter implements HarnessAdapter {
     // Surface on the update stream regardless of mode (observability, T20).
     this.#routeUpdate(sessionKey, { kind: 'permission_request', request });
 
-    const config = this.#options.permissions ?? { mode: 'headless' };
-    const decision = decidePermission(config, title);
+    // No mediation configured at all = default-deny (empty allowlist, no
+    // classifier, no write root), so there is no approval path for a veto to
+    // gate; the explicit no-op states that rather than leaving a hole.
+    const config = this.#options.permissions ?? { mode: 'headless', verifyOperationPayload: noPayloadToVerify };
+    // HIGH-5: hand the classifier the tool call's `rawInput` — the payload the
+    // provider actually executes — alongside the human-readable title.
+    const decision = decidePermission(config, title, toolCall?.['rawInput']);
 
     if (decision.action === 'allow' || decision.action === 'deny') {
       const preference: readonly PermissionOptionKind[] =

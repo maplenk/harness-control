@@ -117,6 +117,7 @@ export { NoDeliverableError } from '../service.js';
  */
 export { adjudicateImplementorDeliverable } from './deliverable.js';
 import { adjudicateImplementorDeliverable } from './deliverable.js';
+import { describeReceiptMismatch } from './implementor.js';
 
 export interface ImplementVerifyLoopDeps {
   readonly service: OrchestrationService;
@@ -350,11 +351,43 @@ function carriedVerifierState(
  *    dirt is never preserved work.
  * The single-writer lease is held on return.
  */
+/**
+ * ROUND 7 (Finding 1) — the durable binding a COMPLETED implementor round
+ * re-enters verification against.
+ *
+ * The receipt (the round's own `pre_verify_handoff` checkpoint) is authoritative:
+ * it is the round asserting which commit it stands behind. The round-scoped
+ * `lastImplementationCommit` pointer is equally durable but written LATER by the
+ * loop driver, so it is accepted only when it AGREES with the receipt — a
+ * disagreement means one of the two records is stale, which is not a state to
+ * silently pick a winner in.
+ *
+ * `undefined` = no durable source; the caller REFUSES. There is deliberately no
+ * fallback to current HEAD: that is authorization by topology.
+ */
+function completedImplementorBinding(
+  receipt: GitSha | undefined,
+  persistedForRound: GitSha | undefined,
+): GitSha | undefined {
+  if (receipt !== undefined) {
+    if (persistedForRound !== undefined && String(persistedForRound) !== String(receipt)) return undefined;
+    return receipt;
+  }
+  return persistedForRound;
+}
+
+/**
+ * ROUND 8 (Blocker 1b): returns the DURABLE BINDING it forced, not just the
+ * handle. The completed-implementor branch used to force the worktree to a
+ * receipt-derived commit and then RE-READ HEAD afterwards — a TOCTOU window in
+ * which anything that moved HEAD between the two became the verifier binding,
+ * defeating the very forcing that had just happened.
+ */
 async function adoptWorktree(
   deps: ImplementVerifyLoopDeps,
   input: ImplementVerifyLoopInput,
   resume: ImplementVerifyResumeInput,
-): Promise<WorktreeHandle> {
+): Promise<{ readonly handle: WorktreeHandle; readonly forcedBinding?: GitSha }> {
   const { service, worktrees } = deps;
   const loopState = service.getImplementVerifyLoopState(input.runId);
   const facts = loopState?.worktree;
@@ -372,6 +405,7 @@ async function adoptWorktree(
     });
   }
 
+  let forcedBinding: GitSha | undefined;
   const recordValidation = (outcome: string, detail: string, wipCommitSha?: GitSha): void => {
     service.saveImplementVerifyLoopState(input.runId, {
       ...loopState,
@@ -403,22 +437,38 @@ async function adoptWorktree(
     const forced =
       resume.round.role === 'verifier'
         ? resume.round.implementationCommit
-        : // The persisted host-verified implementation commit — used ONLY when it was
-          // recorded FOR THIS round (#1, round-4: round-scoped). Otherwise (never
-          // recorded, OR a STALE record left by an earlier round whose successor
-          // completed at a NEW commit but crashed before updating it) fall back to the
-          // current worktree HEAD, which is exactly the resuming completed round's
-          // durable commit — no WIP commit has run yet at adoption. Never reset/verify
-          // a commit from a DIFFERENT round.
-          persisted !== undefined && persisted.round === resume.round.round
-          ? persisted.commit
-          : gitSha(await git.resolveSha(facts.worktreePath, 'HEAD'));
+        : // ROUND 7 (Finding 1) — the COMPLETED-implementor path is bound to a
+          // DURABLE source, never to bare current HEAD. It used to fall back to
+          // `git rev-parse HEAD` whenever no round-scoped
+          // `lastImplementationCommit` existed, so a crash between `runRole`
+          // recording completion and the loop recording that pointer let ANY
+          // commit subsequently appended to the worktree become the verification
+          // binding. That is the original F8 defect — topology is not
+          // authorization — on the other resume path.
+          //
+          // The round's `pre_verify_handoff` RECEIPT is consulted FIRST: it is
+          // what the round itself published for the commit it stands behind.
+          // `lastImplementationCommit` is accepted only when it AGREES with the
+          // receipt (or when no receipt exists, since it is equally durable and
+          // round-scoped). Neither present → REFUSE below.
+          completedImplementorBinding(
+            service.resolveRoundReceiptHead(input.runId, resume.round.round, input.assignmentId),
+            persisted !== undefined && persisted.round === resume.round.round ? persisted.commit : undefined,
+          );
     if (forced === undefined) {
-      throw new LoopCompositionError(
-        'resume re-entry of a verifier round requires its persisted implementationCommit (W2-5 immutable binding)',
+      throw new WorktreeError(
+        'requires_validation',
+        resume.round.role === 'verifier'
+          ? 'resume re-entry of a verifier round requires its persisted implementationCommit (W2-5 immutable binding)'
+          : `resume re-entry of COMPLETED implementor round ${resume.round.round} has no durable binding: neither a ` +
+            'pre_verify_handoff receipt nor a round-scoped lastImplementationCommit was recorded. Refusing rather ' +
+            'than verifying whatever the worktree HEAD happens to be — a commit this round did not publish is ' +
+            'never adopted. The commit is intact in the worktree for an operator to inspect.',
       );
     }
     await worktrees.discardToCommit(input.assignmentId, forced);
+    // The binding the caller MUST use — never a later re-read of HEAD.
+    forcedBinding = forced;
     recordValidation(
       'clean',
       resume.round.role === 'verifier'
@@ -427,7 +477,29 @@ async function adoptWorktree(
             'post-commit dirt discarded, clean asserted (never WIP-committed)',
     );
   } else {
-    const validation = await worktrees.validate(input.assignmentId, resume.checkpoint?.worktree);
+    // F8 (A) / BLOCKER-2: this is the INTERRUPTED-implementor branch — the ONE
+    // place where a HEAD ahead of the checkpoint can be explained as the round's
+    // own commit (cadence checkpoints fire at prompt-turn boundaries and record
+    // the PRE-commit head; the implementor commits AFTER its turn loop).
+    //
+    // Acceptance is bound to the round's RECEIPT, never to topology: the
+    // `pre_verify_handoff` checkpoint it published at its commit boundary
+    // (derived from the log), else the round-scoped `lastImplementationCommit`
+    // the loop driver persisted. Both are round-SCOPED, so a receipt from
+    // another round authorizes nothing. With no receipt we pass nothing and
+    // `validate.ts` keeps the strict any-drift-refuses policy — ancestry alone
+    // must never adopt a worktree, because it proves reachability, not
+    // authorship. The completed-implementor and verifier branches above are
+    // unaffected: they bind to an exact commit via `discardToCommit`.
+    const persistedForRound =
+      facts.lastImplementationCommit?.round === resume.round.round
+        ? facts.lastImplementationCommit.commit
+        : undefined;
+    const receiptHead =
+      service.resolveRoundReceiptHead(input.runId, resume.round.round, input.assignmentId) ?? persistedForRound;
+    const validation = await worktrees.validate(input.assignmentId, resume.checkpoint?.worktree, {
+      ...(receiptHead !== undefined ? { acceptDriftToCommit: receiptHead } : {}),
+    });
     recordValidation(validation.outcome, validation.detail, validation.wipCommitSha);
     if (validation.outcome === 'refuse_resume') {
       throw new WorktreeError(
@@ -441,7 +513,8 @@ async function adoptWorktree(
   if (tracked === undefined) {
     throw new WorktreeError('not_found', `Worktree handle vanished during adoption: ${String(input.assignmentId)}`);
   }
-  return tracked.leased ? tracked : worktrees.reacquireLease(input.assignmentId);
+  const adopted = tracked.leased ? tracked : worktrees.reacquireLease(input.assignmentId);
+  return { handle: adopted, ...(forcedBinding !== undefined ? { forcedBinding } : {}) };
 }
 
 /**
@@ -499,6 +572,9 @@ export async function runImplementVerifyLoop(
   // `provisioning_failed` outcome (no `merge_ready` possible).
   let provisioningFailure: ProvisioningFailure | undefined;
   let implementationCommit!: GitSha;
+  // ROUND 8 (Blocker 1b): the commit  FORCED the worktree to, when
+  // it forced one. Used verbatim by the completed-implementor branch below.
+  let adoptedBinding: GitSha | undefined;
   try {
     let destinationLabel: string;
     if (resume === undefined) {
@@ -542,7 +618,9 @@ export async function runImplementVerifyLoop(
         },
       });
     } else {
-      handle = await adoptWorktree(deps, input, resume);
+      const adoption = await adoptWorktree(deps, input, resume);
+      handle = adoption.handle;
+      adoptedBinding = adoption.forcedBinding;
       const persisted = service.getImplementVerifyLoopState(input.runId);
       destinationLabel =
         input.destinationLabel ?? persisted?.destinationLabel ?? (await git.currentBranch(handle.repoRoot)) ?? 'main';
@@ -635,17 +713,31 @@ export async function runImplementVerifyLoop(
         // the verdict ATOMICALLY at round completion (no `completed`-then-overwrite
         // crash window a resume could read as "verify next"). The adjudicator reads
         // the HOST worktree HEAD itself so a claimed commit is checked against it.
+        // ROUND 9 (Blocker 1): the head adjudication ACCEPTED. The verifier binds
+        // to THIS, verbatim — never to a later re-read of mutable HEAD. Re-reading
+        // after adjudication reopened the whole hole: a delayed verification child
+        // committing in the gap became the binding despite disagreeing with the
+        // receipt, and readiness could not see it because both the binding and
+        // current HEAD contained the raced-in commit.
+        let adjudicatedHead: GitSha | undefined;
+        // ROUND 9 (LOW): why a receipt disagreement refused, so the operator is
+        // told the reason rather than a bare "no deliverable adjudicated".
+        let receiptMismatch: string | undefined;
         const runner: RoleRunner<ImplementorResult> = {
           role: flow.role,
           allowedShellCommands: flow.allowedShellCommands,
           run: (session) => flow.run(session),
-          diagnoseRoundOutcome: describeImplementorRoundDiagnostic,
-          adjudicateRoundOutcome: async (result) =>
-            adjudicateImplementorDeliverable(
-              result,
-              round,
-              gitSha(await git.resolveSha(handle.worktreePath, 'HEAD')),
-            ),
+          diagnoseRoundOutcome: (result) => receiptMismatch ?? describeImplementorRoundDiagnostic(result),
+          adjudicateRoundOutcome: async (result) => {
+            const hostHead = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
+            // ROUND 8 (Blocker 1a): the round`s own receipt is authoritative.
+            const receipt = service.resolveRoundReceiptHead(input.runId, round, input.assignmentId);
+            if (receipt !== undefined && String(hostHead) !== String(receipt)) {
+              receiptMismatch = describeReceiptMismatch(hostHead, receipt);
+            }
+            adjudicatedHead = hostHead;
+            return adjudicateImplementorDeliverable(result, round, hostHead, receipt);
+          },
         };
         // P4b wave 2 FAILOVER: spawn on the EFFECTIVE spec — the ladder rung a
         // prior limit escalated to (durable desired-model record), else the run
@@ -680,14 +772,15 @@ export async function runImplementVerifyLoop(
         // fresh limit later restarts the ladder from the top).
         service.resetFailoverIncident(input.runId, input.assignmentId);
 
-        // The verifier binds to the EXACT commit — read the worktree HEAD
-        // OURSELVES (§8: never trust the agent's claimed SHA). After a round that
-        // committed nothing new, HEAD is unchanged from the prior round. F2: the
-        // deliverable gate ran INSIDE runRole (the adjudicator above), ATOMIC with
-        // round completion — a no_deliverable round threw `NoDeliverableError` and
-        // never reaches here, so we only get here for a round that delivered (or a
-        // legitimate fresh zero-diff no-op).
-        implementationCommit = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
+        // The verifier binds to the EXACT commit the deliverable gate ADJUDICATED
+        // (§8: never the agent's claimed SHA; ROUND 9: never a re-read either). The
+        // gate ran INSIDE runRole, ATOMIC with round completion — a no_deliverable
+        // round threw `NoDeliverableError` and never reaches here — so this is the
+        // head proven to match the round`s receipt. Re-reading HEAD here discarded
+        // exactly that proof. The fallback is defensive: adjudication always runs
+        // for an implementor round before this point.
+        implementationCommit =
+          adjudicatedHead ?? gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
         // F7 (#1): PERSIST this host-verified implementation commit (ROUND-SCOPED)
         // BEFORE the fail-closed break so a completed implementor round that later
         // RESUMES (re-entering at verification) resets the adopted worktree to EXACTLY
@@ -745,10 +838,14 @@ export async function runImplementVerifyLoop(
           worktrees.releaseLease(input.assignmentId); // the verifier reads, never writes
         }
       } else {
-        // Implementor round completed before the pause: verify ITS work — the
-        // adopted worktree's host-read HEAD (a WIP reconciliation commit, if
-        // one was taken, is preserved work and part of that HEAD).
-        implementationCommit = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
+        // Implementor round completed before the pause: verify ITS work. ROUND 8
+        // (Blocker 1b): use the binding adoption FORCED — derived from the round's
+        // durable receipt — never a fresh HEAD read. Re-reading here reopened a
+        // TOCTOU window in which anything that moved HEAD after the forcing became
+        // the verifier binding, discarding the guarantee just established. Adoption
+        // always forces on this path, so the fallback is defensive only.
+        implementationCommit =
+          adoptedBinding ?? gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
         if (worktrees.handleFor(input.assignmentId)?.leased === true) {
           worktrees.releaseLease(input.assignmentId);
         }
@@ -965,12 +1062,30 @@ function outcomeOf(phase: RunPhase): LoopOutcome {
  * already applies, so a secret-shaped install/clone error at the VERIFIER boundary is
  * never surfaced raw. Exported for a focused redaction unit test. */
 export function toProvisioningFailure(error: unknown, handle: WorktreeHandle): ProvisioningFailure {
+  // ROUND 8 (LOW): same as the implementor boundary — the rich message carries
+  // the evidence (package, installed version, lockfile version); `.detail` is the
+  // terse hint.
   const detail =
-    error instanceof WorktreeError ? (error.detail ?? error.message) : error instanceof Error ? error.message : String(error);
+    error instanceof WorktreeError
+      ? error.kind === 'provisioning_failed'
+        ? error.message
+        : (error.detail ?? error.message)
+      : error instanceof Error
+        ? error.message
+        : String(error);
   return {
     kind: 'provisioning_failed',
     repoRoot: handle.repoRoot,
     worktreePath: handle.worktreePath,
+    // MED-7: carry the closed-vocabulary CAUSE across this boundary too. Without
+    // it the CLI fell back to the obsolete generic remedy for every VERIFIER-side
+    // provisioning refusal, while the implementor-side adapter reported the
+    // specific one — the same failure printing two different next steps depending
+    // on which boundary happened to raise it. The cause is a constant, never free
+    // text, so it needs no redaction (unlike `detail`).
+    ...(error instanceof WorktreeError && error.provisioningCause !== undefined
+      ? { cause: error.provisioningCause }
+      : {}),
     detail: redactText(detail),
   };
 }

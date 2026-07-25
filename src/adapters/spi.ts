@@ -283,6 +283,14 @@ export interface PermissionRequest {
   readonly sessionId: AcpSessionId;
   readonly description: string;
   readonly toolTitle?: string;
+  /**
+   * HIGH-5: the tool call's ACP `rawInput` — the payload the provider will
+   * actually EXECUTE, as opposed to the human-readable `toolTitle`. Surfaced so
+   * an INTERACTIVE decider judges what will run rather than the prose describing
+   * it; the headless path binds the two through `verifyOperationPayload`.
+   * Absent when the provider sent none (itself a reason to refuse a shell call).
+   */
+  readonly rawInput?: unknown;
   readonly options: readonly PermissionOption[];
 }
 

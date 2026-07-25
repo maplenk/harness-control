@@ -17,9 +17,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { assignmentId, criterionId, gitSha, specHash } from '../../domain/ids.js';
+import { artifactHash, assignmentId, criterionId, gitSha, specHash, type ArtifactHash } from '../../domain/ids.js';
 import { DeterministicIdFactory } from '../../lib/id-factory.js';
-import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
+import { availableDriverKinds, openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
+import type { DriverKind } from '../../persistence/database.js';
 import { GitWorktreeManager, runGit, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import {
   assertPrimaryCheckoutUntouched,
@@ -53,10 +54,15 @@ import {
   type RunImplementorInput,
 } from './implementor.js';
 import { adjudicateImplementorDeliverable } from './deliverable.js';
+import { err } from '../../lib/result.js';
 
 // ---------------------------------------------------------------------------
 // Fakes
 // ---------------------------------------------------------------------------
+// LOW-10: the F8 (C) receipt tests exercise CAS checkpoint persistence, so they
+// run on every available driver rather than only better-sqlite3.
+const DRIVER_KINDS = await availableDriverKinds();
+
 const CLAUDE_LOW = { harness: 'claude', model: 'opus', effort: 'low' } as const;
 const CODEX_IMPLEMENTOR = { harness: 'codex', model: 'gpt-5.6-terra', effort: 'medium' } as const;
 
@@ -179,6 +185,8 @@ async function setup(opts: {
   readonly provision?: 'auto' | 'clone' | 'install' | 'none';
   /** round-4 #3: the "agent" stages everything it wrote (`git add -A`) during its turn. */
   readonly stageAfterWrite?: boolean;
+  /** LOW-10: persistence driver under test; defaults to better-sqlite3. */
+  readonly driver?: DriverKind;
 }): Promise<{
   service: OrchestrationService;
   worktrees: GitWorktreeManager;
@@ -186,7 +194,7 @@ async function setup(opts: {
   created: CreatedFake[];
 }> {
   repo = await makeTempGitRepo();
-  dbHandle = await openTestDatabase({ kind: 'better-sqlite3', file: false });
+  dbHandle = await openTestDatabase({ kind: opts.driver ?? 'better-sqlite3', file: false });
   const db = dbHandle.db;
   worktrees = await GitWorktreeManager.open({
     primaryRepoRoot: repo.dir,
@@ -287,6 +295,41 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
     expect(prompt).toContain(handle!.worktreePath); // confinement path
     expect(prompt).toMatch(/structured repository tools \(Read, Grep\/Glob, Write, and Edit\)/i);
     expect(prompt).toMatch(/Shell access is limited to read-only repository inspection/i);
+    // LOW-11: assert the F11 shell-quoting guidance as a LINE, located by its own
+    // content — never by whole-prompt text or position — so an unrelated rebase
+    // that adds/reorders prompt rules cannot break this. It must also stay scoped
+    // to INSPECTION: the prompt separately forbids using the shell to change
+    // files or self-verify, and this guidance must not read as widening that.
+    // MERGE COHERENCE: no Hard Rule may GRANT what another FORBIDS. The shell
+    // rule once also granted "the exact declared verification commands below",
+    // which contradicts the (main-side) rule reserving verification for the host
+    // — a prompt that both permits and forbids the same act is worse than either
+    // rule alone, because the agent obeys whichever it reads last.
+    //
+    // Written to hold on BOTH sides of the pending rebase: this branch carries
+    // zero such statements, main's b9ca10c adds exactly one (a prohibition), and
+    // the merged prompt must never carry two or contain a grant.
+    const hardRulesSection = prompt.slice(prompt.indexOf('## Hard Rules'));
+    const hardRules = hardRulesSection
+      .slice(0, hardRulesSection.indexOf('\n## '))
+      .split('\n')
+      .filter((line) => line.startsWith('- '));
+    expect(hardRules.length).toBeGreaterThan(0);
+    const verificationRules = hardRules.filter((line) =>
+      /verification command|verification\/build\/test|declared verification/i.test(line),
+    );
+    expect(verificationRules.length).toBeLessThanOrEqual(1);
+    // No rule may GRANT execution of the verification commands, in any wording.
+    for (const rule of hardRules) {
+      expect(rule).not.toMatch(/shell access is limited to[^.]*verification/i);
+      expect(rule).not.toMatch(/(may|can|should|are allowed to) run the (declared )?verification/i);
+    }
+
+    const quotingLine = prompt.split('\n').find((line) => line.includes('single-quote pattern/regex arguments'));
+    expect(quotingLine).toBeDefined();
+    expect(quotingLine).toMatch(/inspecting the repository/i);
+    expect(quotingLine).toMatch(/will be denied/i);
+    expect(quotingLine).not.toMatch(/verify|test|build|write|modify/i);
     expect(prompt).toMatch(/Do NOT use shell commands such as mkdir, cp, mv, rm, touch/i);
     expect(prompt).toMatch(/MUST NOT declare the task complete/i); // hard rule: cannot mark complete
     expect(prompt).toMatch(/MUST NOT add, remove, or change any acceptance criterion/i); // cannot change criteria
@@ -1041,7 +1084,13 @@ describe('ImplementorFlow — F7 round-2 #3 node_modules commit semantics follow
     expect(files).toContain('node_modules/tracked.js'); // committed, not excluded
   });
 
-  it('with provisioning ACTIVE, the same tracked node_modules edit is EXCLUDED from the commit', async () => {
+  // ROUND 13 (ITEM 1): the ROOT tree is main's UNCONDITIONAL exclusion, tracked or
+  // not — `git add -A -- . ':(exclude)node_modules'` excludes it from the add, so
+  // main leaves this edit unstaged rather than committing it. Round 10 read
+  // "tracked = user content" as licence to commit it, which is stricter than main
+  // in the one direction that writes to the branch. A vendored tree main really
+  // does commit is a NESTED one; that case is asserted in `git.test.ts`.
+  it('with provisioning ACTIVE, a TRACKED ROOT node_modules edit is EXCLUDED from the commit (as on main)', async () => {
     const result = await runOnceTrackingNodeModules('auto', 'asg_f7_active_exclude');
     expect(result.committed).toBe(true);
     const files = await committedFiles(result);
@@ -1131,6 +1180,9 @@ describe('ImplementorFlow — F7 round-4 #3 a pre-staged node_modules is unstage
       turns: [REPORTING_TURN],
       stageAfterWrite: true, // the "implementor" runs `git add -A`, STAGING node_modules
     });
+    // ROUND 10: IGNORE node_modules so the planted tree is the ENGINE's.
+    await r.writeFile('.gitignore', 'node_modules/\n');
+    await r.commitAll('ignore node_modules');
     const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const result = await runImplementor(
       { service, worktrees: wt },
@@ -1144,14 +1196,68 @@ describe('ImplementorFlow — F7 round-4 #3 a pre-staged node_modules is unstage
       },
     );
 
-    // The work IS committed; provisioning then fails closed (no ignore rule) but that
-    // does not undo the commit. The pre-staged node_modules is NOT in it.
+    // The work IS committed, and the pre-staged ENGINE tree is NOT in it.
+    // ROUND 10 (Regression 4): the fixture now IGNORES node_modules, which is what
+    // makes the tree the engine's — force-adding an ignored tree must not launder
+    // it past the guard (that is the round-4 #3 invariant). An UNIGNORED, unmarked
+    // node_modules would now be user content and stay.
     expect(result.committed).toBe(true);
     const committed = (
       await runGit(['diff', '--name-only', `${String(result.baseSha)}..HEAD`], result.worktreePath)
     ).stdout;
     expect(committed).toContain('feature.txt');
     expect(committed.split('\n').some((p) => p.startsWith('node_modules'))).toBe(false); // pre-staged but excluded
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F10: the post-turn commit with a git-IGNORED node_modules on disk — the exact
+// F7-provisioned production shape. Every existing node_modules test above uses an
+// UNIGNORED/tracked tree, which is why none of them caught the git 2.55
+// exclude-pathspec regression that killed run_756ce21b's resume.
+// ---------------------------------------------------------------------------
+describe('ImplementorFlow — F10 commit with a provisioned (git-ignored) node_modules present', () => {
+  it('commits the work when an IGNORED node_modules exists in the worktree', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [
+        { relPath: 'feature.txt', content: 'the real work\n' },
+        // What F7 provisioning leaves in the worktree before the commit.
+        { relPath: 'node_modules/.bin/tsc', content: '#!/bin/sh\nexit 0\n' },
+        { relPath: 'node_modules/left-pad/index.js', content: 'module.exports = () => {};\n' },
+      ],
+      turns: [REPORTING_TURN],
+    });
+    // The repo git-ignores node_modules — the normal, correct target-repo shape.
+    await r.writeFile('.gitignore', 'node_modules/\n');
+    await r.commitAll('ignore node_modules');
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+
+    const result = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: assignmentId('asg_ignored_nm_commit'),
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    );
+
+    expect(result.committed).toBe(true);
+    expect(result.changedFiles).toEqual(['feature.txt']);
+    const committed = (
+      await runGit(['diff', '--name-only', `${String(result.baseSha)}..HEAD`], result.worktreePath)
+    ).stdout;
+    expect(committed.split('\n').some((p) => p.includes('node_modules'))).toBe(false);
+    // ...and it is in NO commit reachable from HEAD, not merely absent from the delta.
+    const tree = (await runGit(['ls-tree', '-r', '--name-only', 'HEAD'], result.worktreePath)).stdout;
+    expect(tree.split('\n').some((p) => p.includes('node_modules'))).toBe(false);
+    // (What happens to the tree ON DISK afterwards is F7's business: this fixture
+    // repo declares no dependencies, so provisioning legitimately removes the stale
+    // toolchain — covered by provision.test.ts, not asserted here.)
+
+    await wt.removeWorktree(assignmentId('asg_ignored_nm_commit'));
   });
 });
 
@@ -1197,5 +1303,212 @@ describe('adjudicateImplementorDeliverable — F7 round-2 #6 provisioning-failur
 
   it('a GOOD committed deliverable + provisioningFailed stays `completed` (the loop still surfaces provisioning_failed)', () => {
     expect(adjudicateImplementorDeliverable(result({ committed: true, commitSha: HEAD }), 1, HEAD)).toBe('completed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F8 (C) — the `pre_verify_handoff` checkpoint at the commit boundary.
+//
+// Cadence checkpoints fire at PROMPT-TURN boundaries, so every one taken during
+// an implementor round records the PRE-COMMIT head (the service captures live
+// HEAD). The round then commits AFTER its turn loop, opening a window in which a
+// crash leaves a committed HEAD that no checkpoint has ever seen — which §16.3
+// read as tamper (`refuse_resume`). PLAN §12.2 mandates a `pre_verify_handoff`
+// checkpoint at exactly this boundary; the reason existed in the vocabulary
+// (`state.ts`, `cadence.ts`) with NO writer in production code.
+// ---------------------------------------------------------------------------
+describe.each(DRIVER_KINDS)('ImplementorFlow — F8 (C) pre_verify_handoff checkpoint (§12.2) (%s)', (driver) => {
+  /** Every `checkpoint.recorded` payload for the run, in log order. */
+  function checkpointsOf(runId: ReturnType<typeof createRunFixture>['runId']): Array<{
+    readonly reason: string;
+    readonly artifactHash: ArtifactHash;
+  }> {
+    return dbHandle!.db.events
+      .listByRun(runId)
+      .filter((e) => e.type === 'checkpoint.recorded')
+      .map((e) => e.payload as { reason: string; artifactHash: ArtifactHash });
+  }
+
+  it('writes exactly ONE pre_verify_handoff checkpoint carrying the COMMITTED head', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      driver,
+      writes: [{ relPath: 'feature.txt', content: 'the new feature\n' }],
+      turns: [REPORTING_TURN],
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const asg = assignmentId('asg_impl_handoff_checkpoint');
+
+    const result = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    );
+    expect(result.committed).toBe(true);
+
+    const handoffs = checkpointsOf(runId).filter((p) => p.reason === 'pre_verify_handoff');
+    expect(handoffs).toHaveLength(1);
+
+    // The checkpoint carries the round's COMMITTED head — the whole point.
+    const content = service.getCheckpointContent(handoffs[0]!.artifactHash);
+    expect(content).toBeDefined();
+    expect(String(content!.worktree.headSha)).toBe(String(result.commitSha));
+    expect(content!.worktree.statusPorcelain).toBe(''); // committed tree, nothing outstanding
+    // Honest §12.2 bookkeeping: a completed commit interrupts nothing.
+    expect(content!.incompleteOperation).toBeUndefined();
+
+    await wt.removeWorktree(asg);
+  });
+
+  // ---------------------------------------------------------------------------
+  // ROUND 8 (Blocker 1a) — codex's exact path, deterministic rather than racy:
+  //   1. a round-ONE no-op (the agent writes nothing, so the tree is clean);
+  //   2. the receipt and the diff are captured BEFORE verification runs;
+  //   3. a declared verification command CREATES AND COMMITS code;
+  //   4. the tree is clean again, so the no-commit adjudication saw empty
+  //      changedFiles/diff/postVerificationDirty and completed the round;
+  //   5. the command-created commit became both `lastImplementationCommit` and
+  //      the verifier's binding — disagreeing with the receipt.
+  // ---------------------------------------------------------------------------
+  it('BLOCKER-1: a verification command that COMMITS is a hard error, never a silent rebinding', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      driver,
+      writes: [], // round-one no-op: the agent changes nothing
+      turns: [REPORTING_TURN],
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const asg = assignmentId('asg_impl_verify_commits');
+
+    // A declared verification command that creates a file AND commits it, then
+    // leaves the tree clean — exactly the shape that used to slip through.
+    const committingVerify: VerificationRunner = async (command, cwd) => {
+      fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+      execFileSync('git', ['add', '-A'], { cwd });
+      execFileSync('git', ['commit', '--no-verify', '-m', 'committed by a verification command'], {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'verify',
+          GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+          GIT_COMMITTER_NAME: 'verify',
+          GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+        },
+      });
+      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const thrown: unknown = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext({ verificationCommands: ['make-a-commit'] }),
+        options: { runVerification: committingVerify },
+      },
+    ).catch((error: unknown) => error);
+
+    // The round is REFUSED rather than completing with a rebound head.
+    expect(thrown).toBeInstanceOf(NoDeliverableError);
+
+    // The receipt still names the pre-verification head, and the worktree HEAD is
+    // the command's commit — the disagreement the adjudication caught.
+    const receipt = service.resolveRoundReceiptHead(runId, 1, asg);
+    expect(receipt).toBeDefined();
+    const handle = wt.handleFor(asg)!;
+    const head = await runGit(['rev-parse', 'HEAD'], handle.worktreePath);
+    expect(head.stdout.trim()).not.toBe(String(receipt));
+
+    await wt.removeWorktree(asg);
+  });
+
+  it('BLOCKER-2: a round whose RECEIPT cannot be recorded FAILS rather than continuing unreceipted', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      driver,
+      writes: [{ relPath: 'feature.txt', content: 'the new feature\n' }],
+      turns: [REPORTING_TURN],
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const asg = assignmentId('asg_impl_receipt_fatal');
+    // The artifact store REJECTS the receipt write the way §12.1 quota admission
+    // does — an `Err`, not a throw, which is the subtler of the two branches
+    // (`#writeStopCheckpoint` returns no event and the round must still fail).
+    const artifacts = dbHandle!.db.artifacts;
+    const realWrite = artifacts.write.bind(artifacts);
+    let failReceipt = true;
+    (artifacts as unknown as { write: typeof artifacts.write }).write = ((
+      input: Parameters<typeof artifacts.write>[0],
+    ) => {
+      if (!failReceipt) return realWrite(input);
+      return err({
+        attemptedHash: artifactHash('a'.repeat(64)),
+        attemptedSizeBytes: 1,
+        scope: 'per_run' as const,
+        limitBytes: 0,
+        currentUsageBytes: 0,
+        occurredAt: dbHandle!.db.clock.nowIso(),
+      });
+    }) as typeof artifacts.write;
+
+    try {
+      const thrown: unknown = await runImplementor(
+        { service, worktrees: wt },
+        {
+          runId,
+          assignmentId: asg,
+          implementor: CODEX_IMPLEMENTOR,
+          baseCommit: gitSha(await r.headSha()),
+          context: baseContext(),
+          options: { runVerification: PASS_VERIFY },
+        },
+      ).catch((error: unknown) => error);
+
+      expect(thrown).toBeInstanceOf(Error);
+      expect(String(thrown)).toMatch(/receipt could not be recorded/i);
+      // The COMMIT is still durable — nothing was rolled back, only auto-resume
+      // is withheld until the operator resolves the store failure.
+      const handle = wt.handleFor(asg)!;
+      const committed = (await runGit(['log', '--format=%s', '-1'], handle.worktreePath)).stdout;
+      expect(committed.trim().length).toBeGreaterThan(0);
+      // ...and no receipt exists for the round, so resume cannot adopt on topology.
+      expect(service.resolveRoundReceiptHead(runId, 1, asg)).toBeUndefined();
+    } finally {
+      failReceipt = false;
+      (artifacts as unknown as { write: typeof artifacts.write }).write = realWrite;
+    }
+
+    await wt.removeWorktree(asg);
+  });
+
+  it('a round that commits NOTHING still checkpoints the handoff honestly (HEAD unchanged)', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({ driver, writes: [], turns: [REPORTING_TURN] });
+    const base = await r.headSha();
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const asg = assignmentId('asg_impl_handoff_empty');
+
+    const result = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(base),
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    );
+    expect(result.committed).toBe(false);
+
+    const handoffs = checkpointsOf(runId).filter((p) => p.reason === 'pre_verify_handoff');
+    expect(handoffs).toHaveLength(1);
+    expect(String(service.getCheckpointContent(handoffs[0]!.artifactHash)!.worktree.headSha)).toBe(base);
+
+    await wt.removeWorktree(asg);
   });
 });

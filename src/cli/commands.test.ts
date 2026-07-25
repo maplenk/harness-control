@@ -29,7 +29,7 @@ import { createRunFixture } from '../app/test-support.js';
 import { ROLE_ROUND_PROJECTION, type RoleRoundProjection } from '../app/projections.js';
 import { DurableDesiredModelStore } from '../app/desired-model-store.js';
 import type { RunId } from '../domain/ids.js';
-import { executeCommand } from './commands.js';
+import { executeCommand, provisioningFailureView } from './commands.js';
 import { makeTempGitRepo, type TempGitRepo } from '../worktree/test-support.js';
 
 const NO_SPAWN_FACTORY: RoleAdapterFactory = {
@@ -848,5 +848,41 @@ describe('executeCommand — cancel (idempotent, one terminal result; T18)', () 
     const second = await executeCommand(service, db, { kind: 'cancel', json: true, runId }, {});
     expect(second.exitCode).toBe(0);
     expect(second.json).toMatchObject({ outcome: 'already_terminal', phase: 'cancelled' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND 6 (Finding 4) — the machine-readable provisioning cause must reach the
+// STABLE JSON, not only the human text. The closed cause vocabulary exists for
+// machine consumption; omitting it forced JSON consumers to parse prose.
+// ---------------------------------------------------------------------------
+describe('provisioningFailureView — the JSON payload carries the cause', () => {
+  it('includes the closed-vocabulary cause alongside the prose detail', () => {
+    const view = provisioningFailureView({
+      kind: 'provisioning_failed',
+      repoRoot: '/repo',
+      worktreePath: '/repo.worktrees/asg',
+      cause: 'primary_tree_stale',
+      detail: 'the primary tree is stale',
+      round: 2,
+    });
+    expect(view).toMatchObject({
+      repoRoot: '/repo',
+      worktreePath: '/repo.worktrees/asg',
+      cause: 'primary_tree_stale',
+      detail: 'the primary tree is stale',
+      round: 2,
+    });
+  });
+
+  it('omits the cause only when provisioning supplied none (pre-F9 refusals)', () => {
+    const view = provisioningFailureView({
+      kind: 'provisioning_failed',
+      repoRoot: '/repo',
+      worktreePath: '/wt',
+      detail: 'node_modules is NOT git-ignored',
+    });
+    expect(view.cause).toBeUndefined();
+    expect(view.detail).toBe('node_modules is NOT git-ignored');
   });
 });

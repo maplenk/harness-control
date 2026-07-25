@@ -27,14 +27,18 @@ import {
   criterionId,
   eventSequence,
   gitSha,
+  segmentId,
   specHash,
   specVersionId,
   type RunId,
 } from '../../domain/ids.js';
 import type { AcceptanceCriterion, CheckpointContent } from '../../domain/entities.js';
 import { buildCheckpointContent } from '../../checkpoint/content.js';
+import { writeCheckpoint } from '../../checkpoint/writer.js';
+import { unwrap } from '../../lib/result.js';
 import { DeterministicIdFactory, RandomIdFactory } from '../../lib/id-factory.js';
-import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
+import { availableDriverKinds, openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
+import type { DriverKind } from '../../persistence/database.js';
 import {
   InProcessFakeAdapter,
   rateLimitErrorEnvelope,
@@ -58,6 +62,10 @@ import { LoopCompositionError, runImplementVerifyLoop } from './orchestrate.js';
 import { RunOwnershipConflictError } from '../run-ownership-store.js';
 import { rebuildFixRequestsFromT23, type EvidenceRecorder } from './verifier.js';
 import type { VerificationRunner } from './implementor.js';
+
+// LOW-10: the F8 receipt tests exercise CAS checkpoint persistence, so they run
+// on every available driver rather than only better-sqlite3.
+const DRIVER_KINDS = await availableDriverKinds();
 
 const IMPLEMENTOR: RoleModelSpec = { harness: 'codex', model: 'gpt-5.6-terra', effort: 'medium' };
 const VERIFIER: RoleModelSpec = { harness: 'claude', model: 'sonnet', effort: 'medium' };
@@ -201,12 +209,16 @@ interface Rig {
 }
 
 /** Open the rig at phase `approved` with the loop's spec hash bound (T1). */
-async function openRig(scripts: {
-  readonly implementor?: readonly AdapterScript[];
-  readonly verifier?: readonly AdapterScript[];
-}): Promise<Rig> {
+async function openRig(
+  scripts: {
+    readonly implementor?: readonly AdapterScript[];
+    readonly verifier?: readonly AdapterScript[];
+  },
+  /** LOW-10: persistence driver under test; defaults to better-sqlite3. */
+  driver: DriverKind = 'better-sqlite3',
+): Promise<Rig> {
   repo = await makeTempGitRepo('harness-resume-');
-  dbHandle = await openTestDatabase({ kind: 'better-sqlite3', file: true });
+  dbHandle = await openTestDatabase({ kind: driver, file: true });
   worktrees = await GitWorktreeManager.open({ primaryRepoRoot: repo.dir, clock: dbHandle.db.clock });
   const ids = new DeterministicIdFactory();
   const { factory, created } = makeFactory(scripts);
@@ -335,6 +347,494 @@ describe('resume mode — interrupted implementor round', () => {
     ).rejects.toThrow(LoopCompositionError);
     // Nothing was created on the resume path.
     expect(rig.worktrees.handleFor(assignmentId(`asg_${rig.runId}`))).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F8 (A) — RECEIPT-BOUND drift acceptance at the interrupted-implementor
+// adoption boundary.
+//
+// Production shape (`run_8aa51aea…`): the last checkpoint of an implementor round
+// is a CADENCE one taken at a prompt-turn boundary, so it records the PRE-COMMIT
+// head. The round then commits and the process dies before any later checkpoint,
+// leaving HEAD one commit AHEAD of the checkpoint. §16.3 refused on ANY drift, so
+// the round was permanently unresumable — the implementor's OWN commit read as
+// tamper.
+//
+// BLOCKER-2: the first fix accepted any STRICT ANCESTOR, which is
+// topology-as-authorization — ancestry proves REACHABILITY, not AUTHORSHIP, so a
+// foreign or stale descendant chain appended to the worktree was adopted (and
+// every taint, including `emergency_kill`, cleared). Acceptance is now bound to
+// a RECEIPT the round published for ITSELF: the `pre_verify_handoff` checkpoint
+// written at its commit boundary, or the round-scoped `lastImplementationCommit`.
+// HEAD must EQUAL that receipt. Ancestry survives only as an extra sanity check
+// layered on top. No receipt → `refuse_resume`, always.
+// ---------------------------------------------------------------------------
+describe.each(DRIVER_KINDS)('resume mode — F8 (A) receipt-bound drift acceptance (%s)', (driver) => {
+  const COMMIT_ENV: Readonly<Record<string, string>> = {
+    GIT_AUTHOR_NAME: 'f8-resume-tests',
+    GIT_AUTHOR_EMAIL: 'f8@harness.invalid',
+    GIT_COMMITTER_NAME: 'f8-resume-tests',
+    GIT_COMMITTER_EMAIL: 'f8@harness.invalid',
+  };
+
+  async function commitInWorktree(worktreePath: string, message: string): Promise<string> {
+    await git.runGit(['add', '-A'], worktreePath);
+    await git.runGit(['commit', '-m', message], worktreePath, COMMIT_ENV);
+    return git.resolveSha(worktreePath, 'HEAD');
+  }
+
+  /** A checkpoint bound to this run's spec whose recorded worktree HEAD is `headSha`. */
+  function checkpointAt(headSha: string): CheckpointContent {
+    return buildCheckpointContent({
+      lineage: { harnessId: 'codex', model: 'gpt-5.6-terra' },
+      eventCursor: eventSequence(1),
+      specHash: SPEC_HASH,
+      criterionStates: [
+        { criterionId: AC1, state: 'pending' },
+        { criterionId: AC2, state: 'pending' },
+      ],
+      permissionPolicy: { mode: 'headless', allowlist: [] },
+      worktree: {
+        headSha: gitSha(headSha),
+        statusPorcelain: '',
+        diffHash: artifactHash('d'),
+        lockfileCleanupPerformed: false,
+        taintFlags: [],
+      },
+    });
+  }
+
+  /** Pause round 1 mid-turn and hand back the durable handles a resume needs. */
+  async function pauseInterruptedImplementor(rig: Rig): Promise<{
+    round: NonNullable<ReturnType<OrchestrationService['getRoleRound']>>;
+    checkpoint: CheckpointContent;
+    worktreePath: string;
+  }> {
+    const paused: unknown = await runImplementVerifyLoop(loopDeps(rig), loopInput(rig)).catch((e: unknown) => e);
+    expect(paused).toBeInstanceOf(LimitPausedError);
+    const round = rig.service.getRoleRound(rig.runId)!;
+    const checkpoint =
+      round.checkpointRef !== undefined ? rig.service.getCheckpointContent(round.checkpointRef) : undefined;
+    expect(checkpoint).toBeDefined();
+    const worktreePath = rig.service.getImplementVerifyLoopState(rig.runId)!.worktree!.worktreePath;
+    // The pause checkpoint recorded the PRE-COMMIT head (the structural bug).
+    expect(String(checkpoint!.worktree.headSha)).toBe(String(rig.baseCommit));
+    return { round, checkpoint: checkpoint!, worktreePath };
+  }
+
+  /**
+   * Publish the ROUND RECEIPT the implementor flow writes at its commit boundary
+   * — a `pre_verify_handoff` checkpoint bound to this role+round+assignment
+   * carrying the committed head. Simulates the real crash window: the flow
+   * committed and published, then died before the loop recorded the round stage
+   * or `lastImplementationCommit`.
+   */
+  async function publishReceipt(rig: Rig, round: number, headSha: string): Promise<void> {
+    const written = unwrap(
+      await writeCheckpoint(
+        { artifacts: rig.db.artifacts, clock: rig.db.clock, ids: new RandomIdFactory() },
+        {
+          runId: rig.runId,
+          segmentId: segmentId(`seg_receipt_${round}`),
+          assignmentId: assignmentId(`asg_${rig.runId}`),
+          reason: 'pre_verify_handoff',
+          content: checkpointAt(headSha),
+          role: 'implementor',
+          round,
+        },
+      ),
+    );
+    expect(rig.service.ingest(written.event).status).toBe('recorded');
+  }
+
+  it('AC-1: a round that committed AND published its receipt resumes (the crash-after-commit window)', async () => {
+    const rig = await openRig(
+      {
+      implementor: [
+        // Round-1 attempt 1: writes the work, then the provider limit lands
+        // mid-turn → durable pause with a PRE-COMMIT cadence/pause checkpoint.
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        // The re-entered round.
+        { writes: [{ relPath: 'src/more.ts', content: 'export const more = 1;\n' }], turns: [implementorTurn('done')] },
+      ],
+      verifier: [{ turns: [PASS_BOTH] }],
+    },
+    driver,
+    );
+    const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
+
+    // The implementor committed its work and PUBLISHED ITS RECEIPT, then died
+    // before the loop recorded the round stage. HEAD is ahead of the pause
+    // checkpoint, and the receipt says exactly which commit is the round's own.
+    const implementationCommit = await commitInWorktree(worktreePath, 'implementor round 1');
+    expect(implementationCommit).not.toBe(String(checkpoint.worktree.headSha));
+    await publishReceipt(rig, round.round, implementationCommit);
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const result = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round, checkpoint },
+    });
+
+    // Adopted, not refused — and the round drove all the way to verification.
+    expect(result.outcome).toBe('merge_ready');
+    const validation = rig.service.getImplementVerifyLoopState(rig.runId)?.worktree?.lastValidation;
+    expect(validation?.outcome).not.toBe('refuse_resume');
+    expect(validation?.detail).toMatch(/receipt/i);
+    // The implementor's own commit survived: it is an ANCESTOR of the verified head.
+    const verified = String(result.implementationCommit);
+    expect(
+      await git.runGit(['merge-base', '--is-ancestor', implementationCommit, verified], worktreePath).then(
+        () => true,
+        () => false,
+      ),
+    ).toBe(true);
+    const log = await git.runGit(['log', '--format=%H'], worktreePath);
+    expect(log.stdout).toContain(implementationCommit);
+  });
+
+  it('AC-1b: the round-scoped lastImplementationCommit is an equally valid receipt', async () => {
+    const rig = await openRig(
+      {
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        { writes: [{ relPath: 'src/more.ts', content: 'export const more = 1;\n' }], turns: [implementorTurn('done')] },
+      ],
+      verifier: [{ turns: [PASS_BOTH] }],
+    },
+    driver,
+    );
+    const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
+    const implementationCommit = await commitInWorktree(worktreePath, 'implementor round 1');
+
+    // No checkpoint receipt — but the loop driver did record the round-scoped
+    // commit before dying.
+    const loopState = rig.service.getImplementVerifyLoopState(rig.runId)!;
+    rig.service.saveImplementVerifyLoopState(rig.runId, {
+      ...loopState,
+      worktree: {
+        ...loopState.worktree!,
+        lastImplementationCommit: { round: round.round, commit: gitSha(implementationCommit) },
+      },
+    });
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const result = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round, checkpoint },
+    });
+    expect(result.outcome).toBe('merge_ready');
+  });
+
+  it('BLOCKER-2: a FOREIGN descendant appended after the checkpoint is REFUSED (ancestry is not authorship)', async () => {
+    const rig = await openRig(
+      {
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        { writes: [], turns: [implementorTurn('never reached')] },
+      ],
+    },
+    driver,
+    );
+    const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
+
+    // The round published a receipt for the commit it actually authored...
+    const authored = await commitInWorktree(worktreePath, 'implementor round 1');
+    await publishReceipt(rig, round.round, authored);
+    // ...and then a FOREIGN commit was appended on top. It is a perfectly good
+    // descendant of the pause checkpoint — is-ancestor says yes — but it is not
+    // what this round published, so it must not be adopted.
+    fs.writeFileSync(path.join(worktreePath, 'foreign.ts'), 'export const foreign = 1;\n', 'utf8');
+    const foreign = await commitInWorktree(worktreePath, 'a foreign commit');
+    expect(
+      await git
+        .runGit(['merge-base', '--is-ancestor', String(checkpoint.worktree.headSha), foreign], worktreePath)
+        .then(() => true, () => false),
+    ).toBe(true); // reachable — and still refused
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const thrown: unknown = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round, checkpoint },
+    }).catch((e: unknown) => e);
+
+    expect(thrown).toMatchObject({ kind: 'requires_validation' });
+    expect(String(thrown)).toMatch(/receipt/i);
+    expect(rig.service.getImplementVerifyLoopState(rig.runId)?.worktree?.lastValidation?.outcome).toBe(
+      'refuse_resume',
+    );
+  });
+
+  it('BLOCKER-2: NO receipt refuses even when HEAD is a clean strict descendant', async () => {
+    const rig = await openRig(
+      {
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        { writes: [], turns: [implementorTurn('never reached')] },
+      ],
+    },
+    driver,
+    );
+    const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
+    // Forward motion, nothing else wrong — but nothing proves this round authored it.
+    await commitInWorktree(worktreePath, 'an unreceipted commit');
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const thrown: unknown = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round, checkpoint },
+    }).catch((e: unknown) => e);
+
+    expect(thrown).toMatchObject({ kind: 'requires_validation' });
+    expect(rig.service.getImplementVerifyLoopState(rig.runId)?.worktree?.lastValidation?.outcome).toBe(
+      'refuse_resume',
+    );
+  });
+
+  it("BLOCKER-2: a receipt from a DIFFERENT round never authorizes this round's drift", async () => {
+    const rig = await openRig(
+      {
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        { writes: [], turns: [implementorTurn('never reached')] },
+      ],
+    },
+    driver,
+    );
+    const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
+    const head = await commitInWorktree(worktreePath, 'implementor round 1');
+    await publishReceipt(rig, round.round + 1, head); // right sha, WRONG round
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const thrown: unknown = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round, checkpoint },
+    }).catch((e: unknown) => e);
+
+    expect(thrown).toMatchObject({ kind: 'requires_validation' });
+  });
+
+  it('BLOCKER-2: taint is NOT cleared when drift acceptance is refused for want of a receipt', async () => {
+    const rig = await openRig(
+      {
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        { writes: [], turns: [implementorTurn('never reached')] },
+      ],
+    },
+    driver,
+    );
+    const { round, checkpoint, worktreePath } = await pauseInterruptedImplementor(rig);
+    await commitInWorktree(worktreePath, 'an unreceipted commit');
+    const asg = assignmentId(`asg_${rig.runId}`);
+    rig.worktrees.markTainted(asg, 'emergency_kill');
+
+    await runImplementVerifyLoop(loopDeps(rig), { ...loopInput(rig), resume: { round, checkpoint } }).catch(
+      () => undefined,
+    );
+
+    // The emergency-kill taint SURVIVES: nothing proved the tree is this round's.
+    expect(rig.worktrees.taintsFor(asg)).toContain('emergency_kill');
+    expect(rig.worktrees.taintsFor(asg)).toContain('reconcile_mismatch');
+  });
+
+  // -------------------------------------------------------------------------
+  // ROUND 7 (Finding 1) — the COMPLETED-implementor resume path had the SAME
+  // topology-as-authorization defect the interrupted path was fixed for. When no
+  // round-scoped `lastImplementationCommit` existed it fell back to bare current
+  // HEAD, so a crash between `runRole` recording completion and the loop
+  // recording that pointer let ANY subsequently-appended commit become the
+  // verification binding.
+  // -------------------------------------------------------------------------
+  it('a COMPLETED round with no pointer binds to its RECEIPT, not to a foreign HEAD', async () => {
+    const rig = await openRig(
+      {
+        implementor: [
+          {
+            writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+            turns: [implementorTurn('done')],
+          },
+        ],
+        // The verifier rate-limits, so the loop PAUSES with implementor round 1
+        // already `completed` and its receipt published — the real crash window.
+        verifier: [{ turns: [{ errorEnvelope: rateLimitErrorEnvelope() }] }],
+      },
+      driver,
+    );
+    const paused: unknown = await runImplementVerifyLoop(loopDeps(rig), loopInput(rig)).catch((e: unknown) => e);
+    expect(paused).toBeInstanceOf(LimitPausedError);
+    const worktreePath = rig.service.getImplementVerifyLoopState(rig.runId)!.worktree!.worktreePath;
+
+    // The RECEIPT is the round's own assertion of what it stands behind.
+    const receipt = rig.service.resolveRoundReceiptHead(rig.runId, 1, assignmentId(`asg_${rig.runId}`));
+    expect(receipt).toBeDefined();
+    const authored = String(receipt);
+
+    // Simulate the crash window: the round-scoped pointer was never written...
+    const loopState = rig.service.getImplementVerifyLoopState(rig.runId)!;
+    const { lastImplementationCommit: _dropped, ...factsWithoutPointer } = loopState.worktree!;
+    rig.service.saveImplementVerifyLoopState(rig.runId, { ...loopState, worktree: factsWithoutPointer });
+    // ...and a FOREIGN commit was appended to the worktree afterwards.
+    fs.writeFileSync(path.join(worktreePath, 'foreign.ts'), 'export const foreign = 1;\n', 'utf8');
+    const foreign = await commitInWorktree(worktreePath, 'a foreign commit');
+    expect(foreign).not.toBe(authored);
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round: { round: 1, role: 'implementor', stage: 'completed', specHash: SPEC_HASH } },
+    }).catch(() => undefined);
+
+    // The binding came from the RECEIPT: the worktree is forced back to the
+    // authored commit, and the foreign commit never becomes the verified head.
+    expect(await git.resolveSha(worktreePath, 'HEAD')).toBe(authored);
+    expect(await git.resolveSha(worktreePath, 'HEAD')).not.toBe(foreign);
+  });
+
+  // -------------------------------------------------------------------------
+  // ROUND 9 (Blocker 1) — the LIVE path used to DISCARD the binding it had just
+  // adjudicated, re-reading mutable HEAD instead. Anything committing in that
+  // gap became the verifier binding despite disagreeing with the receipt.
+  //
+  // This asserts the invariant the fix establishes: the live-path binding IS the
+  // adjudicated head, which the deliverable gate proved equal to the round's
+  // receipt. See the notes for the honest limitation — no reliable in-harness
+  // reproduction of the race window itself was achieved.
+  // -------------------------------------------------------------------------
+  it('the live-path binding is the ADJUDICATED head — identical to the round receipt', async () => {
+    const rig = await openRig(
+      {
+        implementor: [
+          {
+            writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+            turns: [implementorTurn('done')],
+          },
+        ],
+        verifier: [{ turns: [PASS_BOTH] }],
+      },
+      driver,
+    );
+
+    const result = await runImplementVerifyLoop(loopDeps(rig), { ...loopInput(rig), maxRounds: 1 });
+
+    const receipt = rig.service.resolveRoundReceiptHead(rig.runId, 1, assignmentId(`asg_${rig.runId}`));
+    expect(receipt).toBeDefined();
+    // The verifier bound to the receipted commit, and the durable pointer agrees.
+    expect(String(result.implementationCommit)).toBe(String(receipt));
+    const persisted = rig.service.getImplementVerifyLoopState(rig.runId)?.worktree?.lastImplementationCommit;
+    expect(persisted).toBeDefined();
+    expect(String(persisted!.commit)).toBe(String(receipt));
+  });
+  it('a COMPLETED round with NEITHER durable source REFUSES (never verifies bare HEAD)', async () => {
+    const rig = await openRig({
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+      ],
+    });
+    const { round: interrupted, worktreePath } = await pauseInterruptedImplementor(rig);
+    // No receipt was ever published (the round died mid-turn) and no pointer was
+    // recorded — but the durable round says `completed`, so resume re-enters at
+    // verification. There is nothing durable to bind to.
+    await commitInWorktree(worktreePath, 'whatever happened to be here');
+    const round = { ...interrupted, stage: 'completed' as const };
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const thrown: unknown = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round },
+    }).catch((e: unknown) => e);
+
+    expect(thrown).toMatchObject({ kind: 'requires_validation' });
+    expect(String(thrown)).toMatch(/no durable binding/i);
+  });
+
+  it('AC-2: a TAMPERED worktree whose HEAD is NOT a descendant of the checkpoint still refuses', async () => {
+    const rig = await openRig(
+      {
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        { writes: [], turns: [implementorTurn('never reached')] },
+      ],
+    });
+    const paused: unknown = await runImplementVerifyLoop(loopDeps(rig), loopInput(rig)).catch((e: unknown) => e);
+    expect(paused).toBeInstanceOf(LimitPausedError);
+    const round = rig.service.getRoleRound(rig.runId)!;
+    const worktreePath = rig.service.getImplementVerifyLoopState(rig.runId)!.worktree!.worktreePath;
+
+    // The round committed (the F8 (C) checkpoint would have carried THIS sha)...
+    const abandoned = await commitInWorktree(worktreePath, 'implementor round 1');
+    // ...and was then TAMPERED with: reset away and rewritten on the base.
+    await git.runGit(['reset', '--hard', String(rig.baseCommit)], worktreePath);
+    fs.writeFileSync(path.join(worktreePath, 'rewritten.ts'), 'export const rewritten = 1;\n', 'utf8');
+    const rewritten = await commitInWorktree(worktreePath, 'a rewritten round');
+    expect(rewritten).not.toBe(abandoned);
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const thrown: unknown = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round, checkpoint: checkpointAt(abandoned) },
+    }).catch((e: unknown) => e);
+
+    expect(thrown).toMatchObject({ kind: 'requires_validation' });
+    expect(String(thrown)).toMatch(/§16\.3 validation refused resume-in-place/);
+    expect(rig.service.getImplementVerifyLoopState(rig.runId)?.worktree?.lastValidation?.outcome).toBe(
+      'refuse_resume',
+    );
+  });
+
+  it('AC-4: an ancestry-probe FAILURE (unknown checkpoint object) refuses — never an acceptance', async () => {
+    const rig = await openRig(
+      {
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        { writes: [], turns: [implementorTurn('never reached')] },
+      ],
+    });
+    const paused: unknown = await runImplementVerifyLoop(loopDeps(rig), loopInput(rig)).catch((e: unknown) => e);
+    expect(paused).toBeInstanceOf(LimitPausedError);
+    const round = rig.service.getRoleRound(rig.runId)!;
+    const worktreePath = rig.service.getImplementVerifyLoopState(rig.runId)!.worktree!.worktreePath;
+    await commitInWorktree(worktreePath, 'implementor round 1');
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const thrown: unknown = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      // A syntactically valid sha that names no object in this repo.
+      resume: { round, checkpoint: checkpointAt('0'.repeat(39) + '1') },
+    }).catch((e: unknown) => e);
+
+    expect(thrown).toMatchObject({ kind: 'requires_validation' });
+    expect(rig.service.getImplementVerifyLoopState(rig.runId)?.worktree?.lastValidation?.outcome).toBe(
+      'refuse_resume',
+    );
   });
 });
 

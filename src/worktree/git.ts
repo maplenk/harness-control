@@ -13,6 +13,8 @@
  * blocking the event loop here would stall that heartbeat.
  */
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import * as path from 'node:path';
 import { promisify } from 'node:util';
 import { WorktreeError, isWorktreeError } from './errors.js';
 
@@ -47,12 +49,17 @@ export async function runGit(
   args: readonly string[],
   cwd: string,
   extraEnv: Readonly<Record<string, string>> = {},
+  /** F9 (P5): wall-clock cap; on expiry execFile KILLS the child and this
+   * rejects `git_command_failed`. Omitted = unbounded (the historical default —
+   * every caller that holds the git mutex should pass one). */
+  timeoutMs?: number,
 ): Promise<GitResult> {
   try {
     const { stdout, stderr } = await execFileAsync(GIT_BIN, [...args], {
       cwd,
       maxBuffer: MAX_BUFFER_BYTES,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...extraEnv },
+      ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
     });
     return { stdout: toText(stdout), stderr: toText(stderr) };
   } catch (error) {
@@ -65,6 +72,35 @@ export async function runGit(
       detail: [stdout, stderr].filter((s) => s.length > 0).join('\n'),
     });
   }
+}
+
+/**
+ * ROUND 14 — `runGitStatus`'s shape for a command that reads its work from STDIN
+ * (`check-ignore --stdin`, the only caller). Kept beside it deliberately: same
+ * env hardening, same "a non-zero exit is an ANSWER, not a throw" contract, same
+ * buffer cap. Uses the callback form of `execFile` because `promisify` discards
+ * the ChildProcess, and the child's stdin is the whole point.
+ *
+ * A child that exits before reading its input makes the write fail with EPIPE;
+ * that is an ordinary outcome here (the exit code carries the answer), so the
+ * stdin error is absorbed rather than left to surface as an unhandled stream
+ * error and take the orchestrator down.
+ */
+function runGitStatusStdin(args: readonly string[], cwd: string, stdin: string): Promise<GitCommandStatus> {
+  return new Promise<GitCommandStatus>((resolve) => {
+    const child = execFile(
+      GIT_BIN,
+      [...args],
+      { cwd, maxBuffer: MAX_BUFFER_BYTES, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } },
+      (error, stdout, stderr) => {
+        const shaped = error as (ExecFileErrorShape & { code?: unknown }) | null;
+        const exitCode = shaped === null ? 0 : typeof shaped.code === 'number' ? shaped.code : -1;
+        resolve({ stdout: toText(stdout), stderr: toText(stderr), exitCode });
+      },
+    );
+    child.stdin?.on('error', () => undefined);
+    child.stdin?.end(stdin);
+  });
 }
 
 export async function isInsideWorkTree(dir: string): Promise<boolean> {
@@ -208,32 +244,293 @@ export async function addAll(worktreePath: string): Promise<void> {
   await runGit(['add', '-A'], worktreePath);
 }
 
+/** A repo-root-relative path that lies IN (or IS) a `node_modules` directory, at
+ * ANY depth: `node_modules/x`, `web/node_modules/x`, `node_modules`. Deliberately
+ * segment-anchored so `src/node_modules_helper.ts` / `src/my_node_modules/` — real
+ * source files that merely contain the substring — are never touched. */
+const NODE_MODULES_PATH_RE = /(^|\/)node_modules(\/|$)/;
+
+/** The staged paths (index vs HEAD) that live under a `node_modules`, at any depth.
+ * `-z` is NUL-TERMINATED and disables git's path quoting, so paths with spaces,
+ * newlines or non-ASCII bytes come through verbatim (the trailing empty field the
+ * final NUL produces is dropped). */
+async function stagedNodeModulesPaths(worktreePath: string): Promise<string[]> {
+  const { stdout } = await runGit(['diff', '--cached', '--name-only', '-z'], worktreePath);
+  const candidates = stdout.split('\0').filter((p) => p.length > 0 && NODE_MODULES_PATH_RE.test(p));
+  if (candidates.length === 0) return [];
+  // REGRESSION 4 (round 10): only the ENGINE's node_modules is excluded.
+  //
+  // The guard exists to stop the PROVISIONED tree entering a commit. Excluding
+  // every node_modules-shaped path at any depth swept up TRACKED, vendored trees
+  // too — intentional user content that main commits without complaint —
+  // silently unstaging them and then refusing the round for post-verification
+  // dirt. A vendored node_modules stays committable.
+  //
+  // ROUND 13 (ITEM 3): ownership is a property of the ROOT, decided ONCE. The
+  // unstage necessarily acts on the outer root (one pathspec per file would blow
+  // ARG_MAX on a 100k-entry tree), so classifying per FILE let a single ignored,
+  // not-yet-committed file inside a vendored tree condemn the whole root — its
+  // tracked siblings' staged modifications went with it. Grouping first also ends
+  // the per-file subprocess storm: at most two probes per ROOT, whatever the tree's
+  // size.
+  const byRoot = new Map<string, string[]>();
+  for (const candidate of candidates) {
+    const root = outerNodeModulesRoot(candidate);
+    if (root === undefined) continue; // unreachable for NODE_MODULES_PATH_RE matches; defensive
+    const grouped = byRoot.get(root);
+    if (grouped === undefined) byRoot.set(root, [candidate]);
+    else grouped.push(candidate);
+  }
+  // ROUND 14 (REGRESSION 1): ownership of a nested root is read from ALL its
+  // staged paths, so the ignore status of EVERY path is needed — resolved in ONE
+  // subprocess (`--stdin`) rather than one per file. The ROOT tree needs no ignore
+  // data at all (it is unconditional), so the common production shape — a
+  // provisioned root tree — still spends nothing here.
+  const nested = candidates.filter((p) => outerNodeModulesRoot(p)?.includes('/') === true);
+  const ignored = nested.length > 0 ? await pathsIgnoredByRule(worktreePath, nested) : new Set<string>();
+  const engineOwned: string[] = [];
+  for (const [root, staged] of byRoot) {
+    if (await isEngineOwnedNodeModulesRoot(worktreePath, root, staged, ignored)) engineOwned.push(...staged);
+  }
+  return engineOwned;
+}
+
+/** The OUTERMOST `node_modules` directory a repo-relative path sits under
+ * (`node_modules`, `web/node_modules`), or `undefined` if it is not under one. */
+function outerNodeModulesRoot(relpath: string): string | undefined {
+  const segments = relpath.split('/');
+  const index = segments.indexOf('node_modules');
+  if (index < 0) return undefined;
+  return segments.slice(0, index + 1).join('/');
+}
+
+/** The marker the provisioner writes INSIDE a tree it built (see `provision.ts`). */
+const PROVISION_MARKER_BASENAME = '.harness-provisioned';
+
 /**
- * Stage every change EXCEPT a root `node_modules/` (`git add -A -- . :(exclude)node_modules`),
- * preserving full `-A` semantics (adds, modifications, AND deletions) for
- * everything else. F7 (B1): the harness provisions a git-ignored `node_modules`
- * into agent worktrees; if a target repo lacks a `node_modules/` ignore rule (or
- * an agent removed it), a plain `git add -A` would stage the provisioned toolchain
- * INTO the commit. Excluding it here guarantees a provisioned tree can never enter
- * a harness commit — independent of, and complementary to, provisioning's own
- * fail-closed refusal of an unignored/tracked `node_modules`.
+ * REGRESSION 4 (round 10) — is this staged node_modules ROOT the ENGINE's tree
+ * rather than the user's? Asked ONCE per root (ITEM 3), never per file.
+ *
+ * ROUND 13 (ITEM 1) — the ROOT tree is exempt from the question entirely.
+ *
+ * Both callers of this module COMMIT BEFORE provisioning runs (`implementor.ts`'s
+ * post-turn commit, `validate.ts`'s §16.3 WIP reconciliation), so at staging time
+ * an agent-created `node_modules` is necessarily UNIGNORED and UNMARKED —
+ * provisioning is what refuses a missing ignore rule and what writes the marker,
+ * and it has not run yet. Asking for a positive signal therefore COMMITTED it:
+ * a large generated tree, native binaries, or generated secrets added permanently
+ * to the branch and the git object database. A previously provisioned tree whose
+ * marker an `npm ci` removed along with its ignore rule lands in the same place.
+ * Main excluded a ROOT `node_modules` UNCONDITIONALLY, and that is restored here:
+ * while managed provisioning is ACTIVE (the only state in which these helpers are
+ * reached — `provision='none'` uses plain `addAll`) the root tree never enters a
+ * harness commit, whatever its ignore/marker/tracked status.
+ *
+ * NESTED roots keep the round-10 policy, because nested staging is what F10
+ * actually got wrong (main's root-only pathspec never touched them):
+ *  - a git IGNORE RULE covers it (rules only, via `--no-index`, so force-adding
+ *    cannot launder it), which is what a provisioned tree always has; or
+ *  - the tree carries the provisioner's own MARKER file, which proves engine
+ *    ownership even in a repo with no ignore rule at all.
+ *
+ * And one veto that outranks both: ANY content of the root already IN HEAD makes
+ * the WHOLE root committed user content — a vendored dependency tree main commits
+ * without complaint — which must stay committable. ITEM 3: the veto is evaluated
+ * over the root, not over the individual file, because the unstage acts on the
+ * root; deciding per file let one ignored newcomer unstage its tracked siblings.
+ * Excluding every node_modules-shaped path at any depth was the original
+ * regression: it silently unstaged those and then failed the round on the
+ * resulting "post-verification dirt".
  */
-export async function addAllExceptNodeModules(worktreePath: string): Promise<void> {
-  await runGit(['add', '-A', '--', '.', ':(exclude)node_modules'], worktreePath);
+async function isEngineOwnedNodeModulesRoot(
+  worktreePath: string,
+  root: string,
+  staged: readonly string[],
+  ignored: ReadonlySet<string>,
+): Promise<boolean> {
+  // ITEM 1: the ROOT tree — main's unconditional exclusion, asked no questions.
+  if (!root.includes('/')) return true;
+  if (await rootHasHeadContent(worktreePath, root)) return false; // committed user content
+  // The MARKER is whole-TREE evidence: the provisioner wrote it into a tree it
+  // built, so per-path ignore status cannot outrank it.
+  if (existsSync(path.join(worktreePath, root, PROVISION_MARKER_BASENAME))) return true;
+  // ROUND 14 (REGRESSION 1): otherwise EVERY staged path under the root must be
+  // ignored. Reading ownership off `staged[0]` was "classified once" implemented
+  // as "classified from an arbitrary member" — git sorts these, so the deciding
+  // path is not even one the round chose. A narrow, entirely legitimate rule
+  // (`**/node_modules/.bin/` over a vendored tree) then condemned the whole root
+  // and unstaged the files main commits. A MIXED root is not ours: a tree the
+  // engine provisioned is ignored in its entirety, so "some of it is ignored" is
+  // evidence of a user tree with a rule about part of it, not of our tree.
+  return staged.every((p) => ignored.has(p));
 }
 
 /**
- * Unstage any ALREADY-STAGED `node_modules` from the index (`git reset -- node_modules`),
- * WITHOUT touching the working tree. F7 (round-4 #3): `addAllExceptNodeModules` prevents
- * ADDING `node_modules` but does NOT remove entries a prior `git add` already placed in
- * the index — e.g. a verification command or an interrupted implementor that ran
- * `git add node_modules`. Called (while provisioning is active) BEFORE the implementor
- * commit AND the §16.3 WIP reconciliation commit, so a provisioned (git-ignored)
- * toolchain can never enter a harness commit even when it was pre-staged. Resetting a
- * non-matching pathspec is a no-op (exit 0); the file stays on disk.
+ * ROUND 14 — which of `paths` a git IGNORE RULE covers, in ONE subprocess.
+ *
+ * `check-ignore -z -v -n --stdin` emits exactly four NUL-separated fields per
+ * INPUT path (`source`, `linenum`, `pattern`, `pathname`) in input order, with
+ * the pathname echoed verbatim and an empty `pattern` for a path no rule matches
+ * — so the whole staged set is classified without one probe per file. `--no-index`
+ * keeps this about RULES only, so force-adding cannot launder a tree past the
+ * guard. Exit 0 (some matched) and 1 (none matched) are both answers; anything
+ * else is a real failure and throws, exactly as the single-path form does.
+ *
+ * (`check-ignore` does not accept `:(literal)` — verified on git 2.55, it exits
+ * 128 — so paths go in as-is, which is the same spelling the pre-round-14 code
+ * used and the same one the reset's `:(literal)` pathspecs are derived from.)
  */
-export async function unstageNodeModules(worktreePath: string): Promise<void> {
-  await runGit(['reset', '--quiet', '--', 'node_modules'], worktreePath);
+async function pathsIgnoredByRule(worktreePath: string, paths: readonly string[]): Promise<Set<string>> {
+  const { exitCode, stdout, stderr } = await runGitStatusStdin(
+    ['check-ignore', '--no-index', '-z', '-v', '-n', '--stdin'],
+    worktreePath,
+    `${paths.join('\0')}\0`,
+  );
+  if (exitCode !== 0 && exitCode !== 1) {
+    throw new WorktreeError(
+      'git_command_failed',
+      `git check-ignore --no-index --stdin over ${paths.length} path(s) (cwd=${worktreePath}) failed ` +
+        `(exit ${exitCode}): ${stderr.trim()}`,
+    );
+  }
+  const fields = stdout.split('\0');
+  const ignored = new Set<string>();
+  // Four fields per record; a trailing empty element from the final NUL is ignored
+  // by the length check.
+  for (let i = 0; i + 3 < fields.length; i += 4) {
+    const pattern = fields[i + 2];
+    const pathname = fields[i + 3];
+    if (pathname === undefined || pattern === undefined || pattern.length === 0) continue;
+    // ROUND 15: git reports the matching pattern VERBATIM, `!` included, and a
+    // NEGATED match means the path is explicitly NOT ignored — the plain form
+    // exits 1 for it. Reading every non-empty pattern as "ignored" inverted that,
+    // so a vendored tree deliberately re-included through a negation was read as
+    // wholly the engine's and unstaged, where main commits it.
+    if (pattern.startsWith('!')) continue;
+    ignored.add(pathname);
+  }
+  return ignored;
+}
+
+/**
+ * True iff the committed HEAD tree holds ANY content under `root`.
+ *
+ * `:(literal)` (MED-8's reason, and supported by `ls-tree` unlike `check-ignore`):
+ * a repo path may legitimately begin with a colon, and git would otherwise parse a
+ * leading `:(...)` as PATHSPEC MAGIC — the probe would then match nothing and
+ * report a tracked tree as untracked. An unreadable HEAD (unborn branch) exits
+ * non-zero, which is correctly "nothing is tracked yet".
+ */
+async function rootHasHeadContent(worktreePath: string, root: string): Promise<boolean> {
+  const { exitCode, stdout } = await runGitStatus(
+    ['ls-tree', '-r', '--name-only', 'HEAD', '--', `:(literal)${root}`],
+    worktreePath,
+  );
+  return exitCode === 0 && stdout.trim().length > 0;
+}
+
+/**
+ * The OUTERMOST `node_modules` directory each staged path sits under — a tiny,
+ * bounded pathspec set (`node_modules`, `web/node_modules`, …) rather than one
+ * argument per file, so a 100k-entry tree cannot blow past ARG_MAX.
+ *
+ * MED-8: every entry is prefixed `:(literal)`. A repo path can legitimately
+ * begin with a colon (`:(top)foo/node_modules`), and git would then parse the
+ * leading `:(...)` as PATHSPEC MAGIC rather than as part of the path — the reset
+ * silently matches nothing, exits 0, and the node_modules entries stay STAGED.
+ * Verified against real git: without the prefix that exact directory name leaves
+ * `:(top)foo/node_modules/pkg/i.js` in the index after a "successful" reset.
+ */
+function nodeModulesPathspecs(paths: readonly string[]): string[] {
+  const roots = new Set<string>();
+  for (const p of paths) {
+    // The SAME root derivation the ownership classification groups by, so what is
+    // reset is exactly what was classified.
+    const root = outerNodeModulesRoot(p);
+    if (root === undefined) continue; // unreachable for NODE_MODULES_PATH_RE matches; defensive
+    roots.add(`:(literal)${root}`);
+  }
+  return [...roots].sort();
+}
+
+/**
+ * Stage every change EXCEPT anything under a `node_modules` (at any depth),
+ * preserving full `-A` semantics (adds, modifications, AND deletions) for
+ * everything else.
+ *
+ * F7 (B1): the harness provisions a git-ignored `node_modules` into agent
+ * worktrees; if a target repo lacks a `node_modules/` ignore rule (or an agent
+ * removed it), a plain `git add -A` would stage the provisioned toolchain INTO the
+ * commit. Guaranteeing it never enters a harness commit is the invariant — held
+ * here independently of, and complementary to, provisioning's own fail-closed
+ * refusal of an unignored/tracked `node_modules`.
+ *
+ * F10 — HOW that invariant is held changed, because the old mechanism stopped
+ * working. `git add -A -- . ':(exclude)node_modules'` exits 1 under git 2.55 with
+ * "The following paths are ignored by one of your .gitignore files: node_modules"
+ * whenever an ignored `node_modules` exists on disk: the exclude pathspec ITEM is
+ * treated as an explicit mention of an ignored path. Since F7 provisions exactly
+ * such a tree into every worktree, that made BOTH callers (the implementor's
+ * post-turn commit and the §16.3 WIP reconciliation) fail on every provisioned
+ * round. So: stage with a plain `git add -A -- .` — .gitignore alone already keeps
+ * an ignored tree out — and then PROVE the index is clean of `node_modules`,
+ * unstaging what is there and FAILING CLOSED if anything survives. The proof is
+ * strictly stronger than the old pathspec, which only ever covered a ROOT
+ * `node_modules` and silently staged a nested `web/node_modules`.
+ *
+ * Never deletes: unstaging leaves the provisioned tree on disk for the verifier.
+ */
+export async function addAllExceptNodeModules(worktreePath: string): Promise<void> {
+  await runGit(['add', '-A', '--', '.'], worktreePath);
+  // Covers BOTH what `add -A` just staged and anything a prior `git add` had
+  // already placed in the index (F7 round-4 #3 — e.g. a verification command or an
+  // interrupted implementor that ran `git add -f node_modules`).
+  await unstageNodeModules(worktreePath);
+  await assertIndexFreeOfNodeModules(worktreePath);
+}
+
+/**
+ * MED-8 — the INVARIANT, asserted independently of how the index got here: no
+ * `node_modules` path (at any depth) is staged. Exported so the guarantee can be
+ * checked — and tested — on its own, rather than only as a tail of
+ * `addAllExceptNodeModules`.
+ *
+ * Throws the dedicated `node_modules_still_staged` kind, NOT
+ * `git_command_failed`: no git command failed here. The index simply refused to
+ * reach a safe state, which is an invariant violation a caller must not retry
+ * blindly.
+ */
+export async function assertIndexFreeOfNodeModules(worktreePath: string): Promise<void> {
+  const remaining = await stagedNodeModulesPaths(worktreePath);
+  if (remaining.length === 0) return;
+  throw new WorktreeError(
+    'node_modules_still_staged',
+    `refusing to commit: ${remaining.length} node_modules path(s) remain STAGED after unstaging them ` +
+      `(cwd=${worktreePath}): ${remaining.slice(0, 5).join(', ')}. A provisioned dependency tree must never ` +
+      'enter a harness commit.',
+    { detail: remaining.slice(0, 20).join('\n') },
+  );
+}
+
+/**
+ * Unstage every ALREADY-STAGED `node_modules` path from the index, at ANY depth,
+ * WITHOUT touching the working tree. F7 (round-4 #3): staging must not merely
+ * avoid ADDING `node_modules` — it must also remove entries a prior `git add`
+ * already placed in the index. F10: the old form (`git reset -- node_modules`) was
+ * root-only, so a nested `web/node_modules` slipped through; the index is now
+ * enumerated and every `node_modules` root found is reset.
+ *
+ * A tracked-in-HEAD `node_modules` is reset back to its HEAD content, so it is no
+ * longer a staged CHANGE (exactly what the old exclusion achieved); an untracked
+ * one leaves the index entirely. Either way the bytes stay on disk. Resetting a
+ * pathspec that matches nothing is a no-op (exit 0), and no reset runs at all when
+ * nothing is staged. Returns the paths it unstaged.
+ */
+export async function unstageNodeModules(worktreePath: string): Promise<string[]> {
+  const staged = await stagedNodeModulesPaths(worktreePath);
+  if (staged.length === 0) return [];
+  await runGit(['reset', '--quiet', '--', ...nodeModulesPathspecs(staged)], worktreePath);
+  return staged;
 }
 
 const NOTHING_TO_COMMIT_RE = /nothing to commit/i;
@@ -307,12 +604,15 @@ export async function runGitStatus(
   args: readonly string[],
   cwd: string,
   extraEnv: Readonly<Record<string, string>> = {},
+  /** F9 (P5): wall-clock cap; a killed child surfaces as a non-zero exit code. */
+  timeoutMs?: number,
 ): Promise<GitCommandStatus> {
   try {
     const { stdout, stderr } = await execFileAsync(GIT_BIN, [...args], {
       cwd,
       maxBuffer: MAX_BUFFER_BYTES,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...extraEnv },
+      ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
     });
     return { stdout: toText(stdout), stderr: toText(stderr), exitCode: 0 };
   } catch (error) {
@@ -328,8 +628,32 @@ export async function runGitStatus(
  * (exit 128 / spawn failure → throw), so the F7 preflight never mistakes a
  * broken repo for "safe to provision".
  */
-export async function isPathIgnored(worktreePath: string, pathspec: string): Promise<boolean> {
-  const { exitCode, stderr } = await runGitStatus(['check-ignore', '-q', '--', pathspec], worktreePath);
+/**
+ * REGRESSION 4 (round 10) — is `pathspec` covered by an IGNORE RULE, regardless of
+ * whether it currently sits in the index?
+ *
+ * Plain `check-ignore` skips TRACKED paths, so a provisioned tree that an agent
+ * force-added (`git add -f`) would report as "not ignored" and escape the guard —
+ * force-adding must not launder the engine's own tree. `--no-index` consults the
+ * rules alone, which is the question actually being asked.
+ */
+export async function isPathIgnoredByRule(worktreePath: string, pathspec: string, timeoutMs?: number): Promise<boolean> {
+  const { exitCode, stderr } = await runGitStatus(
+    ['check-ignore', '-q', '--no-index', '--', pathspec],
+    worktreePath,
+    {},
+    timeoutMs,
+  );
+  if (exitCode === 0) return true;
+  if (exitCode === 1) return false;
+  throw new WorktreeError(
+    'git_command_failed',
+    `git check-ignore --no-index ${pathspec} (cwd=${worktreePath}) failed (exit ${exitCode}): ${stderr.trim()}`,
+  );
+}
+
+export async function isPathIgnored(worktreePath: string, pathspec: string, timeoutMs?: number): Promise<boolean> {
+  const { exitCode, stderr } = await runGitStatus(['check-ignore', '-q', '--', pathspec], worktreePath, {}, timeoutMs);
   if (exitCode === 0) return true;
   if (exitCode === 1) return false;
   throw new WorktreeError(
@@ -344,13 +668,45 @@ export async function isPathIgnored(worktreePath: string, pathspec: string): Pro
  * known file" (not tracked); ANY OTHER exit (128 real error / -1 spawn failure) →
  * throw — F7 must never mistake an operational git failure for "not tracked".
  */
-export async function isPathTracked(worktreePath: string, pathspec: string): Promise<boolean> {
-  const { exitCode, stderr } = await runGitStatus(['ls-files', '--error-unmatch', '--', pathspec], worktreePath);
+export async function isPathTracked(worktreePath: string, pathspec: string, timeoutMs?: number): Promise<boolean> {
+  const { exitCode, stderr } = await runGitStatus(
+    ['ls-files', '--error-unmatch', '--', pathspec],
+    worktreePath,
+    {},
+    timeoutMs,
+  );
   if (exitCode === 0) return true;
   if (exitCode === 1) return false;
   throw new WorktreeError(
     'git_command_failed',
     `git ls-files --error-unmatch ${pathspec} (cwd=${worktreePath}) failed (exit ${exitCode}): ${stderr.trim()}`,
+  );
+}
+
+/**
+ * F8 (A) — true iff `ancestor` is reachable from `descendant`
+ * (`git merge-base --is-ancestor`). Exit 0 → ancestor; exit 1 → the documented
+ * "not an ancestor"; ANY OTHER exit (128 for an unknown/non-commit object name, a
+ * broken object store, -1 for a spawn failure) → THROW.
+ *
+ * The exit-1/exit-128 split is the whole point: §16.3's forward-containment
+ * acceptance may only trust a POSITIVE answer, and must treat an ancestry probe
+ * it could not complete as a REFUSAL, never as "not an ancestor is fine" and
+ * never as an acceptance. Both revs are peeled with `^{commit}` so a tag/tree/
+ * blob name fails loudly here rather than silently answering about the wrong
+ * object. Note git's own semantics make a commit an ancestor of ITSELF; callers
+ * that need STRICT ancestry (this one does) compare the shas first.
+ */
+export async function isAncestor(worktreePath: string, ancestor: string, descendant: string): Promise<boolean> {
+  const { exitCode, stderr } = await runGitStatus(
+    ['merge-base', '--is-ancestor', `${ancestor}^{commit}`, `${descendant}^{commit}`],
+    worktreePath,
+  );
+  if (exitCode === 0) return true;
+  if (exitCode === 1) return false;
+  throw new WorktreeError(
+    'git_command_failed',
+    `git merge-base --is-ancestor ${ancestor} ${descendant} (cwd=${worktreePath}) failed (exit ${exitCode}): ${stderr.trim()}`,
   );
 }
 
@@ -369,8 +725,12 @@ export async function isPathTracked(worktreePath: string, pathspec: string): Pro
  * The follow-up `git show` reads the proven-present blob's bytes. `relpath` is
  * repo-root-relative, posix-separated.
  */
-export async function readFileAtHead(worktreePath: string, relpath: string): Promise<string | undefined> {
-  const probe = await runGitStatus(['ls-tree', '--name-only', 'HEAD', '--', relpath], worktreePath);
+export async function readFileAtHead(
+  worktreePath: string,
+  relpath: string,
+  timeoutMs?: number,
+): Promise<string | undefined> {
+  const probe = await runGitStatus(['ls-tree', '--name-only', 'HEAD', '--', relpath], worktreePath, {}, timeoutMs);
   if (probe.exitCode !== 0) {
     throw new WorktreeError(
       'git_command_failed',
@@ -378,7 +738,7 @@ export async function readFileAtHead(worktreePath: string, relpath: string): Pro
     );
   }
   if (probe.stdout.trim().length === 0) return undefined; // genuinely absent at HEAD (locale-independent)
-  const { exitCode, stdout, stderr } = await runGitStatus(['show', `HEAD:${relpath}`], worktreePath);
+  const { exitCode, stdout, stderr } = await runGitStatus(['show', `HEAD:${relpath}`], worktreePath, {}, timeoutMs);
   if (exitCode === 0) return stdout;
   throw new WorktreeError(
     'git_command_failed',

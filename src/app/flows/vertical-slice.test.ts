@@ -964,10 +964,14 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
     // Target the handoff checkpoint by reason: the §12.2 completed-turn
     // cadence (W4-1) legitimately writes earlier `cadence` checkpoints as the
     // slice drives its turns, so "the first checkpoint.recorded" is no longer
-    // unambiguous — the resume path wants the pre_verify_handoff one.
+    // unambiguous — the resume path wants the pre_verify_handoff one. F8 (C):
+    // the IMPLEMENTOR round now writes a real `pre_verify_handoff` checkpoint
+    // at its own commit boundary too, so take the LATEST one — the
+    // predecessor-verifier checkpoint this test just appended — exactly as
+    // `resolveResumeCheckpointHash` does (latest-by-sequence).
     const checkpointEvent = db.events
       .listByRun(runId)
-      .find(
+      .findLast(
         (e) =>
           e.type === 'checkpoint.recorded' &&
           (e.payload as { reason?: string }).reason === 'pre_verify_handoff',
@@ -1547,7 +1551,11 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
     expect(result.provisioningFailure?.round).toBe(1);
     expect(result.provisioningFailure?.implementationCommit).toBeDefined();
     // B1: node_modules never entered the committed tree (excluded from the commit),
-    // despite the missing ignore rule.
+    // despite the missing ignore rule. ROUND 13 (ITEM 1) restored this: the commit
+    // happens BEFORE provisioning, so at staging time an agent-created tree is
+    // always unignored and unmarked — requiring a positive signal there meant the
+    // generated tree was committed permanently. The ROOT tree is main's
+    // unconditional exclusion and is excluded again.
     const tracked = (await slice.repo.run(['ls-tree', '-r', '--name-only', String(result.implementationCommit)])).split('\n');
     expect(tracked.some((p) => p.startsWith('node_modules'))).toBe(false);
     expect(tracked).toContain('package.json');
@@ -1636,7 +1644,10 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
       await git.runGit(['rev-list', '--count', `${String(slice.baseCommit)}..HEAD`], worktreePath)
     ).stdout.trim();
     expect(commitCount).toBe('1');
-    // node_modules NEVER entered any commit (not in c1's tree, and c1 is still HEAD).
+    // node_modules NEVER entered any commit (not in c1's tree, and c1 is still HEAD)
+    // — ROUND 13 (ITEM 1) again: the ROOT tree is excluded unconditionally while
+    // provisioning is active, so it stays untracked worktree dirt for the resume
+    // path to reconcile rather than becoming part of the branch.
     const tracked = (await slice.repo.run(['ls-tree', '-r', '--name-only', String(c1)])).split('\n');
     expect(tracked.some((p) => p.startsWith('node_modules'))).toBe(false);
     expect(tracked).toContain('package.json');
@@ -1729,13 +1740,24 @@ describe('F7 round-3 #7 — toProvisioningFailure redacts the surfaced detail', 
   it('scrubs a secret-shaped detail from the verifier-boundary provisioning failure', () => {
     const handle = { repoRoot: '/repo', worktreePath: '/wt' } as WorktreeHandle;
     const secret = 'AKIAIOSFODNN7EXAMPLE'; // a canonical AWS-access-key-id-shaped token
-    const error = new WorktreeError('provisioning_failed', 'dependency install failed', {
-      detail: `npm ci failed: registry auth key ${secret} was rejected`,
+    // ROUND 8 (LOW): a provisioning refusal now surfaces the operator-facing
+    // MESSAGE (it carries the evidence — package, installed vs lockfile version)
+    // rather than the terse `.detail` hint. Redaction is what is under test, so
+    // the secret is planted in the surfaced field.
+    const error = new WorktreeError('provisioning_failed', `npm ci failed: registry auth key ${secret} was rejected`, {
+      detail: 'dependency install failed',
     });
     const pf = toProvisioningFailure(error, handle);
     expect(pf.kind).toBe('provisioning_failed');
     expect(pf.repoRoot).toBe('/repo');
     expect(pf.detail).not.toContain(secret); // the raw secret never reaches the CLI/sink
     expect(pf.detail).toContain('REDACTED'); // replaced by the redaction marker
+
+    // ...and the OTHER field is not a bypass: a secret in `.detail` is simply not
+    // surfaced for a provisioning refusal, so it cannot leak either.
+    const inDetail = new WorktreeError('provisioning_failed', 'dependency install failed', {
+      detail: `npm ci failed: registry auth key ${secret} was rejected`,
+    });
+    expect(toProvisioningFailure(inDetail, handle).detail).not.toContain(secret);
   });
 });

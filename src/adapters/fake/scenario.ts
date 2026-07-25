@@ -127,6 +127,13 @@ export interface FakeStderrScript {
 // ---------------------------------------------------------------------------
 export interface FakePermissionScript {
   readonly toolTitle?: string;
+  /**
+   * HIGH-5: the tool call's `rawInput` — the payload a real provider actually
+   * EXECUTES, as opposed to the human-readable `toolTitle`. Omit it to model a
+   * provider that sends none (the harness then refuses to auto-approve a shell
+   * operation); set it DIVERGENT from the title to exercise that refusal.
+   */
+  readonly rawInput?: unknown;
   /** Defaults to one allow_once + one reject_once option. */
   readonly options?: ReadonlyArray<{
     readonly optionId: string;

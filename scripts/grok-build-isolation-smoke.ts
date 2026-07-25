@@ -26,6 +26,7 @@ import {
 import { homedir, tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { createGrokBuildAcpAdapter } from '../src/adapters/factory.js';
+import { noPayloadToVerify } from '../src/adapters/acp/session.js';
 import {
   GROK_HOME_ENV_VAR,
   GROK_PROVIDER_BIN_ENV_VAR,
@@ -146,7 +147,7 @@ async function runRole(
   const created = createGrokBuildAcpAdapter({
     cwd: repo,
     processEnv: probeProcessEnv(sourceHome),
-    permissions: { mode: 'headless', role },
+    permissions: { mode: 'headless', role, verifyOperationPayload: noPayloadToVerify },
     grokHome: { realHome: sourceHome, tempRoot: isolatedRoot },
     role,
     model: MODEL,
@@ -280,7 +281,7 @@ async function main(): Promise<void> {
       const unexpectedlyCreated = createGrokBuildAcpAdapter({
         cwd: repo,
         processEnv: probeProcessEnv(sourceHome),
-        permissions: { mode: 'headless', role: 'coordinator' },
+        permissions: { mode: 'headless', role: 'coordinator', verifyOperationPayload: noPayloadToVerify },
         grokHome: { realHome: sourceHome, tempRoot: isolatedRoot },
         role: 'coordinator',
         model: MODEL,

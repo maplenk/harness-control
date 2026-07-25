@@ -119,9 +119,9 @@ import {
   resolveSha,
   runGit,
   statusPorcelain,
-  unstageNodeModules,
   WorktreeError,
   type GitWorktreeManager,
+  type ProvisioningCause,
   type WorktreeHandle,
 } from '../../worktree/index.js';
 import { isSecretKeyName, redactText } from '../../redaction/index.js';
@@ -559,6 +559,11 @@ export interface ProvisioningFailure {
   readonly worktreePath: string;
   /** Redacted, operator-actionable summary (ignore-rule / clone-vs-install / install failure). */
   readonly detail: string;
+  /** F9: the machine-readable refusal cause, when provisioning supplied one. The
+   * CLI turns it into a SPECIFIC next step — the pre-F9 generic hint sent the two
+   * commonest cases (a dep-adding implementor commit, a stale primary tree) in
+   * circles. Absent for the pre-F9 refusals, which keep their prose detail. */
+  readonly cause?: ProvisioningCause;
   /** F7 (M9): the loop round that failed (the loop driver fills this in). */
   readonly round?: number;
   /** F7 (M9): the actual committed HEAD at the point of failure (host-read; the
@@ -727,6 +732,12 @@ export interface ImplementorResult {
   readonly postVerificationDirty: boolean;
   /** Bounded dirty-path list (`git status --porcelain`) when dirty; else empty. */
   readonly postVerificationDirtyFiles: readonly string[];
+  /** F8 (C): whether the §12.2 `pre_verify_handoff` checkpoint carrying the
+   * COMMITTED head was actually recorded. `false` means the write was refused
+   * (a §12.1 quota rejection) or failed — reported honestly rather than
+   * assumed, since the round proceeds either way (the commit is already
+   * durable, and F8 (A) accepts the forward drift on resume without it). */
+  readonly verifyHandoffCheckpointed: boolean;
   readonly committed: boolean;
   readonly commitSha?: GitSha;
   /** Stop reason of the last driven turn. */
@@ -820,7 +831,23 @@ export function buildImplementorPrompt(context: ImplementorContext, cwd: string)
     '## Hard Rules (read first)',
     `- You may create, modify, or delete files ONLY inside your assigned worktree: ${cwd}. Never write outside it.`,
     '- Use structured repository tools (Read, Grep/Glob, Write, and Edit) for inspection and file changes. Structured Write can create missing parent directories.',
-    '- Shell access is limited to read-only repository inspection and the exact declared verification commands below. Do NOT use shell commands such as mkdir, cp, mv, rm, touch, network clients, executable preprocessors, or output redirection to scaffold or change files. If structured tools cannot perform a needed action, report that blocker instead of requesting broader shell access.',
+    // MERGE COHERENCE: this rule used to also grant "and the exact declared
+    // verification commands below", which directly contradicts main's separate
+    // rule forbidding the implementor from running verification itself (the host
+    // runs those independently). A prompt that both grants and forbids the same
+    // act is worse than either rule alone — the agent obeys whichever it reads
+    // last. The clause is removed: shell is read-only INSPECTION only, and the
+    // merged rule set carries exactly one statement about executing verification
+    // commands. `buildImplementorPrompt`'s test asserts that invariant.
+    '- Shell access is limited to read-only repository inspection. Do NOT use shell commands such as mkdir, cp, mv, rm, touch, network clients, executable preprocessors, or output redirection to scaffold or change files. If structured tools cannot perform a needed action, report that blocker instead of requesting broader shell access.',
+    // F11: the read-only shell classifier can only reason about a command whose
+    // expansion-bearing bytes are inside SINGLE quotes (where the shell performs
+    // none). Telling the agent the rule up front turns a would-be permission
+    // denial — which kills the turn — into a command it can simply write
+    // correctly. Deliberately scoped to repository INSPECTION only: the rule
+    // above already forbids using the shell to change files or self-verify, and
+    // this line must not read as widening that.
+    '- When inspecting the repository with the shell, single-quote pattern/regex arguments and avoid $, backslashes, backticks, and parentheses outside single quotes — such commands cannot be classified read-only and will be denied.',
     '- The acceptance criteria below are FIXED and shown for context only. You MUST NOT add, remove, or change any acceptance criterion.',
     '- You MUST NOT declare the task complete, verified, or passing. An independent verifier decides that — just do the work and report honestly.',
     '- Do NOT run the verification/build/test commands yourself (e.g. `npm`, `npx`, `node`, typecheck, test) and do NOT try to locate them (no `which`/`find`/PATH probing for node or npm). The host runs them independently AFTER you finish. Such a shell request is likely to be denied, and a denied request ends your turn before your work is committed. Implement with the structured Write/Edit tools, then stop and report.',
@@ -967,15 +994,34 @@ export class ImplementorFlow {
     // a repo that legitimately tracks node_modules changes still commits them.
     const provisionActive = this.#options.provisionActive ?? true;
     if (provisionActive) {
-      // round-4 #3: unstage any ALREADY-STAGED node_modules FIRST (the exclusion
-      // pathspec only prevents adding it, not removing an existing index entry), then
-      // stage everything else — so a pre-staged provisioned tree can never enter HEAD.
-      await unstageNodeModules(cwd);
+      // F10: ONE helper now owns the whole guarantee — it stages `-A`, unstages
+      // every node_modules path in the index at any depth (round-4 #3's
+      // already-staged case included), and FAILS CLOSED if any survives. The
+      // separate pre-unstage call this used to make is folded into it.
       await addAllExceptNodeModules(cwd);
     } else {
       await addAll(cwd);
     }
     const commit = await commitAll(cwd, commitMessage, commitEnv);
+
+    // --- F8 (C, §12.2): the `pre_verify_handoff` safe-boundary checkpoint ----
+    // IMMEDIATELY after the commit, before the provisioning boundary and the
+    // verify handoff, so a §12.2 checkpoint exists carrying the COMMITTED head.
+    // Every checkpoint taken DURING the round is a prompt-turn-boundary one
+    // (cadence/pause) recording the PRE-commit head, because the commit happens
+    // after the turn loop above — so without this, a crash anywhere in the
+    // commit→next-checkpoint window left the round's own commit looking like
+    // tamper to §16.3 and made it permanently unresumable. It also closes the
+    // flow-to-loop window in which the commit exists but the loop driver has
+    // not yet recorded `lastImplementationCommit`.
+    //
+    // BLOCKER-2: this checkpoint is the round's RECEIPT — resume will not adopt
+    // a drifted worktree without it, because ancestry alone proves reachability
+    // rather than authorship. The seam therefore REJECTS on a failed or
+    // quota-rejected write and the round fails honestly here, rather than
+    // continuing unreceipted and becoming silently unresumable. The commit above
+    // is already durable in the worktree; only auto-resume is withheld.
+    const handoffCheckpoint = await session.checkpointVerifyHandoff();
 
     // Capture the base→HEAD delta from the now-clean committed tree, BEFORE
     // verification runs (a verification build must not pollute the recorded
@@ -1006,9 +1052,21 @@ export class ImplementorFlow {
           kind: 'provisioning_failed',
           repoRoot: handle.repoRoot,
           worktreePath: cwd,
+          // F9: the cause is a CLOSED vocabulary constant, never free text — it
+          // needs no redaction and never carries a path or secret.
+          ...(error instanceof WorktreeError && error.provisioningCause !== undefined
+            ? { cause: error.provisioningCause }
+            : {}),
+          // ROUND 8 (LOW): prefer the operator-facing MESSAGE for a provisioning
+          // refusal. `.detail` is the terse machine hint ("2 package(s) diverging"),
+          // so preferring it threw away the evidence the message carries — which
+          // package, installed version, lockfile version. Other WorktreeError kinds
+          // keep `.detail` first, where it holds raw git stdout/stderr.
           detail: redactText(
             error instanceof WorktreeError
-              ? (error.detail ?? error.message)
+              ? error.kind === 'provisioning_failed'
+                ? error.message
+                : (error.detail ?? error.message)
               : error instanceof Error
                 ? error.message
                 : String(error),
@@ -1087,6 +1145,7 @@ export class ImplementorFlow {
       ...(provisioningFailed !== undefined ? { provisioningFailed } : {}),
       postVerificationDirty: postStatus.trim().length > 0,
       postVerificationDirtyFiles,
+      verifyHandoffCheckpointed: handoffCheckpoint.written,
       committed: commit.committed,
       ...(commit.sha !== undefined ? { commitSha: gitSha(commit.sha) } : {}),
       stopReason,
@@ -1144,6 +1203,18 @@ export function describeImplementorRoundDiagnostic(
 // ---------------------------------------------------------------------------
 // Entry point: worktree lifecycle around the engine-driven role
 // ---------------------------------------------------------------------------
+/**
+ * ROUND 10 (LOW) — the ONE wording for a receipt disagreement, shared by the loop
+ * driver and the standalone entry point so the same failure never reads two ways.
+ */
+export function describeReceiptMismatch(hostHead: GitSha, receipt: GitSha): string {
+  return (
+    `the round's worktree HEAD (${String(hostHead)}) does not match the pre_verify_handoff receipt it published ` +
+    `(${String(receipt)}). A declared VERIFICATION COMMAND that creates a commit causes this — verification ` +
+    'commands must observe, never author. Fix the spec so no verification command commits, then re-run.'
+  );
+}
+
 export interface ImplementorFlowDeps {
   readonly service: OrchestrationService;
   readonly worktrees: GitWorktreeManager;
@@ -1230,17 +1301,24 @@ export async function runImplementor(
       input.options?.provisionForVerification ??
       (() => deps.worktrees.provisionForVerification(input.assignmentId)),
   });
+  // ROUND 10 (LOW): the standalone path explains a receipt disagreement in the
+  // SAME words as the loop path — it is the identical failure and deserves the
+  // identical message, not the generic "no deliverable adjudicated".
+  let receiptMismatch: string | undefined;
   const runner: RoleRunner<ImplementorResult> = {
     role: 'implementor',
     allowedShellCommands: flow.allowedShellCommands,
     run: (session) => flow.run(session),
-    diagnoseRoundOutcome: describeImplementorRoundDiagnostic,
-    adjudicateRoundOutcome: async (result) =>
-      adjudicateImplementorDeliverable(
-        result,
-        1,
-        gitSha(await resolveSha(handle.worktreePath, 'HEAD')),
-      ),
+    diagnoseRoundOutcome: (result) => receiptMismatch ?? describeImplementorRoundDiagnostic(result),
+    adjudicateRoundOutcome: async (result) => {
+      const hostHead = gitSha(await resolveSha(handle.worktreePath, 'HEAD'));
+      // ROUND 8 (Blocker 1a): the standalone path binds to the receipt too.
+      const receipt = deps.service.resolveRoundReceiptHead(input.runId, 1, input.assignmentId);
+      if (receipt !== undefined && String(hostHead) !== String(receipt)) {
+        receiptMismatch = describeReceiptMismatch(hostHead, receipt);
+      }
+      return adjudicateImplementorDeliverable(result, 1, hostHead, receipt);
+    },
   };
   try {
     return await deps.service.runRole(input.runId, runner, input.implementor, handle.worktreePath, {

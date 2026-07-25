@@ -113,11 +113,11 @@ import {
   assertSafeGrokProjectConfig,
   buildGrokCapabilityRecord,
   classifyGrokError,
-  grokShellPermissionTitle,
-  isGrokReadOnlyShellPermissionTitle,
+  buildGrokMediation,
   prepareGrokHomeIsolation,
   probeGrokAuthReadiness,
   type PreparedGrokHome,
+  type VetoedMediation,
 } from './grok/index.js';
 
 // ---------------------------------------------------------------------------
@@ -570,26 +570,22 @@ export function createGrokBuildAcpAdapter(
   }
   assertSafeGrokProjectConfig(cwd);
 
-  const permissions: PermissionMediationConfig | undefined =
-    role === 'implementor' && options.permissions?.mode === 'headless'
-      ? {
-          ...options.permissions,
-          policy: {
-            allow: [
-              ...new Set([
-                ...(options.permissions.policy?.allow ?? []),
-                ...(options.allowedShellCommands ?? []).map(grokShellPermissionTitle),
-              ]),
-            ],
-            allowReadOnlyOperation: isGrokReadOnlyShellPermissionTitle,
-            workspaceWriteRoot: cwd,
-          },
-        }
-      : options.permissions;
-  const providerOptions: CreateProviderAdapterOptions = {
-    ...options,
-    ...(permissions !== undefined ? { permissions } : {}),
-  };
+  // ROUND 6 (Finding 1): the veto is installed for EVERY Grok session — every
+  // role, every mediation mode. It used to be attached only for
+  // `implementor` + `headless`, so a production INTERACTIVE session never got
+  // one and its decider could approve a divergent or absent payload. The type
+  // `VetoedMediation` requires the veto, and `buildGrokMediation` is its only
+  // producer, so a future construction path cannot omit it without failing to
+  // compile.
+  const permissions: VetoedMediation = buildGrokMediation({
+    ...(options.permissions !== undefined ? { permissions: options.permissions } : {}),
+    ...(role !== undefined ? { role } : {}),
+    cwd,
+    ...(options.allowedShellCommands !== undefined
+      ? { allowedShellCommands: options.allowedShellCommands }
+      : {}),
+  });
+  const providerOptions: CreateProviderAdapterOptions = { ...options, permissions };
 
   const isolationMode = options.grokHome?.mode ?? 'isolated';
   const authHome = options.grokHome?.realHome ?? processEnv['HOME'];

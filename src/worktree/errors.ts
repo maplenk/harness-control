@@ -35,25 +35,84 @@ export const WORKTREE_ERROR_KINDS = [
    * self-check, no verifier dispatch, no `merge_ready`.
    */
   'provisioning_failed',
+  /**
+   * MED-8 (`./git.ts`): after staging, `node_modules` paths REMAINED in the index
+   * and could not be unstaged, so a harness commit would have carried a
+   * provisioned dependency tree. Distinct from `git_command_failed` because no
+   * git command failed — the index simply refused to reach a safe state, which is
+   * an invariant violation the caller must not retry blindly.
+   */
+  'node_modules_still_staged',
 ] as const;
 
 export type WorktreeErrorKind = (typeof WORKTREE_ERROR_KINDS)[number];
+
+/**
+ * F9 — WHY provisioning refused, as a machine code rather than prose. Every one
+ * of these has a DIFFERENT operator remedy, and the old single generic CLI hint
+ * ("ensure node_modules is installed and git-ignored") sent the two most common
+ * cases in circles. The CLI maps each to its own `next:` line; `undefined`
+ * (the pre-F9 refusals that keep their prose) falls back to the generic hint.
+ */
+export const PROVISIONING_CAUSES = [
+  // ROUND 15: `deps_changed_in_worktree`, `primary_manifests_diverged` and
+  // `manifest_divergence_unclassified` were REMOVED with the refusals that raised
+  // them. A primary whose manifests are not this round's is not a usable clone
+  // source, so the round installs from its own manifests instead of refusing.
+  /** Fingerprints match, but a manifest-declared package has no directory in the
+   * primary's `node_modules` — the primary was never `npm install`ed since the
+   * manifests changed. Cloning it would propagate a stale tree (the false clone). */
+  'primary_tree_stale',
+  /** A staged package that declares a native build step could not be `require`d —
+   * the tree is present but UNBUILT. Raised BEFORE the marker write, so an
+   * unproven tree can never become sticky. */
+  'native_toolchain_unproven',
+  /** A cloned tree held an absolute / worktree-escaping symlink. Refused outright:
+   * `auto` and `clone` are both clone-or-fail; there is no install lane to fall to. */
+  'unsafe_clone_symlinks',
+  /** ROUND 15: the install lane RAN and failed (npm ci errored, or produced no
+   * node_modules). The lane itself is back — a script-less install is fine for a
+   * project with no native dependencies, and the artifact proof gates the rest. */
+  'install_failed',
+  /** Clone is the only lane and this host cannot copy-on-write clone. */
+  'clone_unsupported',
+  /** The clone itself failed (cross-volume stage, FS error). */
+  'clone_failed',
+  /** A provisioning command/probe exceeded its deadline; refused with the mutex
+   * and advisory lease released. */
+  'provisioning_timeout',
+  /** This assignment already holds the maximum number of QUARANTINED stages, each
+   * possibly still being written by a producer that outlived its deadline. Back
+   * pressure: refuse to start another rather than delete one of theirs. */
+  'quarantine_cap_reached',
+] as const;
+
+export type ProvisioningCause = (typeof PROVISIONING_CAUSES)[number];
 
 export interface WorktreeErrorOptions {
   readonly cause?: unknown;
   /** Extra machine-oriented detail (e.g. raw git stdout+stderr). */
   readonly detail?: string;
+  /** F9: the machine-readable provisioning cause (`provisioning_failed` only). */
+  readonly provisioningCause?: ProvisioningCause;
 }
 
 export class WorktreeError extends Error {
   override readonly name: string = 'WorktreeError';
   readonly kind: WorktreeErrorKind;
   readonly detail?: string;
+  /**
+   * F9: the machine-readable refusal cause for `provisioning_failed`. Named
+   * `provisioningCause` on the OPTIONS bag and exposed here as `cause` would
+   * collide with `Error.cause`, so it keeps the explicit name at both ends.
+   */
+  readonly provisioningCause?: ProvisioningCause;
 
   constructor(kind: WorktreeErrorKind, message: string, options: WorktreeErrorOptions = {}) {
     super(message, options.cause !== undefined ? { cause: options.cause } : {});
     this.kind = kind;
     if (options.detail !== undefined) this.detail = options.detail;
+    if (options.provisioningCause !== undefined) this.provisioningCause = options.provisioningCause;
   }
 }
 

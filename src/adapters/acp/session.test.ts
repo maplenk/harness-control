@@ -9,6 +9,7 @@
  * Integration-style: real child processes, real timers, generous bounds.
  */
 import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { noPayloadToVerify } from './session.js';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -174,11 +175,11 @@ describe('permission mediation decision core (§10.2, T20)', () => {
   });
 
   it('headless defaults to DENY; only the EXACT operation string is allowlisted', () => {
-    expect(decidePermission({ mode: 'headless' }, 'write file')).toEqual({
+    expect(decidePermission({ verifyOperationPayload: noPayloadToVerify, mode: 'headless' }, 'write file')).toEqual({
       action: 'deny',
       reason: 'denied_default',
     });
-    const policy = { mode: 'headless', policy: { allow: ['write file'] } } as const;
+    const policy = { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: ['write file'] } } as const;
     expect(decidePermission(policy, 'write file').action).toBe('allow');
     expect(decidePermission(policy, 'write file 2').action).toBe('deny');
     expect(decidePermission(policy, 'Write File').action).toBe('deny'); // exact match, case-sensitive
@@ -188,10 +189,116 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     });
   });
 
+  // -------------------------------------------------------------------------
+  // HIGH-5 (round 4) — the payload veto gates EVERY approval path.
+  //
+  // The exact-allowlist match ran BEFORE the raw-input classifier, so an
+  // allowlisted title was approved with a missing or hostile payload and the
+  // binding never ran at all. The verifier legitimately keeps exact
+  // per-criterion allowlisted commands, so this path has to be sound on its own
+  // — it cannot lean on the implementor's allowlist being empty.
+  // -------------------------------------------------------------------------
+  describe('verifyOperationPayload — the veto applies to every allow', () => {
+    const shellTitle = 'Execute `npm run typecheck`';
+    /** Byte-identity between the title's command and the payload's. */
+    const verifyOperationPayload = (operation: string | undefined, rawInput: unknown): boolean => {
+      const command = (rawInput as { command?: unknown } | null | undefined)?.command;
+      const match = operation !== undefined ? /^Execute `(.+)`$/.exec(operation) : null;
+      // Fail closed on ambiguity: an unreadable title is non-shell ONLY when the
+      // payload also carries no command (mirrors grokShellPayloadMatchesTitle).
+      if (match === null) return typeof command !== 'string'
+      return typeof command === 'string' && command === match[1];
+    };
+
+    it('VETOES an ALLOWLISTED title whose payload is missing or hostile', () => {
+      const policy = { mode: 'headless', policy: { allow: [shellTitle] }, verifyOperationPayload } as const;
+      // The regression: allowlisted + no payload used to be `allow/allowlisted`.
+      expect(decidePermission(policy, shellTitle, undefined)).toEqual({
+        action: 'deny',
+        reason: 'denied_raw_input_mismatch',
+      });
+      expect(decidePermission(policy, shellTitle, { command: 'rm -rf /' })).toEqual({
+        action: 'deny',
+        reason: 'denied_raw_input_mismatch',
+      });
+      // ...and the honest call still passes.
+      expect(decidePermission(policy, shellTitle, { command: 'npm run typecheck' })).toEqual({
+        action: 'allow',
+        reason: 'allowlisted',
+      });
+    });
+
+    it('VETOES a READ-ONLY-classified title whose payload diverges', () => {
+      const policy = {
+        mode: 'headless',
+        policy: { allow: [], allowReadOnlyOperation: () => true },
+        verifyOperationPayload,
+      } as const;
+      expect(decidePermission(policy, 'Execute `ls`', { command: 'rm -rf /' })).toEqual({
+        action: 'deny',
+        reason: 'denied_raw_input_mismatch',
+      });
+      expect(decidePermission(policy, 'Execute `ls`', { command: 'ls' })).toEqual({
+        action: 'allow',
+        reason: 'allowlisted_read_only_operation',
+      });
+    });
+
+    it('VETOES a WORKSPACE-WRITE approval too (no approval path is exempt)', () => {
+      const policy = {
+        mode: 'headless',
+        role: 'implementor',
+        policy: { allow: [], workspaceWriteRoot: '/repo' },
+        verifyOperationPayload: () => false,
+      } as const;
+      expect(decidePermission(policy, 'Write `/repo/src/a.ts`', undefined).action).toBe('deny');
+    });
+
+    it('a THROWING veto is a denial, never a pass', () => {
+      const policy = {
+        mode: 'headless',
+        policy: { allow: [shellTitle] },
+        verifyOperationPayload: (): boolean => {
+          throw new Error('classifier exploded');
+        },
+      } as const;
+      expect(decidePermission(policy, shellTitle, { command: 'npm run typecheck' })).toEqual({
+        action: 'deny',
+        reason: 'denied_raw_input_mismatch',
+      });
+    });
+
+    it('runs BEFORE the interactive branch — no mediation mode can bypass it', () => {
+      // Round-4 evaluated the veto only after `mode === 'interactive'` returned,
+      // so an interactive decider (or a configured handler) could forward a
+      // `selected` option for a payload that was never bound to its title.
+      const policy = { verifyOperationPayload: noPayloadToVerify, mode: 'interactive', onRequest: async () => ({ kind: 'cancelled' as const }) };
+      expect(
+        decidePermission({ ...policy, verifyOperationPayload } as never, shellTitle, {
+          command: 'rm -rf /',
+        }),
+      ).toEqual({ action: 'deny', reason: 'denied_raw_input_mismatch' });
+      // An honest interactive request still reaches the human.
+      expect(
+        decidePermission({ ...policy, verifyOperationPayload } as never, shellTitle, {
+          command: 'npm run typecheck',
+        }),
+      ).toEqual({ action: 'interactive', reason: 'interactive' });
+    });
+
+    it('no veto configured leaves every existing decision untouched', () => {
+      const policy = { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: [shellTitle] } } as const;
+      expect(decidePermission(policy, shellTitle, undefined)).toEqual({
+        action: 'allow',
+        reason: 'allowlisted',
+      });
+    });
+  });
+
   it('admits only trusted read-only classifier matches and fails closed when it throws', () => {
     const allowReadOnlyOperation = (operation: string): boolean => operation === 'safe inspection';
     const policy = {
-      mode: 'headless',
+      verifyOperationPayload: noPayloadToVerify, mode: 'headless',
       policy: { allow: [], allowReadOnlyOperation },
     } as const;
     expect(decidePermission(policy, 'safe inspection')).toEqual({
@@ -205,7 +312,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     expect(
       decidePermission(
         {
-          mode: 'headless',
+          verifyOperationPayload: noPayloadToVerify, mode: 'headless',
           policy: {
             allow: [],
             allowReadOnlyOperation: () => {
@@ -221,31 +328,31 @@ describe('permission mediation decision core (§10.2, T20)', () => {
   it('coordinator/verifier WRITE requests are always denied — in every mode, over any allowlist', () => {
     expect(
       decidePermission(
-        { mode: 'headless', role: 'verifier', policy: { allow: ['write file'] } },
+        { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier', policy: { allow: ['write file'] } },
         'write file',
       ),
     ).toEqual({ action: 'deny', reason: 'denied_role_write' });
     expect(
       decidePermission(
-        { mode: 'interactive', role: 'coordinator', handler: async () => ({ kind: 'cancelled' }) },
+        { verifyOperationPayload: noPayloadToVerify, mode: 'interactive', role: 'coordinator', handler: async () => ({ kind: 'cancelled' }) },
         'write file',
       ),
     ).toEqual({ action: 'deny', reason: 'denied_role_write' });
     // Read-only operations are NOT vetoed for those roles.
     expect(
       decidePermission(
-        { mode: 'headless', role: 'verifier', policy: { allow: ['read config'] } },
+        { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier', policy: { allow: ['read config'] } },
         'read config',
       ).action,
     ).toBe('allow');
     // Implementor writes follow the normal policy.
     expect(
       decidePermission(
-        { mode: 'headless', role: 'implementor', policy: { allow: ['write file'] } },
+        { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor', policy: { allow: ['write file'] } },
         'write file',
       ).action,
     ).toBe('allow');
-    expect(decidePermission({ mode: 'interactive' }, 'write file').action).toBe('interactive');
+    expect(decidePermission({ verifyOperationPayload: noPayloadToVerify, mode: 'interactive' }, 'write file').action).toBe('interactive');
   });
 
   it('allows only path-qualified structured writes inside an implementor worktree', async () => {
@@ -261,7 +368,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     const outsideTitle = `Write \`${path.join(outside, 'new-file.txt')}\``;
     const symlinkTitle = `Edit \`${path.join(root, 'escape', 'new-file.txt')}\``;
     const policy = {
-      mode: 'headless',
+      verifyOperationPayload: noPayloadToVerify, mode: 'headless',
       role: 'implementor',
       policy: { allow: [], workspaceWriteRoot: root },
     } as const;
@@ -343,7 +450,7 @@ describe('PLAN §19 test 6 — permission mediation on the wire', () => {
           turns: [{ permission: { toolTitle: 'write file' }, response: { stopReason: 'end_turn' } }],
         },
         {
-          permissions: { mode: 'headless', role: 'implementor', policy: { allow: ['write file'] } },
+          permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor', policy: { allow: ['write file'] } },
         },
       );
       await adapter.initialize();
@@ -373,7 +480,7 @@ describe('PLAN §19 test 6 — permission mediation on the wire', () => {
             },
           ],
         },
-        { permissions: { mode: 'headless', policy: { allow: ['some other op'] } } },
+        { permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: ['some other op'] } } },
       );
       await adapter.initialize();
       const session = await adapter.createSession({ cwd: tmpdir() });
@@ -397,7 +504,7 @@ describe('PLAN §19 test 6 — permission mediation on the wire', () => {
           turns: [{ permission: { toolTitle: 'write file' }, response: { stopReason: 'end_turn' } }],
         },
         {
-          permissions: { mode: 'headless', role: 'verifier', policy: { allow: ['write file'] } },
+          permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier', policy: { allow: ['write file'] } },
         },
       );
       await adapter.initialize();
@@ -421,7 +528,7 @@ describe('PLAN §19 test 6 — permission mediation on the wire', () => {
         },
         {
           permissions: {
-            mode: 'interactive',
+            verifyOperationPayload: noPayloadToVerify, mode: 'interactive',
             role: 'implementor',
             handler: async (request) => {
               seen.push(request);
@@ -509,7 +616,7 @@ describe('PLAN §19 test 7 — cancellation across turn phases', () => {
           cancel: { behavior: 'acknowledge' },
           turns: [{ permission: { toolTitle: 'write file' }, response: { stopReason: 'end_turn' } }],
         },
-        { permissions: { mode: 'interactive' } }, // no handler → waits for resolvePermission
+        { permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'interactive' } }, // no handler → waits for resolvePermission
       );
       await adapter.initialize();
       const session = await adapter.createSession({ cwd: tmpdir() });
@@ -983,7 +1090,7 @@ describe('P2 live-gate regression P-1 — per-role session-mode pinning at sessi
       const adapter = await makeAdapter(
         {},
         {
-          permissions: { mode: 'headless', role: 'implementor' },
+          permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
           sessionMode: CLAUDE_STYLE,
         },
       );
@@ -1009,7 +1116,7 @@ describe('P2 live-gate regression P-1 — per-role session-mode pinning at sessi
       const adapter = await makeAdapter(
         {},
         {
-          permissions: { mode: 'headless', role: 'verifier' },
+          permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
           sessionMode: CODEX_STYLE,
         },
       );
@@ -1038,7 +1145,7 @@ describe('P2 live-gate regression P-1 — per-role session-mode pinning at sessi
       const adapter = await makeAdapter(
         {},
         {
-          permissions: { mode: 'headless', role: 'implementor' },
+          permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
           sessionMode: {
             byRole: {},
             defaultPin: { mechanism: 'session_set_mode', value: 'not-a-real-mode' },

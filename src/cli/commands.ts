@@ -75,13 +75,13 @@ import {
   type EvidenceRecorder,
   type FixRequest,
 } from '../app/flows/verifier.js';
-import type { VerificationRunner } from '../app/flows/implementor.js';
+import type { ProvisioningFailure, VerificationRunner } from '../app/flows/implementor.js';
 import { collectIncidentProbeState, latestIncidentEvent } from '../scheduler/limit-schedule.js';
 import { redactText } from '../redaction/index.js';
 import { parseRoleProfile } from './profile.js';
 import { isErr, ok, type Result } from '../lib/result.js';
 import { DEFAULT_ENGINE_CONFIG } from '../config/loader.js';
-import type { GitWorktreeManager } from '../worktree/index.js';
+import type { GitWorktreeManager, ProvisioningCause } from '../worktree/index.js';
 import type { RunCommand } from './args.js';
 
 export interface CommandOutput {
@@ -1100,17 +1100,7 @@ function loopResultOutput(
     },
     ...(mr !== undefined ? { mergeReadiness: mergeReadinessView(mr) } : {}),
     ...(result.provisioningFailure !== undefined
-      ? {
-          provisioningFailure: {
-            repoRoot: result.provisioningFailure.repoRoot,
-            worktreePath: result.provisioningFailure.worktreePath,
-            detail: result.provisioningFailure.detail,
-            ...(result.provisioningFailure.round !== undefined ? { round: result.provisioningFailure.round } : {}),
-            ...(result.provisioningFailure.implementationCommit !== undefined
-              ? { implementationCommit: String(result.provisioningFailure.implementationCommit) }
-              : {}),
-          },
-        }
+      ? { provisioningFailure: provisioningFailureView(result.provisioningFailure) }
       : {}),
   };
   const lines = [
@@ -1144,8 +1134,9 @@ function loopResultOutput(
       `    repo:     ${pf.repoRoot}`,
       `    worktree: ${pf.worktreePath}`,
       ...(pf.implementationCommit !== undefined ? [`    commit:   ${String(pf.implementationCommit)}`] : []),
+      ...(pf.cause !== undefined ? [`    cause:    ${pf.cause}`] : []),
       `    detail:   ${pf.detail}`,
-      `  next: ensure the primary checkout's node_modules is installed and node_modules is git-ignored, then re-run.`,
+      `  next: ${provisioningNextHint(pf.cause)}`,
     );
   }
   const exitCode =
@@ -1155,6 +1146,80 @@ function loopResultOutput(
         ? EXIT_INTEGRATION_BLOCKED
         : 1;
   return finish(kind, body, lines.join('\n'), exitCode);
+}
+
+/**
+ * F9 — the operator's NEXT STEP, chosen by the refusal's cause code. The pre-F9
+ * text was a single generic line ("ensure the primary checkout's node_modules is
+ * installed and node_modules is git-ignored"), which is actively misleading for
+ * the two commonest causes: it tells someone whose IMPLEMENTOR added a dependency
+ * to reinstall the primary (which cannot help), and says nothing at all about a
+ * present-but-unbuilt native toolchain. Unknown/absent causes (the pre-F9
+ * refusals, which keep their prose detail) fall back to the generic hint.
+ */
+function provisioningNextHint(cause: ProvisioningCause | undefined): string {
+  switch (cause) {
+    case 'primary_tree_stale':
+      return 'run `npm install` in the primary checkout (its node_modules does not match its own manifests), then re-run.';
+    case 'native_toolchain_unproven':
+      return (
+        'a dependency with a native build step is present but was never built. Run `npm install` (NOT ' +
+        '`--ignore-scripts`) in the primary checkout so its lifecycle scripts compile the bindings, verify with ' +
+        '`node -e "require(\'<package>\')"`, then re-run.'
+      );
+    case 'unsafe_clone_symlinks':
+      return (
+        "the primary checkout's node_modules contains absolute or escaping symlinks; remove and reinstall it " +
+        '(`rm -rf node_modules && npm install`), then re-run.'
+      );
+    case 'install_failed':
+      return (
+        'the dependency install for this round failed — check the npm output above, that the committed manifests ' +
+        'are installable, and that the host can reach the registry, then re-run.'
+      );
+    case 'clone_unsupported':
+      return (
+        'this host cannot copy-on-write clone (no APFS `cp -c`), and there is no install lane. Set ' +
+        "worktree.provision='none' and provision each worktree's node_modules yourself."
+      );
+    case 'clone_failed':
+      return (
+        'the clone itself failed — check free space and that the worktree base dir is on the SAME filesystem as ' +
+        'the primary checkout, then re-run.'
+      );
+    case 'provisioning_timeout':
+      return 'a provisioning command exceeded its deadline; check for a stalled npm/git process, then re-run.';
+    case 'quarantine_cap_reached':
+      return (
+        'repeated provisioning timeouts have left this assignment at its quarantined-stage cap, and those stages are ' +
+        'not deleted while a stalled command may still be writing into them. Kill any stalled npm/git/cp process for ' +
+        'this assignment, then re-run; the stages are released automatically 24h after quarantine.'
+      );
+    default:
+      return "ensure the primary checkout's node_modules is installed and node_modules is git-ignored, then re-run.";
+  }
+}
+
+/**
+ * The STABLE JSON projection of a provisioning failure. Sibling of
+ * `mergeReadinessView`, extracted so the payload is asserted directly.
+ *
+ * ROUND 6 (Finding 4): `cause` is part of it. The closed cause vocabulary exists
+ * for MACHINE consumption — omitting it here forced JSON consumers (the future
+ * UI included) to parse the human prose in `detail` to recover what the text
+ * renderer already had.
+ */
+export function provisioningFailureView(pf: ProvisioningFailure): Record<string, unknown> {
+  return {
+    repoRoot: pf.repoRoot,
+    worktreePath: pf.worktreePath,
+    ...(pf.cause !== undefined ? { cause: pf.cause } : {}),
+    detail: pf.detail,
+    ...(pf.round !== undefined ? { round: pf.round } : {}),
+    ...(pf.implementationCommit !== undefined
+      ? { implementationCommit: String(pf.implementationCommit) }
+      : {}),
+  };
 }
 
 function mergeReadinessView(mr: MergeReadiness): Record<string, unknown> {

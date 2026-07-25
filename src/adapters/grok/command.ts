@@ -109,7 +109,23 @@ const SAFE_GIT_READ_SUBCOMMANDS = new Set([
 
 interface ShellToken {
   readonly value: string;
+  /** The token contained AT LEAST ONE quoted span. Never sufficient on its own —
+   * see `unquotedRedirect` (BLOCKER-1). */
   readonly quoted: boolean;
+  /**
+   * BLOCKER-1: the token contains a `>` or `<` that appeared OUTSIDE quotes,
+   * i.e. a real shell redirection OPERATOR. Tracked per CHARACTER because a
+   * token can mix quoted and unquoted spans with no whitespace between them
+   * (`echo '$HOME'>owned.txt` is ONE token), and a single whole-token `quoted`
+   * flag let such a token inherit blanket-quoted status — which
+   * `stripSafeRedirections` read as "no redirection here", classifying a real
+   * WRITE as read-only.
+   *
+   * This mirrors the shell's own rule exactly: token recognition happens BEFORE
+   * quote removal, so an operator is one that appears outside quotes. A `>` the
+   * user quoted is an ordinary argument byte and stays admissible.
+   */
+  readonly unquotedRedirect: boolean;
 }
 
 function splitShellSegments(command: string): readonly string[] | undefined {
@@ -127,11 +143,26 @@ function splitShellSegments(command: string): readonly string[] | undefined {
   for (let index = 0; index < command.length; index += 1) {
     const char = command[index];
     if (char === undefined) return undefined;
-    if (char === '\0' || char === '\n' || char === '\r' || char === '`' || char === '$' || char === '\\') {
-      return undefined;
+    // Control bytes are unacceptable in EVERY context — quoting cannot make a
+    // NUL or an embedded newline a legitimate literal.
+    if (char === '\0' || char === '\n' || char === '\r') return undefined;
+    // F11: quote state FIRST. A POSIX SINGLE-quoted span is expansion-free — the
+    // shell performs no parameter/command substitution and no escape processing
+    // inside it — so `$`, `\` and a backtick there are ordinary argument bytes,
+    // and so are `;`/`|`/`&`/`(`/`<`. Treating the span as an opaque literal is
+    // therefore exactly as safe as the old blanket rejection, and it is what
+    // makes a quoted regex (`rg -n 'a\.b|c$'`) classifiable at all. The scan
+    // still ends the span only at the closing quote, so nothing inside it can
+    // introduce a second, unclassified command.
+    if (quote === "'") {
+      if (char === "'") quote = undefined;
+      continue;
     }
-    if (quote !== undefined) {
-      if (char === quote) quote = undefined;
+    // OUTSIDE single quotes — including INSIDE double quotes, where the shell
+    // DOES expand — the conservative rejection is unchanged.
+    if (char === '`' || char === '$' || char === '\\') return undefined;
+    if (quote === '"') {
+      if (char === '"') quote = undefined;
       continue;
     }
     if (char === "'" || char === '"') {
@@ -168,23 +199,38 @@ function tokenizeShellSegment(segment: string): readonly ShellToken[] | undefine
   let quote: "'" | '"' | undefined;
   let value = '';
   let quoted = false;
+  // BLOCKER-1: per-CHARACTER provenance. Set only by a `>`/`<` seen while NOT
+  // inside quotes, so a token that mixes spans (`'$HOME'>owned.txt`) can never
+  // launder its operator through the whole-token `quoted` flag.
+  let unquotedRedirect = false;
   const push = (): void => {
     if (value.length === 0 && !quoted) return;
-    tokens.push({ value, quoted });
+    tokens.push({ value, quoted, unquotedRedirect });
     value = '';
     quoted = false;
+    unquotedRedirect = false;
   };
 
   for (const char of segment) {
-    if (char === '\0' || char === '\n' || char === '\r' || char === '`' || char === '$' || char === '\\') {
-      return undefined;
+    // Same ordering as `splitShellSegments` (F11), for the same reason: control
+    // bytes are always fatal, a SINGLE-quoted span is an opaque literal, and
+    // everywhere else (including inside double quotes) expansion characters are
+    // still refused. The literal bytes land in the token VALUE, so the
+    // downstream checks — `stripSafeRedirections` (which only treats an
+    // UNQUOTED `>`/`<` as a redirection) and `hasEscapingPathArgument` (which
+    // inspects the resolved value, so `cat '/etc/passwd'` is still caught) —
+    // see exactly what the shell will pass to the program.
+    if (char === '\0' || char === '\n' || char === '\r') return undefined;
+    if (quote === "'") {
+      if (char === "'") quote = undefined;
+      else value += char;
+      quoted = true;
+      continue;
     }
-    if (quote !== undefined) {
-      if (char === quote) {
-        quote = undefined;
-      } else {
-        value += char;
-      }
+    if (char === '`' || char === '$' || char === '\\') return undefined;
+    if (quote === '"') {
+      if (char === '"') quote = undefined;
+      else value += char;
       quoted = true;
       continue;
     }
@@ -197,6 +243,9 @@ function tokenizeShellSegment(segment: string): readonly ShellToken[] | undefine
       push();
       continue;
     }
+    // Unquoted (we are past every in-quote branch above): a redirection
+    // character here is a real OPERATOR, whatever else the token contains.
+    if (char === '>' || char === '<') unquotedRedirect = true;
     value += char;
   }
   if (quote !== undefined) return undefined;
@@ -204,11 +253,27 @@ function tokenizeShellSegment(segment: string): readonly ShellToken[] | undefine
   return tokens.length > 0 ? tokens : undefined;
 }
 
+/**
+ * Drop the STANDALONE safe null redirections and refuse every other redirection.
+ *
+ * BLOCKER-1: the decision is driven by `token.unquotedRedirect` — per-character
+ * provenance — not by the whole-token `quoted` flag. A token is dropped as a
+ * safe null redirection only when it is STRUCTURALLY standalone: entirely
+ * unquoted AND exactly one of the allowlisted forms. `echo x'2>/dev/nul'l` is a
+ * mixed token that merely resembles one, and is refused. A `>`/`<` that appeared
+ * INSIDE quotes never sets the flag, so `rg -n '>' src` keeps passing it through
+ * as the ordinary argument the shell will pass to the program.
+ */
 function stripSafeRedirections(tokens: readonly ShellToken[]): readonly string[] | undefined {
   const argv: string[] = [];
   for (const token of tokens) {
-    if (!token.quoted && SAFE_NULL_REDIRECTIONS.has(token.value)) continue;
-    if (!token.quoted && (token.value.includes('>') || token.value.includes('<'))) return undefined;
+    // Q26: only a token that CARRIES a redirection operator is a candidate for
+    // being dropped. A hypothetical redirection-free allowlist entry must reach
+    // `argv` as the ordinary argument it is, never be silently stripped.
+    if (token.unquotedRedirect) {
+      if (!token.quoted && SAFE_NULL_REDIRECTIONS.has(token.value)) continue;
+      return undefined;
+    }
     argv.push(token.value);
   }
   return argv.length > 0 ? argv : undefined;
@@ -258,6 +323,35 @@ function isSafeReadOnlyArgv(argv: readonly string[]): boolean {
   return argv[0] !== undefined && SAFE_SIMPLE_READ_COMMANDS.has(argv[0]);
 }
 
+const PERMISSION_TITLE_PREFIX = 'Execute `';
+const PERMISSION_TITLE_SUFFIX = '`';
+
+/**
+ * MED-9 — recover the command from an `Execute \`…\`` title STRUCTURALLY, by
+ * stripping the fixed prefix and suffix, rather than with a capture that forbade
+ * backticks in the interior (`/^Execute \`([^\`\r\n]+)\`$/`).
+ *
+ * That capture made a literal backtick unclassifiable ANYWHERE, including inside
+ * single quotes where the shell treats it as an ordinary byte — so `ls 'x\`y'`
+ * could never be approved no matter how obviously read-only it is. Judging
+ * interior bytes is the quote-aware scanners' job, not the wrapper's: they still
+ * reject an unquoted backtick (command substitution) and every control byte.
+ *
+ * The prefix/suffix are exact and the interior must be non-empty, so the title
+ * shape is as strictly bounded as before.
+ */
+function commandFromPermissionTitle(operation: string): string | undefined {
+  const trimmed = operation.trim();
+  if (!trimmed.startsWith(PERMISSION_TITLE_PREFIX) || !trimmed.endsWith(PERMISSION_TITLE_SUFFIX)) {
+    return undefined;
+  }
+  const command = trimmed.slice(PERMISSION_TITLE_PREFIX.length, trimmed.length - PERMISSION_TITLE_SUFFIX.length);
+  // CR/LF never belong in a single-line title; the scanners reject them anyway,
+  // but keeping the check here preserves the old wrapper's guarantee exactly.
+  if (command.length === 0 || command.includes('\r') || command.includes('\n')) return undefined;
+  return command;
+}
+
 /**
  * Recognizes only shell compositions whose every segment is a conservative
  * read-only repository inspection. This intentionally rejects shell
@@ -266,9 +360,7 @@ function isSafeReadOnlyArgv(argv: readonly string[]): boolean {
  * forms, network clients, and all unknown commands.
  */
 export function isGrokReadOnlyShellPermissionTitle(operation: string): boolean {
-  const match = /^Execute `([^`\r\n]+)`$/.exec(operation.trim());
-  if (match === null) return false;
-  const command = match[1];
+  const command = commandFromPermissionTitle(operation);
   if (command === undefined) return false;
   const segments = splitShellSegments(command);
   if (segments === undefined) return false;
@@ -279,6 +371,141 @@ export function isGrokReadOnlyShellPermissionTitle(operation: string): boolean {
     return argv !== undefined && isSafeReadOnlyArgv(argv);
   });
 }
+
+/**
+ * HIGH-5 — the command a Grok shell tool call will ACTUALLY execute, recovered
+ * from its ACP `rawInput`. Returns `undefined` for anything that is not an
+ * object carrying a string `command`, so a missing or malformed payload can only
+ * ever produce a DENIAL, never an approval.
+ */
+export function grokRawShellCommand(rawInput: unknown): string | undefined {
+  const field = readPayloadField(rawInput, 'command');
+  return field.kind === 'string' ? field.value : undefined;
+}
+
+/**
+ * ROUND 7 (Finding 4) — reading ONE payload field, distinguishing the three
+ * outcomes that matter: the field is a usable string, the field is ABSENT, or
+ * the field is PRESENT BUT MALFORMED.
+ *
+ * Collapsing the last two into `undefined` is the same logical error corrected
+ * twice already at other layers: absence can be evidence about an operation's
+ * kind, but a value we could not read never is. `{command: 42}` said something
+ * about this call and we failed to understand it; treating that as "there is no
+ * command here" is exactly the inference a fail-closed gate must not make.
+ */
+type PayloadField =
+  | { readonly kind: 'string'; readonly value: string }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'malformed' };
+
+function readPayloadField(rawInput: unknown, name: string): PayloadField {
+  if (rawInput === undefined || rawInput === null) return { kind: 'absent' };
+  if (typeof rawInput !== 'object' || Array.isArray(rawInput)) return { kind: 'malformed' };
+  const record = rawInput as Record<string, unknown>;
+  if (!(name in record) || record[name] === undefined) return { kind: 'absent' };
+  const value = record[name];
+  return typeof value === 'string' ? { kind: 'string', value } : { kind: 'malformed' };
+}
+
+/**
+ * HIGH-5 — the payload VETO the permission policy wires as
+ * `verifyOperationPayload`. It is consulted before EVERY approval the mediator
+ * can grant, which is the whole point: binding the title to the payload INSIDE
+ * the read-only classifier left the exact-allowlist path (checked first)
+ * approving `Execute \`npm run typecheck\`` with a missing or hostile payload.
+ *
+ * A permission TITLE is human-readable prose the provider composes; ACP
+ * `rawInput` is the payload it EXECUTES. A provider — or anything able to shape
+ * a tool call — could present `Execute \`ls\`` while `rawInput.command` is
+ * `rm -rf /`. For a SHELL title the two must be BYTE-IDENTICAL.
+ *
+ * Returns true for a NON-shell operation (a structured `Write`/`Edit` title):
+ * there is no shell payload to bind, and the workspace-write rule adjudicates
+ * those on the path itself. Fail-closed for shell titles on every gap: absent
+ * `rawInput`, a non-object, a missing/non-string `command`, or any divergence.
+ */
+export function grokShellPayloadMatchesTitle(operation: string | undefined, rawInput: unknown): boolean {
+  const classified = classifyGrokOperation(operation, rawInput);
+  switch (classified.kind) {
+    case 'shell':
+      // The command the provider will EXECUTE must be byte-identical to the one
+      // the title displays.
+      return classified.executed !== undefined && classified.executed === classified.titled;
+    case 'structured_file':
+      // Positively a structured file operation with no shell payload at all —
+      // there is nothing to bind, and the workspace-write rule adjudicates it on
+      // the PATH.
+      return true;
+    case 'unknown':
+      // ROUND 6 — inability to understand something is never evidence of its
+      // safety. Previously "non-shell" was CONCLUDED from two failed parses, so
+      // an exactly-allowlisted but malformed title like `Execute ls` with no
+      // rawInput was vacuously approvable. Anything not POSITIVELY recognised as
+      // non-shell must carry a bound command, and by definition an unrecognised
+      // operation has no title command to bind against — so it is refused.
+      return false;
+  }
+}
+
+/** Positively-recognised operation shapes; everything else is `unknown`. */
+type GrokOperationClass =
+  | { readonly kind: 'shell'; readonly titled: string; readonly executed: string | undefined }
+  | { readonly kind: 'structured_file' }
+  | { readonly kind: 'unknown' };
+
+/**
+ * ROUND 6 — determine the operation KIND AFFIRMATIVELY, from the title shape AND
+ * the payload shape together, rather than inferring "not a shell request" from a
+ * parse that failed.
+ *
+ * The distinction matters because this is a fail-closed gate: a title we cannot
+ * parse is not evidence of anything, so it can only ever be `unknown`. A
+ * structured file operation is recognised POSITIVELY — a `Write`/`Edit` title
+ * with a readable path AND a payload carrying no `command` — which is why a
+ * `Write` title smuggling `{command: …}` falls through to `unknown` instead of
+ * being waved past as "not shell".
+ *
+ * `Write`/`Edit` matching mirrors `isWorkspaceWriteOperation`'s own shape, so the
+ * two rules cannot disagree about what a structured file operation looks like.
+ */
+function classifyGrokOperation(operation: string | undefined, rawInput: unknown): GrokOperationClass {
+  if (operation === undefined) return { kind: 'unknown' };
+  const command = readPayloadField(rawInput, 'command');
+  const titled = commandFromPermissionTitle(operation);
+  if (titled !== undefined) {
+    return { kind: 'shell', titled, executed: command.kind === 'string' ? command.value : undefined };
+  }
+
+  // ROUND 7 (Finding 4): a structured file operation is recognised only when the
+  // payload is POSITIVELY free of a command. A MALFORMED command
+  // (`{command: 42}`) is not an absent one — we failed to read something that
+  // was there — so it can only be `unknown`.
+  if (command.kind !== 'absent') return { kind: 'unknown' };
+  const titledPath = STRUCTURED_FILE_TITLE_RE.exec(operation.trim())?.[1];
+  if (titledPath === undefined) return { kind: 'unknown' };
+
+  // ...and BIND the path the title asserts. Without this the veto never compared
+  // `rawInput.path` to the title's, so `Write \`<inside-worktree>\`` carrying
+  // `{path: "<outside>"}` passed both the veto and the title-based
+  // workspace-containment check — which inspects the TITLE — making that
+  // containment check decorative. Every field the title asserts must be bound,
+  // not just the command.
+  const payloadPath = readPayloadField(rawInput, 'path');
+  switch (payloadPath.kind) {
+    case 'absent':
+      // Nothing asserted twice; the workspace rule adjudicates the title's path.
+      return { kind: 'structured_file' };
+    case 'string':
+      return payloadPath.value === titledPath ? { kind: 'structured_file' } : { kind: 'unknown' };
+    case 'malformed':
+      return { kind: 'unknown' };
+  }
+}
+
+/** Mirrors `isWorkspaceWriteOperation`'s title shape (see `acp/session.ts`),
+ * capturing the asserted path so the payload can be bound to it. */
+const STRUCTURED_FILE_TITLE_RE = /^(?:Write|Edit) `([^`\r\n]+)`$/;
 
 export interface ResolvedGrokCommand {
   readonly command: string;

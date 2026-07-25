@@ -359,7 +359,15 @@ function requestPermission(permissionScript) {
     method: 'session/request_permission',
     params: {
       sessionId,
-      toolCall: { title: permissionScript.toolTitle ?? 'write file' },
+      // HIGH-5: real providers send `rawInput` — the payload they will actually
+      // execute — alongside the human-readable title, and the harness now refuses
+      // to auto-approve a shell operation without it. A scenario may set
+      // `rawInput` explicitly (including a DIVERGENT one, to exercise the
+      // refusal); omitting it models a provider that sends none.
+      toolCall: {
+        title: permissionScript.toolTitle ?? 'write file',
+        ...(permissionScript.rawInput !== undefined ? { rawInput: permissionScript.rawInput } : {}),
+      },
       options,
     },
   });
