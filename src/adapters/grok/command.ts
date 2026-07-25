@@ -326,6 +326,35 @@ function isSafeReadOnlyArgv(argv: readonly string[]): boolean {
   return argv[0] !== undefined && SAFE_SIMPLE_READ_COMMANDS.has(argv[0]);
 }
 
+const PERMISSION_TITLE_PREFIX = 'Execute `';
+const PERMISSION_TITLE_SUFFIX = '`';
+
+/**
+ * MED-9 — recover the command from an `Execute \`…\`` title STRUCTURALLY, by
+ * stripping the fixed prefix and suffix, rather than with a capture that forbade
+ * backticks in the interior (`/^Execute \`([^\`\r\n]+)\`$/`).
+ *
+ * That capture made a literal backtick unclassifiable ANYWHERE, including inside
+ * single quotes where the shell treats it as an ordinary byte — so `ls 'x\`y'`
+ * could never be approved no matter how obviously read-only it is. Judging
+ * interior bytes is the quote-aware scanners' job, not the wrapper's: they still
+ * reject an unquoted backtick (command substitution) and every control byte.
+ *
+ * The prefix/suffix are exact and the interior must be non-empty, so the title
+ * shape is as strictly bounded as before.
+ */
+function commandFromPermissionTitle(operation: string): string | undefined {
+  const trimmed = operation.trim();
+  if (!trimmed.startsWith(PERMISSION_TITLE_PREFIX) || !trimmed.endsWith(PERMISSION_TITLE_SUFFIX)) {
+    return undefined;
+  }
+  const command = trimmed.slice(PERMISSION_TITLE_PREFIX.length, trimmed.length - PERMISSION_TITLE_SUFFIX.length);
+  // CR/LF never belong in a single-line title; the scanners reject them anyway,
+  // but keeping the check here preserves the old wrapper's guarantee exactly.
+  if (command.length === 0 || command.includes('\r') || command.includes('\n')) return undefined;
+  return command;
+}
+
 /**
  * Recognizes only shell compositions whose every segment is a conservative
  * read-only repository inspection. This intentionally rejects shell
@@ -334,9 +363,7 @@ function isSafeReadOnlyArgv(argv: readonly string[]): boolean {
  * forms, network clients, and all unknown commands.
  */
 export function isGrokReadOnlyShellPermissionTitle(operation: string): boolean {
-  const match = /^Execute `([^`\r\n]+)`$/.exec(operation.trim());
-  if (match === null) return false;
-  const command = match[1];
+  const command = commandFromPermissionTitle(operation);
   if (command === undefined) return false;
   const segments = splitShellSegments(command);
   if (segments === undefined) return false;
@@ -346,6 +373,40 @@ export function isGrokReadOnlyShellPermissionTitle(operation: string): boolean {
     const argv = stripSafeRedirections(tokens);
     return argv !== undefined && isSafeReadOnlyArgv(argv);
   });
+}
+
+/**
+ * HIGH-5 — the command a Grok shell tool call will ACTUALLY execute, recovered
+ * from its ACP `rawInput`. Returns `undefined` for anything that is not an
+ * object carrying a string `command`, so a missing or malformed payload can only
+ * ever produce a DENIAL, never an approval.
+ */
+export function grokRawShellCommand(rawInput: unknown): string | undefined {
+  if (rawInput === null || typeof rawInput !== 'object' || Array.isArray(rawInput)) return undefined;
+  const command = (rawInput as Record<string, unknown>)['command'];
+  return typeof command === 'string' ? command : undefined;
+}
+
+/**
+ * HIGH-5 — the AUTHORIZATION entry point the permission policy wires (as opposed
+ * to `isGrokReadOnlyShellPermissionTitle`, which is the pure classifier).
+ *
+ * A permission TITLE is human-readable prose the provider composes; ACP
+ * `rawInput` is the payload it EXECUTES. Classifying only the title authorizes a
+ * string that nothing runs — a provider (or anything able to shape a tool call)
+ * could present `Execute \`ls\`` while `rawInput.command` is `rm -rf /`. So the
+ * command recovered from `rawInput` must be BYTE-IDENTICAL to the one embedded
+ * in the title, and only then is it classified.
+ *
+ * Fail-closed on every gap: absent `rawInput`, a non-object, a missing/non-string
+ * `command`, or any divergence from the title → false.
+ */
+export function isGrokReadOnlyShellToolCall(operation: string, rawInput: unknown): boolean {
+  const titled = commandFromPermissionTitle(operation);
+  if (titled === undefined) return false;
+  const executed = grokRawShellCommand(rawInput);
+  if (executed === undefined || executed !== titled) return false;
+  return isGrokReadOnlyShellPermissionTitle(operation);
 }
 
 export interface ResolvedGrokCommand {

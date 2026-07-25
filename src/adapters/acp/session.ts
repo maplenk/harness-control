@@ -106,8 +106,16 @@ export interface HeadlessPermissionPolicy {
    * Optional fail-closed classifier for provider operation titles that can be
    * proven read-only after parsing. The harness supplies this only for Grok's
    * implementor `Execute` requests; a false result or throw is a denial.
+   *
+   * HIGH-5: it receives the tool call's `rawInput` as well as the title,
+   * because the TITLE is human-readable prose while `rawInput` is what the
+   * provider actually EXECUTES. Classifying the title alone authorizes a string
+   * nothing runs. The parameter is REQUIRED (not optional) precisely so no
+   * caller can classify without it; an implementation that cannot recover a
+   * command from `rawInput`, or finds one that differs from the title's, must
+   * return false.
    */
-  readonly allowReadOnlyOperation?: (operation: string) => boolean;
+  readonly allowReadOnlyOperation?: (operation: string, rawInput: unknown) => boolean;
   /**
    * Optional canonical workspace boundary for structured path-qualified
    * `Write` / `Edit` operations. Shell-shaped or unparseable operations never
@@ -215,6 +223,9 @@ export function isWorkspaceWriteOperation(
 export function decidePermission(
   config: PermissionMediationConfig,
   operation: string | undefined,
+  /** HIGH-5: the tool call's `rawInput` — what the provider will actually
+   * execute. The read-only classifier is never consulted without it. */
+  rawInput?: unknown,
 ): PermissionDecision {
   const role = config.role;
   if ((role === 'coordinator' || role === 'verifier') && isWriteOperation(operation)) {
@@ -230,7 +241,7 @@ export function decidePermission(
     return { action: 'allow', reason: 'allowlisted' };
   }
   try {
-    if (config.policy?.allowReadOnlyOperation?.(operation) === true) {
+    if (config.policy?.allowReadOnlyOperation?.(operation, rawInput) === true) {
       return { action: 'allow', reason: 'allowlisted_read_only_operation' };
     }
   } catch {
@@ -1090,7 +1101,9 @@ export class AcpStdioAdapter implements HarnessAdapter {
     this.#routeUpdate(sessionKey, { kind: 'permission_request', request });
 
     const config = this.#options.permissions ?? { mode: 'headless' };
-    const decision = decidePermission(config, title);
+    // HIGH-5: hand the classifier the tool call's `rawInput` — the payload the
+    // provider actually executes — alongside the human-readable title.
+    const decision = decidePermission(config, title, toolCall?.['rawInput']);
 
     if (decision.action === 'allow' || decision.action === 'deny') {
       const preference: readonly PermissionOptionKind[] =

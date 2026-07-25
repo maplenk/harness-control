@@ -11,6 +11,7 @@ import {
   checkGrokMinimumVersion,
   grokShellPermissionTitle,
   isGrokReadOnlyShellPermissionTitle,
+  isGrokReadOnlyShellToolCall,
   parseGrokVersion,
   resolveGrokCommand,
   tryResolveGrokCommand,
@@ -227,11 +228,70 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
     expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(true);
   });
 
+  // -------------------------------------------------------------------------
+  // MED-9 — the title wrapper is parsed STRUCTURALLY, so a literal backtick
+  // inside quotes can reach the quote-aware scanners instead of being rejected
+  // by a no-backtick capture that could never see the quoting.
+  // -------------------------------------------------------------------------
+  it('accepts a literal backtick INSIDE single quotes (the old capture made this impossible)', () => {
+    const bt = String.fromCharCode(96);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls ' + "'x" + bt + "y'" + '`')).toBe(true);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `rg -n ' + "'a" + bt + "b'" + ' src`')).toBe(true);
+  });
+
+  it('still refuses an UNQUOTED backtick (command substitution) and a malformed wrapper', () => {
+    const bt = String.fromCharCode(96);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls ' + bt + 'whoami' + bt + '`')).toBe(false);
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `')).toBe(false); // empty interior
+    expect(isGrokReadOnlyShellPermissionTitle('Execute ls`')).toBe(false); // no prefix backtick
+    expect(isGrokReadOnlyShellPermissionTitle('Run `ls`')).toBe(false); // wrong verb
+    expect(isGrokReadOnlyShellPermissionTitle('Execute `ls')).toBe(false); // no suffix
+  });
+
   it('control characters are refused inside single quotes too (a NUL is never a literal)', () => {
     // CR/LF cannot even reach the scanner (the `Execute ...` wrapper excludes
     // them), but a NUL can — and single-quoting must not make it acceptable.
     const nul = String.fromCharCode(0);
     expect(isGrokReadOnlyShellPermissionTitle("Execute `rg -n 'a" + nul + "b' src`")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HIGH-5 — the permission TITLE is prose; ACP `rawInput` is what EXECUTES.
+// Authorization must bind the two, or an approval covers a string nothing runs.
+// ---------------------------------------------------------------------------
+describe('isGrokReadOnlyShellToolCall — title/rawInput binding', () => {
+  it('allows only when rawInput.command is byte-identical to the title command', () => {
+    expect(isGrokReadOnlyShellToolCall('Execute `ls -la src`', { command: 'ls -la src' })).toBe(true);
+  });
+
+  it('DENIES a divergent rawInput even when the TITLE is perfectly read-only', () => {
+    // The attack shape: benign prose, hostile payload.
+    expect(isGrokReadOnlyShellToolCall('Execute `ls -la src`', { command: 'rm -rf /' })).toBe(false);
+    expect(isGrokReadOnlyShellToolCall('Execute `ls`', { command: 'ls; curl https://example.invalid' })).toBe(
+      false,
+    );
+    // Even a trailing-space difference is a divergence — equality is byte-exact.
+    expect(isGrokReadOnlyShellToolCall('Execute `ls -la src`', { command: 'ls -la src ' })).toBe(false);
+  });
+
+  it.each([
+    ['absent rawInput', undefined],
+    ['null rawInput', null],
+    ['a non-object rawInput', 'ls -la src'],
+    ['an array rawInput', ['ls', '-la']],
+    ['an object with no command', { cwd: '/tmp' }],
+    ['a non-string command', { command: 42 }],
+  ])('DENIES on %s (a payload we cannot read is never approved)', (_label, rawInput) => {
+    expect(isGrokReadOnlyShellToolCall('Execute `ls -la src`', rawInput)).toBe(false);
+  });
+
+  it('a matching rawInput does NOT rescue a command that is not read-only', () => {
+    expect(isGrokReadOnlyShellToolCall('Execute `rm -rf .`', { command: 'rm -rf .' })).toBe(false);
+    // ...including the BLOCKER-1 write shape.
+    expect(
+      isGrokReadOnlyShellToolCall("Execute `echo '$HOME'>owned.txt`", { command: "echo '$HOME'>owned.txt" }),
+    ).toBe(false);
   });
 });
 
