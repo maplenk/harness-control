@@ -37,10 +37,15 @@ slice(i):
               role-scoped doctor · (d) THE GATING DRILL: the real
               addAllExceptNodeModules imported out of dist/ and run against an
               ignored+present node_modules fixture · (e) discovery floor ≥103 ·
-              (f) clean tree. ENFORCED: start-slice.sh and run-slice.sh call
-              require-preflight.sh and refuse without a verdict=pass record at
-              this HEAD, same toolchain, <30 min old (SKIP_BUILD=1 records are
-              "diagnostic" and are rejected).
+              (f) clean tree + the DIST DIGEST. ENFORCED: start-slice.sh and
+              run-slice.sh call require-preflight.sh, which refuses without a
+              complete verdict=pass record binding this HEAD, this dist digest
+              (dist/ is gitignored and mutable — the commit alone does not
+              identify what will execute), this toolchain, and the same resolved
+              role triple + config sha, <30 min old. SKIP_BUILD=1 records are
+              "diagnostic" and rejected; incomplete records are rejected.
+              Roles/config resolve in ONE place (scripts/dogfood/lib.sh) so the
+              gate and the spend paths cannot drift.
               Then: budget sanity · SECTION/SLICE/PATHS written · plan SHA pinned.
               REPO FREEZE begins at `start` — no commits and no tracked-file edits
               until the run is terminal. Queue doc edits in the scratchpad.
@@ -75,7 +80,7 @@ Cost basis (run 1 actuals): coordinator ≈ $1.5 (532k in / 31k out, opus xhigh)
 
 | # | Milestone | Slices | Why now |
 |---|---|---|---|
-| M0 | Base secured | — | ✅ done today: F7 pushed, WIP committed, F8 diagnosed, fresh 1a in flight |
+| M0 | Base secured | — | ✅ F7 landed, WIP committed, F8–F11 diagnosed and specced, the L11 preflight battery built and enforced. **No run is in flight** — `run_756ce21b` was cancelled; the fresh 1a starts after the LAND window (F10 must land first, or its commit path is fatal). |
 | M1 | **The loop is proven end-to-end** | 1a | First legitimate `merge_ready` through the fixed engine. Everything else compounds on this. |
 | M2 | Grok-on-React de-risked | B0 (fixture shell) | Optional slice, zero engine deps, first *visible* UI. Resolves the biggest unknown (can grok write our React?) while it's cheap. Classic DP: probe the high-uncertainty branch early. |
 | M3 | The spine (daemon) | 1b → 2a → 2b → 2c | Hardest engineering: durable operations, writer lease, security gate, WS relay. Serial, engine-adjacent, codex earns its keep here. |
