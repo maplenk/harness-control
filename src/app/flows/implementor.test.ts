@@ -17,7 +17,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { assignmentId, criterionId, gitSha, specHash } from '../../domain/ids.js';
+import { assignmentId, criterionId, gitSha, specHash, type ArtifactHash } from '../../domain/ids.js';
 import { DeterministicIdFactory } from '../../lib/id-factory.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
 import { GitWorktreeManager, runGit, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
@@ -1197,5 +1197,90 @@ describe('adjudicateImplementorDeliverable — F7 round-2 #6 provisioning-failur
 
   it('a GOOD committed deliverable + provisioningFailed stays `completed` (the loop still surfaces provisioning_failed)', () => {
     expect(adjudicateImplementorDeliverable(result({ committed: true, commitSha: HEAD }), 1, HEAD)).toBe('completed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F8 (C) — the `pre_verify_handoff` checkpoint at the commit boundary.
+//
+// Cadence checkpoints fire at PROMPT-TURN boundaries, so every one taken during
+// an implementor round records the PRE-COMMIT head (the service captures live
+// HEAD). The round then commits AFTER its turn loop, opening a window in which a
+// crash leaves a committed HEAD that no checkpoint has ever seen — which §16.3
+// read as tamper (`refuse_resume`). PLAN §12.2 mandates a `pre_verify_handoff`
+// checkpoint at exactly this boundary; the reason existed in the vocabulary
+// (`state.ts`, `cadence.ts`) with NO writer in production code.
+// ---------------------------------------------------------------------------
+describe('ImplementorFlow — F8 (C) pre_verify_handoff checkpoint (§12.2)', () => {
+  /** Every `checkpoint.recorded` payload for the run, in log order. */
+  function checkpointsOf(runId: ReturnType<typeof createRunFixture>['runId']): Array<{
+    readonly reason: string;
+    readonly artifactHash: ArtifactHash;
+  }> {
+    return dbHandle!.db.events
+      .listByRun(runId)
+      .filter((e) => e.type === 'checkpoint.recorded')
+      .map((e) => e.payload as { reason: string; artifactHash: ArtifactHash });
+  }
+
+  it('writes exactly ONE pre_verify_handoff checkpoint carrying the COMMITTED head', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [{ relPath: 'feature.txt', content: 'the new feature\n' }],
+      turns: [REPORTING_TURN],
+    });
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const asg = assignmentId('asg_impl_handoff_checkpoint');
+
+    const result = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    );
+    expect(result.committed).toBe(true);
+
+    const handoffs = checkpointsOf(runId).filter((p) => p.reason === 'pre_verify_handoff');
+    expect(handoffs).toHaveLength(1);
+
+    // The checkpoint carries the round's COMMITTED head — the whole point.
+    const content = service.getCheckpointContent(handoffs[0]!.artifactHash);
+    expect(content).toBeDefined();
+    expect(String(content!.worktree.headSha)).toBe(String(result.commitSha));
+    expect(content!.worktree.statusPorcelain).toBe(''); // committed tree, nothing outstanding
+    // Honest §12.2 bookkeeping: a completed commit interrupts nothing.
+    expect(content!.incompleteOperation).toBeUndefined();
+
+    await wt.removeWorktree(asg);
+  });
+
+  it('a round that commits NOTHING still checkpoints the handoff honestly (HEAD unchanged)', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({ writes: [], turns: [REPORTING_TURN] });
+    const base = await r.headSha();
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+    const asg = assignmentId('asg_impl_handoff_empty');
+
+    const result = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(base),
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    );
+    expect(result.committed).toBe(false);
+
+    const handoffs = checkpointsOf(runId).filter((p) => p.reason === 'pre_verify_handoff');
+    expect(handoffs).toHaveLength(1);
+    expect(String(service.getCheckpointContent(handoffs[0]!.artifactHash)!.worktree.headSha)).toBe(base);
+
+    await wt.removeWorktree(asg);
   });
 });

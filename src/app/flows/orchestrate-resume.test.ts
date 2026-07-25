@@ -339,6 +339,172 @@ describe('resume mode — interrupted implementor round', () => {
 });
 
 // ---------------------------------------------------------------------------
+// F8 (A) — forward containment at the interrupted-implementor adoption boundary.
+//
+// Production shape (`run_8aa51aea…`): the last checkpoint of an implementor round
+// is a CADENCE one taken at a prompt-turn boundary, so it records the PRE-COMMIT
+// head. The round then commits and the process dies before any later checkpoint,
+// leaving HEAD one commit AHEAD of the checkpoint. §16.3 refused on ANY drift, so
+// the round was permanently unresumable — the implementor's OWN commit read as
+// tamper. Forward motion (checkpoint sha is a STRICT git ancestor of HEAD) is now
+// accepted on the interrupted-implementor path ONLY; anything that is not a
+// strict descent stays `refuse_resume`.
+// ---------------------------------------------------------------------------
+describe('resume mode — F8 (A) interrupted implementor forward containment', () => {
+  const COMMIT_ENV: Readonly<Record<string, string>> = {
+    GIT_AUTHOR_NAME: 'f8-resume-tests',
+    GIT_AUTHOR_EMAIL: 'f8@harness.invalid',
+    GIT_COMMITTER_NAME: 'f8-resume-tests',
+    GIT_COMMITTER_EMAIL: 'f8@harness.invalid',
+  };
+
+  async function commitInWorktree(worktreePath: string, message: string): Promise<string> {
+    await git.runGit(['add', '-A'], worktreePath);
+    await git.runGit(['commit', '-m', message], worktreePath, COMMIT_ENV);
+    return git.resolveSha(worktreePath, 'HEAD');
+  }
+
+  /** A checkpoint bound to this run's spec whose recorded worktree HEAD is `headSha`. */
+  function checkpointAt(headSha: string): CheckpointContent {
+    return buildCheckpointContent({
+      lineage: { harnessId: 'codex', model: 'gpt-5.6-terra' },
+      eventCursor: eventSequence(1),
+      specHash: SPEC_HASH,
+      criterionStates: [
+        { criterionId: AC1, state: 'pending' },
+        { criterionId: AC2, state: 'pending' },
+      ],
+      permissionPolicy: { mode: 'headless', allowlist: [] },
+      worktree: {
+        headSha: gitSha(headSha),
+        statusPorcelain: '',
+        diffHash: artifactHash('d'),
+        lockfileCleanupPerformed: false,
+        taintFlags: [],
+      },
+    });
+  }
+
+  it('AC-1: a round that COMMITTED after its last checkpoint resumes — the implementor\'s own commit is not tamper', async () => {
+    const rig = await openRig({
+      implementor: [
+        // Round-1 attempt 1: writes the work, then the provider limit lands
+        // mid-turn → durable pause with a PRE-COMMIT cadence/pause checkpoint.
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        // The re-entered round.
+        { writes: [{ relPath: 'src/more.ts', content: 'export const more = 1;\n' }], turns: [implementorTurn('done')] },
+      ],
+      verifier: [{ turns: [PASS_BOTH] }],
+    });
+
+    const paused: unknown = await runImplementVerifyLoop(loopDeps(rig), loopInput(rig)).catch((e: unknown) => e);
+    expect(paused).toBeInstanceOf(LimitPausedError);
+    const round = rig.service.getRoleRound(rig.runId)!;
+    const checkpoint =
+      round.checkpointRef !== undefined ? rig.service.getCheckpointContent(round.checkpointRef) : undefined;
+    expect(checkpoint).toBeDefined();
+    const worktreePath = rig.service.getImplementVerifyLoopState(rig.runId)!.worktree!.worktreePath;
+    // The checkpoint recorded the PRE-COMMIT head (this is the structural bug).
+    expect(String(checkpoint!.worktree.headSha)).toBe(String(rig.baseCommit));
+
+    // ...and then the implementor committed its work and the process died before
+    // any later checkpoint. HEAD is now one commit AHEAD of the checkpoint.
+    const implementationCommit = await commitInWorktree(worktreePath, 'implementor round 1');
+    expect(implementationCommit).not.toBe(String(checkpoint!.worktree.headSha));
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const result = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round, checkpoint: checkpoint! },
+    });
+
+    // Adopted, not refused — and the round drove all the way to verification.
+    expect(result.outcome).toBe('merge_ready');
+    const validation = rig.service.getImplementVerifyLoopState(rig.runId)?.worktree?.lastValidation;
+    expect(validation?.outcome).not.toBe('refuse_resume');
+    // The implementor's own commit survived: it is an ANCESTOR of the verified head.
+    const verified = String(result.implementationCommit);
+    expect(
+      (await git.runGit(['merge-base', '--is-ancestor', implementationCommit, verified], worktreePath).then(
+        () => true,
+        () => false,
+      )),
+    ).toBe(true);
+    // ...and the worktree's own history still contains it.
+    const log = await git.runGit(['log', '--format=%H'], worktreePath);
+    expect(log.stdout).toContain(implementationCommit);
+  });
+
+  it('AC-2: a TAMPERED worktree whose HEAD is NOT a descendant of the checkpoint still refuses', async () => {
+    const rig = await openRig({
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        { writes: [], turns: [implementorTurn('never reached')] },
+      ],
+    });
+    const paused: unknown = await runImplementVerifyLoop(loopDeps(rig), loopInput(rig)).catch((e: unknown) => e);
+    expect(paused).toBeInstanceOf(LimitPausedError);
+    const round = rig.service.getRoleRound(rig.runId)!;
+    const worktreePath = rig.service.getImplementVerifyLoopState(rig.runId)!.worktree!.worktreePath;
+
+    // The round committed (the F8 (C) checkpoint would have carried THIS sha)...
+    const abandoned = await commitInWorktree(worktreePath, 'implementor round 1');
+    // ...and was then TAMPERED with: reset away and rewritten on the base.
+    await git.runGit(['reset', '--hard', String(rig.baseCommit)], worktreePath);
+    fs.writeFileSync(path.join(worktreePath, 'rewritten.ts'), 'export const rewritten = 1;\n', 'utf8');
+    const rewritten = await commitInWorktree(worktreePath, 'a rewritten round');
+    expect(rewritten).not.toBe(abandoned);
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const thrown: unknown = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round, checkpoint: checkpointAt(abandoned) },
+    }).catch((e: unknown) => e);
+
+    expect(thrown).toMatchObject({ kind: 'requires_validation' });
+    expect(String(thrown)).toMatch(/§16\.3 validation refused resume-in-place/);
+    expect(rig.service.getImplementVerifyLoopState(rig.runId)?.worktree?.lastValidation?.outcome).toBe(
+      'refuse_resume',
+    );
+  });
+
+  it('AC-4: an ancestry-probe FAILURE (unknown checkpoint object) refuses — never an acceptance', async () => {
+    const rig = await openRig({
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+        { writes: [], turns: [implementorTurn('never reached')] },
+      ],
+    });
+    const paused: unknown = await runImplementVerifyLoop(loopDeps(rig), loopInput(rig)).catch((e: unknown) => e);
+    expect(paused).toBeInstanceOf(LimitPausedError);
+    const round = rig.service.getRoleRound(rig.runId)!;
+    const worktreePath = rig.service.getImplementVerifyLoopState(rig.runId)!.worktree!.worktreePath;
+    await commitInWorktree(worktreePath, 'implementor round 1');
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const thrown: unknown = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      // A syntactically valid sha that names no object in this repo.
+      resume: { round, checkpoint: checkpointAt('0'.repeat(39) + '1') },
+    }).catch((e: unknown) => e);
+
+    expect(thrown).toMatchObject({ kind: 'requires_validation' });
+    expect(rig.service.getImplementVerifyLoopState(rig.runId)?.worktree?.lastValidation?.outcome).toBe(
+      'refuse_resume',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Interrupted VERIFIER round — forced binding, dirt DISCARDED, same binding
 // ---------------------------------------------------------------------------
 describe('resume mode — interrupted verifier round', () => {
