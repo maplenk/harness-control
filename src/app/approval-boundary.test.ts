@@ -47,9 +47,22 @@ import {
   SpecApprovalRefusedError,
   type RoleAdapterFactory,
 } from './service.js';
-import { ENGINE_STATE_PROJECTION, SPEC_DRAFT_PROJECTION, type SpecDraftState } from './projections.js';
+import {
+  ENGINE_STATE_PROJECTION,
+  SPEC_DRAFT_PROJECTION,
+  type MergeReadinessBlockedState,
+  type SpecDraftState,
+} from './projections.js';
 import { draftEvent, type DomainEvent, type EventOfType } from '../domain/events.js';
-import { idempotencyKey } from '../domain/ids.js';
+import { SpecApprovalProvenanceError } from '../domain/transitions.js';
+import type { Verification } from '../domain/entities.js';
+import {
+  assignmentId,
+  gitSha,
+  idempotencyKey,
+  mergeReadinessId,
+  verificationId,
+} from '../domain/ids.js';
 import type { Clock } from '../lib/clock.js';
 
 const CLAUDE_LOW = { harness: 'claude', model: 'opus', effort: 'low' } as const;
@@ -171,6 +184,59 @@ function handBuiltApproval(
     idempotencyKey: idempotencyKey(key),
     occurredAt: '2026-07-25T00:00:00.000Z' as ReturnType<Clock['nowIso']>,
   }) as DomainEvent;
+}
+
+/**
+ * A blocked-readiness record shaped exactly as round-2 code persisted them:
+ * the whole `MergeReadiness` embedded, carrying whatever signer that build
+ * computed — including the stale `'human'` the optional-signer default produced.
+ */
+function staleBlockedState(runId: RunId, claimedSigner: 'human' | 'auto'): MergeReadinessBlockedState {
+  const verification: Verification = {
+    id: verificationId('ver_stale_1'),
+    runId,
+    assignmentId: assignmentId('asg_stale_1'),
+    specHash: toSpecHash('hash_1'),
+    baseCommit: gitSha('b'.repeat(40)),
+    implementationCommit: gitSha('a'.repeat(40)),
+    criteria: [],
+    outcome: 'all_verified',
+    completedAt: '2026-07-25T00:00:00.000Z' as ReturnType<Clock['nowIso']>,
+  };
+  return {
+    verification,
+    binding: {
+      assignmentId: assignmentId('asg_stale_1'),
+      specHash: toSpecHash('hash_1'),
+      baseCommit: gitSha('b'.repeat(40)),
+      implementationCommit: gitSha('a'.repeat(40)),
+    },
+    worktreePath: '/worktree',
+    probeDestinationRef: 'HEAD',
+    requiredTestsPassed: true,
+    approvedSpecHash: toSpecHash('hash_1'),
+    mergeReadiness: {
+      id: mergeReadinessId('mrg_stale_1'),
+      runId,
+      verificationId: verificationId('ver_stale_1'),
+      specHash: toSpecHash('hash_1'),
+      baseCommit: gitSha('b'.repeat(40)),
+      verifiedCommit: gitSha('a'.repeat(40)),
+      destinationClean: false,
+      worktreeClean: true,
+      baseDrifted: false,
+      conflicts: false,
+      requiredTestsPassed: true,
+      specApprovedBy: claimedSigner,
+      ready: false,
+      blockers: ['the destination working tree is dirty (human action: commit or stash the destination changes)'],
+      manualIntegrationCommands: [],
+      createdAt: '2026-07-25T00:00:00.000Z' as ReturnType<Clock['nowIso']>,
+    },
+    blockers: ['the destination working tree is dirty (human action: commit or stash the destination changes)'],
+    stage: 'blocked',
+    recordedAt: '2026-07-25T00:00:00.000Z' as ReturnType<Clock['nowIso']>,
+  };
 }
 
 const DRIVER_KINDS = await availableDriverKinds();
@@ -559,5 +625,143 @@ describe.each(DRIVER_KINDS)('B2 round 3 — absence of a completion ref refuses 
     });
     expect(applied.status).toBe('applied');
     expect(service.status(runId).specApprovedBy).toBe('human');
+  });
+});
+
+// ===========================================================================
+// B2 ROUND 4 — the DURABLE LOG boundary
+//
+// Round 3 converged every SERVICE producer on one assertion. Codex then went
+// under it: `db.events.append`/`appendBatch` and `appendTriggerWithEffects` are
+// PUBLIC and used to accept any DomainEvent, and `recover()` folds whatever is
+// in the log. Round 4's answer is two-layered:
+//   compile — the append signatures require a `ValidatedApproval` brand that
+//             only the service's validated path mints;
+//   STATE   — `applyTransition` refuses a T1 whose provenance the LOG ITSELF
+//             contradicts, so a row written straight into the store cannot fold
+//             into `approved` even on replay.
+// ===========================================================================
+describe.each(DRIVER_KINDS)('B2 round 4 — an unvalidated T1 in the durable log [%s]', (kind) => {
+  it('CODEX REPRO: a hand-built T1 appended straight to db.events cannot be RECOVERED into approved', async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+
+    // Straight past every service check, into the durable log.
+    db.events.append(
+      handBuiltApproval(
+        runId,
+        { specVersionId: 'spec_fabricated', specHash: 'totally-made-up-hash', approvedBy: 'auto' },
+        'log_bypass_1',
+      ),
+    );
+    // It IS in the log — the append boundary is a compile-time guard, not a
+    // runtime one, and this test deliberately widened past it.
+    expect(db.events.listByRun(runId).some((e) => e.type === 'spec.approved')).toBe(true);
+
+    // …and it can never become state: the fold refuses, naming the run.
+    expect(() => service.recover(runId)).toThrow(SpecApprovalProvenanceError);
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+  });
+
+  it('a hand-built T1 that claims auto with NO completed round is refused by the fold', async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = runAtGateWithoutDraft(service); // no completion ref in the log
+
+    db.events.append(
+      handBuiltApproval(runId, { specVersionId: 's', specHash: 'h', approvedBy: 'auto' }, 'log_bypass_2'),
+    );
+    expect(() => service.recover(runId)).toThrow(SpecApprovalProvenanceError);
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+  });
+
+  it('a hand-built T1 naming a STALE version/hash is refused by the fold', async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(2));
+
+    db.events.append(
+      handBuiltApproval(
+        runId,
+        { specVersionId: 'spec_1', specHash: 'hash_1', approvedBy: 'human' }, // superseded
+        'log_bypass_3',
+      ),
+    );
+    expect(() => service.recover(runId)).toThrow(SpecApprovalProvenanceError);
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+  });
+
+  it('a LEGITIMATE approval still recovers cleanly — the guard is surgical, not a blanket refusal', async () => {
+    const { service } = await setup(kind, HUMAN_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    await service.approve(runId, {
+      specVersionId: toSpecVersionId('spec_1'),
+      specHash: toSpecHash('hash_1'),
+    });
+    expect(service.status(runId).phase).toBe('approved');
+
+    // Full replay from the log reproduces the same state, no throw.
+    const recovered = service.recover(runId);
+    expect(recovered.phase).toBe('approved');
+    expect(recovered.specApprovedBy).toBe('human');
+    expect(String(recovered.approvedSpecHash)).toBe('hash_1');
+  });
+
+  it('a run that never drafted still recovers a HUMAN approval (the deliberate asymmetry, on the log side too)', async () => {
+    const { service } = await setup(kind, HUMAN_CONFIG());
+    const runId = runAtGateWithoutDraft(service);
+    await service.approve(runId, {
+      specVersionId: toSpecVersionId('spec_imported'),
+      specHash: toSpecHash('hash_imported'),
+    });
+    const recovered = service.recover(runId);
+    expect(recovered.phase).toBe('approved');
+    expect(recovered.specApprovedBy).toBe('human');
+  });
+
+  it('appending a PRECISELY typed spec.approved is a COMPILE error without the brand (enforced by tsc)', () => {
+    const event = undefined as unknown as EventOfType<'spec.approved'>;
+    const events = undefined as unknown as TestDatabaseHandle['db']['events'];
+    // @ts-expect-error -- B2 round 4: `AppendableEvent` requires the
+    // `ValidatedApproval` brand, which only the service's validated path mints.
+    const refused = (): unknown => events.append(event);
+    expect(typeof refused).toBe('function');
+  });
+});
+
+// ===========================================================================
+// B2 ROUND 4 — BLOCKER 2: a persisted projection is UNTRUSTED INPUT
+// ===========================================================================
+describe.each(DRIVER_KINDS)('B2 round 4 — stale persisted attribution is migrated on read [%s]', (kind) => {
+  it("CODEX REPRO: a round-2 blocked record claiming 'human' is corrected from the event log, not republished", async () => {
+    const { service, db } = await setup(kind, AUTO_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    expect(service.status(runId).specApprovedBy).toBe('auto'); // the LOG says auto
+
+    // A record as round-2 code would have written it: the stale 'human' lie.
+    service.saveMergeReadinessBlocked(runId, staleBlockedState(runId, 'human'));
+
+    const read = service.getMergeReadinessBlocked(runId);
+    expect(read?.mergeReadiness.specApprovedBy).toBe('auto');
+  });
+
+  it("a record whose signer the log cannot substantiate reads as 'unknown', never 'human'", async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = runAtGateWithoutDraft(service); // never approved at all
+    service.saveMergeReadinessBlocked(runId, staleBlockedState(runId, 'human'));
+
+    const read = service.getMergeReadinessBlocked(runId);
+    expect(read?.mergeReadiness.specApprovedBy).toBe('unknown');
+    expect(read?.mergeReadiness.specApprovedBy).not.toBe('human');
+  });
+
+  it('a record that already agrees with the log is returned untouched', async () => {
+    const { service } = await setup(kind, HUMAN_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    await service.approve(runId, {
+      specVersionId: toSpecVersionId('spec_1'),
+      specHash: toSpecHash('hash_1'),
+    });
+    const stored = staleBlockedState(runId, 'human');
+    service.saveMergeReadinessBlocked(runId, stored);
+    expect(service.getMergeReadinessBlocked(runId)?.mergeReadiness.specApprovedBy).toBe('human');
   });
 });

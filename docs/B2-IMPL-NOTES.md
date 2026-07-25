@@ -6,7 +6,9 @@ which is NOT the tip of `main` at the time of writing (`main` is at `5669d22`, F
 numbers below are measured against `a77f3da`.
 Spec: `docs/AUTONOMOUS-BASE-PLAN.md` §1 + B2. Invariant reversal recorded in `PLAN.md` §7.1.
 
-> **READ §7 FIRST, THEN §6.** Sections 1–5 describe round 1 and are superseded in places.
+> **READ §8 FIRST, THEN §7, THEN §6.** Sections 1–5 describe round 1 and are superseded in places.
+> **§8** is the round-4 record (durable-log boundary + persisted-projection migration) and is the
+> current state of the design.
 > **§6** is the round-2 record (codex review of `c45eccf`: five findings, all reproduced). **§7** is
 > the round-3 record (re-review of `52362b7`: F3/F4 confirmed fixed, F1/F2/F5 NOT-fixed because
 > round 2 guarded the routes into the approval state instead of the state itself). Where they
@@ -539,3 +541,113 @@ only/always production path. True before B2, false after. All three now name bot
   knows what they are passing. A caller who has already erased the type is caught one layer down.
 - **The human/engine asymmetry on a missing completion ref** (above) — the one place I did not
   "refuse hardest", with the reasoning stated rather than buried.
+
+---
+
+## 8. ROUND 4 — the same lesson, one layer deeper: the durable log
+
+Codex re-reviewed `36a0662`. Both round-3 judgement calls **endorsed** (the typecheck-enforced compile
+layer "adequate and accurately disclosed"; the no-completion-ref asymmetry to be **retained** — "a
+human can explicitly attest an externally produced or legacy spec hash, while the engine must have
+durable coordinator provenance before signing autonomously"). Atomicity **confirmed**. Two blockers.
+
+### BLOCKER 1 — the guard was at the SERVICE boundary; the LOG boundary is below it
+
+Round 3 converged every service producer on one assertion in `#ingestTransition`. But that is not the
+append boundary: `EventRepository.append`/`appendBatch` and `appendTriggerWithEffects` are PUBLIC
+(re-exported from `persistence/index.ts`) and accepted any `DomainEvent`; `recover()` then folds a
+directly-appended T1 through `applyTransition` with no assertion. Codex also **disproved my round-3
+claim** that every §6.3 append goes through `#ingestTransition` — `#pauseForLimit` calls
+`applyTransition` directly (its fixed T4/T16 trigger cannot produce a T1 today, but the path is not
+universal, so the claim was wrong as stated).
+
+**Fix — two layers, and this time the inner one is genuinely universal.**
+
+*Compile.* `EventRepository.append`/`appendBatch` and `appendTriggerWithEffects` now take
+`AppendableEvent<E>`: a precisely typed `spec.approved` must be a `ValidatedApproval`, a branded type
+whose only minter is `OrchestrationService.#validateApproval` (which asserts first). Same conditional
+shape as round 3's `NotServiceOwned`, chosen for the same reason — **zero churn**: every existing call
+site passing a widened `DomainEvent` still compiles, while a caller holding the precise type cannot.
+Verified: the whole tree typechecks with no call-site changes.
+
+*State.* The real guarantee is in `applyTransition` itself (`src/domain/transitions.ts`), which is
+where **every** §6.3 application funnels — the reducer, `recover()`'s replay, the service path, and
+`#pauseForLimit`'s direct call. It now refuses a `spec.approved` whose provenance the LOG ITSELF
+contradicts, using only folded state and no database read:
+- `EngineState.lastDraftRef` is folded from the `workflow.dispatch.advanced` that carries the
+  coordinator-completion draft ref (`makeEngineReducer`);
+- a T1 must name that exact version+hash, else `SpecApprovalProvenanceError`;
+- with NO completion ref, `approvedBy:'auto'` throws — the engine may not sign without provenance —
+  while `'human'` is allowed, the same asymmetry codex told me to retain, now enforced on the log side too.
+
+**Chosen fold behaviour: REFUSE with a typed error**, not "fold to a non-mergeable state". Reasons:
+(1) there is an exact precedent — `WorkflowDispatchReplayError` already throws from this reducer for a
+corrupt dispatch, so this is the established treatment for log corruption rather than a new concept;
+(2) a rejection would silently no-op and leave the caller believing the log is sound; (3) folding to
+some tainted-but-alive state invents new state semantics and keeps a half-trusted run runnable. The
+error names the run and says which rule it broke.
+
+**What this does NOT catch, stated plainly.** The reducer cannot read the run's PINNED approval mode
+or the draft PROJECTION — both need DB reads a reducer must not do (codex said so explicitly). So a
+raw-log writer can still append a **human** approval that matches the log's own completion ref. That
+is precisely the approval `approve()` would itself have accepted, so it is not an escalation — but it
+is the honest boundary of this layer, and the pinned-mode check remains service-side.
+
+### BLOCKER 2 — a persisted projection is untrusted input
+
+A blocked-readiness record written by round-2 code embeds a whole `MergeReadiness` and can carry the
+stale `specApprovedBy:'human'` that round 3 proved was a lie; `getMergeReadinessBlocked` returned it
+verbatim. Codex: same rule as F13's fix — migrate on read; a record whose signer predates
+event-derived attribution is UNKNOWN, never `human`.
+
+**Fix.** `getMergeReadinessBlocked` re-derives the signer from the durable log
+(`#resolveApprovalSigner`) and rewrites the nested value. When the log cannot substantiate any signer
+it reads `'unknown'`.
+
+To make that sayable I added `SpecApprovalAttribution = SpecApprovalMode | 'unknown'` for the REPORT
+field only. The INPUT side (`BuildMergeReadinessInput.specApprovedBy`) stays a real
+`SpecApprovalMode`, so `'unknown'` is reachable *only* by migrating an old record — a freshly built
+report always knows its signer. The CLI renders it with a notice deliberately louder than the auto
+one: "we cannot tell you who approved this" is worse news than "the engine did".
+
+**One design correction mid-implementation, worth recording:** my first attempt threw from
+`getMergeReadinessBlocked` when the signer was unsubstantiated. That broke an existing recheck test —
+and rightly: a read accessor that throws makes unrelated, EARLIER guards unreachable (the recheck
+phase guard among them) and hides a real refusal behind a migration concern. Representing UNKNOWN is
+the correct shape; throwing was me reaching for fail-closed in a place where it degraded the
+diagnostics. The test that caught it was a legitimate guard test, and I fixed my design rather than
+the test.
+
+### Round-4 fails-on-parent proof (parent `36a0662`)
+
+Tests drive the persistence surface directly (`db.events.append` with a hand-built T1) plus a
+`recover()` case, as required.
+
+| What | Parent failure (verbatim) |
+| --- | --- |
+| hand-built T1 → `db.events.append` → `recover()` | `expected [Function] to throw an error` — folded into `approved` |
+| T1 claiming `auto` with no completed round | `expected [Function] to throw an error` |
+| T1 naming a stale version/hash | `expected [Function] to throw an error` |
+| stale blocked record claiming `human` (log says auto) | `expected 'human' to be 'auto'` |
+| stale record the log cannot substantiate | `expected 'human' to be 'unknown'` |
+
+Passing on the parent, correctly: legitimate approval still recovers (the guard is surgical), the
+never-drafted human approval still recovers (the retained asymmetry), the record that already agrees
+is untouched, and the compile-time test (a runtime no-op — same disclosure as round 3: its teeth are
+`@ts-expect-error` under `npm run typecheck`).
+
+**Green bar after round 4:** `npm run typecheck` exit 0; `npx vitest run` → **108 files / 2030 tests,
+0 failed** (round 3: 108 / 2012).
+
+### Round-4 judgement calls
+
+- **Refuse the fold rather than fold-to-a-safe-state** — precedent, loudness, and no new state
+  semantics (reasoning above).
+- **Widen the REPORT type, not the input type**, so `'unknown'` cannot leak into freshly computed
+  readiness records and can only ever mean "migrated from an old record".
+- **Did not attempt to re-run the full binding check inside the fold** — codex forbade it, and it
+  would need DB reads. The pure in-stream subset (provenance + identity) is what a reducer can
+  honestly do; the rest stays at the service.
+- **The brand is a compile-time guard only.** A caller who widens to `DomainEvent` before appending
+  still compiles. That is the same tolerance round 3 accepted for `ingest`, and it is why the
+  `applyTransition` guard — which no widening escapes — is the load-bearing one.

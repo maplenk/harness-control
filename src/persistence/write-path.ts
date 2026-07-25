@@ -7,7 +7,7 @@
  * as a tested primitive rather than left as "wrap two repository calls in
  * `db.transaction`" — §19 tests 9 and 10 both exercise it.
  */
-import type { DomainEvent } from '../domain/events.js';
+import type { AppendableEvent, DomainEvent } from '../domain/events.js';
 import type { Database } from './database.js';
 import type { AppendOutcome } from './event-repository.js';
 import type { ProjectionRecord } from './projection-repository.js';
@@ -58,16 +58,22 @@ export interface AppendTriggerOptions {
  * transition") plus the pause spine's "ONE atomic append" both land here.
  * Like `emitted`, extras are effects/facts, never further reducer inputs.
  */
-export function appendTriggerWithEffects<S>(
+export function appendTriggerWithEffects<S, E extends DomainEvent = DomainEvent>(
   db: Database,
-  trigger: DomainEvent,
+  // B2 round 4: the trigger reaches the durable log, so it carries the same
+  // brand requirement as `EventRepository.append` — a precisely typed
+  // `spec.approved` must be a `ValidatedApproval`. See `AppendableEvent`.
+  trigger: AppendableEvent<E>,
   emitted: readonly DomainEvent[],
   projection: ProjectionUpdate<S>,
   extraEvents: readonly DomainEvent[] = [],
   options: AppendTriggerOptions = {},
 ): AppendWithProjectionResult<S> {
   const body = (): AppendWithProjectionResult<S> => {
-    const appended = db.events.appendBatch([trigger, ...emitted, ...extraEvents]);
+    // The brand requirement is discharged at THIS function's boundary (above),
+    // so the batch is widened here rather than re-asserted per element.
+    const batch: readonly DomainEvent[] = [trigger as DomainEvent, ...emitted, ...extraEvents];
+    const appended = db.events.appendBatch(batch);
     const triggerOutcome = appended[0];
     const lastOutcome = appended[appended.length - 1];
     if (!triggerOutcome || !lastOutcome) {

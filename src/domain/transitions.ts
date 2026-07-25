@@ -20,7 +20,7 @@
  * recorded via SUPPORTING events by their coordinators, not via this engine.
  */
 import type { IsoTimestamp } from '../lib/clock.js';
-import type { ProcessGenerationId, SegmentId, SpecHash } from './ids.js';
+import type { ProcessGenerationId, RunId, SegmentId, SpecHash } from './ids.js';
 import {
   DEFAULT_BOUNDS,
   OPERATION_IDLE,
@@ -52,6 +52,7 @@ import {
   type EventPayloads,
   type LimitClassification,
   type NotifyTopic,
+  type SpecDraftRef,
   type SuccessorReason,
 } from './events.js';
 
@@ -607,6 +608,16 @@ export interface EngineState {
    * suspension-clear — and cleared by the SAME `resume_reentry.completed` ack.
    */
   readonly successorIntent?: SuccessorIntent;
+  /**
+   * B2 round 4 — the latest coordinator-completion draft ref, folded from the
+   * `workflow.dispatch.advanced` that carried it. This is the run's own LOG
+   * saying which SpecVersion was drafted, so `applyTransition` can check a T1's
+   * provenance PURELY, with no database read: a `spec.approved` must name this
+   * exact version+hash, and the ENGINE may not sign at all when it is absent.
+   * That is what makes an unvalidated T1 unable to produce `approved` even when
+   * it was written straight into the durable log and replayed by `recover()`.
+   */
+  readonly lastDraftRef?: SpecDraftRef;
   /** Bound on T1. */
   readonly approvedSpecHash?: SpecHash;
   /**
@@ -760,9 +771,33 @@ interface MutableDraft {
   activeChild: ActiveChild | undefined;
   resumeReentryPending: ResumeReentryPending | undefined;
   successorIntent: SuccessorIntent | undefined;
+  lastDraftRef: SpecDraftRef | undefined;
   approvedSpecHash: SpecHash | undefined;
   specApprovedBy: SpecApprovalMode | undefined;
   counters: RestartCounters;
+}
+
+/**
+ * B2 round 4 — a `spec.approved` in the durable log whose provenance the LOG
+ * ITSELF contradicts. Thrown (not rejected) because this is corruption, not an
+ * illegal-but-expected transition: the same treatment, and the same reasoning,
+ * as `WorkflowDispatchReplayError`. A rejection would silently no-op and leave
+ * the caller believing the log is sound.
+ *
+ * Reachable only by writing a T1 into the event store directly — every service
+ * route validates against the projection AND the completion ref first. This is
+ * the backstop for exactly that: `recover()` replaying a hand-appended T1 must
+ * not produce `approved`.
+ */
+export class SpecApprovalProvenanceError extends Error {
+  override readonly name: string = 'SpecApprovalProvenanceError';
+  readonly runId: RunId;
+  readonly reason: 'no_completion_ref' | 'binding_mismatch';
+  constructor(runId: RunId, reason: 'no_completion_ref' | 'binding_mismatch', detail: string) {
+    super(`Corrupt event log for run ${runId}: ${detail}`);
+    this.runId = runId;
+    this.reason = reason;
+  }
 }
 
 function classificationOf(event: DomainEvent): LimitClassification | undefined {
@@ -837,14 +872,76 @@ function reject(
 }
 
 /**
+ * B2 round 4 — PURE provenance check on a `spec.approved`, using only the
+ * run's own folded log. No database read, so it is safe inside the reducer and
+ * inside `recover()`'s replay, which is exactly where it is needed.
+ *
+ * Two rules, mirroring the service-side gate's log-derived half:
+ *  - a completion ref folded from `workflow.dispatch.advanced` means the run
+ *    HAS drafted provenance, and the approval must name that exact
+ *    version+hash;
+ *  - no completion ref means there is no drafted provenance at all, so the
+ *    ENGINE may not sign (`approvedBy:'auto'`). A HUMAN may — that is the
+ *    documented pre-B2 explicit-hash path for imported/legacy specs, and the
+ *    same deliberate asymmetry the service applies: a person can attest to an
+ *    externally produced hash, the engine must have provenance.
+ *
+ * What this canNOT see (and the service still must): the run's PINNED approval
+ * mode, and whether the draft PROJECTION agrees with the ref. Both need reads a
+ * reducer must not do. The residual, stated plainly: a raw-log writer can still
+ * append a HUMAN approval that matches the log's own completion ref — which is
+ * precisely the approval `approve()` would itself have accepted, so it is not
+ * an escalation.
+ */
+function assertApprovalProvenance(state: EngineState, event: DomainEvent): void {
+  if (event.type !== 'spec.approved') return;
+  const payload = (event as EventOfType<'spec.approved'>).payload;
+  const ref = state.lastDraftRef;
+  if (ref === undefined) {
+    if (payload.approvedBy === 'auto') {
+      throw new SpecApprovalProvenanceError(
+        event.runId,
+        'no_completion_ref',
+        `spec.approved claims approvedBy='auto' but the log records no completed coordinator round ` +
+          `(no workflow.dispatch.advanced carrying a draft ref). The engine never signs a spec it ` +
+          `cannot prove was drafted.`,
+      );
+    }
+    return;
+  }
+  if (
+    String(payload.specVersionId) !== String(ref.specVersionId) ||
+    String(payload.specHash) !== String(ref.specHash)
+  ) {
+    throw new SpecApprovalProvenanceError(
+      event.runId,
+      'binding_mismatch',
+      `spec.approved binds spec ${payload.specVersionId} (hash ${payload.specHash}) but the latest ` +
+        `completed coordinator round drafted ${ref.specVersionId} (hash ${ref.specHash}, revision ` +
+        `${ref.revision}). Approval must bind the drafted SpecVersion exactly (W1-F3).`,
+    );
+  }
+}
+
+/**
  * Pure, deterministic transition engine over the §6.3 table.
  * Never throws for domain-level illegality; never mutates `state`.
+ * (B2 round 4 exception: a `spec.approved` whose provenance the LOG itself
+ * contradicts throws `SpecApprovalProvenanceError` — that is corruption, not
+ * illegality, and is treated exactly as `WorkflowDispatchReplayError` is.)
  */
 export function applyTransition(state: EngineState, event: DomainEvent): TransitionOutcome {
   const row = TRANSITIONS_BY_EVENT.get(event.type);
   if (!row) {
     return reject(state, event, 'unlisted_event', `No §6.3 row triggers on event '${event.type}'`);
   }
+  // B2 round 4: the DEEPEST approval guard, and the only one a durable-log
+  // writer cannot go under. Every §6.3 application funnels through here — the
+  // engine reducer, `recover()`'s replay, the service's transition path, and
+  // the direct `applyTransition` call in the limit-pause composite — so a T1
+  // whose provenance the log contradicts can never become `approved`, no
+  // matter which surface wrote it.
+  assertApprovalProvenance(state, event);
   const failures = checkPreconditions(row, state, event);
   if (failures.length > 0) {
     return reject(state, event, 'precondition_failed', `${row.id}: ${failures.join('; ')}`);
@@ -858,6 +955,7 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
     activeChild: state.activeChild,
     resumeReentryPending: state.resumeReentryPending,
     successorIntent: state.successorIntent,
+    lastDraftRef: state.lastDraftRef,
     approvedSpecHash: state.approvedSpecHash,
     specApprovedBy: state.specApprovedBy,
     counters: { ...state.counters },
@@ -1297,6 +1395,7 @@ export function applyTransition(state: EngineState, event: DomainEvent): Transit
       ? { resumeReentryPending: draft.resumeReentryPending }
       : {}),
     ...(draft.successorIntent !== undefined ? { successorIntent: draft.successorIntent } : {}),
+    ...(draft.lastDraftRef !== undefined ? { lastDraftRef: draft.lastDraftRef } : {}),
     ...(draft.approvedSpecHash !== undefined ? { approvedSpecHash: draft.approvedSpecHash } : {}),
     ...(draft.specApprovedBy !== undefined ? { specApprovedBy: draft.specApprovedBy } : {}),
   };

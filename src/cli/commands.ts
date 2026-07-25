@@ -1403,12 +1403,23 @@ function mergeReadinessView(mr: MergeReadiness): Record<string, unknown> {
  * that nobody reviewed the intent. Empty for a human-approved run.
  */
 function autoApprovalMergeNotice(mr: MergeReadiness): string[] {
-  return mr.specApprovedBy === 'auto'
-    ? [
-        `  spec approval: AUTO — the ENGINE approved this spec (spec.approved {approvedBy:'auto'}); ` +
-          `NO human reviewed the intent. Review WHAT was built, not only that it verified.`,
-      ]
-    : [];
+  if (mr.specApprovedBy === 'auto') {
+    return [
+      `  spec approval: AUTO — the ENGINE approved this spec (spec.approved {approvedBy:'auto'}); ` +
+        `NO human reviewed the intent. Review WHAT was built, not only that it verified.`,
+    ];
+  }
+  // B2 round 4: a report migrated from an older persisted record whose signer
+  // the event log cannot substantiate. Louder than the auto notice on purpose —
+  // "we cannot tell you who approved this" is worse news than "the engine did".
+  if (mr.specApprovedBy === 'unknown') {
+    return [
+      `  spec approval: UNKNOWN — this readiness record predates event-derived attribution and the ` +
+        `event log cannot substantiate who approved the spec. Do NOT assume a human did. Verify the ` +
+        `intent yourself before merging.`,
+    ];
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------

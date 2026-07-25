@@ -905,6 +905,43 @@ export type NotServiceOwned<E extends DomainEvent> = E['type'] extends ServiceOw
   : E;
 
 // ---------------------------------------------------------------------------
+// B2 round 4 — the DURABLE-LOG append boundary
+// ---------------------------------------------------------------------------
+declare const VALIDATED_APPROVAL: unique symbol;
+
+/**
+ * A `spec.approved` that has passed the service's binding gate. The brand is
+ * mintable only by `OrchestrationService`'s validated path (the sole
+ * `validateApproval` call site) — nothing else can produce this type without an
+ * explicit, greppable `as ValidatedApproval`, which is the same visible act as
+ * the `as DomainEvent` widening that the `ingest` guard tolerates.
+ *
+ * WHY IT EXISTS: `EventRepository.append`/`appendBatch` and
+ * `appendTriggerWithEffects` are PUBLIC (re-exported from persistence/index)
+ * and used to accept any `DomainEvent`, so a T1 could be written straight into
+ * the durable log beneath every service check. Requiring the brand makes that
+ * append not COMPILE for a caller holding a precisely typed T1.
+ *
+ * It is not the whole defence, and deliberately so: a caller who widens to
+ * `DomainEvent` first still compiles. The guarantee that holds regardless is in
+ * `applyTransition` — a T1 whose provenance the LOG contradicts throws when
+ * folded, including during `recover()`.
+ */
+export type ValidatedApproval = EventOfType<'spec.approved'> & {
+  readonly [VALIDATED_APPROVAL]: true;
+};
+
+/**
+ * What the durable log accepts. Same conditional shape as `NotServiceOwned`,
+ * and for the same reason: a caller holding the PRECISE `spec.approved` type
+ * must supply the brand, while the many call sites that legitimately pass a
+ * widened `DomainEvent` keep compiling unchanged.
+ */
+export type AppendableEvent<E extends DomainEvent> = E['type'] extends 'spec.approved'
+  ? ValidatedApproval
+  : E;
+
+// ---------------------------------------------------------------------------
 // Construction helpers
 // ---------------------------------------------------------------------------
 export interface EventDraftInput<T extends DomainEventType> {

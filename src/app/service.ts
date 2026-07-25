@@ -77,6 +77,7 @@ import {
   type LimitClassification,
   type NotServiceOwned,
   type SpecDraftRef,
+  type ValidatedApproval,
 } from '../domain/events.js';
 import {
   buildAlertStatusEntries,
@@ -1704,12 +1705,14 @@ export class OrchestrationService {
     const { written, meta: outcome } = this.#atomicEngineWrite<TransitionOutcome>(event.runId, (currentState) => {
       // B2 round 3: inside the write lock, before the transition is applied, so
       // the binding is validated against the SAME committed state the fold sees
-      // and a throw rolls the whole append back.
-      if (event.type === 'spec.approved') {
-        const approval = (event as EventOfType<'spec.approved'>).payload;
-        this.#assertApprovalBinding(event.runId, approval, approval.approvedBy);
-      }
-      const outcome = applyTransition(currentState, event);
+      // and a throw rolls the whole append back. Round 4: validation MINTS the
+      // `ValidatedApproval` brand the durable-log append boundary requires —
+      // this is the only call site that produces one.
+      const trigger: DomainEvent =
+        event.type === 'spec.approved'
+          ? (this.#validateApproval(event as EventOfType<'spec.approved'>) as DomainEvent)
+          : event;
+      const outcome = applyTransition(currentState, trigger);
       if (outcome.status === 'rejected') {
         return { trigger: outcome.rejectionEvent as DomainEvent, meta: outcome };
       }
@@ -1717,7 +1720,9 @@ export class OrchestrationService {
         alertCtx !== undefined
           ? this.#deriveAlertEvents(currentState, event, outcome.emitted, alertCtx)
           : [];
-      return { trigger: event, emitted: outcome.emitted, extraEvents, meta: outcome };
+      // The BRANDED trigger is what reaches the log — never the caller's
+      // unvalidated original.
+      return { trigger, emitted: outcome.emitted, extraEvents, meta: outcome };
     });
 
     if (outcome.status === 'rejected') {
@@ -1967,6 +1972,17 @@ export class OrchestrationService {
    *     version AND revision (codex F2: hash-only detection let a superseded
    *     revision carrying the same content hash through).
    */
+  /**
+   * B2 round 4 — the ONLY minter of `ValidatedApproval`. Asserts the binding,
+   * then brands the event so it satisfies the durable-log append boundary
+   * (`EventRepository.append`/`appendBatch`, `appendTriggerWithEffects`). No
+   * other code can produce the brand without an explicit `as ValidatedApproval`.
+   */
+  #validateApproval(event: EventOfType<'spec.approved'>): ValidatedApproval {
+    this.#assertApprovalBinding(event.runId, event.payload, event.payload.approvedBy);
+    return event as ValidatedApproval;
+  }
+
   #assertApprovalBinding(
     runId: RunId,
     input: { readonly specVersionId: SpecVersionId; readonly specHash: SpecHash },
@@ -3511,8 +3527,31 @@ export class OrchestrationService {
 
   /** The persisted W2-2 blocked-readiness read-model, if a round recorded one. */
   getMergeReadinessBlocked(runId: RunId): MergeReadinessBlockedState | undefined {
-    return this.#db.projections.get<MergeReadinessBlockedState>(runId, MERGE_READINESS_BLOCKED_PROJECTION)
-      ?.state;
+    const stored = this.#db.projections.get<MergeReadinessBlockedState>(
+      runId,
+      MERGE_READINESS_BLOCKED_PROJECTION,
+    )?.state;
+    if (stored === undefined) return undefined;
+    // B2 round 4 (codex BLOCKER 2) — a PERSISTED PROJECTION IS UNTRUSTED INPUT,
+    // not internal state. This record embeds a whole `MergeReadiness`, and one
+    // written by round-2 code can carry the stale `specApprovedBy:'human'` that
+    // round 3 proved was a lie (the optional-signer default). Returning it
+    // verbatim would re-publish that lie to every reader.
+    //
+    // Same rule as the signer everywhere else: the EVENT decides. Migrate on
+    // read against the durable log — and when the log cannot substantiate any
+    // signer, say `'unknown'` rather than republish a claim. (Confirmed twice
+    // today in two branches as a class: state written by older code is a
+    // first-class input.) Deliberately NOT a throw: a read accessor that throws
+    // makes unrelated, earlier guards unreachable — the recheck phase guard
+    // among them — and hides a real refusal behind a migration concern.
+    const signer =
+      this.#resolveApprovalSigner(runId, this.#loadEngineRecord(runId).state).specApprovedBy ?? 'unknown';
+    if (stored.mergeReadiness.specApprovedBy === signer) return stored;
+    return {
+      ...stored,
+      mergeReadiness: { ...stored.mergeReadiness, specApprovedBy: signer },
+    };
   }
 
   // ---- W2-5 implement→verify loop binding (durable resume input) -----------

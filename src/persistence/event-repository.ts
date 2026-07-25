@@ -18,7 +18,7 @@ import {
   type IdempotencyKey,
   type RunId,
 } from '../domain/ids.js';
-import type { DomainEvent, DomainEventType } from '../domain/events.js';
+import type { AppendableEvent, DomainEvent, DomainEventType } from '../domain/events.js';
 import type { SqlDriver } from './driver.js';
 import { redactEventPayload } from './metadata-redaction.js';
 import { registerRun } from './runs.js';
@@ -36,8 +36,15 @@ export interface ListByRunOptions {
 }
 
 export interface EventRepository {
-  /** Appends one event; see `appendBatch` for the transactional/dedup contract. */
-  append(draft: DomainEvent): AppendOutcome;
+  /**
+   * Appends one event; see `appendBatch` for the transactional/dedup contract.
+   *
+   * B2 round 4: a precisely typed `spec.approved` must be a `ValidatedApproval`
+   * — the brand only the service's binding gate mints — so an unvalidated T1
+   * cannot be written into the durable log through this API without an
+   * explicit, greppable cast. See `AppendableEvent`.
+   */
+  append<E extends DomainEvent>(draft: AppendableEvent<E>): AppendOutcome;
   /**
    * Appends a batch of events belonging to ONE run inside a single
    * transaction (§6.3: "one idempotent event append ... in one
@@ -46,7 +53,7 @@ export interface EventRepository {
    * one call is fine (e.g. re-applying a trigger + its emitted effects
    * after a crash of unknown outcome — some may already be durable).
    */
-  appendBatch(drafts: readonly DomainEvent[]): readonly AppendOutcome[];
+  appendBatch<E extends DomainEvent>(drafts: readonly AppendableEvent<E>[]): readonly AppendOutcome[];
   /** Ordered ascending by sequence; empty array if the run has no events. */
   listByRun(runId: RunId, options?: ListByRunOptions): readonly DomainEvent[];
   getByIdempotencyKey(runId: RunId, key: IdempotencyKey): DomainEvent | undefined;
@@ -97,13 +104,14 @@ export class SqliteEventRepository implements EventRepository {
     this.#clock = clock;
   }
 
-  append(draft: DomainEvent): AppendOutcome {
-    const [outcome] = this.appendBatch([draft]);
+  append<E extends DomainEvent>(draft: AppendableEvent<E>): AppendOutcome {
+    const [outcome] = this.appendBatch([draft as DomainEvent]);
     // appendBatch([draft]) always returns exactly one outcome for one input.
     return outcome as AppendOutcome;
   }
 
-  appendBatch(drafts: readonly DomainEvent[]): readonly AppendOutcome[] {
+  appendBatch<E extends DomainEvent>(input: readonly AppendableEvent<E>[]): readonly AppendOutcome[] {
+    const drafts = input as readonly DomainEvent[];
     if (drafts.length === 0) return [];
     const owner = drafts[0]!.runId;
     for (const draft of drafts) {

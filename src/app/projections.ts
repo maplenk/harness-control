@@ -397,12 +397,16 @@ export function makeEngineReducer(
   return (state, event) => {
     const withBounds: EngineState = { ...state, bounds };
     if (event.type === 'workflow.dispatch.advanced') {
-      const { from, to } = event.payload;
+      const { from, to, draft } = event.payload;
       const listed = WORKFLOW_DISPATCH_EDGES.some(([a, b]) => a === from && b === to);
       if (!listed || withBounds.phase !== from) {
         throw new WorkflowDispatchReplayError(event.runId, from, to, withBounds.phase);
       }
-      return { ...withBounds, phase: to };
+      // B2 round 4: fold the coordinator-completion draft ref. This is the run's
+      // own LOG recording which SpecVersion was drafted, and it is what lets
+      // `applyTransition` check a T1's provenance purely — including during
+      // `recover()`, where no database read is permissible.
+      return { ...withBounds, phase: to, ...(draft !== undefined ? { lastDraftRef: draft } : {}) };
     }
     if (event.type === 'child.spawn.initiated') {
       return foldChildSpawnInitiated(withBounds, event);
