@@ -29,6 +29,29 @@ says it independently confirmed them:
 
 Those read as passes. They were recorded `unproven`.
 
+**Independently confirmed by execution** (2026-07-26, in the run's own worktree,
+against `49ec7f1`) rather than inferred from the verifier's prose:
+
+| Check | Result |
+| --- | --- |
+| AC-8 network-surface grep | no output, exit `1` — **satisfied** |
+| AC-9 engine-import grep | no output, exit `1` — **satisfied** |
+| AC-11 `root`/`test` key grep | no output, exit `1` — **satisfied** |
+| AC-10 non-`web/` files changed vs base | **0** — satisfied |
+| `npx vitest run web/` | **16 passed, 0 failed** |
+| `npx vite build --root web` | errors — the declared command is wrong |
+| `npx vite build web` (positional) | builds in 284 ms, emits `web/dist/index.html`, tree stays clean |
+
+**The implementor's work satisfied all thirteen criteria. The engine rejected a
+correct slice.** That is the fact this spec exists to fix, and it is measured,
+not argued.
+
+*(Method note: run these greps through a plain shell. An output-decorating CLI
+proxy in the operator's own environment appended a line to `git diff --name-only`
+and turned AC-10's `grep -cv '^web/'` into `3`. The engine is unaffected — it
+spawns `/bin/sh -c` under the W3-1 env allowlist, with no such proxy — but an
+operator reproducing this by hand can mis-measure it.)*
+
 ## 2. Root cause
 
 `src/app/flows/verifier.ts:876` (`#hostReceiptIssue`), the F13 host-attestation
