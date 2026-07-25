@@ -64,7 +64,7 @@ describe('engineConfigSchema defaults (PLAN §12.1, §13, §14, §17.2)', () => 
       budget: { conservativeReservationUsd: 0.5 },
       // W3-1: the verification runner's per-run env additions default EMPTY —
       // the minimal allowlist is the whole default surface.
-      verification: { envAllowlist: [] },
+      verification: { envAllowlist: [], allowSameHarness: false },
       // F7 (§3): worktree dependency provisioning defaults to `auto` (clone when
       // the committed fingerprint matches the primary + APFS is available, else
       // `npm ci`).
@@ -442,6 +442,16 @@ describe('parseEngineConfig (deep partial overrides + validation)', () => {
     const result = parseEngineConfig({ verification: { envAllowlist: ['NVM_DIR', 'JAVA_HOME'] } });
     expect(isOk(result)).toBe(true);
     expect(unwrap(result).verification.envAllowlist).toEqual(['NVM_DIR', 'JAVA_HOME']);
+  });
+
+  it('F13: the same-harness verification opt-out is explicit and acts', () => {
+    const defaulted = unwrap(parseEngineConfig({}));
+    expect(defaulted.verification.allowSameHarness).toBe(false);
+
+    const optedOut = unwrap(
+      parseEngineConfig({ verification: { allowSameHarness: true } }),
+    );
+    expect(optedOut.verification.allowSameHarness).toBe(true);
   });
 
   it('W3-1: rejects credential-shaped verification env-allowlist additions (§17.1: NO credential-shaped vars)', () => {

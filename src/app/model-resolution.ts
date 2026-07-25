@@ -125,6 +125,102 @@ export interface ResolvedRoleModel {
   readonly codexConfigOverrides?: Readonly<Record<string, string>>;
 }
 
+/** Sink-safe profile identity used by F13's cross-vendor audit and rejection. */
+export interface ResolvedRoleProfile {
+  readonly harness: Harness;
+  readonly model: string;
+  readonly effort?: ReasoningEffort;
+}
+
+export interface VerificationRoleResolution {
+  readonly implementor: ResolvedRoleProfile;
+  readonly verifier: ResolvedRoleProfile;
+  readonly resolvedHarnesses: {
+    readonly implementor: Harness;
+    readonly verifier: Harness;
+  };
+  readonly warnings: readonly string[];
+}
+
+export class IndependenceViolationError extends Error {
+  override readonly name: string = 'IndependenceViolationError';
+  readonly code = 'independence_violation' as const;
+  readonly implementor: ResolvedRoleProfile;
+  readonly verifier: ResolvedRoleProfile;
+
+  constructor(
+    implementor: ResolvedRoleProfile,
+    verifier: ResolvedRoleProfile,
+  ) {
+    super(
+      'independence_violation: verifier harness equals implementor harness ' +
+        `(${describeResolvedProfile(implementor)}; ${describeResolvedProfile(verifier)}). ` +
+        'Set verification.allowSameHarness=true only for a knowing single-vendor run.',
+    );
+    this.implementor = implementor;
+    this.verifier = verifier;
+  }
+}
+
+function resolvedProfile(spec: RoleModelSpec): ResolvedRoleProfile {
+  const resolved = resolveRoleModel(spec);
+  return {
+    harness: resolved.harness,
+    model: resolved.model,
+    ...(resolved.effort !== undefined ? { effort: resolved.effort } : {}),
+  };
+}
+
+function describeResolvedProfile(profile: ResolvedRoleProfile): string {
+  return (
+    `${profile.harness}/${profile.model}` +
+    (profile.effort !== undefined ? `@${profile.effort}` : '')
+  );
+}
+
+/**
+ * Resolve both verification roles together and enforce harness independence.
+ * Model sameness is reported, not rejected; harness sameness requires the
+ * explicit run-config opt-out.
+ */
+export function resolveVerificationRoles(
+  implementorSpec: RoleModelSpec,
+  verifierSpec: RoleModelSpec,
+  allowSameHarness: boolean,
+): VerificationRoleResolution {
+  const implementor = resolvedProfile(implementorSpec);
+  const verifier = resolvedProfile(verifierSpec);
+  if (
+    implementor.harness === verifier.harness &&
+    !allowSameHarness
+  ) {
+    throw new IndependenceViolationError(implementor, verifier);
+  }
+
+  const warnings: string[] = [];
+  if (implementor.harness === verifier.harness) {
+    warnings.push(
+      'verification.allowSameHarness=true: implementor and verifier use the ' +
+        `same harness (${implementor.harness}); cross-vendor independence is disabled.`,
+    );
+    if (implementor.model === verifier.model) {
+      warnings.push(
+        `implementor and verifier also resolve to the same model ` +
+          `(${implementor.harness}/${implementor.model}); allowed with warning.`,
+      );
+    }
+  }
+  return {
+    implementor,
+    verifier,
+    resolvedHarnesses: {
+      implementor: implementor.harness,
+      verifier: verifier.harness,
+    },
+    warnings,
+  };
+}
+
 /**
  * Pure mapping of `{harness, model, effort}` → config-option intents (§11.2).
  * Model slug always pins the `model` option; effort (when present) pins the

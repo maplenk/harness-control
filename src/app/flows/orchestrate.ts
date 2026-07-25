@@ -54,7 +54,10 @@ import type { RunPhase } from '../../domain/state.js';
 import * as git from '../../worktree/git.js';
 import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import { redactText } from '../../redaction/index.js';
-import type { RoleModelSpec } from '../model-resolution.js';
+import {
+  resolveVerificationRoles,
+  type RoleModelSpec,
+} from '../model-resolution.js';
 import {
   AutoRespawnSignal,
   LimitPausedError,
@@ -67,6 +70,7 @@ import type { RoleRoundProjection } from '../projections.js';
 import type { RoleRunner } from '../role-runner.js';
 import {
   describeImplementorRoundDiagnostic,
+  defaultVerificationRunner,
   ImplementorFlow,
   verificationRunnerViolationEvent,
   type ImplementorContext,
@@ -77,6 +81,7 @@ import {
 } from './implementor.js';
 import {
   formatFixRequests,
+  executeEvidenceReceipts,
   gitMergeReadinessProbe,
   runVerification,
   type EvidenceRecorder,
@@ -224,6 +229,8 @@ export interface ImplementVerifyLoopResult {
   readonly worktree: WorktreeHandle;
   /** The final implementation commit (last round's worktree HEAD). */
   readonly implementationCommit: GitSha;
+  /** Non-fatal independence warnings (only possible under the explicit opt-out). */
+  readonly warnings: readonly string[];
   /** The last §16 readiness report computed (criteria-verified rounds only).
    * `ready === true` iff the run reached `merge_ready` (W1-F1); a NOT-ready
    * report carries the blockers that forced the round back to T23 — or, on
@@ -459,6 +466,17 @@ export async function runImplementVerifyLoop(
 ): Promise<ImplementVerifyLoopResult> {
   const { service, worktrees } = deps;
   const resume = input.resume;
+  const allowSameHarness =
+    service.getRunConfig(input.runId)?.verification.allowSameHarness ?? false;
+  const independenceWarnings = new Set<string>();
+  const initialRoleResolution = resolveVerificationRoles(
+    service.effectiveRoleSpec(input.runId, 'implementor', input.implementor),
+    service.effectiveRoleSpec(input.runId, 'verifier', input.verifier),
+    allowSameHarness,
+  );
+  for (const warning of initialRoleResolution.warnings) {
+    independenceWarnings.add(warning);
+  }
 
   const entryPhase = service.status(input.runId).phase;
   if (resume === undefined) {
@@ -592,6 +610,7 @@ export async function runImplementVerifyLoop(
         skipImplement && reentry !== undefined && reentry.round.role === 'verifier' ? reentry.round : undefined;
 
       let implementation: ImplementorResult | undefined;
+      let hostVerificationPassed = false;
       if (!skipImplement) {
         // --- Dispatch the implementor round (W2-3 pending/active split) ------
         // The workflow REMAINS at its previous stable phase
@@ -688,11 +707,18 @@ export async function runImplementVerifyLoop(
         // never reaches here, so we only get here for a round that delivered (or a
         // legitimate fresh zero-diff no-op).
         implementationCommit = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
+        hostVerificationPassed = implementation.verificationPassed;
         // F7 (#1): PERSIST this host-verified implementation commit (ROUND-SCOPED)
         // BEFORE the fail-closed break so a completed implementor round that later
         // RESUMES (re-entering at verification) resets the adopted worktree to EXACTLY
         // it — never WIP-committing post-commit dirt onto a new, unadjudicated HEAD.
-        recordImplementationCommit(deps, input, round, implementationCommit);
+        recordImplementationCommit(
+          deps,
+          input,
+          round,
+          implementationCommit,
+          hostVerificationPassed,
+        );
 
         // F7 (§2.4) FAIL CLOSED: the implementor's post-commit provisioning could
         // not be proven, so its self-check runner was already skipped. HALT the
@@ -741,6 +767,12 @@ export async function runImplementVerifyLoop(
         // cross-process path (`adoptWorktree` already discarded to this commit).
         await worktrees.discardToCommit(input.assignmentId, boundCommit);
         implementationCommit = boundCommit;
+        hostVerificationPassed = persistedHostVerificationPassed(
+          service,
+          input.runId,
+          round,
+          implementationCommit,
+        );
         if (worktrees.handleFor(input.assignmentId)?.leased === true) {
           worktrees.releaseLease(input.assignmentId); // the verifier reads, never writes
         }
@@ -749,6 +781,12 @@ export async function runImplementVerifyLoop(
         // adopted worktree's host-read HEAD (a WIP reconciliation commit, if
         // one was taken, is preserved work and part of that HEAD).
         implementationCommit = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
+        hostVerificationPassed = persistedHostVerificationPassed(
+          service,
+          input.runId,
+          round,
+          implementationCommit,
+        );
         if (worktrees.handleFor(input.assignmentId)?.leased === true) {
           worktrees.releaseLease(input.assignmentId);
         }
@@ -762,8 +800,16 @@ export async function runImplementVerifyLoop(
       // otherwise (skipImplement paths, or a discardToCommit that changed HEAD) it
       // does the real work against the forced/committed HEAD. A rejection FAILS
       // CLOSED — no verifier dispatch, no `merge_ready`. -------------------------
+      let provisioningMarker = '';
       try {
-        await worktrees.provisionForVerification(input.assignmentId);
+        const provisioned = await worktrees.provisionForVerification(
+          input.assignmentId,
+        );
+        provisioningMarker = `${provisioned.strategy}:${
+          provisioned.fingerprint.length > 0
+            ? provisioned.fingerprint
+            : 'operator-managed'
+        }`;
       } catch (error) {
         // M9: implementationCommit is already the host-read HEAD for this round.
         provisioningFailure = { ...toProvisioningFailure(error, handle), round, implementationCommit };
@@ -773,15 +819,46 @@ export async function runImplementVerifyLoop(
       // --- Independently verify (T23/T24). W2-3 split: the run stays at
       // `implementing` through the verifier's spawn+pin; runVerification's
       // dispatch advances `implementing → verifying` after pins succeed. ---
+      const effectiveImplementorSpec = service.effectiveRoleSpec(
+        input.runId,
+        'implementor',
+        input.implementor,
+      );
+      const effectiveVerifierSpec = service.effectiveRoleSpec(
+        input.runId,
+        'verifier',
+        input.verifier,
+      );
+      const roleResolution = resolveVerificationRoles(
+        effectiveImplementorSpec,
+        effectiveVerifierSpec,
+        allowSameHarness,
+      );
+      for (const warning of roleResolution.warnings) {
+        independenceWarnings.add(warning);
+      }
       const binding: VerificationBinding = {
         assignmentId: input.assignmentId,
         specHash: input.specHash,
         baseCommit: handle.baseSha,
         implementationCommit,
+        resolvedHarnesses: roleResolution.resolvedHarnesses,
         repoRoot: handle.repoRoot,
         worktreeBranch: handle.branch,
         destinationRef: destinationLabel,
       };
+      const hostReceipts = await executeEvidenceReceipts({
+        runId: input.runId,
+        criteria: input.criteria,
+        binding,
+        cwd: handle.worktreePath,
+        runner:
+          input.runVerificationCommands ?? defaultVerificationRunner(),
+        evidence: input.evidence,
+        provisioningMarker,
+        ids: deps.ids,
+        clock: deps.clock,
+      });
       const probe = gitMergeReadinessProbe({
         repoRoot: handle.repoRoot,
         worktreePath: handle.worktreePath,
@@ -804,11 +881,13 @@ export async function runImplementVerifyLoop(
         runId: input.runId,
         // P4b wave 2 FAILOVER: verify on the EFFECTIVE spec (ladder rung or run
         // default), same as the implementor half.
-        verifierSpec: service.effectiveRoleSpec(input.runId, 'verifier', input.verifier),
+        verifierSpec: effectiveVerifierSpec,
         cwd: handle.worktreePath,
         binding,
         criteria: input.criteria,
         evidence: input.evidence,
+        hostVerificationPassed,
+        hostReceipts,
         ...(input.explorationIndex !== undefined ? { explorationIndex: input.explorationIndex } : {}),
         ...(resumeFrom !== undefined ? { resumeFrom } : {}),
         mergeReadinessProbe: probe,
@@ -944,6 +1023,7 @@ export async function runImplementVerifyLoop(
           : outcomeOf(finalPhase),
     worktree: handle,
     implementationCommit,
+    warnings: [...independenceWarnings],
     ...(mergeReadiness !== undefined ? { mergeReadiness } : {}),
     ...(provisioningFailure !== undefined ? { provisioningFailure } : {}),
   };
@@ -988,6 +1068,7 @@ function recordImplementationCommit(
   input: ImplementVerifyLoopInput,
   round: number,
   commit: GitSha,
+  verificationPassed: boolean,
 ): void {
   const loopState = deps.service.getImplementVerifyLoopState(input.runId);
   if (loopState?.worktree === undefined) return;
@@ -995,8 +1076,28 @@ function recordImplementationCommit(
     ...loopState,
     // ROUND-SCOPED so a resume can only trust it for the SAME round (#1, round-4):
     // a record left stale by an earlier round never resets/verifies the wrong commit.
-    worktree: { ...loopState.worktree, lastImplementationCommit: { round, commit } },
+    worktree: {
+      ...loopState.worktree,
+      lastImplementationCommit: { round, commit, verificationPassed },
+    },
   });
+}
+
+/** F13 step 1 resume gate: a host result is reusable only for the exact
+ * persisted round/commit. Legacy, missing, or mismatched state fails closed. */
+function persistedHostVerificationPassed(
+  service: OrchestrationService,
+  runId: RunId,
+  round: number,
+  commit: GitSha,
+): boolean {
+  const attestation = service.getImplementVerifyLoopState(runId)?.worktree
+    ?.lastImplementationCommit;
+  return (
+    attestation?.round === round &&
+    String(attestation.commit) === String(commit) &&
+    attestation.verificationPassed === true
+  );
 }
 
 function ensureLeased(worktrees: GitWorktreeManager, assignmentId: AssignmentId): void {

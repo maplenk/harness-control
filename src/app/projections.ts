@@ -308,6 +308,8 @@ export interface WorktreeFactsState {
   readonly lastImplementationCommit?: {
     readonly round: number;
     readonly commit: GitSha;
+    /** F13 step 1: host-observed command result for this exact round/commit. */
+    readonly verificationPassed: boolean;
   };
 }
 

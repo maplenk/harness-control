@@ -260,6 +260,33 @@ export interface CriterionResult {
   readonly note?: string;
 }
 
+/** F13 host-created proof for one declared verification-command execution. */
+export interface EvidenceReceipt {
+  /** Host-generated logical id; the immutable receipt body is stored in CAS. */
+  readonly receiptId: string;
+  readonly receiptRef: ArtifactHash;
+  readonly runId: RunId;
+  readonly criterionId: CriterionId;
+  readonly specHash: SpecHash;
+  readonly implementationCommit: GitSha;
+  /** Exact host process invocation, including the shell and approved command. */
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  readonly exitCode: number;
+  readonly startedAt: IsoTimestamp;
+  readonly endedAt: IsoTimestamp;
+  readonly stdoutRef: ArtifactHash;
+  readonly stderrRef: ArtifactHash;
+  /** Digest of the redacted stdout/stderr bytes bound into this receipt. */
+  readonly outputDigest: string;
+  readonly toolchain: {
+    readonly node: string;
+    readonly platform: string;
+    readonly arch: string;
+    readonly provisioningMarker: string;
+  };
+}
+
 export interface Verification {
   readonly id: VerificationId;
   readonly runId: RunId;
@@ -268,6 +295,8 @@ export interface Verification {
   readonly baseCommit: GitSha;
   readonly implementationCommit: GitSha;
   readonly criteria: readonly CriterionResult[];
+  /** Host attestations supplied to the verifier and enforced by the gate. */
+  readonly evidenceReceipts: readonly EvidenceReceipt[];
   /** Any failed/unproven blocks (§8) → 'blocked'. */
   readonly outcome: 'all_verified' | 'blocked';
   readonly completedAt: IsoTimestamp;
@@ -276,6 +305,11 @@ export interface Verification {
 // ---------------------------------------------------------------------------
 // MergeReadiness (§16; report only — never auto-merged)
 // ---------------------------------------------------------------------------
+export interface VerificationHarnessPair {
+  readonly implementor: string;
+  readonly verifier: string;
+}
+
 export interface MergeReadiness {
   readonly id: MergeReadinessId;
   readonly runId: RunId;
@@ -283,6 +317,8 @@ export interface MergeReadiness {
   readonly specHash: SpecHash;
   readonly baseCommit: GitSha;
   readonly verifiedCommit: GitSha;
+  /** Resolved runtime harnesses; proves the independence decision in the audit. */
+  readonly resolvedHarnesses: VerificationHarnessPair;
   readonly destinationClean: boolean;
   /** W1-F4: the implementation worktree was clean at probe time (post-commit
    * verification commands can dirty it — that content is in NO commit). */
@@ -290,6 +326,8 @@ export interface MergeReadiness {
   readonly baseDrifted: boolean;
   readonly conflicts: boolean;
   readonly requiredTestsPassed: boolean;
+  /** CAS refs of the host receipts enforced for this report. */
+  readonly evidenceReceiptRefs: readonly ArtifactHash[];
   readonly ready: boolean;
   /** The §16 blockers when NOT ready (empty iff `ready`); W1-F1 maps these to
    * `integration_blocker` fix-requests and the T23 trigger payload. */

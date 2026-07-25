@@ -329,6 +329,11 @@ const verificationSchema = z
           'verification.envAllowlist must not contain credential-shaped names ' +
           '(§17.1/W3-1: verification commands never see credentials in the MVP)',
       }),
+    /**
+     * F13 explicit opt-out for knowing single-vendor runs. False keeps
+     * cross-vendor harness independence fail-closed.
+     */
+    allowSameHarness: z.boolean().default(false),
   })
   .strict()
   .readonly();

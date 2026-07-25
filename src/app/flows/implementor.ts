@@ -58,8 +58,9 @@
  *  2. **Primary-checkout mutation guard**: the flow snapshots the PRIMARY
  *     repo before the commands and re-checks after; ANY drift produces the
  *     typed `verification_runner_violation` — the round's verification fails
- *     honestly (`verificationPassed:false`), the §16 readiness gate blocks
- *     on it (verifier flow), and the loop driver records the durable
+ *     honestly (`verificationPassed:false`); the loop binds that host result
+ *     to the exact round/commit, the §16 readiness gate blocks on it, and the
+ *     loop driver records the durable
  *     `verification.runner.violation` incident event. The snapshot covers
  *     HEAD, `git status --porcelain --ignored` (so a NEW gitignored file is
  *     drift, not just tracked-tree edits), a content manifest of the primary
@@ -709,7 +710,8 @@ export interface ImplementorResult {
   /** Per-command results of the spec's declared verification commands (§8). */
   readonly verification: readonly VerificationCommandResult[];
   /** True iff every declared verification command passed (vacuously true if
-   * none) AND the W3-1 primary-checkout guard saw no drift. */
+   * none) AND the W3-1 primary-checkout guard saw no drift. F13 threads this
+   * host-observed result into the §16 gate for the same round/commit. */
   readonly verificationPassed: boolean;
   /** W3-1: the primary checkout mutated across the verification commands —
    * typed proof of a confinement violation. Forces `verificationPassed:false`;
