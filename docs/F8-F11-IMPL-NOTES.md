@@ -1348,10 +1348,80 @@ fail-closed. Everything else is either strictly better than main or unchanged.
 
 ---
 
+---
+
+# Round 10 — codex terminal regression check on `c6548ec`
+
+Four REGRESSIONS AGAINST MAIN — cases where main succeeds and this branch failed.
+All four closed. Commit: `374414d`.
+
+| # | regression | fix |
+| --- | --- | --- |
+| 1 | Nested smoke requested `parent/node_modules/child`, which Node resolves as a SUBPATH of the parent — a parent declaring `exports` threw ERR_PACKAGE_PATH_NOT_EXPORTED and a VALID tree was falsely refused | resolve each package from its OWN package.json via `createRequire`; the smoke proves the addon LOADS, not that one spelling resolves |
+| 2 | Quarantine recorded the ORCHESTRATOR pid, so a long-lived orchestrator retained every timed-out stage forever — unbounded cost main lacks | TTL runs from the timestamp alone; liveness no longer extends it; plus a hard cap with oldest-first eviction and a LOGGED count |
+| 3 | Both `warn(...)` calls in `quarantineStage` could throw from the timeout `finally`, masking the refusal | `safeWarn` — an observability sink never masks the failure it describes |
+| 4 | Exclusion widened to every node_modules at any depth, so a TRACKED vendored tree main commits was silently unstaged and then failed as dirt | scoped to the ENGINE tree: ignore-rule (`--no-index`, so force-add cannot launder) OR provisioner MARKER, with in-HEAD as an overriding veto |
+
+Regression 1 was reproduced against real Node before fixing; regression 4's
+tracked-vendored fixture fails pre-fix. Both new tests use shapes main handles.
+
+**LOW** — the standalone `runImplementor` now explains a receipt disagreement in
+the same words as the loop path (shared `describeReceiptMismatch`).
+
+## New residual introduced by the Regression 4 fix — flagged for judgement
+
+Scoping exclusion to provably-engine trees leaves one case where **main is
+stricter than this branch**: a node_modules that is UNIGNORED, UNMARKED, and not
+in HEAD. Main excluded a ROOT one unconditionally; here it is committed like any
+other agent-created file, because nothing distinguishes it from user content.
+
+I did not paper over this. It follows directly from the directive — never unstage
+tracked ones; a provisioned tree is by definition git-ignored — and I added the
+provisioner MARKER as a second positive signal specifically so that
+provisioned-but-unignored trees stay excluded. The remaining gap is only for a
+tree the engine never provisioned. Provisioning independently fails closed when
+node_modules is not ignored, so no engine-managed round reaches a commit through
+this path — but it IS a delta and codex should rule on it rather than me.
+
+Two vertical-slice sub-assertions ("node_modules never entered the commit despite
+the missing ignore rule") were updated to match; their primary invariants —
+provisioning fails closed, no verifier, no merge_ready, exactly one commit — are
+unchanged and still asserted.
+
+## R8 — still unresolved, stated plainly
+
+I did not build a deterministic seam that mutates HEAD between adjudication and
+binding. I instrumented an injection at the call immediately preceding the old
+re-read and confirmed it fired, but the resulting state did not land reproducibly
+and I could not explain why. The committed test asserts the invariant (the
+live-path binding IS the adjudicated head, identical to the receipt and the
+durable pointer) and, as codex notes, would pass on the pre-fix implementation
+whenever no race occurs. **Record it as a known untested invariant.** The fix
+itself is four lines and mirrors the completed-resume path codex already
+confirmed correct.
+
+---
+
+# Final residual list for the merge record
+
+| # | residual | disposition |
+| --- | --- | --- |
+| R1 | Veto universality's syntactic defeat — typed no-op combinable with an interactive handler by direct generic construction. Production Grok safe (`buildGrokMediation` overwrites last). | Non-blocking (codex) |
+| R2 | Claude/Codex payload-binding gap — both carry `noPayloadToVerify` though their tool calls carry executable payloads. Typed and greppable, not silent. | Tracked |
+| R3 | Quarantine retention — **now bounded** (TTL from timestamp + capped, logged eviction). Residual cost vs main is a bounded number of retained stages. | Reduced this round |
+| R4 | `factory.ts` `prepared.dispose()` unguarded — can mask a primary failure. | Non-blocking |
+| R5 | **Closed this round** (Regression 3). | — |
+| R6 | Transitive dependency versions unverified — only root deps/devDeps proven. | Stated limit |
+| R7 | F13 — role-independent stop-reason adjudication, host-attested evidence receipts. | Out of the LAND window |
+| R8 | No deterministic test for Blocker 1's race window; the invariant is asserted instead. | **Known untested invariant** |
+| R9 | **New:** an UNIGNORED, UNMARKED, untracked node_modules is now committed where main excluded a root one. See above. | **For codex to rule on** |
+
+---
+
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1903 passed, 0 failed**, 106 files
+- `npx vitest run` (full, from this worktree) → **1906 passed, 0 failed**, 106 files
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
