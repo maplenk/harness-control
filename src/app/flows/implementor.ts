@@ -832,6 +832,11 @@ export function buildImplementorPrompt(context: ImplementorContext, cwd: string)
     `- You may create, modify, or delete files ONLY inside your assigned worktree: ${cwd}. Never write outside it.`,
     '- Use structured repository tools (Read, Grep/Glob, Write, and Edit) for inspection and file changes. Structured Write can create missing parent directories.',
     '- Shell access is limited to read-only repository inspection and the exact declared verification commands below. Do NOT use shell commands such as mkdir, cp, mv, rm, touch, network clients, executable preprocessors, or output redirection to scaffold or change files. If structured tools cannot perform a needed action, report that blocker instead of requesting broader shell access.',
+    // F11: the read-only shell classifier can only reason about a command whose
+    // expansion-bearing bytes are inside SINGLE quotes (where the shell performs
+    // none). Telling the agent the rule up front turns a would-be permission
+    // denial — which kills the turn — into a command it can simply write correctly.
+    "- When you do use the shell for reading, single-quote pattern/regex arguments and avoid $, backslashes, backticks, and parentheses outside single quotes — such commands cannot be classified read-only and will be denied.",
     '- The acceptance criteria below are FIXED and shown for context only. You MUST NOT add, remove, or change any acceptance criterion.',
     '- You MUST NOT declare the task complete, verified, or passing. An independent verifier decides that — just do the work and report honestly.',
     '- If you cannot satisfy a criterion, state it plainly as a risk in your completion report; never paper over it.',

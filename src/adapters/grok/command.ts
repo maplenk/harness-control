@@ -127,11 +127,26 @@ function splitShellSegments(command: string): readonly string[] | undefined {
   for (let index = 0; index < command.length; index += 1) {
     const char = command[index];
     if (char === undefined) return undefined;
-    if (char === '\0' || char === '\n' || char === '\r' || char === '`' || char === '$' || char === '\\') {
-      return undefined;
+    // Control bytes are unacceptable in EVERY context — quoting cannot make a
+    // NUL or an embedded newline a legitimate literal.
+    if (char === '\0' || char === '\n' || char === '\r') return undefined;
+    // F11: quote state FIRST. A POSIX SINGLE-quoted span is expansion-free — the
+    // shell performs no parameter/command substitution and no escape processing
+    // inside it — so `$`, `\` and a backtick there are ordinary argument bytes,
+    // and so are `;`/`|`/`&`/`(`/`<`. Treating the span as an opaque literal is
+    // therefore exactly as safe as the old blanket rejection, and it is what
+    // makes a quoted regex (`rg -n 'a\.b|c$'`) classifiable at all. The scan
+    // still ends the span only at the closing quote, so nothing inside it can
+    // introduce a second, unclassified command.
+    if (quote === "'") {
+      if (char === "'") quote = undefined;
+      continue;
     }
-    if (quote !== undefined) {
-      if (char === quote) quote = undefined;
+    // OUTSIDE single quotes — including INSIDE double quotes, where the shell
+    // DOES expand — the conservative rejection is unchanged.
+    if (char === '`' || char === '$' || char === '\\') return undefined;
+    if (quote === '"') {
+      if (char === '"') quote = undefined;
       continue;
     }
     if (char === "'" || char === '"') {
@@ -176,15 +191,25 @@ function tokenizeShellSegment(segment: string): readonly ShellToken[] | undefine
   };
 
   for (const char of segment) {
-    if (char === '\0' || char === '\n' || char === '\r' || char === '`' || char === '$' || char === '\\') {
-      return undefined;
+    // Same ordering as `splitShellSegments` (F11), for the same reason: control
+    // bytes are always fatal, a SINGLE-quoted span is an opaque literal, and
+    // everywhere else (including inside double quotes) expansion characters are
+    // still refused. The literal bytes land in the token VALUE, so the
+    // downstream checks — `stripSafeRedirections` (which only treats an
+    // UNQUOTED `>`/`<` as a redirection) and `hasEscapingPathArgument` (which
+    // inspects the resolved value, so `cat '/etc/passwd'` is still caught) —
+    // see exactly what the shell will pass to the program.
+    if (char === '\0' || char === '\n' || char === '\r') return undefined;
+    if (quote === "'") {
+      if (char === "'") quote = undefined;
+      else value += char;
+      quoted = true;
+      continue;
     }
-    if (quote !== undefined) {
-      if (char === quote) {
-        quote = undefined;
-      } else {
-        value += char;
-      }
+    if (char === '`' || char === '$' || char === '\\') return undefined;
+    if (quote === '"') {
+      if (char === '"') quote = undefined;
+      else value += char;
       quoted = true;
       continue;
     }
