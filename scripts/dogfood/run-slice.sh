@@ -78,8 +78,9 @@ case "$RC" in
   0) echo "✔ reached a terminal/hand-off state — if merge_ready, MERGE GATE next:";
      echo "   1) human merges the verified commit  2) npm test && npm run typecheck  3) npm run build  4) clean tree  5) record new base SHA";;
   3) echo "‖ paused on a provider usage limit (--no-wait semantics). Resume with:";
-     echo "   node dist/cli/index.js resume $RUN_ID --wait";;
-  4) echo "▲ integration_blocked — resolve §16 blockers then: node dist/cli/index.js recheck $RUN_ID";;
+     echo "   scripts/dogfood/resume-slice.sh $RUN_ID          (gated: re-runs preflight enforcement)";;
+  4) echo "▲ integration_blocked — resolve §16 blockers then:";
+     echo "   scripts/dogfood/resume-slice.sh $RUN_ID recheck";;
   *) echo "✗ run exited $RC — inspect $RUN_LOG and status above.";;
 esac
 exit "$RC"

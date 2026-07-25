@@ -17,8 +17,13 @@ LOGDIR="${HARNESS_HOME:-$HOME/.harness}/logs"; mkdir -p "$LOGDIR"
 LOG="$LOGDIR/reverify.log"
 cd "$REPO" || { echo "repo not found"; exit 1; }
 
-echo "== 1/4  ensure dist is the F7-fixed build =="
-npm run build >/dev/null 2>&1 && echo "   dist rebuilt (F7 present)" || { echo "   BUILD FAILED"; exit 1; }
+echo "== 1/4  L11 gate: a fresh PASSING preflight must vouch for this dist =="
+# This script RESUMES a run — it spends and it mutates, exactly like `run`. It
+# used to `npm run build` and then call the CLI directly, which both bypassed the
+# gate AND invalidated any dist digest a preflight had bound. The build now
+# belongs to preflight (section c), and the gate binds it.
+bash "$REPO/scripts/dogfood/require-preflight.sh" "$RUN" || {
+  echo "   run: bash scripts/dogfood/preflight.sh   (it rebuilds dist and binds the digest)"; exit 1; }
 
 echo "== 2/4  drop the manual salvage-proof node_modules symlink =="
 # F7 fails closed on a symlinked node_modules; remove it so F7's OWN provisioning runs.
@@ -34,7 +39,7 @@ echo "== 3/4  current run state =="
 node ./dist/cli/index.js status "$RUN" --json 2>/dev/null | head -30 \
   || echo "   (status unavailable — resume will report the durable state)"
 
-echo "== 4/4  resume through the F7-fixed engine =="
+echo "== 4/4  resume through the F7-fixed engine (gated above) =="
 echo "   (F7 provisions node_modules at the verify boundary; watch for merge_ready)"
 node ./dist/cli/index.js resume "$RUN" --json 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}

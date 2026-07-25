@@ -77,7 +77,7 @@ Cost basis (run 1 actuals): coordinator ≈ $1.5 (532k in / 31k out, opus xhigh)
 - `watch.sh` uses `sqlite3 -readonly`, which transiently fails `SQLITE_CANTOPEN` right after any CLI command deletes the WAL sidecars (last-connection cleanup). Cosmetic; self-heals on the next 5s tick.
 - `~/.harness/.current-dogfood-run` is a **stale pointer** (points at the cancelled run). No script reads it — ignore it.
 - The live grok binary is **0.2.112** (was 0.2.111 earlier the same day — it moves fast); `src/adapters/grok/capabilities.ts:1` documents the baseline against **0.2.106**. If grok misbehaves in a new way, check this skew first — preflight prints the installed-vs-baseline delta on every run.
-- RSS recovery if a role trips the ceiling: `node dist/cli/index.js set-budget RUN_ID --role implementor --memory-budget-mb <MB> --resume` — an audited raise, never a silent one.
+- RSS recovery if a role trips the ceiling: `scripts/dogfood/resume-slice.sh RUN_ID budget implementor <MB>` — an audited raise, never a silent one. Use the wrapper, not the raw CLI: `resume`, `recheck` and `set-budget --resume` all spend and all mutate a run, so they go through the L11 gate like `run` does (`resume-slice.sh RUN_ID` / `… recheck` / `… budget ROLE MB`).
 - Per-slice preconditions, predicted failure modes and spec mitigations live in **`docs/DOGFOOD-FEASIBILITY.md`** §4 (the slice table) and §1 (the transition laws L1–L11). Read the row for slice *i* before writing its SECTION/SLICE/PATHS.
 
 ## 3. Milestones + ordering (and why this order)
