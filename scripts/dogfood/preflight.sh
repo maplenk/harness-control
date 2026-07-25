@@ -488,18 +488,21 @@ fs.appendFileSync(record, line + '\n');
 process.stdout.write(line + '\n');
 NODE
 }
+# Node's stack trace is noise here; the escalation below is the operator message.
+append_record_quiet() { append_record "$1" 2>>"$WORK/record.err"; }
 
 # A failed append is NOT a cosmetic problem. The gate reads the FILE, not this
 # process's memory, so flipping VERDICT here would leave the previous PASS as the
 # last record — and it would authorise the very run this battery just rejected.
 # Escalate: write a fail record; failing that, destroy the log. The gate refuses
 # on missing/empty/unreadable, which is the safe landing state.
-if ! append_record "$VERDICT"; then
+if ! append_record_quiet "$VERDICT"; then
   echo
   echo "!! could not append the provenance record to $RECORD"
-  if append_record "fail"; then
+  [ -s "$WORK/record.err" ] && grep -m1 -E 'Error|EACCES|EPERM|ENOENT|ENOSPC|EROFS' "$WORK/record.err" | sed 's/^/     /'
+  if append_record_quiet "fail"; then
     echo "!! wrote a FAIL record instead — the gate will refuse"
-  elif : > "$RECORD" 2>/dev/null; then
+  elif { : 2>/dev/null > "$RECORD"; }; then
     echo "!! truncated $RECORD — no stale pass remains"
   elif rm -f "$RECORD" 2>/dev/null; then
     echo "!! removed $RECORD — no stale pass remains"
@@ -520,7 +523,7 @@ if [ "$POST_DIRT" != "$DIRT" ]; then
   echo
   echo "!! the provenance write dirtied the repo — invalidating the record just written"
   printf '%s\n' "$POST_DIRT" | sed 's/^/     /'
-  append_record "fail" >/dev/null 2>&1 || : > "$RECORD" 2>/dev/null || rm -f "$RECORD" 2>/dev/null
+  append_record_quiet "fail" >/dev/null 2>&1 || { : 2>/dev/null > "$RECORD"; } || rm -f "$RECORD" 2>/dev/null
   echo "── PREFLIGHT FAILED (post-write dirt) — do NOT start a run ──"
   exit 1
 fi
