@@ -20,38 +20,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-. "$ROOT/scripts/dogfood/lib.sh"
-
 : "${HARNESS_HOME:=$HOME/.harness}"; export HARNESS_HOME
-LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"
-
-# Containment BEFORE creating anything: the store and the log dir must live
-# outside the repo, or the CLI writes harness.db/artifacts (and this script writes
-# its logs) into the working tree and dirties it. Ordering matters — mkdir -p on
-# an unvetted path is what created directories inside the repo before the refusal
-# could fire.
-CONTAINMENT="$(dogfood_require_containment "$ROOT" "$HARNESS_HOME" "$LOGDIR")" || { echo "!! ${CONTAINMENT#!}" >&2; exit 1; }
-mkdir -p "$LOGDIR"
+LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"; mkdir -p "$LOGDIR"
 CLI=(node "$ROOT/dist/cli/index.js")
-
-# REMINDER (advisory, not enforced): run `bash scripts/dogfood/preflight.sh`
-# before this. It is the operator's check that the engine can actually commit on
-# this machine — automated enforcement is deferred to the `gate-enforcement`
-# branch, so it is on you to run it.
 
 SECTION="${SECTION:?set SECTION (e.g. §3A.1)}"
 SLICE="${SLICE:?set SLICE (one-line scope)}"
 PATHS="${PATHS:?set PATHS (files the implementor may touch)}"
 PLAN_SHA="${PLAN_SHA:-$(git rev-parse HEAD)}"
-# Roles and per-run engine config come from lib.sh — the SAME resolution the
-# preflight battery gated doctor on and the gate re-checked. Restating the
-# defaults here is what let an overridden role dispatch an unchecked adapter.
-# (COORDINATOR default claude:opus:xhigh; CONFIG defaults to the committed
-# dogfood config with the implementor RSS budget pinned to 2048 MB — set
-# CONFIG="" for engine defaults. --config at `start` pins it into the run's
-# persisted config, so the `run` stage inherits it.)
-dogfood_resolve_roles
-dogfood_resolve_config "$ROOT"
+COORDINATOR="${COORDINATOR:-claude:opus:xhigh}"
+# Per-run engine config (F4 per-role memory budget, etc.). Default: the committed
+# dogfood config (implementor RSS budget pinned to 2048 MB). Set CONFIG="" to run
+# on engine defaults. --config at `start` pins it into the run's persisted config,
+# so the `run` stage inherits it (no need to pass it to run-slice.sh).
+CONFIG="${CONFIG-$ROOT/scripts/dogfood/dogfood.config.json}"
 
 [ -f "$ROOT/dist/cli/index.js" ] || { echo "!! dist not built — run: npm run build" >&2; exit 1; }
 

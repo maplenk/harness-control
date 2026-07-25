@@ -18,9 +18,6 @@ LOG="$LOGDIR/reverify.log"
 cd "$REPO" || { echo "repo not found"; exit 1; }
 
 echo "== 1/4  ensure dist is the F7-fixed build =="
-# REMINDER (advisory, not enforced): this script RESUMES a run — it spends and it
-# mutates, exactly like `run`. Run `bash scripts/dogfood/preflight.sh` first; its
-# section (d) is the check that the engine can commit at all on this machine.
 npm run build >/dev/null 2>&1 && echo "   dist rebuilt (F7 present)" || { echo "   BUILD FAILED"; exit 1; }
 
 echo "== 2/4  drop the manual salvage-proof node_modules symlink =="
@@ -37,7 +34,7 @@ echo "== 3/4  current run state =="
 node ./dist/cli/index.js status "$RUN" --json 2>/dev/null | head -30 \
   || echo "   (status unavailable — resume will report the durable state)"
 
-echo "== 4/4  resume through the F7-fixed engine (gated above) =="
+echo "== 4/4  resume through the F7-fixed engine =="
 echo "   (F7 provisions node_modules at the verify boundary; watch for merge_ready)"
 node ./dist/cli/index.js resume "$RUN" --json 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}

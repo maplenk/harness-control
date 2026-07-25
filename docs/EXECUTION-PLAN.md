@@ -24,7 +24,7 @@ Two checkpoints worth naming inside that:
 | Run 1 (`run_8aa51aea…`, slice 1a) is **unresumable** | `resume` failed closed: §16.3 (`src/worktree/validate.ts:251`) refuses resume-in-place because HEAD (`ef952b1`) drifted past the last cadence checkpoint (`36101cf1`). See F8 below. |
 | Grok's three commits survive on the assignment branch | `77cfd09 → 36101cf → ef952b1`, base `01ff719` (8 commits behind main — salvage would have bought a merge conflict with F7's `commands.ts` rewrite). |
 | Slice-1a run `run_756ce21b…` was **cancelled** (2026-07-25) | Started against §3A.1 at plan SHA `b9ca10c`, then cancelled once round 1 surfaced **F11** (the grok quoting trap → `no_deliverable`) and **F10** (the staging helper is fatal on git 2.55). A fresh 1a run is pending the LAND gate — starting one before F10 lands would just re-buy the same failure. |
-| Engine-fix branches **F8–F11 are under codex review**, none merged to `main` | The staging drill in `scripts/dogfood/preflight.sh` fails on `main` today for exactly this reason: the built `addAllExceptNodeModules` still carries the pre-F10 pathspec. That failure is the battery working, not the battery breaking. |
+| Engine-fix branches **F8–F11 are under codex review**, none merged to `main` | Until F10 lands, the built `addAllExceptNodeModules` still carries the pre-F10 pathspec, so **the engine cannot produce a commit on git 2.55** — that is the item blocking the LAND window, and it is why nothing else on this branch is worth blocking it. |
 | Run 2 (`run_992e9598…`) is a cancelled opencode-era run | Event tail: limit incident → pause → cancel. Historical only; its worktree is cleanup noise. |
 | Engine suite green at F7 land | **Real suite: 103 files / 1699 tests (~17s), both SQLite drivers**, typecheck 0. The historically reported 206/3398 was exactly **doubled**: the leftover gitignored `.claude/worktrees/agent-ad6b0180db834588b` (an F7 agent worktree) mirrors `src/` with its own `node_modules`, and vitest's default excludes don't cover `.claude/`, so a bare `npm test` discovers the whole suite twice (1699×2 = 3398). Verified via `npx vitest run --exclude '**/.claude/**'`; now fixed permanently by the root `vitest.config.ts` exclude (risk #9). |
 
@@ -32,22 +32,17 @@ Two checkpoints worth naming inside that:
 
 ```
 slice(i):
-  PREFLIGHT   scripts/dogfood/preflight.sh — the L11 battery, ADVISORY (you must
-              remember to run it; enforcement is deferred to the
-              `gate-enforcement` branch): (a) toolchain provenance · (b)
-              native-toolchain runtime proof · (c) build + role-scoped doctor ·
-              (d) THE DRILL that justifies the whole battery — the real
-              addAllExceptNodeModules imported out of dist/ and run against an
-              ignored+present node_modules fixture, i.e. "can this machine
-              produce a commit at all" · (e) discovery floor ≥103 · (f) clean
-              tree + a dist digest. Store/log dirs must resolve outside the repo
-              (checked before anything is created, by the battery and by each
-              slice wrapper). `npm run test:preflight` tests the battery itself.
-              NOTE: `status` is NOT read-only — every run-scoped CLI call appends
-              alert.delivered, so monitor.sh mutates; watch.sh is the only
-              read-only watch. resume/recheck/set-budget spend like `run`: run
-              preflight before them too.
-              Then: budget sanity · SECTION/SLICE/PATHS written · plan SHA pinned.
+  PREFLIGHT   Operator discipline, not tooling on this branch. Confirm by hand:
+              clean tree · dist rebuilt from merged HEAD (`npm run build`) ·
+              `npm test` shows 103 files / 1699 tests (not doubled) ·
+              `node dist/cli/index.js doctor --json` healthy for the three
+              dispatched harnesses · budget sanity · SECTION/SLICE/PATHS written ·
+              plan SHA pinned. A scripted battery for all of this exists on the
+              `gate-enforcement` branch — advisory there too, deliberately not
+              merged (see §5A). NOTE: `status` is NOT read-only — every
+              run-scoped CLI call appends alert.delivered, so monitor.sh mutates
+              the run; watch.sh is the read-only watch. resume/recheck/set-budget
+              spend exactly like `run`.
               REPO FREEZE begins at `start` — no commits and no tracked-file edits
               until the run is terminal. Queue doc edits in the scratchpad.
   START       scripts/dogfood/start-slice.sh  → coordinator drafts spec → awaiting_approval
@@ -73,8 +68,8 @@ Cost basis (run 1 actuals): coordinator ≈ $1.5 (532k in / 31k out, opus xhigh)
 - `run-slice.sh` exit codes: **0** = terminal (check for `merge_ready`) · **3** = provider usage-limit pause (`resume --wait`) · **4** = `integration_blocked` (`recheck` after fixing).
 - `watch.sh` uses `sqlite3 -readonly`, which transiently fails `SQLITE_CANTOPEN` right after any CLI command deletes the WAL sidecars (last-connection cleanup). Cosmetic; self-heals on the next 5s tick.
 - `~/.harness/.current-dogfood-run` is a **stale pointer** (points at the cancelled run). No script reads it — ignore it.
-- The live grok binary is **0.2.112** (was 0.2.111 earlier the same day — it moves fast); `src/adapters/grok/capabilities.ts:1` documents the baseline against **0.2.106**. If grok misbehaves in a new way, check this skew first — preflight prints the installed-vs-baseline delta on every run.
-- RSS recovery if a role trips the ceiling: `node dist/cli/index.js set-budget RUN_ID --role implementor --memory-budget-mb <MB> --resume` — an audited raise, never a silent one (`RUN_ID` and `--role` are both required, `args.ts:61`). Re-run preflight first: `resume`, `recheck` and `set-budget --resume` all spend and all mutate a run exactly as `run` does.
+- The live grok binary is **0.2.112** (was 0.2.111 earlier the same day — it moves fast); `src/adapters/grok/capabilities.ts:1` documents the baseline against **0.2.106**. If grok misbehaves in a new way, check this skew first (`node dist/cli/index.js doctor --json` reports installed vs expected per adapter).
+- RSS recovery if a role trips the ceiling: `node dist/cli/index.js set-budget RUN_ID --role implementor --memory-budget-mb <MB> --resume` — an audited raise, never a silent one (`RUN_ID` and `--role` are both required, `args.ts:61`). `resume`, `recheck` and `set-budget --resume` all spend and all mutate a run exactly as `run` does — treat them with the same care.
 - **`status` is not a read: it writes.** Every CLI invocation carrying a run id delivers pending alerts and appends `alert.delivered` (`commands.ts:201` → `service.ts:1658`, the deliberate P4b-1 at-least-once delivery). So `monitor.sh`, which polls `status --json`, mutates the durable log, advances sequence numbers, and contends for the SQLite write lock. **`watch.sh` (direct `sqlite3 -readonly`) is the only side-effect-free way to watch a run** — prefer it for idle watching during long turns.
 - Per-slice preconditions, predicted failure modes and spec mitigations live in **`docs/DOGFOOD-FEASIBILITY.md`** §4 (the slice table) and §1 (the transition laws L1–L11). Read the row for slice *i* before writing its SECTION/SLICE/PATHS.
 
@@ -82,7 +77,7 @@ Cost basis (run 1 actuals): coordinator ≈ $1.5 (532k in / 31k out, opus xhigh)
 
 | # | Milestone | Slices | Why now |
 |---|---|---|---|
-| M0 | Base secured | — | ✅ F7 landed, WIP committed, F8–F11 diagnosed and specced, the L11 preflight battery built and enforced. **No run is in flight** — `run_756ce21b` was cancelled; the fresh 1a starts after the LAND window (F10 must land first, or its commit path is fatal). |
+| M0 | Base secured | — | ✅ F7 landed, WIP committed, F8–F11 diagnosed and specced, the L11 preflight battery built and then deferred to the `gate-enforcement` branch (advisory tooling, never enforcement). **No run is in flight** — `run_756ce21b` was cancelled; the fresh 1a starts after the LAND window (F10 must land first, or its commit path is fatal). |
 | M1 | **The loop is proven end-to-end** | 1a | First legitimate `merge_ready` through the fixed engine. Everything else compounds on this. |
 | M2 | Grok-on-React de-risked | B0 (fixture shell) | Optional slice, zero engine deps, first *visible* UI. Resolves the biggest unknown (can grok write our React?) while it's cheap. Classic DP: probe the high-uncertainty branch early. |
 | M3 | The spine (daemon) | 1b → 2a → 2b → 2c | Hardest engineering: durable operations, writer lease, security gate, WS relay. Serial, engine-adjacent, codex earns its keep here. |
@@ -138,7 +133,7 @@ Four fixes, all surfaced by real runs rather than by review, all specced against
 | **F10** | on git 2.55 the staging helper's `:(exclude)node_modules` pathspec exits 1, so **every** harness commit path dies | BLOCKER | `docs/engine-fix-f10-staging-spec.md` |
 | **F11** | the grok read-only classifier rejects `$`/backslash/backtick even inside quotes — one backslash in a quoted regex killed slice-1a round 1 | HIGH | `docs/engine-fix-f11-grok-shell-quoting-spec.md` |
 
-F10 and F11 are the two 2026-07-25 misses that a green suite could never have caught. **F10 is now permanently gated** by `scripts/dogfood/preflight.sh` section (d), which imports the real `addAllExceptNodeModules` out of `dist/` and runs it against an ignored+present `node_modules` fixture — it fails on `main` today, which is the correct answer until F10 lands. **F11 is NOT covered by preflight:** the permission-policy lint (enumerating the implementor's plausible first tool calls against the live grok allowlist) needs the classifier to be invocable from a script, which it is not yet. That remains a tracked gap; F11 removes the specific trap, but nothing yet catches the *next* denial-shaped mismatch before a run pays for it. The durable lesson of this queue stands: **prove the engine against the current machine, not only against itself.**
+F10 and F11 are the two 2026-07-25 misses that a green suite could never have caught. **Neither is gated by anything on this branch.** A preflight battery whose section (d) executed the real `addAllExceptNodeModules` against an ignored+present `node_modules` fixture was built for exactly that purpose and is preserved on the **`gate-enforcement`** branch; it is deliberately not merged here. Its value was proving the engine could commit *before* F10 landed — once F10 merges, its regression suite proves the same thing continuously and on every change, which is the better place for the guarantee. F11 was never covered by it either: the permission-policy lint needs the grok classifier to be invocable from a script, which it is not yet, so the *next* denial-shaped mismatch would still be discovered by a paying run. The durable lesson of this queue stands regardless: **prove the engine against the current machine, not only against itself** — the F10 and F11 regression tests are where that now lives.
 
 ## 6. Operating agreement (who does what)
 

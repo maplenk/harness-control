@@ -18,11 +18,13 @@ implementor **grok:grok-build:high** (xAI/Grok Build), verifier
 ## Per slice
 
 ```sh
-# 0. PREFLIGHT — ALWAYS run this first. Advisory, not enforced: nothing stops a
-#    run without it, so it is on you. Its section (d) executes the engine's REAL
-#    staging helper out of dist/ and is the check that the harness can commit at
-#    all on this machine (it fails today: F10 is unlanded).
-bash scripts/dogfood/preflight.sh
+# 0. PREFLIGHT — by hand, every time. There is no script for this on this branch
+#    (one exists on `gate-enforcement`, advisory and deliberately unmerged), so
+#    it is operator discipline:
+npm run build                               # dist must be the merged HEAD
+npm test                                    # 103 files / 1699 tests, NOT doubled
+node dist/cli/index.js doctor --json        # claude/grok/codex resolved + authed
+git status --porcelain                      # must be empty before `start`
 
 # 1. START — coordinator drafts the spec, stops at the approval gate.
 scripts/dogfood/slice-1a.sh                 # Run 1a (§3A.1); or:
@@ -64,17 +66,17 @@ engine defaults. The config path + sha256 are recorded in the run manifest.
 
 If the implementor still trips the RSS ceiling, the safe recovery is an **audited
 raise + resume** (the run stays `resource_exhausted`, spawns no verifier, until it
-succeeds). Re-run preflight first — `resume` spends and mutates exactly like
-`run` does — then:
+succeeds). Re-run the step-0 checks first — `resume` spends and mutates exactly
+like `run` does — then:
 
 ```sh
 node dist/cli/index.js set-budget RUN_ID --role implementor --memory-budget-mb <MB> --resume
 ```
 
-`RUN_ID` and `--role` are both required (`args.ts:61`). The same "preflight
-first" rule applies to `resume` and `recheck`: they drive provider turns and
-mutate the run, and they are what you reach for when a run is *already* in
-trouble — the worst moment to be running an unverified binary.
+`RUN_ID` and `--role` are both required (`args.ts:61`). The same rule applies to
+`resume` and `recheck`: they drive provider turns and mutate the run, and they
+are what you reach for when a run is *already* in trouble — the worst moment to
+be running an unverified binary.
 
 ## Merge/rebuild gate (between every run — why runs are serial)
 

@@ -17,29 +17,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 : "${HARNESS_HOME:=$HOME/.harness}"; export HARNESS_HOME
-LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"
-. "$ROOT/scripts/dogfood/lib.sh"
-
-# Containment BEFORE creating anything: the CLI is about to write harness.db and
-# artifacts into $HARNESS_HOME, and this script writes logs into $LOGDIR. Neither
-# may be inside the repo, and the check must precede the mkdir — creating the
-# directory first is what put directories inside the working tree before the
-# refusal could fire.
-CONTAINMENT="$(dogfood_require_containment "$ROOT" "$HARNESS_HOME" "$LOGDIR")" || { echo "!! ${CONTAINMENT#!}" >&2; exit 1; }
-mkdir -p "$LOGDIR"
+LOGDIR="${DOGFOOD_LOG_DIR:-$HARNESS_HOME/logs}"; mkdir -p "$LOGDIR"
 CLI=(node "$ROOT/dist/cli/index.js")
-
-# REMINDER (advisory, not enforced): run `bash scripts/dogfood/preflight.sh`
-# before this — approve+run is where the real money and the real worktree commits
-# happen. Automated enforcement is deferred to the `gate-enforcement` branch.
 
 RUN_ID="${1:?usage: run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH}"
 SPEC_VERSION="${2:?spec version id required}"
 SPEC_HASH="${3:?spec hash required (binds the exact drafted spec)}"
-# Roles come from lib.sh — the SAME resolution preflight gated doctor on and the
-# gate re-checked. Restating the defaults here is what let an overridden role
-# dispatch an adapter the battery had declared "unused and not gating".
-dogfood_resolve_roles
+IMPLEMENTOR="${IMPLEMENTOR:-grok:grok-build:high}"
+VERIFIER="${VERIFIER:-codex:gpt-5.6-sol:xhigh}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 APPROVE_JSON="$LOGDIR/slice-$STAMP-approve.json"
@@ -74,10 +59,9 @@ echo
 case "$RC" in
   0) echo "✔ reached a terminal/hand-off state — if merge_ready, MERGE GATE next:";
      echo "   1) human merges the verified commit  2) npm test && npm run typecheck  3) npm run build  4) clean tree  5) record new base SHA";;
-  3) echo "‖ paused on a provider usage limit (--no-wait semantics). Re-run preflight, then:";
+  3) echo "‖ paused on a provider usage limit (--no-wait semantics). Resume with:";
      echo "   node dist/cli/index.js resume $RUN_ID --wait";;
-  4) echo "▲ integration_blocked — resolve §16 blockers, re-run preflight, then:";
-     echo "   node dist/cli/index.js recheck $RUN_ID";;
+  4) echo "▲ integration_blocked — resolve §16 blockers then: node dist/cli/index.js recheck $RUN_ID";;
   *) echo "✗ run exited $RC — inspect $RUN_LOG and status above.";;
 esac
 exit "$RC"

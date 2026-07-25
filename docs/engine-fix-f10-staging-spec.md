@@ -104,7 +104,7 @@ Scratch repos, real git, no engine code involved. `OLD` = `git add -A -- . ':(ex
 | **r4** | **tracked** `node_modules`, modified (`provision='none'`) | n/a | plain add stages `[node_modules/pkg/i.js, tracked.txt]`; an **ungated** post-check would drop the legitimate change → §2.4 gate is required |
 | **r5** | reset with a pathspec matching nothing | n/a | rc=0 no-op, staging untouched — the post-check is safe to run unconditionally |
 
-`scripts/dogfood/preflight.sh` section (b) carries r1 forward as a **permanent canary**: it drills the git *behavior* rather than the repo's helper, so it keeps catching version regressions after the helper is rewritten again. It also prints the OLD form's exit code as living documentation of this fix.
+A preflight battery on the **`gate-enforcement`** branch carries r1 forward as an operator canary in its section **(d)**: it drills the git *behaviour* rather than the repo's helper, so it keeps catching version regressions after the helper is rewritten again, and prints the OLD form's exit code as living documentation. That battery is deliberately not on the engine track — **the durable home for this guarantee is the regression suite specified in §3**, which must run on every change rather than when an operator remembers.
 
 ---
 

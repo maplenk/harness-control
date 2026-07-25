@@ -2,7 +2,16 @@
 #
 # Dogfood MONITOR — tail a run's event log (the coordinator/implementor/verifier
 # activity) plus its current phase/suspension/vitals. There is no `serve` daemon
-# yet (Phase A), so this reads the durable SQLite store directly — read-only.
+# yet (Phase A), so this reads the durable SQLite store directly and also calls
+# the CLI for `status`.
+#
+# ⚠ THIS IS NOT A READ-ONLY OBSERVER. It polls `status --json`, and every
+# run-scoped CLI invocation delivers pending alerts and appends `alert.delivered`
+# to the durable log (`src/cli/commands.ts:201` → `service.ts:1658` — deliberate
+# P4b-1 at-least-once delivery). So monitoring WRITES: it advances the event
+# sequence and takes the SQLite write lock, which can contend with the run it is
+# watching. For idle watching during long turns use `watch.sh`, which queries the
+# store with `sqlite3 -readonly` and appends nothing.
 #
 # Usage:
 #   scripts/dogfood/monitor.sh [RUN_ID]           # live loop (Ctrl-C to stop)
