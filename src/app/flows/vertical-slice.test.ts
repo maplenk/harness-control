@@ -73,6 +73,7 @@ import {
   type TempGitRepo,
 } from '../../worktree/test-support.js';
 import type { PsClient } from '../../supervisor/index.js';
+import { DurableDesiredModelStore } from '../desired-model-store.js';
 import {
   AdvisoryGitLease,
   createPsLeaseProbe,
@@ -494,6 +495,78 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
       }),
     });
     expect(slice.created.map((created) => created.role)).toEqual(['coordinator']);
+  });
+
+  // The loop-entry check cannot see a pair that only becomes same-harness LATER:
+  // a `switch_harness` failover re-points a role's effective profile mid-round.
+  // The verifier-boundary re-check is the only thing between that and a report
+  // asserting independent cross-vendor verification.
+  it('refuses a same-harness pair that only appears at the verifier boundary', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'observed check-ac1 pass' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'observed check-ac2 pass' },
+            ]),
+          ],
+        },
+      ],
+    });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+
+    // Entry pair is independent (codex implements / claude verifies) so the
+    // loop-entry check passes; this runs during the implementor round and
+    // re-points the VERIFIER at the implementor's harness, exactly as a
+    // `switch_harness` failover would.
+    const failoverToImplementorHarness: VerificationRunner = async (command) => {
+      new DurableDesiredModelStore(dbHandle!.db).set({
+        runId: String(runId),
+        role: 'verifier',
+        harness: 'codex',
+        model: 'gpt-5.6-sol',
+        requestedAt: '2026-07-25T00:00:00.000Z',
+      });
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const error: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: assignmentId('asg_boundary_independence'),
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: failoverToImplementorHarness,
+      },
+    ).then(() => undefined).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: 'independence_violation',
+      implementor: expect.objectContaining({ harness: 'codex', model: 'gpt-5.6-terra' }),
+      verifier: expect.objectContaining({ harness: 'codex', model: 'gpt-5.6-sol' }),
+    });
+    // The implementor DID run — this is the boundary check, not the entry check.
+    expect(slice.created.map((created) => created.role)).toEqual([
+      'coordinator',
+      'implementor',
+    ]);
   });
 
   it('honors verification.allowSameHarness and warns on same-model use (F13 AC-7/W4-1)', async () => {

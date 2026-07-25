@@ -553,7 +553,13 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
     expect(service.status(runId).phase).toBe('needs_remediation');
   });
 
-  it('voids a complete passing verifier report when the turn stops with refusal (F13 AC-5)', async () => {
+  // The two LIVE false-positive vectors (spec triage): the model emits a
+  // complete, parseable, passing report and THEN terminates abnormally. Both
+  // must void the whole attempt — a `max_tokens` truncation is only fail-safe
+  // by accident (unparseable payload), so it proves nothing about these.
+  it.each(['refusal', 'max_turn_requests'] as const)(
+    'voids a complete passing verifier report when the turn stops with %s (F13 AC-5)',
+    async (abnormalStop) => {
     const criteria = [crit('C1'), crit('C2')];
     const turns = [
       reportTurn(
@@ -569,7 +575,7 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
             evidence: 'Complete parseable prose claims the receipt satisfies C2.',
           },
         ],
-        'refusal',
+        abnormalStop,
       ),
     ];
     const { service, db, ids, runId } = await setup(turns);
@@ -591,7 +597,7 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
       clock: db.clock,
     });
 
-    expect(result.gathering.stopReason).toBe('refusal');
+    expect(result.gathering.stopReason).toBe(abnormalStop);
     expect(result.gathering.outcome).toBe('blocked');
     expect(result.verification.criteria).toEqual(
       ['C1', 'C2'].map((id) =>
@@ -599,13 +605,14 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
           criterionId: criterionId(id),
           verdict: 'unproven',
           evidenceRefs: [],
-          note: expect.stringContaining('refusal'),
+          note: expect.stringContaining(abnormalStop),
         }),
       ),
     );
     expect(result.mergeReadiness).toBeUndefined();
     expect(service.status(runId).phase).toBe('needs_remediation');
-  });
+  },
+  );
 
   it.each([
     {

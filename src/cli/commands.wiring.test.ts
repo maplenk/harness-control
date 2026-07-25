@@ -668,22 +668,27 @@ describe('D-1: the shipped CLI (executeCommand) drives the full P3 slice', () =>
       { HARNESS_TEST_MODE: '1' },
     );
 
-    // Explicit --implementor (claude:opus) must win over the proposed codex:gpt-5.6-terra;
-    // --verifier omitted still defaults to the proposed claude:opus.
+    // Explicit --implementor (opencode:gpt-5.6-sol) must win over the proposed
+    // codex:gpt-5.6-terra in BOTH dimensions — harness and model; --verifier
+    // omitted still defaults to the proposed claude:opus. The override stays on
+    // a harness other than the verifier's so this test exercises flag precedence
+    // only, not F13's cross-vendor independence invariant (covered separately in
+    // vertical-slice.test.ts).
     const run = await executeCommand(
       service,
       db,
-      { kind: 'run', json: true, runId, implementor: { harness: 'claude', model: 'opus', effort: 'low' } },
+      { kind: 'run', json: true, runId, implementor: { harness: 'opencode', model: 'gpt-5.6-sol', effort: 'low' } },
       {},
       deps,
     );
+    expect(run.json['error']).toBeUndefined();
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ outcome: 'merge_ready' });
     const plan = run.json['plan'] as {
       implementor: { harness: string; model: string };
       verifier: { harness: string; model: string };
     };
-    expect(plan.implementor).toMatchObject({ harness: 'claude', model: 'opus' });
+    expect(plan.implementor).toMatchObject({ harness: 'opencode', model: 'gpt-5.6-sol' });
     expect(plan.verifier).toMatchObject({ harness: 'claude', model: 'opus' });
   });
 
