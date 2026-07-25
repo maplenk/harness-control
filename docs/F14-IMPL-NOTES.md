@@ -47,13 +47,13 @@ worktree root.** Everything else is refused exactly as before.
 
 | file | what changed |
 | --- | --- |
-| `src/lib/path-containment.ts` (new) | `isPathInside`, `nearestExistingAncestor`, `resolvesInsideRoot` — the containment computation, extracted so there is ONE copy. |
-| `src/adapters/grok/command.ts:281-330` | `hasEscapingPathArgument(argv, worktreeRoot)` — `startsWith('/')` replaced by `worktreeRoot === undefined || !resolvesInsideRoot(worktreeRoot, arg)`. |
+| `src/lib/path-containment.ts` (new) | `isPathInside` (:61), `nearestExistingAncestor` (:75), `resolvesInsideRoot` (:99) — the containment computation, extracted so there is ONE copy. |
+| `src/adapters/grok/command.ts:313` | `hasEscapingPathArgument(argv, worktreeRoot)` — `startsWith('/')` replaced by `worktreeRoot === undefined || !resolvesInsideRoot(worktreeRoot, arg)`. |
 | `src/adapters/grok/command.ts:357` | `isSafeReadOnlyArgv(argv, worktreeRoot)` threads it. |
-| `src/adapters/grok/command.ts:398-421` | `isGrokReadOnlyShellPermissionTitle(operation, worktreeRoot)` — second parameter REQUIRED (`string \| undefined`). |
-| `src/adapters/grok/permissions.ts:71-86` | `allowReadOnlyOperation` is now a closure binding `input.cwd` — the assignment worktree, the same root `workspaceWriteRoot` uses. |
-| `src/adapters/acp/session.ts:210-230` | `isWorkspaceWriteOperation` now calls the shared `resolvesInsideRoot`; its private `isPathInside`/`nearestExistingAncestor` are deleted. Behaviour identical except §4. |
-| `src/app/flows/implementor.ts:851-858` | one prompt line preferring relative paths for shell inspection. |
+| `src/adapters/grok/command.ts:409` | `isGrokReadOnlyShellPermissionTitle(operation, worktreeRoot)` — second parameter REQUIRED (`string \| undefined`). |
+| `src/adapters/grok/permissions.ts:86` | `allowReadOnlyOperation` is now a closure binding `input.cwd` — the assignment worktree, the same root `workspaceWriteRoot` uses. |
+| `src/adapters/acp/session.ts:223-233` | `isWorkspaceWriteOperation` now calls the shared `resolvesInsideRoot`; its private `isPathInside`/`nearestExistingAncestor` are deleted. Behaviour identical except §4. |
+| `src/app/flows/implementor.ts:858` | one prompt line preferring relative paths for shell inspection. |
 
 ### Why the root is trustworthy at that call site
 
@@ -204,7 +204,12 @@ for the other. The §4 finding fails on the parent too (proof above).
 | `npx vitest run` | 106 files / 1945 passed | **107 files / 1987 passed**, 0 failed |
 | `npx vitest list --filesOnly` | 106 | 107 (floor is 103) |
 
-42 new tests. A green suite is not the gate — codex adversarial review is.
+42 new tests. Each commit in the map is independently green — verified by extracting
+it with `git archive` (read-only) and running typecheck + the suite there:
+`794b6c5` 107 files / 1952 passed, `efd0a9c` 107 / 1987, `ee9d133` 107 / 1987,
+`4281200` (docs only) 107 / 1987. All typecheck exit 0.
+
+A green suite is not the gate — codex adversarial review is.
 
 ## 8. What I could NOT verify, and known residuals
 
