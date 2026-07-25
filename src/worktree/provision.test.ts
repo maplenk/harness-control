@@ -1774,13 +1774,15 @@ describe('F9 AC-2 — a stale primary tree is never cloned (primary_tree_stale)'
     expect(fake.calls.clone).toBe(0); // refused BEFORE cloning
   });
 
-  // ROUND 8 (Blocker 2) — the version proof was CONDITIONAL: an absent lock entry
-  // skipped the comparison, and an unreadable/unsupported lockfile produced an
-  // empty map, so Yarn, pnpm, no lockfile, a malformed package-lock.json, or an
-  // unrecognised entry all degraded silently to presence-only — cloning a stale
-  // tree and stamping it v2. That is the F9 defect reintroduced through F9's own
-  // precondition. Absence of proof is not proof.
-  describe('unusable lock data is a REFUSAL, never a downgrade to presence-only', () => {
+  // ROUND 8 (Blocker 2) made unusable lock data a REFUSAL, because it had been a
+  // SILENT downgrade to presence-only. ROUND 15 REVERSES the refusal and keeps the
+  // loudness: the defect round 8 fixed was the SILENCE, and refusing was a
+  // heavier remedy than the disease. A repo using Yarn or pnpm, or a future npm
+  // lockfile format, is a tree MAIN clones and verifies; the governing principle
+  // says such a shape is INDETERMINATE — warn loudly, name what could not be read,
+  // and proceed. Presence is still proven, so a genuinely missing package still
+  // refuses (asserted below).
+  describe('unusable lock data is INDETERMINATE — loud, never silent, and never a refusal', () => {
     /** A repo declaring `left-pad` whose lockfile is exactly `lock` (absent when undefined). */
     async function repoWithLock(lock: string | undefined): Promise<TempGitRepo> {
       const repo = track(await makeTempGitRepo('harness-f9-lock-'));
@@ -1822,22 +1824,68 @@ describe('F9 AC-2 — a stale primary tree is never cloned (primary_tree_stale)'
       [
         'a lockfile with no entry for a DECLARED package',
         `${JSON.stringify({ name: 'x', lockfileVersion: 3, packages: { '': { name: 'x' } } }, null, 2)}\n`,
-        /resolves no version for it/i,
+        /no version/i,
       ],
-    ])('refuses on %s', async (_label, lock, expected) => {
+      [
+        'a lockfile whose entry is null',
+        `${JSON.stringify(
+          { name: 'x', lockfileVersion: 3, packages: { '': { name: 'x' }, 'node_modules/left-pad': null } },
+          null,
+          2,
+        )}\n`,
+        /no version|not an object/i,
+      ],
+      [
+        'a lockfile whose entry is a primitive',
+        `${JSON.stringify(
+          { name: 'x', lockfileVersion: 3, packages: { '': { name: 'x' }, 'node_modules/left-pad': '1.0.0' } },
+          null,
+          2,
+        )}\n`,
+        /no version|not an object/i,
+      ],
+    ])('warns and PROCEEDS on %s', async (_label, lock, expected) => {
       const repo = await repoWithLock(lock);
       await writePrimaryNodeModules(repo.dir); // a PRESENT, healthy-looking tree
       const fake = fakeRuntime();
-      const manager = await openManager(repo, { runtime: fake.runtime });
+      const warnings: ProvisionWarnEvent[] = [];
+      const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
       const asg = assignmentId(`asg_f9_lock_${String(_label).replace(/[^a-z]/gi, '').slice(0, 12)}`);
       const handle = await createAtHead(repo, manager, asg);
+
+      // Main clones and verifies this tree, so we must too.
+      expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+      expect(fake.calls.clone).toBe(1);
+      expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(true);
+      // …but never silently: the operator is told exactly what could not be read.
+      const indeterminate = warnings.filter((w) => w.kind === 'proof_indeterminate');
+      expect(indeterminate.length).toBeGreaterThan(0);
+      expect(indeterminate.map((w) => (w as { reason: string }).reason).join(' ')).toMatch(expected);
+    });
+
+    it('a genuinely MISSING package still refuses, even with an unreadable lockfile', async () => {
+      // The pair: dropping the version proof must not drop the presence proof.
+      // This is what separates "we cannot check the version" from "the tree is
+      // demonstrably not installed against these manifests".
+      const repo = track(await makeTempGitRepo('harness-f9-lock-missing-'));
+      await repo.writeFile('.gitignore', 'node_modules/\n');
+      await repo.writeFile(
+        'package.json',
+        `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0', chalk: '5.0.0' } }, null, 2)}\n`,
+      );
+      await repo.writeFile('package-lock.json', '{ not json at all');
+      await repo.commitAll('deps with an unreadable lockfile');
+      await writePrimaryNodeModules(repo.dir, { packages: ['left-pad'] }); // chalk absent
+      const fake = fakeRuntime();
+      const manager = await openManager(repo, { runtime: fake.runtime });
+      const asg = assignmentId('asg_f9_lock_missing_pkg');
+      await createAtHead(repo, manager, asg);
 
       const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
 
       expect(error.provisioningCause).toBe('primary_tree_stale');
-      expect(error.message).toMatch(expected);
-      expect(fake.calls.clone).toBe(0); // the stale tree is never cloned...
-      expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false); // ...nor marked
+      expect(error.message).toContain('chalk');
+      expect(fake.calls.clone).toBe(0);
     });
 
     it('a v1 lockfile (top-level `dependencies`) IS recognised and proven', async () => {
@@ -2408,10 +2456,13 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     expect(error.message).toContain('implicit-gyp');
   });
 
-  it('nesting DEEPER than the scan limit FAILS CLOSED (never a silent truncation)', async () => {
-    // Round-3 returned silently past the depth cap, so a native package below it
-    // was never smoked — yet the tree still got a v2 (smoke-attested) marker. An
-    // unexamined tree cannot be attested, so exceeding the cap must refuse.
+  // ROUND 15 REGRESSION 4 — REVERSED. Round 4 made the depth cap fail closed
+  // because a silent truncation still produced a smoke-attested marker; that was
+  // right when the proof was the only guard. It is wrong under the governing
+  // principle: a tree nested past our limit is a tree MAIN clones and verifies,
+  // and refusing it means the SCAN's limit, not the tree, decides the run. Depth
+  // exhaustion is now indeterminate — warn loudly, name the path, proceed.
+  it('nesting DEEPER than the scan limit warns and PROCEEDS (never a silent truncation either)', async () => {
     const repo = track(await makeDepsRepo());
     const nm = await writePrimaryNodeModules(repo.dir);
     let deep = path.join(nm, 'left-pad');
@@ -2420,17 +2471,18 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     }
     fs.mkdirSync(deep, { recursive: true });
     fs.writeFileSync(path.join(deep, 'package.json'), '{"name":"deep","version":"1.0.0"}\n');
-    const manager = await openManager(repo);
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { warn: (e) => warnings.push(e) });
     const asg = assignmentId('asg_scan_depth');
     const handle = await createAtHead(repo, manager, asg);
 
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-
-    expect(error.provisioningCause).toBe('native_toolchain_unproven');
-    expect(error.message).toMatch(/nests deeper than \d+ levels/i);
-    expect(error.message).toContain('node_modules');
-    // ...and nothing was marked, so the unexamined tree cannot become sticky.
-    expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(true);
+    const depthWarn = warnings
+      .filter((w) => w.kind === 'proof_indeterminate')
+      .find((w) => /deeper than \d+ levels/i.test((w as { reason: string }).reason));
+    expect(depthWarn).toBeDefined();
+    expect((depthWarn as { subject: string }).subject).toContain('node_modules');
   });
 
   it('an UNREADABLE package manifest fails the scan closed (never silently omitted)', async () => {

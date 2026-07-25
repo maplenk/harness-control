@@ -1565,33 +1565,42 @@ function assertRootVersionsProven(
   label: string,
   warn: ProvisionWarnSink,
 ): void {
+  const declared = declaredRootPackages(manifests);
   const locked = lockedRootVersions(manifests);
-  if (!locked.ok) {
-    throw failClosed(
-      `${label}'s node_modules at ${treeNodeModules} cannot be proven against the committed dependency ` +
-        `manifests (repo ${root}): ${locked.reason}. Refusing rather than trusting a tree whose dependency ` +
-        'VERSIONS nothing can confirm — presence alone is not proof (a package bumped without reinstalling keeps ' +
-        'its old directory). Commit an npm package-lock.json alongside package.json and run `npm install`.',
-      `unusable lock data: ${locked.reason}`,
-      'primary_tree_stale',
-    );
-  }
+  // ROUND 15 (REGRESSION 2) — a lockfile this engine cannot read is outcome (3),
+  // not a refusal. Round 8 made it fatal because it had been a SILENT downgrade to
+  // presence-only; the defect there was the silence, and refusing was a heavier
+  // remedy than the disease. Yarn, pnpm, and any future npm format are trees MAIN
+  // clones and verifies — so warn once, loudly, naming what could not be read, and
+  // fall back to the PRESENCE proof, which still refuses a genuinely missing
+  // package (asserted by test).
   const { defects, indeterminate } = proveePrimaryTree(
     treeNodeModules,
-    declaredRootPackages(manifests),
-    locked.versions,
-    locked.indeterminate,
+    declared,
+    locked.ok ? locked.versions : new Map<string, string>(),
+    locked.ok ? locked.indeterminate : new Map(declared.map((name) => [name, locked.reason])),
   );
-  // Outcome (3), reported per package before any refusal decision: these are
-  // installed but unproven, and the run PROCEEDS exactly as main would.
-  for (const item of indeterminate) {
+  if (!locked.ok) {
     warn({
       kind: 'proof_indeterminate',
-      subject: item.name,
+      subject: 'package-lock.json',
       reason:
-        `${item.detail}; its version is therefore NOT proven against the lockfile. Proceeding as main does ` +
-        `(${label}'s node_modules at ${treeNodeModules}).`,
+        `${locked.reason}, so NO root dependency version can be proven for ${label}'s node_modules at ` +
+        `${treeNodeModules}. Presence is still proven. Proceeding as main does; commit an npm package-lock.json ` +
+        'and run `npm install` if you want version-level proof.',
     });
+  } else {
+    // Outcome (3), reported per package before any refusal decision: these are
+    // installed but unproven, and the run PROCEEDS exactly as main would.
+    for (const item of indeterminate) {
+      warn({
+        kind: 'proof_indeterminate',
+        subject: item.name,
+        reason:
+          `${item.detail}; its version is therefore NOT proven against the lockfile. Proceeding as main does ` +
+          `(${label}'s node_modules at ${treeNodeModules}).`,
+      });
+    }
   }
   if (defects.length === 0) return;
   const named = defects
@@ -1652,13 +1661,14 @@ function proveePrimaryTree(
     }
     const expected = lockedVersions.get(name);
     if (expected === undefined) {
-      // ROUND 8 (Blocker 2): no resolved version for a DECLARED package means the
-      // lockfile cannot prove this package at all. Skipping the comparison is the
-      // same silent downgrade the empty-map fallback was. ROUND 14 keeps this a
-      // DEFECT deliberately: reaching here means the lockfile has no entry for the
-      // name whatsoever (an entry we merely could not interpret was routed above),
-      // which is the lockfile positively disagreeing with the manifest.
-      defects.push({ name, detail: 'the lockfile resolves no version for it (unrecognised or absent entry)' });
+      // ROUND 15 (REGRESSION 2) — indeterminate, not a defect. The package IS
+      // installed; the lockfile simply records no version we can compare against,
+      // which says nothing about the tree being stale. Round 8 made this fatal to
+      // end a SILENT skip — the warning below keeps that honesty without refusing
+      // a tree main verifies. Refusing here was also incoherent: a wholly
+      // unreadable lockfile now proceeds, so a readable one missing a single entry
+      // must not be treated more harshly.
+      indeterminate.push({ name, detail: 'the lockfile resolves no version for it (unrecognised or absent entry)' });
       continue;
     }
     let installed: string | undefined;
@@ -1759,7 +1769,12 @@ function lockedRootVersions(manifests: ManifestSet): LockVersions {
       if (!key.startsWith('node_modules/')) continue;
       const name = key.slice('node_modules/'.length);
       if (name.includes('node_modules/')) continue;
-      if (value === null || typeof value !== 'object') continue;
+      if (value === null || typeof value !== 'object') {
+        // ROUND 15: a null/primitive descriptor is a shape we cannot read, not a
+        // defect — skipping it silently made it one further down.
+        indeterminate.set(name, 'its lockfile entry is not an object, so no version can be read from it');
+        continue;
+      }
       const entry = value as { version?: unknown; link?: unknown; resolved?: unknown };
       if (typeof entry.version === 'string') {
         versions.set(name, entry.version);
@@ -1951,7 +1966,7 @@ function readManifestBestEffort(dir: string): Record<string, unknown> | undefine
   }
 }
 
-function nativeBuildPackages(treePath: string): NativePackage[] {
+function nativeBuildPackages(treePath: string, warn: ProvisionWarnSink): NativePackage[] {
   const found: NativePackage[] = [];
 
   /** `dir` holds a package; `specifier` is how `require()` names it. */
@@ -2025,13 +2040,21 @@ function nativeBuildPackages(treePath: string): NativePackage[] {
     // proven, and sticky from then on. Refusing is the only honest option: a tree
     // we did not finish examining is a tree we cannot attest.
     if (depth > MAX_NATIVE_SCAN_DEPTH) {
-      throw failClosed(
-        `the staged node_modules nests deeper than ${MAX_NATIVE_SCAN_DEPTH} levels at ${root} — the native-build ` +
-          'scan could not examine the whole tree, so no toolchain attestation can be made for it. Refusing rather ' +
-          'than marking an unexamined tree proven. Flatten/reinstall the primary tree, or raise the scan depth.',
-        `native scan depth limit ${MAX_NATIVE_SCAN_DEPTH} exceeded at ${root}`,
-        'native_toolchain_unproven',
-      );
+      // ROUND 15 (REGRESSION 4) — REVERSES round 4's fail-closed cap. That cap was
+      // right when this proof was the only guard: a silent truncation still
+      // produced a smoke-attested marker, so an unexamined subtree was stamped
+      // proven. It is wrong under the governing principle — a tree nested past OUR
+      // limit is one main clones and verifies, so refusing lets the scan's limit,
+      // rather than the tree, decide the run. Outcome (3): say plainly what was
+      // not examined, and proceed. The silence round 4 objected to is still gone.
+      warn({
+        kind: 'proof_indeterminate',
+        subject: root,
+        reason:
+          `the staged node_modules nests deeper than ${MAX_NATIVE_SCAN_DEPTH} levels here, so the native-build ` +
+          'scan stopped descending and any package below this point is NOT proven. Proceeding as main does.',
+      });
+      return;
     }
     let entries: Dirent[];
     try {
@@ -2112,7 +2135,7 @@ async function runNativeSmoke(
   warn: ProvisionWarnSink,
   timeoutMs: number,
 ): Promise<void> {
-  const packages = nativeBuildPackages(treePath);
+  const packages = nativeBuildPackages(treePath, warn);
   if (packages.length === 0) return;
   const env: Record<string, string> = {};
   for (const key of SMOKE_ENV_ALLOWLIST) {
