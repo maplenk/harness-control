@@ -1678,7 +1678,20 @@ function proveePrimaryTree(
   for (const name of declared) {
     // A package name is a posix path fragment ('@scope/pkg'); join it as such.
     const dir = path.join(primaryNodeModules, ...name.split('/'));
-    const entry = lstatSafe(dir);
+    // ROUND 17 — an inspection FAILURE is not an observation about the tree.
+    // `lstatSafe` fails closed for its pre-existing callers, which is right: they
+    // are main-era safety preflights, and main makes those same checks. This proof
+    // does not exist on main, so an EACCES/EIO here (a restrictively-permissioned
+    // scope directory, a flaky mount) turned "we could not look at this package"
+    // into a hard refusal AHEAD of main's own clone-then-install fallback. Only
+    // THIS call site degrades; `lstatSafe` itself is untouched.
+    let entry: fs.Stats | undefined;
+    try {
+      entry = lstatSafe(dir);
+    } catch (error) {
+      indeterminate.push({ name, detail: `it could not be inspected (${messageOf(error)})` });
+      continue;
+    }
     if (entry === undefined) {
       // Positively stale (outcome 2): nothing is installed under this name.
       defects.push({ name, detail: 'no directory in the primary node_modules' });
@@ -1978,33 +1991,53 @@ const MAX_NATIVE_ARTIFACTS = 8;
  * real package triggers none; `new Database(':memory:')` triggers one.
  *
  * Nested `node_modules` are skipped — those artifacts belong to other packages,
- * which the scan visits in their own right. `complete` is false when a directory
- * could not be read, which keeps "found nothing" distinguishable from "could not
- * look" (outcome 3 rather than a refusal).
+ * which the scan visits in their own right.
+ *
+ * ROUND 17 — `complete` is false whenever the traversal STOPPED EARLY for any
+ * reason, and `incompleteReason` says which. Every limit here is OURS, not the
+ * tree's, so hitting one means "we stopped looking", never "there is nothing
+ * there" — and the caller may only conclude from a scan that ran to the end.
  */
-function nativeArtifacts(pkgDir: string): { readonly artifacts: string[]; readonly complete: boolean } {
+function nativeArtifacts(pkgDir: string): {
+  readonly artifacts: string[];
+  readonly complete: boolean;
+  readonly incompleteReason: string | undefined;
+} {
   const artifacts: string[] = [];
-  let complete = true;
+  // The FIRST reason the walk stopped short; also the flag that it did.
+  let stoppedBecause: string | undefined;
+  const capReason = `the scan stopped at its ${MAX_NATIVE_ARTIFACTS}-artifact cap, so any further artifact was never examined`;
   const walk = (dir: string, depth: number): void => {
-    if (artifacts.length >= MAX_NATIVE_ARTIFACTS) return; // enough found; not a gap
+    if (artifacts.length >= MAX_NATIVE_ARTIFACTS) {
+      // ROUND 17: this cap is exactly the depth cap's mistake by another route. A
+      // `prebuildify` package ships one artifact per platform/ABI and only one is
+      // loadable HERE; if the cap is reached before the scan meets it, the visible
+      // foreign variants are all we judge — and "none of these load" was reported
+      // as "nothing it produced loads here". Truncation is indeterminate.
+      stoppedBecause ??= capReason;
+      return;
+    }
     if (depth > NATIVE_ARTIFACT_SCAN_DEPTH) {
       // ROUND 16: stopping is NOT looking. Round 15 returned here silently and
       // then declared "no artifact", so a valid addon stored deeper than the
       // traversal goes — `node-gyp-build` layouts nest by runtime/ABI/platform —
       // was reported as never built. The same rule the native-package scan's own
       // depth cap follows: exhaustion is indeterminate, never absence.
-      complete = false;
+      stoppedBecause ??= `the scan stopped at its ${NATIVE_ARTIFACT_SCAN_DEPTH}-directory depth limit under ${dir}`;
       return;
     }
     let entries: Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      complete = false;
+    } catch (error) {
+      stoppedBecause ??= `${dir} could not be read (${messageOf(error)})`;
       return;
     }
     for (const entry of entries) {
-      if (artifacts.length >= MAX_NATIVE_ARTIFACTS) return;
+      if (artifacts.length >= MAX_NATIVE_ARTIFACTS) {
+        stoppedBecause ??= capReason;
+        return;
+      }
       if (entry.isDirectory()) {
         if (entry.name === 'node_modules') continue;
         walk(path.join(dir, entry.name), depth + 1);
@@ -2014,7 +2047,7 @@ function nativeArtifacts(pkgDir: string): { readonly artifacts: string[]; readon
     }
   };
   walk(pkgDir, 0);
-  return { artifacts, complete };
+  return { artifacts, complete: stoppedBecause === undefined, incompleteReason: stoppedBecause };
 }
 
 /**
@@ -2245,13 +2278,14 @@ async function runNativeSmoke(
     if (scan.artifacts.length === 0) {
       if (!scan.complete) {
         // Outcome (3): we could not finish looking, which is not evidence of an
-        // unbuilt package.
+        // unbuilt package. ROUND 17 — name the limit that stopped the search; a
+        // warning the operator cannot act on is barely better than silence.
         warn({
           kind: 'proof_indeterminate',
           subject: pkg.dir,
           reason:
-            'it declares a native build step, and the scan for its compiled artifact could not read part of the ' +
-            'package, so no conclusion is available. Proceeding as main does.',
+            'it declares a native build step and no compiled artifact was found, but the search did not finish: ' +
+            `${scan.incompleteReason ?? 'the scan did not complete'}. No conclusion is available. Proceeding as main does.`,
         });
         continue;
       }
@@ -2295,6 +2329,22 @@ async function runNativeSmoke(
       const stderr = typeof (error as { stderr?: unknown }).stderr === 'string'
         ? ((error as { stderr: string }).stderr).trim().split('\n').slice(0, 6).join(' | ')
         : messageOf(error);
+      if (!scan.complete) {
+        // ROUND 17 — "none of these load" is positive evidence of breakage ONLY
+        // over a COMPLETE scan. Truncated, the artifacts we judged are merely the
+        // ones we happened to see first, and the variant this host loads may sit
+        // beyond the limit that stopped us. Refusing here rejected exactly the
+        // multi-platform layouts the one-artifact-is-enough rule exists to admit.
+        warn({
+          kind: 'proof_indeterminate',
+          subject: pkg.dir,
+          reason:
+            `none of the ${scan.artifacts.length} compiled artifact(s) the scan SAW load here, but the search did ` +
+            `not finish: ${scan.incompleteReason ?? 'the scan did not complete'}. An artifact this host can load ` +
+            `may never have been examined, so its build is NOT proven. Proceeding as main does. Attempts: ${stderr}`,
+        });
+        continue;
+      }
       throw failClosed(
         `provisioned node_modules for ${treePath} could not dlopen ANY of the ${scan.artifacts.length} compiled ` +
           `artifact(s) of '${pkg.dir}': the build is present but nothing it produced loads here — a truncated ` +
@@ -2343,28 +2393,24 @@ async function runNativeSmoke(
       const stderr = typeof (error as { stderr?: unknown }).stderr === 'string'
         ? ((error as { stderr: string }).stderr).trim().split('\n').slice(0, 6).join(' | ')
         : messageOf(error);
-      if (pkg.declaresRootEntry) {
-        // Outcome (2) — POSITIVELY broken: the package declares a root entry and
-        // that entry does not load. This is the better-sqlite3 case F9 exists for.
-        throw failClosed(
-          `provisioned node_modules for ${treePath} could not LOAD '${pkg.dir}', which declares a native build step — ` +
-            'the package is present but was never built (a script-less install cannot build it). Refusing to verify ' +
-            `against an unproven toolchain: ${stderr}`,
-          `native smoke failed for ${pkg.dir}`,
-          'native_toolchain_unproven',
-        );
-      }
-      // Outcome (3) — the package declares no way in that we can load: subpath
-      // wildcards only, a CLI `bin` (which we will not EXECUTE as a smoke), or a
-      // shape npm has yet to teach us. Main provisions this tree without a smoke
-      // at all, so refusing would be strictly worse than the status quo.
+      // ROUND 17 — outcome (3) in BOTH shapes now. Control only reaches here after
+      // an artifact of this package ALREADY dlopened, so the build demonstrably
+      // produced something this host loads. A wrapper that then refuses to
+      // initialise is telling us about the smoke ENVIRONMENT — absent runtime
+      // configuration, an unmet precondition, a conditional export that resolves
+      // differently here — not about whether the package was built. The case this
+      // refusal was written for, a genuinely missing binding, is caught above by
+      // the artifact check (a tree with NO artifact and a COMPLETE scan), which is
+      // where the decisive better-sqlite3 row lands and stays a refusal.
       warn({
         kind: 'proof_indeterminate',
         subject: pkg.dir,
-        reason:
-          `it declares a native build step but ${pkg.binOnly ? 'ships only a CLI `bin`' : 'no root entry'} this ` +
-          'engine can load, so its build is NOT proven. Proceeding as main does. Attempts: ' +
-          stderr,
+        reason: pkg.declaresRootEntry
+          ? 'its compiled artifact LOADED, but the root entry it declares did not load in the minimal smoke ' +
+            'environment, so the package is not fully proven — this says nothing about whether it was built. ' +
+            `Proceeding as main does. Attempts: ${stderr}`
+          : `it declares a native build step but ${pkg.binOnly ? 'ships only a CLI `bin`' : 'no root entry'} this ` +
+            `engine can load, so its build is NOT proven. Proceeding as main does. Attempts: ${stderr}`,
       });
     }
   }

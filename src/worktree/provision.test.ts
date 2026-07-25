@@ -2257,6 +2257,101 @@ describe('ROUND 15 — the native proof is the compiled ARTIFACT, not a successf
   });
 });
 
+// ---------------------------------------------------------------------------
+// ROUND 17 — the same error, one level deeper: treating the ABSENCE of a
+// positive result as positive evidence of absence, when the search itself was
+// BOUNDED or the observation FAILED. Round 16 fixed the sites where we never
+// looked; these three are the sites where we looked, stopped early or could not
+// see, and then concluded.
+// ---------------------------------------------------------------------------
+describe('ROUND 17 — a bounded search that found nothing is not a finding', () => {
+  it('the ARTIFACT cap truncating the scan is indeterminate, never "nothing here loads"', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'many-native': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad'] });
+    writeInstalledPackage(nm, 'many-native', { native: true, built: false });
+    // MORE prebuild variants than the scan will look at. A `prebuildify` package
+    // ships one directory per platform/ABI, and the one THIS host loads can sit
+    // beyond the cap — in which case the cap, not the tree, decides the verdict.
+    const prebuilds = path.join(nm, 'many-native', 'prebuilds');
+    for (let i = 0; i < 12; i += 1) {
+      const target = path.join(prebuilds, `platform-${String(i).padStart(2, '0')}`);
+      fs.mkdirSync(target, { recursive: true });
+      fs.writeFileSync(path.join(target, 'node.napi.node'), `not loadable on this host (${i})\n`);
+    }
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r17_artifact_cap');
+    await createAtHead(repo, manager, asg);
+
+    // Stopping at the cap is not evidence that nothing here loads.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    const indeterminate = warnings.filter((w) => w.kind === 'proof_indeterminate');
+    expect(indeterminate.some((w) => /many-native/.test((w as { subject: string }).subject))).toBe(true);
+    // The operator must be able to tell WHICH limit stopped the search.
+    expect(indeterminate.some((w) => /cap/i.test((w as { reason: string }).reason))).toBe(true);
+  });
+
+  it('a wrapper that fails in the smoke env AFTER its addon loaded is indeterminate, not unbuilt', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'picky-native': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad'] });
+    writeInstalledPackage(nm, 'picky-native', { native: true, built: true }); // a REAL, loadable addon
+    // The BUILD is fine and the proof has already watched its artifact dlopen.
+    // The JS wrapper simply refuses to initialise without runtime configuration
+    // the minimal smoke environment does not carry — a package main installs,
+    // verifies against, and uses.
+    fs.writeFileSync(
+      path.join(nm, 'picky-native', 'index.js'),
+      "'use strict';\n" +
+        "if (!process.env.PICKY_NATIVE_HOME) throw new Error('PICKY_NATIVE_HOME is not set');\n" +
+        "module.exports = require('./build/Release/bind.node');\n",
+    );
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r17_picky_wrapper');
+    await createAtHead(repo, manager, asg);
+
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    const indeterminate = warnings.filter((w) => w.kind === 'proof_indeterminate');
+    expect(indeterminate.some((w) => /picky-native/.test((w as { subject: string }).subject))).toBe(true);
+  });
+
+  it('a declared package that cannot be INSPECTED is indeterminate, not stale', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0', '@acme/widget': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad', '@acme/widget'] });
+    // No search permission on the scope directory, so `lstat` of the package
+    // INSIDE it fails EACCES. Main never opens these paths at all: it clones, and
+    // if the copy fails it installs. The version proof must not turn "could not
+    // look at it" into "the tree is stale" AHEAD of that fallback.
+    const scopeDir = path.join(nm, '@acme');
+    fs.chmodSync(scopeDir, 0o000);
+    const warnings: ProvisionWarnEvent[] = [];
+    try {
+      const manager = await openManager(repo, {
+        warn: (e) => warnings.push(e),
+        // The clone cannot copy through the same unreadable directory, so main's
+        // own next step is the install lane. It lays down the declared tree.
+        runtime: fakeRuntime({
+          installImpl: async (cwd) => {
+            const dst = path.join(cwd, 'node_modules');
+            fs.mkdirSync(path.join(dst, '.bin'), { recursive: true });
+            writeInstalledPackage(dst, 'left-pad');
+            writeInstalledPackage(dst, '@acme/widget');
+            await symlink('../left-pad/index.js', path.join(dst, '.bin', 'left-pad'));
+          },
+        }).runtime,
+      });
+      const asg = assignmentId('asg_r17_uninspectable');
+      await createAtHead(repo, manager, asg);
+
+      expect((await manager.provisionForVerification(asg)).strategy).toBe('install');
+      const indeterminate = warnings.filter((w) => w.kind === 'proof_indeterminate');
+      expect(indeterminate.some((w) => /@acme\/widget/.test((w as { subject: string }).subject))).toBe(true);
+    } finally {
+      fs.chmodSync(scopeDir, 0o755); // so the temp tree can be torn down
+    }
+  });
+});
+
 describe('F9 AC-5 — an unbuilt native dependency is caught BEFORE the tree is marked', () => {
   it('a script-bearing package that cannot be loaded → native_toolchain_unproven, no marker (never sticky)', async () => {
     const repo = track(
@@ -2764,8 +2859,18 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     expect(error.message).toContain('real-native');
   });
 
-  it('an ESM-only native package whose entry point is BROKEN is still refused', async () => {
-    // The fallback proves loading; it must not become a way to pass without one.
+  it('an ESM-only native package whose entry point is BROKEN is INDETERMINATE (its artifact loaded)', async () => {
+    // ROUND 17 — this row asserted a REFUSAL until codex named it a
+    // misclassification, and the fixture is why: it deliberately ships a REAL
+    // compiled artifact (see below), so by the time the entry point is tried the
+    // proof has already watched that artifact dlopen. The build is not in
+    // question; only this engine's ability to load the wrapper is. The invariant
+    // the row was written for — the require→import fallback must not become a way
+    // to pass WITHOUT proving loading — is now carried by the artifact check,
+    // which refuses a package that declares a native build and ships no artifact
+    // (the decisive better-sqlite3 row). What is preserved here is the
+    // DIAGNOSTIC: both attempts still reported, so the operator is not told a
+    // half-truth about which mechanism failed.
     const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0', 'esm-native': '1.0.0' } }));
     const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad', 'esm-native'] });
     const dir = path.join(nm, 'esm-native');
@@ -2791,18 +2896,26 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
         2,
       )}\n`,
     );
-    const manager = await openManager(repo);
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { warn: (e) => warnings.push(e) });
     const asg = assignmentId('asg_esm_native_broken');
     await createAtHead(repo, manager, asg);
 
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-
-    expect(error.provisioningCause).toBe('native_toolchain_unproven');
-    // BOTH attempts are reported, so the operator is not told a half-truth about
-    // which mechanism failed. ROUND 14: each attempt now names the TARGET it
+    // Main clones this tree and verifies against it; so do we now.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    const reported = warnings
+      .filter((w) => w.kind === 'proof_indeterminate')
+      .filter((w) => /esm-native/.test((w as { subject: string }).subject))
+      .map((w) => (w as { reason: string }).reason);
+    expect(reported.length).toBe(1);
+    // BOTH attempts are still reported, so the operator is not told a half-truth
+    // about which mechanism failed. ROUND 14: each attempt names the TARGET it
     // tried, since a package can declare several.
-    expect(error.message).toMatch(/require esm-native:/);
-    expect(error.message).toMatch(/import esm-native:/);
+    expect(reported[0]).toMatch(/require esm-native:/);
+    expect(reported[0]).toMatch(/import esm-native:/);
+    // And it says plainly that the ARTIFACT was fine — the distinction the
+    // reclassification turns on.
+    expect(reported[0]).toMatch(/artifact LOADED/);
   });
 });
 
