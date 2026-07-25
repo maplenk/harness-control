@@ -1,6 +1,9 @@
 # B2 — auto-approval: implementation notes
 
-Branch: `worktree-agent-a5af67e014eaeee62` · Parent: `a77f3da` (F7 worktree dependency provisioning)
+Branch: `worktree-agent-a5af67e014eaeee62` · Parent: `a77f3da` ("F8-F11: resumable rounds, proven
+provisioning, git-2.55 staging, grok permission veto"). Note this worktree branched from `a77f3da`,
+which is NOT the tip of `main` at the time of writing (`main` is at `5669d22`, F7); the green-bar
+numbers below are measured against `a77f3da`.
 Spec: `docs/AUTONOMOUS-BASE-PLAN.md` §1 + B2. Invariant reversal recorded in `PLAN.md` §7.1.
 
 ---
