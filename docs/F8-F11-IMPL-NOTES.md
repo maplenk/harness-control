@@ -1589,6 +1589,159 @@ two earlier rounds.
 
 ---
 
+---
+
+# Round 14 — codex verdict on `dc303ac`
+
+ITEMS 1, 2 and 4 confirmed; R10 accepted. Three regressions remained, and they
+were one defect wearing three faces. Commit map:
+
+| item | commit |
+| --- | --- |
+| REGRESSION 1 — a nested root condemned by `staged[0]` | `dd79566` |
+| REGRESSIONS 2 + 3 — the governing principle, `file:`/link shapes, subpath-only packages | `54491b2` |
+
+## THE GOVERNING PRINCIPLE
+
+> **The proof may never refuse something MAIN accepts.**
+
+It is written into `src/worktree/provision.ts` immediately above the F9 proof
+section, where the next person tempted to tighten a check will read it, not only
+here. F9's job is to strengthen confidence where it CAN prove something — not to
+require that every project match a layout we anticipated. Every check now has
+three outcomes, and the third is the one that kept being forgotten:
+
+| # | outcome | action |
+| --- | --- | --- |
+| 1 | **PROVEN** | proceed |
+| 2 | **POSITIVELY STALE** — the check can SHOW the tree is wrong: a declared package with no directory at all, an installed version disagreeing with the lockfile, a declared entry point that fails to load | **REFUSE.** This is F9's whole reason to exist and it must keep working |
+| 3 | **INDETERMINATE** — a shape we do not understand: an unrecognised lock descriptor, a symlinked installed entry, a package with no loadable root entry, whatever npm does next | **degrade to main's behaviour (proceed) and `warn`** with `proof_indeterminate`, naming the package and exactly what could not be interpreted |
+
+(3) is not the silent degradation rounds 8 and 9 rejected: it is explicit,
+logged, per-package, and provably no worse than the status quo. The production
+warn sink already writes every event to stderr as JSON (`cli/index.ts:273`), so
+"loudly" needed no new plumbing.
+
+Rounds 10 through 14 each found another legitimate npm shape a stricter proof
+falsely refused — a nested package under a parent declaring `exports`, an
+ESM-only package, `file:` dependencies installed as symlinks, `link` descriptors
+that omit the usual fields, packages exporting only a subpath. npm's surface is
+wider than any enumeration we write. The point of writing the rule down is that
+the NEXT unfamiliar shape lands in (3) by construction instead of becoming
+round 15's regression.
+
+## REGRESSION 1 — "classified once" had become "classified from an arbitrary member"
+
+Round 13 fixed per-FILE classification by reading ownership from `staged[0]`.
+That is not the same thing: git sorts the staged paths, so the deciding path is
+not even one the round chose. A narrow, entirely legitimate rule over a vendored
+tree — `**/node_modules/.bin/`, which also happens to sort first — condemned the
+whole root and unstaged the files main commits.
+
+**What changed** — `src/worktree/git.ts:322-340`. A root is owned WHOLLY or not
+at all: HEAD content vetoes, the provisioner MARKER is whole-tree evidence that
+outranks per-path rules, and otherwise EVERY staged path under the root must be
+ignored. A MIXED root is user content — a tree the engine provisioned is ignored
+in its entirety, so "part of it is ignored" is evidence of a user tree with a
+rule about part of it.
+
+Examining every path costs nothing: `check-ignore --no-index -z -v -n --stdin`
+(`git.ts:352-378`, over a new `runGitStatusStdin` primitive at `:78`) classifies
+the whole staged set in ONE subprocess — four NUL-separated fields per input
+path, pathname echoed verbatim, empty pattern meaning not ignored, verified on
+git 2.55 — and the ROOT tree needs no ignore data at all, so the common
+production shape spends nothing here. The round-13 probe-budget test still holds.
+
+**Fails on parent (`dc303ac`)** — `git.test.ts -t "ROUND 13 ITEM 3"` PASS(4)
+FAIL(1): `expected ['vendor/web/app.ts'] to include
+'vendor/web/node_modules/left-pad/index.js'`. The two companions — a wholly
+ignored nested root, and a marker-carrying root — pass on BOTH sides: the
+engine-tree cases are unweakened.
+
+## REGRESSION 2 — a `file:` dependency is a normal npm shape
+
+npm installs one as a SYMLINK to its target directory and records it as a LINK
+descriptor (`{"resolved": "packages/local-pkg", "link": true}`) with no version,
+the version living on a separate entry keyed by that path. Both halves of the
+proof rejected it: `lstat` said "not a directory", and the descriptor resolved no
+version.
+
+**What changed** — `provision.ts`:
+
+- the installed-entry check resolves THROUGH a symlink (`statFollowingSafe`,
+  `:1993`), so a `file:` dep is examined like any other package;
+- link descriptors are INTERPRETED (`lockedRootVersions`, `:1770-1800`) by
+  following `resolved` to its target entry — so a linked package is PROVEN, not
+  merely tolerated, and a version mismatch still refuses;
+- a descriptor that exists but cannot be interpreted is outcome (3);
+- a declared package with NO lockfile entry at all stays a DEFECT. That
+  distinction is the load-bearing one: an entry we cannot READ is a shape, an
+  ABSENT entry is the lockfile positively disagreeing with the manifest, which is
+  round 8's Blocker 2 and is preserved.
+
+**Fails on parent (`dc303ac`)** — the REGRESSION 2 block PASS(1) FAIL(4), each
+with `local-pkg (no directory in the primary node_modules)`. The passing one is
+the "declared but wholly absent → still refuses" pin.
+
+## REGRESSION 3 — a package may declare no root entry at all
+
+Node lets a package define exported SUBPATHS with no `.` export
+(nodejs.org/api/packages.html#subpath-exports), and lets one ship only a CLI. The
+smoke asked for the bare name and nothing else, so neither `require(name)` nor
+`import(name)` could EVER resolve — unprovable by construction, and refused.
+
+**What changed** — `provision.ts:1908-1960` derives a LOAD PLAN from each
+candidate's manifest: the bare name plus every concrete `exports` subpath
+(wildcards are skipped — they need a match to resolve). The smoke child
+(`:2035-2050`) tries each target with `require` and then dynamic `import`, and
+the first success proves the package. The refusal decision is then made on
+`declaresRootEntry`:
+
+- declares a root entry (`main`, or an `exports` resolving `.`) and it fails to
+  load → **REFUSE** (outcome 2). This is better-sqlite3's exact shape, and a new
+  test pins it alongside the pre-existing AC-5 row.
+- declares no way in we can load → **warn and proceed** (outcome 3).
+
+**Deliberate deviation, flagged rather than buried.** The directive said to try
+the `bin` target "if that is cheap". I did NOT execute `bin`. Requiring a CLI
+entry point RUNS it — arbitrary side effects inside the orchestrator, and a
+plausible hang against the smoke deadline — which is not a smoke. A bin-only
+package therefore lands in outcome (3) directly, which is the same OBSERVABLE
+result the directive asked for: warn and proceed, never refuse.
+
+The manifest read that feeds the load plan is BEST-EFFORT
+(`readManifestBestEffort`, `:1963`) precisely because the `binding.gyp` branch of
+the scan admits a package without ever reading its manifest — making this read
+strict would have refused trees the scan already accepts, which is the same
+mistake one layer down.
+
+**Fails on parent (`dd79566`)** — the subpath package refused with `No "exports"
+main defined`, the CLI-only one with `Cannot find module 'cli-native'`.
+
+## Stated consequence of (3)
+
+A v3 marker attests "the smoke ran and nothing positively failed", which now
+includes trees carrying indeterminate packages. The short-circuit therefore does
+not re-emit those warnings on later rounds of the same run. Re-running the smoke
+would reach the same verdict, so nothing is hidden that a rebuild would reveal —
+but the warning is per-BUILD, not per-round. Recorded as R11 rather than expanded
+into marker vocabulary this round.
+
+## Round-14 regression proofs
+
+| item | command | on parent | after |
+| --- | --- | --- | --- |
+| 1 | `vitest run src/worktree/git.test.ts -t "ROUND 13 ITEM 3"` | PASS 4 FAIL 1 | 5/5 |
+| 2 | `vitest run src/worktree/provision.test.ts -t "ROUND 14 REGRESSION 2"` | PASS 1 FAIL 4 | 5/5 |
+| 3 | `vitest run src/worktree/provision.test.ts -t "SUBPATH"` / `-t "CLI only"` | refused (both) | 2/2 |
+
+Three tests in this round PASS ON BOTH SIDES by design — the wholly-ignored
+nested root, the declared-but-absent package, and the declared-root-entry that
+fails to load. They are the pair to the four regression tests: together they show
+the strictness was TARGETED, not removed.
+
+---
+
 # Final residual list for the merge record
 
 | # | residual | disposition |
@@ -1601,17 +1754,20 @@ two earlier rounds.
 | R6 | Transitive dependency versions unverified — only root deps/devDeps proven. | Stated limit |
 | R7 | F13 — role-independent stop-reason adjudication, host-attested evidence receipts. | Out of the LAND window |
 | R8 | No deterministic test for Blocker 1's race window; the invariant is asserted instead. | **Known untested invariant** (codex: coverage debt, not a defect) |
-| R9 | **Closed this round** (ITEM 1): the unignored/unmarked/untracked ROOT tree is excluded again, as main did. A NESTED unignored, unmarked, untracked tree is still committed — which is what main did too, since main's exclusion was root-only. | — |
-| R10 | **New (ITEM 2):** an assignment that accumulates 8 quarantined stages cannot provision until a TTL expires or the stages are cleared. Fail-closed, named cause, CLI remedy; unreachable on main, which has no deadline to time out. | Stated consequence |
+| R9 | Closed in round 13 (ITEM 1): the unignored/unmarked/untracked ROOT tree is excluded again, as main did. A NESTED unignored, unmarked, untracked tree is still committed — which is what main did too, since main's exclusion was root-only. | — |
+| R10 | **(ITEM 2):** an assignment that accumulates 8 quarantined stages cannot provision until a TTL expires or the stages are cleared. Fail-closed, named cause, CLI remedy; unreachable on main, which has no deadline to time out. | Accepted (codex) |
+| R11 | **New (round 14):** `proof_indeterminate` warnings are emitted per BUILD, not per round — a v3 marker short-circuit does not re-emit them for a tree already built with an unprovable package. Nothing is hidden that a rebuild would not reveal. | Stated consequence |
+| R12 | **New (round 14):** a native package that ships only a CLI `bin` is never proven, by choice — executing a CLI is not a smoke. It warns and proceeds, exactly as main provisions it. | Deliberate, documented |
 
 ---
 
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1916 passed, 0 failed**, 106
-  files (1906 → 1916: ten new tests, three of them for ITEM 1, two for ITEM 3,
-  two for ITEM 4, three for ITEM 2)
+- `npx vitest run` (full, from this worktree) → **1927 passed, 0 failed**, 106
+  files (1916 → 1927: eleven new tests — three for REGRESSION 1, five for
+  REGRESSION 2, three for REGRESSION 3, of which three across the round are
+  same-on-both-sides pins)
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
