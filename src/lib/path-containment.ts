@@ -100,6 +100,32 @@ function probeComponent(target: string): ComponentProbe {
   }
 }
 
+/**
+ * Drop TRAILING separators, because they route around the probe above.
+ *
+ *     lstat('link/')        -> ENOTDIR / ENOENT      ("absent")
+ *     path.dirname('link/') -> the GRANDparent       (the link is never probed)
+ *
+ * One byte turns "this component resolves outside the root" into "this component
+ * is not here, ask its parent" — and the parent IS inside. Demonstrated against
+ * this repo: with `node_modules/.bin` as the root, `tsx` declines and `tsx/`
+ * admitted, the same symlink to `node_modules/tsx/dist/cli.mjs`.
+ *
+ * Stripping preserves meaning rather than merely deleting bytes: `link/` denotes
+ * the directory `link` points at, and probing `link` resolves exactly that
+ * target — so an escaping link still declines and an inside one still admits.
+ * `path.normalize` is NOT usable here: it keeps one trailing separator and it
+ * collapses `..` lexically, which is the behaviour this module exists to refuse.
+ *
+ * The `> 1` floor keeps the filesystem root `/` intact. (POSIX-shaped, like the
+ * rest of this module; a Windows drive root would need its own floor.)
+ */
+function withoutTrailingSeparators(p: string): string {
+  let end = p.length;
+  while (end > 1 && (p[end - 1] === '/' || p[end - 1] === '\\')) end -= 1;
+  return p.slice(0, end);
+}
+
 /** The outcome of the ancestor walk — `undecidable` is a first-class answer. */
 export type AncestorResolution =
   | { readonly kind: 'found'; readonly path: string }
@@ -113,7 +139,12 @@ export type AncestorResolution =
  * absence, ends the walk as `undecidable`.
  */
 export function nearestExistingAncestor(candidate: string): AncestorResolution {
-  let current = candidate;
+  // Normalised ONCE, here, before the first probe: every later step comes from
+  // `path.dirname`, which never produces a trailing separator (except the
+  // filesystem root, which `withoutTrailingSeparators` preserves anyway). Doing
+  // it inside the walk rather than at the call site means no caller can reach
+  // the probe with an un-normalised path.
+  let current = withoutTrailingSeparators(candidate);
   for (;;) {
     const probe = probeComponent(current);
     if (probe === 'present') return { kind: 'found', path: current };
@@ -139,12 +170,16 @@ function hasParentSegment(p: string): boolean {
  * `process.cwd()` by the fs calls below — an answer to a question nobody asked —
  * so it is refused instead. A `..` component on either side is refused for the
  * reason in the module header: `realpathSync` cannot be trusted to resolve one.
+ *
+ * Trailing separators are stripped from BOTH sides — the candidate inside the
+ * ancestor walk, the root here — so `<root>/` and `<root>` are the same boundary
+ * and `link/` is judged as the `link` it is.
  */
 export function resolvesInsideRoot(root: string, candidate: string): boolean {
   if (!path.isAbsolute(root) || !path.isAbsolute(candidate)) return false;
   if (hasParentSegment(root) || hasParentSegment(candidate)) return false;
   try {
-    const realRoot = realpathSync(root);
+    const realRoot = realpathSync(withoutTrailingSeparators(root));
     const ancestor = nearestExistingAncestor(candidate);
     if (ancestor.kind !== 'found') return false;
     // `realpathSync` on a DANGLING link throws ENOENT and on a LOOP throws

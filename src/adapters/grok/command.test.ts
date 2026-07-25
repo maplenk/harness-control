@@ -326,6 +326,10 @@ function worktreeFixture(): WorktreeFixture {
   // target does not. `existsSync` calls this "absent", which is how an
   // undecidable component gets stepped over.
   symlinkSync(path.join(base, 'not-created-yet'), path.join(root, 'dangling'));
+  // `node_modules/.bin/tsx`'s shape: a link naming a FILE outside the worktree.
+  // With a TRAILING SEPARATOR this is the one that lstat-ed ENOTDIR, was called
+  // absent, and had its component skipped by the ancestor walk.
+  symlinkSync(path.join(outside, 'secret.txt'), path.join(root, 'file-link'));
   return { root, sibling, parent, outside };
 }
 
@@ -349,6 +353,7 @@ describe('F14 — absolute paths are judged by CONTAINMENT, not by their first b
     ['the worktree root itself', (f: WorktreeFixture) => `ls -la ${f.root}`],
     ['the worktree root with a trailing slash', (f: WorktreeFixture) => `ls -la ${f.root}/`],
     ['a subdirectory of the worktree', (f: WorktreeFixture) => `ls -la ${f.root}/web`],
+    ['a subdirectory named with a trailing separator', (f: WorktreeFixture) => `ls -la ${f.root}/web/`],
     ['a file inside the worktree', (f: WorktreeFixture) => `head -n 5 ${f.root}/package.json`],
     ['a SINGLE-QUOTED absolute path inside the worktree', (f: WorktreeFixture) => `cat '${f.root}/package.json'`],
     ['several absolute paths inside the worktree', (f: WorktreeFixture) => `ls -la ${f.root}/web ${f.root}/docs`],
@@ -381,6 +386,10 @@ describe('F14 — absolute paths are judged by CONTAINMENT, not by their first b
     ['a `=/` option value, even one pointing INSIDE the worktree', (f: WorktreeFixture) => `rg -n foo --file=${f.root}/pat.txt`],
     ['a DANGLING symlink inside the worktree (an entry that exists and resolves nowhere)', (f: WorktreeFixture) => `ls -la ${f.root}/dangling`],
     ['a path THROUGH a dangling symlink', (f: WorktreeFixture) => `cat ${f.root}/dangling/file.txt`],
+    ['an escaping symlink named with a TRAILING SEPARATOR', (f: WorktreeFixture) => `ls -la ${f.root}/file-link/`],
+    ['...with a doubled separator', (f: WorktreeFixture) => `ls -la ${f.root}/file-link//`],
+    ['a DANGLING symlink with a trailing separator', (f: WorktreeFixture) => `ls -la ${f.root}/dangling/`],
+    ['a directory-target escaping symlink with a trailing separator', (f: WorktreeFixture) => `ls -la ${f.root}/escape/`],
     ['a bare `..`', () => 'cat ..'],
     ['a leading `../`', () => 'cat ../outside.txt'],
     ['an interior `/../`', () => 'cat web/../../etc/passwd'],

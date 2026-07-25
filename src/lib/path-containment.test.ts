@@ -36,6 +36,10 @@ interface Fixture {
   readonly dangling: string;
   /** The path that symlink would create/name if anything followed it. */
   readonly danglingTarget: string;
+  /** A symlink inside the root pointing at a FILE outside it — the exact shape
+   * of `node_modules/.bin/tsx`, which is how the trailing-separator bypass was
+   * demonstrated against this repo. */
+  readonly fileLink: string;
 }
 
 function fixture(): Fixture {
@@ -59,7 +63,11 @@ function fixture(): Fixture {
   // absence.
   symlinkSync(path.join(root, 'loop-b'), path.join(root, 'loop-a'));
   symlinkSync(path.join(root, 'loop-a'), path.join(root, 'loop-b'));
-  return { base, root, sibling, outside, dangling, danglingTarget };
+  // `node_modules/.bin/tsx`'s shape: a link inside the root naming a FILE
+  // outside it.
+  const fileLink = path.join(root, 'file-link');
+  symlinkSync(path.join(outside, 'secret.txt'), fileLink);
+  return { base, root, sibling, outside, dangling, danglingTarget, fileLink };
 }
 
 describe('resolvesInsideRoot', () => {
@@ -152,6 +160,75 @@ describe('resolvesInsideRoot', () => {
     const tooLong = path.join(root, 'x'.repeat(5_000), 'file.txt');
     expect(existsSync(tooLong)).toBe(false);
     expect(resolvesInsideRoot(root, tooLong)).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // A TRAILING SEPARATOR routed around the absent-vs-unresolvable switch before
+  // the switch ever saw the real component.
+  //
+  //   lstat('link/')          -> ENOTDIR/ENOENT   (classified "absent")
+  //   path.dirname('link/')   -> the GRANDparent  (the link is never probed)
+  //
+  // So the walk answered about a higher ancestor that is inside the root.
+  // Demonstrated against this repo's own `node_modules/.bin`: with `.bin` as the
+  // root, `tsx` correctly declines, `tsx/` admitted — same symlink, one byte
+  // apart, and it resolves to `node_modules/tsx/dist/cli.mjs`, outside `.bin`.
+  //
+  // Note `link/.` was ALREADY correct: `path.dirname('link/.')` is `link`, so the
+  // component still got probed. It is pinned below because the difference
+  // between the two is exactly the thing that is easy to get wrong again.
+  // -------------------------------------------------------------------------
+  it('DECLINES a component named with a TRAILING SEPARATOR instead of skipping it', () => {
+    const { root, fileLink, dangling } = fixture();
+    // The mechanism, pinned: without normalisation these lstats are the ones
+    // that get called "absent"...
+    expect(() => lstatSync(`${fileLink}/`)).toThrow();
+    // ...and this is the ancestor the walk would jump to.
+    expect(path.dirname(`${fileLink}/`)).toBe(root);
+
+    // codex's exact shape: a symlink to a FILE outside, probed with a trailing
+    // separator.
+    expect(resolvesInsideRoot(root, fileLink)).toBe(false);
+    expect(resolvesInsideRoot(root, `${fileLink}/`)).toBe(false);
+    expect(resolvesInsideRoot(root, `${fileLink}//`)).toBe(false);
+    expect(resolvesInsideRoot(root, `${fileLink}/.`)).toBe(false);
+    expect(resolvesInsideRoot(root, `${fileLink}/./`)).toBe(false);
+
+    // A DANGLING link with a trailing separator — the same skip, reached through
+    // ENOENT rather than ENOTDIR.
+    expect(resolvesInsideRoot(root, `${dangling}/`)).toBe(false);
+    expect(resolvesInsideRoot(root, `${dangling}//`)).toBe(false);
+    expect(resolvesInsideRoot(root, `${dangling}/.`)).toBe(false);
+
+    // A link to a DIRECTORY outside: `escape/` DENOTES that outside directory,
+    // so normalising must keep declining it (this one lstat-ed as `present`
+    // even before, and must not become an admit now).
+    expect(resolvesInsideRoot(root, `${root}/escape/`)).toBe(false);
+    expect(resolvesInsideRoot(root, `${root}/escape//`)).toBe(false);
+
+    // And the walk itself now reports the component rather than its parent.
+    expect(nearestExistingAncestor(`${fileLink}/`)).toEqual({ kind: 'found', path: fileLink });
+  });
+
+  it('a trailing separator changes no verdict for paths that really are inside', () => {
+    const { root, outside } = fixture();
+    expect(resolvesInsideRoot(root, `${root}/web/`)).toBe(true);
+    expect(resolvesInsideRoot(root, `${root}/web//`)).toBe(true);
+    expect(resolvesInsideRoot(root, `${root}/web/.`)).toBe(true);
+    expect(resolvesInsideRoot(root, `${root}/inner-link/`)).toBe(true); // link INTO the root
+    expect(resolvesInsideRoot(root, `${root}/`)).toBe(true);
+    expect(resolvesInsideRoot(root, `${root}//`)).toBe(true);
+    expect(resolvesInsideRoot(root, `${root}/never-existed/`)).toBe(true); // absent tail, still inside
+    expect(resolvesInsideRoot(root, '/')).toBe(false);
+
+    // The ROOT argument gets the same treatment: a root supplied with a trailing
+    // separator behaves identically to one without, in both directions.
+    for (const shaped of [`${root}/`, `${root}//`]) {
+      expect(resolvesInsideRoot(shaped, path.join(root, 'web'))).toBe(true);
+      expect(resolvesInsideRoot(shaped, `${root}/web/`)).toBe(true);
+      expect(resolvesInsideRoot(shaped, outside)).toBe(false);
+      expect(resolvesInsideRoot(shaped, `${root}/file-link/`)).toBe(false);
+    }
   });
 
   it('fails closed on anything it cannot decide', () => {

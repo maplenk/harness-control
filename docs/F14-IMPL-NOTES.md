@@ -47,7 +47,7 @@ worktree root.** Everything else is refused exactly as before.
 
 | file | what changed |
 | --- | --- |
-| `src/lib/path-containment.ts` (new) | `isPathInside` (:66), `nearestExistingAncestor` (:115), `resolvesInsideRoot` (:143) — the containment computation, extracted so there is ONE copy. |
+| `src/lib/path-containment.ts` (new) | `isPathInside` (:66), `withoutTrailingSeparators` (:123), `nearestExistingAncestor` (:141), `resolvesInsideRoot` (:174) — the containment computation, extracted so there is ONE copy. |
 | `src/adapters/grok/command.ts:313` | `hasEscapingPathArgument(argv, worktreeRoot)` — `startsWith('/')` replaced by `worktreeRoot === undefined || !resolvesInsideRoot(worktreeRoot, arg)`. |
 | `src/adapters/grok/command.ts:357` | `isSafeReadOnlyArgv(argv, worktreeRoot)` threads it. |
 | `src/adapters/grok/command.ts:409` | `isGrokReadOnlyShellPermissionTitle(operation, worktreeRoot)` — second parameter REQUIRED (`string \| undefined`). |
@@ -87,8 +87,9 @@ admissible, i.e. exactly today's behaviour, stated rather than assumed.
 1. both sides must be ABSOLUTE (a relative path would silently be resolved against
    `process.cwd()`);
 2. neither may contain a `..` segment (see §4);
-3. `realpathSync(root)`, then the `lstat`-probed nearest existing ancestor of
-   `candidate` (§4b blocker 1), then `realpathSync` of THAT;
+3. trailing separators are stripped from both sides (§4c), then `realpathSync(root)`,
+   then the `lstat`-probed nearest existing ancestor of `candidate` (§4b blocker 1),
+   then `realpathSync` of THAT;
 4. `path.relative` containment between those two realpaths;
 5. any throw, an undecidable ancestor walk, or no existing ancestor → `false`.
 
@@ -140,7 +141,7 @@ symlink to a not-yet-existing path outside. `existsSync` says the link is not
 there, the walk selects `<root>`, containment says yes — and the write follows the
 link and CREATES the file outside the worktree.
 
-Fixed at `src/lib/path-containment.ts:88-129`: probe with `lstat` (a symlink is an
+Fixed at `src/lib/path-containment.ts:88-118`: probe with `lstat` (a symlink is an
 ENTRY whether or not its target exists) and act on the error CODE —
 `ENOENT`/`ENOTDIR` are the only definitive absences, per the F9 `lstatSafe`
 contract in `worktree/provision.ts:2450`. Everything else ends the walk as
@@ -181,6 +182,53 @@ nothing about which BYTES are). I then diffed every touched file against `a77f3d
 for parent lines with no counterpart in HEAD: the only remaining absences are the
 intended edits (import rewrites, the moved containment helpers, the rewritten
 predicate). Nothing else was lost.
+
+## 4c. Codex round 2 — a trailing separator routed around the walk
+
+Round 2 confirmed the round-1 blocker fixes (including that the error-code switch
+admits ENOENT/ENOTDIR as absence and declines ELOOP, ENAMETOOLONG, EACCES/EPERM,
+EIO, EMFILE/ENFILE, NUL's `ERR_INVALID_ARG_VALUE` and every unknown) and found one
+more bypass — of the switch itself, before it could ever see the real component:
+
+```
+lstat('link/')        -> ENOTDIR / ENOENT      classified ABSENT
+path.dirname('link/') -> the GRANDparent       the link is never probed
+```
+
+One byte turns "this component resolves outside the root" into "not here, ask its
+parent" — and the parent is inside. Demonstrated against this repo's own
+`node_modules/.bin`, measured again here on the parent implementation:
+
+```
+lstat('.bin/tsx')  -> present     resolvesInsideRoot(.bin, .bin/tsx)  -> false  (correct)
+lstat('.bin/tsx/') -> ENOTDIR     resolvesInsideRoot(.bin, .bin/tsx/) -> TRUE   (bypass)
+   … the same symlink, resolving to node_modules/tsx/dist/cli.mjs, outside .bin
+```
+
+**Fix** (`src/lib/path-containment.ts:104-147`, `:182`): strip trailing separators
+from the candidate INSIDE `nearestExistingAncestor`, before the first probe — not
+at a call site, so no caller can reach the probe un-normalised — and from the root
+in `resolvesInsideRoot`. Every later step of the walk comes from `path.dirname`,
+which never emits a trailing separator, so one normalisation at entry covers the
+whole walk.
+
+Stripping preserves MEANING rather than deleting bytes: `link/` denotes the
+directory `link` points at, and probing `link` resolves exactly that target — an
+escaping link still declines, an inside one still admits. `path.normalize` is not
+usable (it keeps one trailing separator, and it collapses `..` lexically, which is
+what §4 exists to refuse). The `> 1` floor keeps `/` intact.
+
+Re-run of codex's exact demonstration against the fixed helper:
+
+```
+.bin/tsx  .bin/tsx/  .bin/tsx//  .bin/tsx/.  .bin/tsx/./   -> all false
+root supplied as `.bin/` with candidate `.bin/tsx/`        -> false
+root `.bin` with candidate `.bin/`                         -> true
+```
+
+`link/.` was already correct — `path.dirname('link/.')` is `link`, so the component
+was still probed — and is now pinned, because the difference between `link/` and
+`link/.` is exactly the thing that is easy to get wrong again.
 
 ## 5. Fails-on-parent proof
 
@@ -233,6 +281,25 @@ FAIL … F14 … > REFUSES a path THROUGH a dangling symlink
 Written against the round-1 implementation, i.e. they fail on `5733c7f` — the commit
 codex reviewed — for the reasons codex named, not for a compile error.
 
+### Round 3 (the trailing separator), same discipline
+
+```
+$ npx vitest run src/lib/path-containment.test.ts src/adapters/grok/command.test.ts
+      Tests  5 failed | 117 passed (122)
+
+FAIL … resolvesInsideRoot > DECLINES a component named with a TRAILING SEPARATOR instead of skipping it
+FAIL … resolvesInsideRoot > a trailing separator changes no verdict for paths that really are inside
+FAIL … F14 … > REFUSES an escaping symlink named with a TRAILING SEPARATOR
+FAIL … F14 … > REFUSES ...with a doubled separator
+FAIL … F14 … > REFUSES a DANGLING symlink with a trailing separator
+```
+
+Written against `dcc9219`, the commit codex reviewed in round 2. The second failure
+is worth reading: it is the PRESERVATION test, and it failed only on its escape
+assertion (`resolvesInsideRoot('<root>/', '<root>/file-link/')`) — every
+"still admits what it should" assertion above it already passed. The tightening had
+nothing to preserve that it was breaking.
+
 ## 6. The case table actually pinned
 
 ### ADMITTED (absolute, inside the worktree)
@@ -249,6 +316,8 @@ codex reviewed — for the reasons codex named, not for a compile error.
 | a non-implementor Grok adapter constructed without `cwd` (negative control: the refusal is scoped to the role that consumes the root) | `factory.test.ts` |
 | `git log --oneline -5 <root>/docs` | `command.test.ts` |
 | a symlink inside the worktree pointing to another place inside it | `path-containment.test.ts` |
+| **a real inside path named with a TRAILING SEPARATOR** — `<root>/web/`, `<root>/web//`, `<root>/web/.`, `<root>/`, `<root>//`, an inside-pointing `link/`, and a not-yet-created `never-existed/` | `command.test.ts`, `path-containment.test.ts` |
+| **a ROOT supplied with a trailing separator** (`<root>/`, `<root>//`) — identical verdicts in both directions | `path-containment.test.ts` |
 | relative paths (`.`, `web`, `docs/x.md`) — unchanged | `command.test.ts` |
 | **production wiring**: `decidePermission` → `allowlisted_read_only_operation` for `ls -la <cwd> && ls -la web 2>/dev/null` through `buildGrokMediation` | `permissions.test.ts` |
 
@@ -274,6 +343,11 @@ codex reviewed — for the reasons codex named, not for a compile error.
 | **a DANGLING symlink inside the worktree** — the entry exists, `existsSync` calls it absent, following it would create/read outside | `command.test.ts`, `path-containment.test.ts` |
 | **a path THROUGH a dangling symlink** | `command.test.ts`, `path-containment.test.ts` |
 | **a symlink LOOP** (ELOOP — an error that is not absence) | `path-containment.test.ts` |
+| **an escaping symlink named with a TRAILING SEPARATOR** — codex's exact `node_modules/.bin/tsx/` shape, a link to a FILE outside | `command.test.ts`, `path-containment.test.ts` |
+| **the same with a doubled separator** (`link//`), **with `/.`**, and **with `/./`** | `path-containment.test.ts` |
+| **a DANGLING link with a trailing separator** (`dangling/`, `dangling//`, `dangling/.`) — the ENOENT route to the same skip | `command.test.ts`, `path-containment.test.ts` |
+| **a directory-target escaping symlink with a trailing separator** (`escape/`, `escape//`) — normalising must not flip this to an admit | `command.test.ts`, `path-containment.test.ts` |
+| the filesystem root `/` as the candidate | `path-containment.test.ts` |
 | **a component longer than `NAME_MAX`** (ENAMETOOLONG — the other suppressed-error shape) | `path-containment.test.ts` |
 | a NUL-bearing single-quoted argument, with AND without a root (restored F11 pin) | `command.test.ts` |
 | **constructing a Grok implementor adapter with no `cwd`** (role stated, and role inferred from the mediation config) → `invalid_argument`, before any resource is built | `factory.test.ts` |
@@ -285,19 +359,20 @@ codex reviewed — for the reasons codex named, not for a compile error.
 
 ## 7. Green bar
 
-| | parent | round 1 | after the codex blockers |
-| --- | --- | --- | --- |
-| `npm run typecheck` | exit 0 | exit 0 | exit 0 |
-| `npx vitest run` | 106 files / 1945 passed | 107 / 1987 | **107 files / 1993 passed**, 0 failed |
-| `npx vitest list --filesOnly` | 106 | 107 | 107 (floor is 103) |
+| | parent | round 1 | round 2 | round 3 (now) |
+| --- | --- | --- | --- | --- |
+| `npm run typecheck` | exit 0 | exit 0 | exit 0 | exit 0 |
+| `npx vitest run` | 106 files / 1945 passed | 107 / 1987 | 107 / 1993 | **107 files / 2000 passed**, 0 failed |
+| `npx vitest list --filesOnly` | 106 | 107 | 107 | 107 (floor is 103) |
 
-48 new tests. Each round-1 commit was verified independently green by extracting it
+55 new tests. Each round-1 commit was verified independently green by extracting it
 with `git archive` (read-only) and running typecheck + the suite there: `794b6c5`
 107 files / 1952 passed, `efd0a9c` 107 / 1987, `ee9d133` 107 / 1987, `4281200`
 (docs) 107 / 1987 — all typecheck exit 0.
 
 A green suite is not the gate — codex adversarial review is. Round 1 was green and
-still had two blockers in it.
+still had two blockers in it; round 2 was green, had passed a blocker review, and
+still had a one-byte bypass in it.
 
 ## 8. What I could NOT verify, and known residuals
 
@@ -339,6 +414,11 @@ still had two blockers in it.
   root today, so the guard would be decoration rather than enforcement. If any of
   them gains one, it needs the same refusal — the check is role-scoped precisely so
   that omission is visible rather than inherited.
-- **`ENOTDIR` is treated as absence** (the F9 `lstatSafe` contract). A path under a
-  non-directory cannot exist, so the walk continues to the non-directory itself and
-  resolves THAT — which is where the containment answer actually lives.
+- **`ENOTDIR` is treated as absence** (the F9 `lstatSafe` contract), and that is safe
+  ONLY because the walk then probes the component itself. The invariant is not
+  "ENOTDIR means absent"; it is **ENOTDIR may be skipped only when the skipped step
+  moves exactly one component, so the real component is still probed next**. §4c is
+  what that invariant looked like when it did not hold: a trailing separator made
+  `path.dirname` skip TWO levels, the component was never probed, and an ENOTDIR
+  that was fine everywhere else became a bypass. Any future change to the walk's
+  step function has to re-establish this, not just the error-code switch.
