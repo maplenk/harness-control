@@ -2232,6 +2232,87 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
     expect(fake.calls.clone).toBe(1);
   });
+
+  // ROUND 13 ITEM 4 — the same error, one layer over: the smoke proved loading by
+  // CommonJS `require` EXCLUSIVELY, so an ESM-only package was refused for the
+  // mechanism it declares rather than for being broken. Main clones and uses such a
+  // tree without complaint. The principle is REGRESSION 1's: prove the addon LOADS,
+  // by whichever mechanism the package declares — not that one specifier form works.
+  it('an ESM-ONLY native package that loads via import() is NOT falsely refused', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0', 'esm-native': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad', 'esm-native'] });
+    const dir = path.join(nm, 'esm-native');
+    // A native build (binding.gyp + a node-gyp install hook) whose ONLY export
+    // condition is `import`. `require('esm-native')` throws
+    // ERR_PACKAGE_PATH_NOT_EXPORTED — "No \"exports\" main defined" — because the
+    // `require` condition matches nothing; `import('esm-native')` loads it. (A
+    // `"type":"module"` entry point reaches the same place via ERR_REQUIRE_ESM, or
+    // ERR_REQUIRE_ASYNC_MODULE with a top-level await.)
+    fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
+    fs.writeFileSync(path.join(dir, 'index.mjs'), 'export const native = true;\n');
+    fs.rmSync(path.join(dir, 'index.js'), { force: true });
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      `${JSON.stringify(
+        {
+          name: 'esm-native',
+          version: '1.0.0',
+          type: 'module',
+          exports: { '.': { import: './index.mjs' } },
+          scripts: { install: 'node-gyp rebuild' },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const fake = fakeRuntime();
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_esm_native');
+    await createAtHead(repo, manager, asg);
+
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    // And it was genuinely SMOKED, not skipped: the package is in the attestation.
+    const smoked = warnings.find((w) => w.kind === 'native_smoke_passed');
+    expect(smoked).toBeDefined();
+    expect((smoked as { packages: readonly string[] }).packages.some((p) => p.endsWith('esm-native'))).toBe(true);
+  });
+
+  it('an ESM-only native package whose entry point is BROKEN is still refused', async () => {
+    // The fallback proves loading; it must not become a way to pass without one.
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0', 'esm-native': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad', 'esm-native'] });
+    const dir = path.join(nm, 'esm-native');
+    fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
+    // Declares the ESM entry point but never built the addon it imports.
+    fs.writeFileSync(path.join(dir, 'index.mjs'), "import './build/Release/bind.node';\nexport const native = true;\n");
+    fs.rmSync(path.join(dir, 'index.js'), { force: true });
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      `${JSON.stringify(
+        {
+          name: 'esm-native',
+          version: '1.0.0',
+          type: 'module',
+          exports: { '.': { import: './index.mjs' } },
+          scripts: { install: 'node-gyp rebuild' },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_esm_native_broken');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('native_toolchain_unproven');
+    // BOTH attempts are reported, so the operator is not told a half-truth about
+    // which mechanism failed.
+    expect(error.message).toMatch(/require:/);
+    expect(error.message).toMatch(/import:/);
+  });
 });
 
 describe('F9 AC-4 — the config vocabulary means what it says', () => {

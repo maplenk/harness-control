@@ -1842,12 +1842,13 @@ function nativeBuildPackages(treePath: string): NativePackage[] {
  * stamped "proven" and then, because the marker matched, reused by every
  * subsequent round until the run burned to terminal.
  *
- * The replacement actually loads each native-build package with
- * `node -e "require('<pkg>')"` from the staged tree's parent (so bare-specifier
- * resolution walks into the staged `node_modules`), under a minimal env and a
- * per-package deadline. A load failure is `native_toolchain_unproven` naming the
- * package. The CLONE lane runs it too: the clone is CHEAP, not SAFE — its
- * correctness is inherited from whenever the primary was last really installed.
+ * The replacement actually LOADS each native-build package in a child node,
+ * resolved from the package's own directory, under a minimal env and a
+ * per-package deadline: `require` first, falling back to a dynamic `import()` for
+ * a package that declares itself ESM-only (ITEM 4). A load failure by BOTH
+ * mechanisms is `native_toolchain_unproven` naming the package. The CLONE lane
+ * runs it too: the clone is CHEAP, not SAFE — its correctness is inherited from
+ * whenever the primary was last really installed.
  */
 async function runNativeSmoke(
   treePath: string,
@@ -1856,10 +1857,6 @@ async function runNativeSmoke(
 ): Promise<void> {
   const packages = nativeBuildPackages(treePath);
   if (packages.length === 0) return;
-  // Bare specifiers resolve from `<cwd>/node_modules`, and the staged tree IS
-  // `<parent>/node_modules` on both lanes (clone: `<stage>/node_modules`;
-  // install: `<stage>/install/node_modules`).
-  const cwd = path.dirname(treePath);
   const env: Record<string, string> = {};
   for (const key of SMOKE_ENV_ALLOWLIST) {
     const value = process.env[key];
@@ -1871,11 +1868,31 @@ async function runNativeSmoke(
       // specifier walks up into the directory that actually holds it. Requesting
       // `parent/node_modules/child` instead asked Node for a SUBPATH of the
       // parent, which a parent declaring `exports` rejects outright.
+      //
+      // ROUND 13 (ITEM 4): and prove the addon LOADS by whichever mechanism the
+      // PACKAGE declares, not by one specifier form. `require` alone refused a
+      // valid ESM-only native package — ERR_PACKAGE_PATH_NOT_EXPORTED when its
+      // `exports` declares only an `import` condition, ERR_REQUIRE_ESM /
+      // ERR_REQUIRE_ASYNC_MODULE for a module entry point — a tree main clones and
+      // uses without complaint. The dynamic `import()` fallback cannot launder a
+      // genuinely broken addon: importing a CJS package evaluates it through the
+      // same CommonJS loader, so a missing `.node` binding fails identically (a
+      // test drives exactly that). Both errors are reported, so the operator is
+      // never told a half-truth about which mechanism failed.
       const script =
         'const {createRequire}=require("node:module");' +
-        `createRequire(${JSON.stringify(path.join(pkg.dir, 'package.json'))})(${JSON.stringify(pkg.name)});`;
+        `const name=${JSON.stringify(pkg.name)};` +
+        `try{createRequire(${JSON.stringify(path.join(pkg.dir, 'package.json'))})(name);}catch(err){` +
+        'import(name).catch((esmErr)=>{process.exitCode=1;' +
+        'console.error("require: "+(err&&err.message));' +
+        'console.error("import: "+(esmErr&&esmErr.message));});}';
       await execFileAsync(process.execPath, ['-e', script], {
-        cwd,
+        // The package's OWN directory: a bare `import()` from the eval module
+        // resolves against cwd, and Node's node_modules walk from here reaches the
+        // directory that actually holds this package (the NESTED copy for a nested
+        // one, never the hoisted namesake) — the same base `createRequire` uses
+        // above, so both mechanisms prove the same artifact.
+        cwd: pkg.dir,
         env,
         timeout: Math.min(timeoutMs, NATIVE_SMOKE_TIMEOUT_MS),
         maxBuffer: 4 * 1024 * 1024,
