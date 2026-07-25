@@ -1200,6 +1200,12 @@ function provisioningNextHint(cause: ProvisioningCause | undefined): string {
       );
     case 'provisioning_timeout':
       return 'a provisioning command exceeded its deadline; check for a stalled npm/git process, then re-run.';
+    case 'quarantine_cap_reached':
+      return (
+        'repeated provisioning timeouts have left this assignment at its quarantined-stage cap, and those stages are ' +
+        'not deleted while a stalled command may still be writing into them. Kill any stalled npm/git/cp process for ' +
+        'this assignment, then re-run; the stages are released automatically 24h after quarantine.'
+      );
     default:
       return "ensure the primary checkout's node_modules is installed and node_modules is git-ignored, then re-run.";
   }

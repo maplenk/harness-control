@@ -25,6 +25,7 @@ import { isPathIgnored, isPathTracked, runGit } from './git.js';
 import {
   defaultProvisionRuntime,
   lstatSafe,
+  MAX_QUARANTINED_STAGES,
   provisionWorktreeDeps,
   PROVISION_MARKER_FILE,
   PROVISION_STAGE_SUBDIR,
@@ -2603,6 +2604,100 @@ describe('F9 AC-6 — a stalled provisioning command fails closed with the locks
     // The quarantined stage and the producer's bytes are STILL there.
     expect(existsSync(path.join(stageRoot, quarantinedStage!, QUARANTINE_MARKER_FILE))).toBe(true);
     expect(existsSync(path.join(producerDst!, 'late-write.txt'))).toBe(true);
+  });
+
+  // ROUND 13 ITEM 2 — the cap was enforced by DELETING protected stages, which is
+  // the exact race quarantine exists to prevent: those stages are protected
+  // precisely because a producer that outlived its deadline may still be writing
+  // into them, and `withDeadline` stops waiting without stopping the writer. A cap
+  // is a reason to stop STARTING producers, not a licence to delete their trees.
+  it('ROUND 13 ITEM 2: at the cap, provisioning refuses to start another producer and deletes nothing', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_cap_backpressure');
+    await createAtHead(repo, manager, asg);
+    const stageRoot = path.join(manager.baseDir, PROVISION_STAGE_SUBDIR, String(asg));
+    fs.mkdirSync(stageRoot, { recursive: true });
+
+    // One MORE than the cap, all freshly quarantined (inside the TTL) — the state
+    // the old code resolved by evicting the oldest.
+    const planted: string[] = [];
+    for (let i = 0; i <= MAX_QUARANTINED_STAGES; i += 1) {
+      const stage = path.join(stageRoot, `stage-protected-${String(i)}`);
+      fs.mkdirSync(stage, { recursive: true });
+      fs.writeFileSync(
+        path.join(stage, QUARANTINE_MARKER_FILE),
+        JSON.stringify({ quarantinedAtMs: Date.now(), ownerPid: process.pid }),
+      );
+      fs.writeFileSync(path.join(stage, 'producer-output.txt'), `stage ${String(i)}\n`);
+      planted.push(stage);
+    }
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('quarantine_cap_reached');
+    expect(fake.calls.clone).toBe(0); // no producer was started — that IS the fix
+    // Back-pressure, not eviction: every protected stage, and every byte a live
+    // producer may still be writing into it, is untouched.
+    for (const stage of planted) {
+      expect(existsSync(path.join(stage, QUARANTINE_MARKER_FILE))).toBe(true);
+      expect(existsSync(path.join(stage, 'producer-output.txt'))).toBe(true);
+    }
+  });
+
+  it('ROUND 13 ITEM 2: a GC sweep never deletes a PROTECTED stage, cap or no cap', async () => {
+    // The same rule stated where the deletion used to happen. GC collects ordinary
+    // stages and leaves protected ones for the TTL; the cap is enforced by refusing
+    // new producers (above), never by sweeping a stage a writer may still hold.
+    const repo = track(await makeDepsRepo());
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_cap_gc');
+    await createAtHead(repo, manager, asg);
+    const stageRoot = path.join(manager.baseDir, PROVISION_STAGE_SUBDIR, String(asg));
+    fs.mkdirSync(stageRoot, { recursive: true });
+    for (let i = 0; i <= MAX_QUARANTINED_STAGES; i += 1) {
+      const stage = path.join(stageRoot, `stage-protected-${String(i)}`);
+      fs.mkdirSync(stage, { recursive: true });
+      fs.writeFileSync(
+        path.join(stage, QUARANTINE_MARKER_FILE),
+        JSON.stringify({ quarantinedAtMs: Date.now(), ownerPid: process.pid }),
+      );
+    }
+    // …plus one ORDINARY stage, which must still be collected.
+    fs.mkdirSync(path.join(stageRoot, 'stage-ordinary'), { recursive: true });
+
+    gcProvisionStages(manager.baseDir, String(asg));
+
+    for (let i = 0; i <= MAX_QUARANTINED_STAGES; i += 1) {
+      expect(existsSync(path.join(stageRoot, `stage-protected-${String(i)}`))).toBe(true);
+    }
+    expect(existsSync(path.join(stageRoot, 'stage-ordinary'))).toBe(false);
+  });
+
+  it('a stage that cannot be REMOVED is never reported as removed', async () => {
+    // The other half of ITEM 2: report only what actually happened. (The eviction
+    // block counted every stage it TRIED to delete; the ordinary sweep already
+    // warned only after a successful `rmSync`, and this pins that it stays so.)
+    const repo = track(await makeDepsRepo());
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_gc_unremovable');
+    await createAtHead(repo, manager, asg);
+    const stageRoot = path.join(manager.baseDir, PROVISION_STAGE_SUBDIR, String(asg));
+    const stage = path.join(stageRoot, 'stage-undeletable');
+    fs.mkdirSync(stage, { recursive: true });
+    fs.writeFileSync(path.join(stage, 'child.txt'), 'x\n');
+    fs.chmodSync(stage, 0o500); // r-x: its children cannot be unlinked
+
+    const warnings: ProvisionWarnEvent[] = [];
+    try {
+      gcProvisionStages(manager.baseDir, String(asg), undefined, (e) => warnings.push(e));
+      expect(existsSync(stage)).toBe(true); // it really did survive
+      expect(warnings.some((w) => w.kind === 'stage_gc_removed')).toBe(false);
+    } finally {
+      fs.chmodSync(stage, 0o700);
+    }
   });
 });
 

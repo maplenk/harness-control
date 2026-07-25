@@ -85,6 +85,10 @@ export const PROVISIONING_CAUSES = [
   /** A provisioning command/probe exceeded its deadline; refused with the mutex
    * and advisory lease released. */
   'provisioning_timeout',
+  /** This assignment already holds the maximum number of QUARANTINED stages, each
+   * possibly still being written by a producer that outlived its deadline. Back
+   * pressure: refuse to start another rather than delete one of theirs. */
+  'quarantine_cap_reached',
 ] as const;
 
 export type ProvisioningCause = (typeof PROVISIONING_CAUSES)[number];

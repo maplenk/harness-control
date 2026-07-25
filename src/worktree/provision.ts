@@ -153,8 +153,9 @@ export type ProvisionWarnEvent =
   /** ROUND 5 (#4): the stage could NOT be marked, so it is not protected — said
    * plainly rather than reported as a quarantine that did not happen. */
   | { readonly kind: 'stage_quarantine_failed'; readonly stage: string; readonly detail: string }
-  /** REGRESSION 2: quarantined stages exceeded the cap; the oldest were evicted. */
-  | { readonly kind: 'quarantine_cap_evicted'; readonly evicted: number; readonly retained: number }
+  /** ITEM 2: the assignment is AT the quarantine cap, so no new producer is
+   * started until a stage's TTL releases it. Nothing is deleted. */
+  | { readonly kind: 'quarantine_cap_reached'; readonly retained: number; readonly cap: number }
   /** F9: the runtime native smoke loaded these packages from the staged tree. */
   | { readonly kind: 'native_smoke_passed'; readonly packages: readonly string[] };
 
@@ -572,7 +573,7 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
   // worktree's node_modules is MISSING but a stage holds an `old-*` backup (a crash
   // after move-aside, before move-in), the backup is RESTORED before deletion — it
   // is the only surviving copy of the prior valid tree.
-  gcAbandonedStages(assignmentStageRoot, worktreePath, warn, ownerProbe);
+  const quarantined = gcAbandonedStages(assignmentStageRoot, worktreePath, warn, ownerProbe);
 
   // Explicit opt-out: `none` disables managed provisioning (the operator owns
   // node_modules). Proven-skip so the fail-closed gate never halts a deliberately
@@ -700,6 +701,28 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
       repoRoot,
       worktreePath,
       `existing node_modules matches the committed dependency fingerprint; its ${marker.smokeAttested ? 'pre-version-proof (v2)' : 'pre-F9 (v1)'} marker was re-proven in place and upgraded`,
+    );
+  }
+
+  // ITEM 2 (round 13) — BACK PRESSURE at the quarantine cap, applied here because
+  // here is where a PRODUCER would be started. A quarantined stage is protected
+  // precisely because a producer that outlived its deadline may still be writing
+  // into it; `withDeadline` stops waiting without stopping the writer. Deleting
+  // one to make room (the round-10 eviction) raced that writer — the exact hazard
+  // quarantining exists to prevent — so the cap is enforced by NOT starting
+  // another producer instead. Retention stays bounded (the cap is now a real
+  // ceiling: no new stage can be created above it) and no live tree is destroyed.
+  // Everything above this point — `'none'`, no-deps, and the proven short-circuit
+  // — starts no producer and is deliberately unaffected.
+  if (quarantined.length >= MAX_QUARANTINED_STAGES) {
+    warn({ kind: 'quarantine_cap_reached', retained: quarantined.length, cap: MAX_QUARANTINED_STAGES });
+    throw failClosed(
+      `assignment ${params.assignmentId} already holds ${quarantined.length} quarantined provisioning stage(s) ` +
+        `under ${assignmentStageRoot} (cap ${MAX_QUARANTINED_STAGES}) — each may still be written by a provisioning ` +
+        'command that outlived its deadline. Refusing to start another rather than deleting one of theirs. They are ' +
+        `released automatically ${QUARANTINE_TTL_MS / (60 * 60 * 1000)}h after quarantine.`,
+      `fingerprint=${fingerprint}; quarantined=${quarantined.length}`,
+      'quarantine_cap_reached',
     );
   }
 
@@ -839,6 +862,11 @@ export const QUARANTINE_TTL_MS = 24 * 60 * 60 * 1000;
  * REGRESSION 2 (round 10) — the hard cap on retained quarantine stages per
  * assignment. Bounds the cost even inside a TTL window, so repeated timeouts
  * cannot accumulate trees without limit.
+ *
+ * ITEM 2 (round 13): it is a real ceiling rather than an eviction trigger. At the
+ * cap, provisioning refuses to start another PRODUCER (`quarantine_cap_reached`)
+ * — so no further stage can be created — instead of deleting a protected stage a
+ * timed-out producer may still be writing into.
  */
 export const MAX_QUARANTINED_STAGES = 8;
 
@@ -1284,12 +1312,24 @@ export function gcProvisionStages(
   );
 }
 
+/**
+ * Sweeps this assignment's stage namespace and returns the names of the stages it
+ * left alone because they are QUARANTINE-PROTECTED.
+ *
+ * ITEM 2 (round 13): the returned list is what the caller applies BACK PRESSURE
+ * from. The cap used to be enforced here by deleting the oldest protected stages,
+ * which is the exact race quarantine exists to prevent — they are protected
+ * precisely because a producer that outlived its deadline may still be writing
+ * into them, and the eviction counted stages it merely TRIED to delete as
+ * evicted. Removal is reported (`stage_gc_removed`) only after an `rmSync` that
+ * actually returned.
+ */
 function gcAbandonedStages(
   assignmentStageRoot: string,
   worktreePath: string | undefined,
   warn: ProvisionWarnSink,
   ownerProbe: QuarantineOwnerProbe,
-): void {
+): string[] {
   // #5: `assignmentStageRoot` is THIS assignment's own namespace dir — every child is
   // one of its stage dirs, so no slug prefix filter is needed (which is what caused
   // `asg-x` to also match `asg-x-y-*`). A distinct assignment has a distinct dir.
@@ -1303,8 +1343,8 @@ function gcAbandonedStages(
     // defined) FAIL CLOSED (preserve + throw) rather than continue as if empty. On the
     // removeWorktree cleanup path (`worktreePath` undefined) the assignment is being
     // torn down — there is no future provision to protect — so best-effort return.
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    if (worktreePath === undefined) return;
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if (worktreePath === undefined) return [];
     throw failClosed(
       `crash-recovery could not enumerate the provisioning stage namespace ${assignmentStageRoot}: ` +
         `${messageOf(error)}. It may hold the only node_modules backup; preserving it and failing closed.`,
@@ -1379,30 +1419,6 @@ function gcAbandonedStages(
     }
   }
 
-  // REGRESSION 2 (round 10): a HARD CAP on retained quarantine stages, so the
-  // cost is bounded even when the TTL has not yet elapsed (or a marker is
-  // unreadable and therefore held open). Repeated timeouts within one TTL window
-  // would otherwise accumulate without limit — a resource cost main does not
-  // have. Oldest-first eviction, and the count is LOGGED rather than silent:
-  // bounded-and-logged beats unbounded-and-silent.
-  if (retained.length > MAX_QUARANTINED_STAGES) {
-    const byAge = retained
-      .map((name) => ({ name, at: mtimeMsOf(path.join(assignmentStageRoot, name)) ?? 0 }))
-      .sort((a, b) => a.at - b.at);
-    const evicting = byAge.slice(0, retained.length - MAX_QUARANTINED_STAGES);
-    for (const { name } of evicting) {
-      try {
-        fs.rmSync(path.join(assignmentStageRoot, name), { recursive: true, force: true });
-      } catch {
-        /* best effort */
-      }
-    }
-    warn({
-      kind: 'quarantine_cap_evicted',
-      evicted: evicting.length,
-      retained: MAX_QUARANTINED_STAGES,
-    });
-  }
   // Best-effort: drop the now-empty per-assignment namespace dir. `rmdirSync` removes
   // it ONLY when empty, so a preserved `old-*` backup (fail-closed above threw before
   // here) or a stage the sweep could not remove keeps it — never a recursive force.
@@ -1411,6 +1427,7 @@ function gcAbandonedStages(
   } catch {
     /* non-empty or already gone — leave it */
   }
+  return retained;
 }
 
 function purgeTransientCaches(treePath: string, warn: ProvisionWarnSink): void {
