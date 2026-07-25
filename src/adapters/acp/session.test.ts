@@ -373,6 +373,17 @@ describe('permission mediation decision core (§10.2, T20)', () => {
       policy: { allow: [], workspaceWriteRoot: root },
     } as const;
 
+    // F14 (found while consolidating containment): a `..` that FOLLOWS a symlink
+    // is not undone by the symlink — `<root>/escape/..` is the parent of
+    // `outside`, not `<root>`. This rule admitted it anyway, because Node's
+    // `realpathSync` is not POSIX `realpath(3)`: it `path.resolve`s first, which
+    // collapses the `..` LEXICALLY back to `<root>` before any symlink is
+    // touched. Measured on the parent commit, this exact title returned `true`
+    // and the write lands in the worktree's PARENT directory.
+    const lexicalEscapeTitle = `Write \`${root}/escape/../pwned.txt\``;
+    expect(isWorkspaceWriteOperation(lexicalEscapeTitle, root)).toBe(false);
+    expect(decidePermission(policy, lexicalEscapeTitle).action).toBe('deny');
+
     expect(isWorkspaceWriteOperation(insideTitle, root)).toBe(true);
     expect(decidePermission(policy, insideTitle)).toEqual({
       action: 'allow',
