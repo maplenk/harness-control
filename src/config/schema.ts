@@ -356,15 +356,25 @@ const budgetSchema = z
 const BUDGET_DEFAULT = budgetSchema.parse({});
 
 // ---------------------------------------------------------------------------
-// F7 (spec §3): worktree dependency provisioning. The engine provisions a REAL,
-// git-ignored `node_modules` into each child worktree at the post-commit /
-// pre-verification boundary so host self-check + verifier commands
-// (`npm run typecheck`, `npx vitest`) don't exit 127. `auto` (default) clones the
-// primary checkout's tree when the committed dependency fingerprint matches and
-// APFS copy-on-write is available, else `npm ci`; `clone`/`install` force a lane
-// (both fall back to install on a non-clonable host); `none` disables managed
-// provisioning (the operator owns node_modules). The value flows into
-// `WorktreeManagerOptions.provision` via cli/index.ts.
+// F7 (spec §3) / F9 (spec §4): worktree dependency provisioning. The engine
+// provisions a REAL, git-ignored `node_modules` into each child worktree at the
+// post-commit / pre-verification boundary so host self-check + verifier commands
+// (`npm run typecheck`, `npx vitest`) don't exit 127.
+//
+// The vocabulary must be HONEST — accepted config must ACT or be REFUSED (W4-1):
+//   `auto`   = clone the primary's proven tree when it matches, else install;
+//   `clone`  = prefer the clone; install when there is no eligible source;
+//   `install`= always build from the round's OWN committed manifests;
+//   `none`   = managed provisioning off; the operator owns node_modules.
+//
+// ROUND 15: `install` is back. F9 removed it because `npm ci --ignore-scripts`
+// cannot build a native dependency — true, and too broad: a script-less install
+// is fine for a project with no native dependencies, which is most of them. The
+// hazard was never the lane, it was stamping its output PROVEN, and the artifact
+// proof now catches exactly that (see `runNativeSmoke`). Removing the lane
+// unconditionally refused three things main does successfully: `install`, a round
+// that changed its manifests, and any host without APFS copy-on-write.
+// The value flows into `WorktreeManagerOptions.provision` via cli/index.ts.
 // ---------------------------------------------------------------------------
 export const PROVISION_STRATEGIES = ['auto', 'clone', 'install', 'none'] as const satisfies readonly ProvisionStrategy[];
 export const DEFAULT_PROVISION_STRATEGY: ProvisionStrategy = 'auto';

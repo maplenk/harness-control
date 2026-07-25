@@ -262,11 +262,17 @@ interface CreatedAdapter {
   readonly prompts: string[];
 }
 
-function makeSliceFactory(scripts: {
-  readonly coordinator?: readonly AdapterScript[];
-  readonly implementor?: readonly AdapterScript[];
-  readonly verifier?: readonly AdapterScript[];
-}): { factory: RoleAdapterFactory; created: CreatedAdapter[] } {
+function makeSliceFactory(
+  scripts: {
+    readonly coordinator?: readonly AdapterScript[];
+    readonly implementor?: readonly AdapterScript[];
+    readonly verifier?: readonly AdapterScript[];
+  },
+  /** Fires as each role's adapter is created — a seam for asserting behaviour
+   * that depends on state changing mid-run (e.g. a failover recorded during
+   * the implementor round, after loop entry and before verifier dispatch). */
+  onAdapterCreated?: (role: string) => void,
+): { factory: RoleAdapterFactory; created: CreatedAdapter[] } {
   const created: CreatedAdapter[] = [];
   const cursors: Record<string, number> = {};
   const factory: RoleAdapterFactory = {
@@ -295,6 +301,7 @@ function makeSliceFactory(scripts: {
         return orig(input);
       };
       created.push({ role, options, adapter, prompts });
+      onAdapterCreated?.(role);
       return { adapter, dispose: (): Promise<void> => adapter.close() };
     },
   };
@@ -361,7 +368,10 @@ async function openSlice(scripts: {
   readonly coordinator?: readonly AdapterScript[];
   readonly implementor?: readonly AdapterScript[];
   readonly verifier?: readonly AdapterScript[];
-}, options: { readonly allowSameHarness?: boolean } = {}): Promise<Slice> {
+}, options: {
+  readonly allowSameHarness?: boolean;
+  readonly onAdapterCreated?: (role: string) => void;
+} = {}): Promise<Slice> {
   repo = await makeTempGitRepo('harness-slice-');
   dbHandle = await openTestDatabase({ kind: 'better-sqlite3', file: true });
   casDir = await mkdtemp(path.join(tmpdir(), 'harness-slice-cas-'));
@@ -376,7 +386,7 @@ async function openSlice(scripts: {
   const ids = new DeterministicIdFactory();
   const flowIds = new DeterministicIdFactory();
   const store = new ArtifactStore({ rootDir: casDir, clock: dbHandle.db.clock, ids: flowIds });
-  const { factory, created } = makeSliceFactory(scripts);
+  const { factory, created } = makeSliceFactory(scripts, options.onAdapterCreated);
   const service = new OrchestrationService({
     db: dbHandle.db,
     ids,
@@ -502,6 +512,20 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
   // The verifier-boundary re-check is the only thing between that and a report
   // asserting independent cross-vendor verification.
   it('refuses a same-harness pair that only appears at the verifier boundary', async () => {
+    // Fires as the IMPLEMENTOR adapter is created — after the loop-entry check
+    // has already accepted the independent pair, and before the verifier
+    // boundary re-check — and re-points the VERIFIER at the implementor's
+    // harness, exactly as a `switch_harness` failover mid-round would.
+    const flipVerifierToImplementorHarness = (role: string): void => {
+      if (role !== 'implementor') return;
+      new DurableDesiredModelStore(dbHandle!.db).set({
+        runId: String(runId),
+        role: 'verifier',
+        harness: 'codex',
+        model: 'gpt-5.6-sol',
+        requestedAt: '2026-07-25T00:00:00.000Z',
+      });
+    };
     const slice = await openSlice({
       coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
       implementor: [
@@ -520,24 +544,11 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
           ],
         },
       ],
-    });
+    }, { onAdapterCreated: flipVerifierToImplementorHarness });
+    // The entry pair is independent (codex implements / claude verifies), so
+    // the loop-entry check passes and only the boundary re-check can catch it.
     const { runId, outcome } = await coordinateAndApprove(slice);
     const { recorder } = fakeEvidence();
-
-    // Entry pair is independent (codex implements / claude verifies) so the
-    // loop-entry check passes; this runs during the implementor round and
-    // re-points the VERIFIER at the implementor's harness, exactly as a
-    // `switch_harness` failover would.
-    const failoverToImplementorHarness: VerificationRunner = async (command) => {
-      new DurableDesiredModelStore(dbHandle!.db).set({
-        runId: String(runId),
-        role: 'verifier',
-        harness: 'codex',
-        model: 'gpt-5.6-sol',
-        requestedAt: '2026-07-25T00:00:00.000Z',
-      });
-      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
-    };
 
     const error: unknown = await runImplementVerifyLoop(
       { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
@@ -553,7 +564,7 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
         criteria: outcome.specVersion.criteria,
         baseCommit: slice.baseCommit,
         evidence: recorder,
-        runVerificationCommands: failoverToImplementorHarness,
+        runVerificationCommands: PASS_VERIFY,
       },
     ).then(() => undefined).catch((caught: unknown) => caught);
 
@@ -622,6 +633,66 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
       implementor: 'codex',
       verifier: 'codex',
     });
+  });
+
+  it('executes each declared verification command exactly ONCE on a happy-path round', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+            ]),
+          ],
+        },
+      ],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const executed: string[] = [];
+    const countingVerify: VerificationRunner = async (command) => {
+      executed.push(command);
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: assignmentId('asg_single_exec'),
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: countingVerify,
+      },
+    );
+
+    expect(result.outcome).toBe('merge_ready');
+    // The F13 receipts are the authoritative command proof — post-provisioning
+    // and commit-bound. The implementor boundary re-running the same commands
+    // doubled wall-clock and cost, executed NON-IDEMPOTENT commands (migrations,
+    // port binders, quota-consuming calls) twice, and compounded across
+    // remediation rounds.
+    expect({
+      total: executed.length,
+      ac1: executed.filter((c) => c.includes('ac1')).length,
+      ac2: executed.filter((c) => c.includes('ac2')).length,
+    }).toEqual({ total: 2, ac1: 1, ac2: 1 });
   });
 
   it('composes the whole loop end to end and reaches a READY merge-readiness in one round', async () => {
@@ -949,9 +1020,10 @@ describe('W1-F1/W1-F4 — a mutating verification command never yields merge_rea
     expect(result.rounds).toHaveLength(2);
     expect(slice.service.status(runId).counters.remediationRounds).toBe(2);
 
-    // --- W1-F4: the implementor report caught the post-commit dirt ----------
-    expect(result.rounds[0]!.implementation!.postVerificationDirty).toBe(true);
-    expect(result.rounds[0]!.implementation!.postVerificationDirtyFiles).toContain('verify-side-effect.txt');
+    // --- W1-F4: the implementor round handed over a CLEAN tree; the dirt is
+    // created later, by the declared commands at the verify boundary, which is
+    // where the §16 readiness probe below catches it and names the file. -----
+    expect(result.rounds[0]!.implementation!.postVerificationDirty).toBe(false);
 
     // --- The §16 report is honest: not ready, blocker names the file --------
     const mr = result.mergeReadiness!;
@@ -1048,12 +1120,13 @@ describe('W3-1 — a verification command that writes into the PRIMARY checkout 
     expect(result.finalPhase).toBe('needs_remediation');
     expect(slice.service.status(runId).phase).toBe('needs_remediation');
 
-    // --- The round report carries the typed violation, self-check failed ----
+    // --- The implementor round itself is sound: it committed, and its own
+    // boundary (provisioning) raised nothing. The escape happened in the
+    // declared commands, which now run once at the VERIFY boundary — so the
+    // violation surfaces from there, as the durable incident asserted below.
     const impl = result.rounds[0]!.implementation!;
-    expect(impl.runnerViolation).toBeDefined();
-    expect(impl.runnerViolation!.kind).toBe('verification_runner_violation');
-    expect(impl.runnerViolation!.changedPaths).toContain('planted-by-verification.txt');
-    expect(impl.verificationPassed).toBe(false); // commands exited 0; the guard failed it
+    expect(impl.committed).toBe(true);
+    expect(impl.provisioningFailed).toBeUndefined();
 
     // --- The durable incident event landed BEFORE the verifier verdict ------
     const events = dbHandle!.db.events.listByRun(runId);
@@ -1153,7 +1226,7 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
         criteria,
         taskScope: 'Implement --verbose.',
       },
-      { runVerification: PASS_VERIFY },
+      {},
     );
     const implResult = await slice.service.runRole(
       runId,
@@ -1259,10 +1332,14 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
     // Target the handoff checkpoint by reason: the §12.2 completed-turn
     // cadence (W4-1) legitimately writes earlier `cadence` checkpoints as the
     // slice drives its turns, so "the first checkpoint.recorded" is no longer
-    // unambiguous — the resume path wants the pre_verify_handoff one.
+    // unambiguous — the resume path wants the pre_verify_handoff one. F8 (C):
+    // the IMPLEMENTOR round now writes a real `pre_verify_handoff` checkpoint
+    // at its own commit boundary too, so take the LATEST one — the
+    // predecessor-verifier checkpoint this test just appended — exactly as
+    // `resolveResumeCheckpointHash` does (latest-by-sequence).
     const checkpointEvent = db.events
       .listByRun(runId)
-      .find(
+      .findLast(
         (e) =>
           e.type === 'checkpoint.recorded' &&
           (e.payload as { reason?: string }).reason === 'pre_verify_handoff',
@@ -1851,7 +1928,11 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
     expect(result.provisioningFailure?.round).toBe(1);
     expect(result.provisioningFailure?.implementationCommit).toBeDefined();
     // B1: node_modules never entered the committed tree (excluded from the commit),
-    // despite the missing ignore rule.
+    // despite the missing ignore rule. ROUND 13 (ITEM 1) restored this: the commit
+    // happens BEFORE provisioning, so at staging time an agent-created tree is
+    // always unignored and unmarked — requiring a positive signal there meant the
+    // generated tree was committed permanently. The ROOT tree is main's
+    // unconditional exclusion and is excluded again.
     const tracked = (await slice.repo.run(['ls-tree', '-r', '--name-only', String(result.implementationCommit)])).split('\n');
     expect(tracked.some((p) => p.startsWith('node_modules'))).toBe(false);
     expect(tracked).toContain('package.json');
@@ -1940,7 +2021,10 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
       await git.runGit(['rev-list', '--count', `${String(slice.baseCommit)}..HEAD`], worktreePath)
     ).stdout.trim();
     expect(commitCount).toBe('1');
-    // node_modules NEVER entered any commit (not in c1's tree, and c1 is still HEAD).
+    // node_modules NEVER entered any commit (not in c1's tree, and c1 is still HEAD)
+    // — ROUND 13 (ITEM 1) again: the ROOT tree is excluded unconditionally while
+    // provisioning is active, so it stays untracked worktree dirt for the resume
+    // path to reconcile rather than becoming part of the branch.
     const tracked = (await slice.repo.run(['ls-tree', '-r', '--name-only', String(c1)])).split('\n');
     expect(tracked.some((p) => p.startsWith('node_modules'))).toBe(false);
     expect(tracked).toContain('package.json');
@@ -2040,13 +2124,24 @@ describe('F7 round-3 #7 — toProvisioningFailure redacts the surfaced detail', 
   it('scrubs a secret-shaped detail from the verifier-boundary provisioning failure', () => {
     const handle = { repoRoot: '/repo', worktreePath: '/wt' } as WorktreeHandle;
     const secret = 'AKIAIOSFODNN7EXAMPLE'; // a canonical AWS-access-key-id-shaped token
-    const error = new WorktreeError('provisioning_failed', 'dependency install failed', {
-      detail: `npm ci failed: registry auth key ${secret} was rejected`,
+    // ROUND 8 (LOW): a provisioning refusal now surfaces the operator-facing
+    // MESSAGE (it carries the evidence — package, installed vs lockfile version)
+    // rather than the terse `.detail` hint. Redaction is what is under test, so
+    // the secret is planted in the surfaced field.
+    const error = new WorktreeError('provisioning_failed', `npm ci failed: registry auth key ${secret} was rejected`, {
+      detail: 'dependency install failed',
     });
     const pf = toProvisioningFailure(error, handle);
     expect(pf.kind).toBe('provisioning_failed');
     expect(pf.repoRoot).toBe('/repo');
     expect(pf.detail).not.toContain(secret); // the raw secret never reaches the CLI/sink
     expect(pf.detail).toContain('REDACTED'); // replaced by the redaction marker
+
+    // ...and the OTHER field is not a bypass: a secret in `.detail` is simply not
+    // surfaced for a provisioning refusal, so it cannot leak either.
+    const inDetail = new WorktreeError('provisioning_failed', 'dependency install failed', {
+      detail: `npm ci failed: registry auth key ${secret} was rejected`,
+    });
+    expect(toProvisioningFailure(inDetail, handle).detail).not.toContain(secret);
   });
 });

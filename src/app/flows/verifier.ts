@@ -87,10 +87,12 @@ import type { RoleModelSpec } from '../model-resolution.js';
 import type { IngestResult, RoleDispatch } from '../service.js';
 import type { MergeReadinessBlockedState } from '../projections.js';
 import { redactText } from '../../redaction/index.js';
-import type {
-  VerificationCommandOutcome,
-  VerificationRunner,
-  VerificationRunnerViolation,
+import {
+  detectPrimaryCheckoutDrift,
+  snapshotPrimaryCheckoutState,
+  type VerificationCommandOutcome,
+  type VerificationRunner,
+  type VerificationRunnerViolation,
 } from './implementor.js';
 
 // ===========================================================================
@@ -215,6 +217,64 @@ export async function executeEvidenceReceipts(
     }
   }
   return receipts;
+}
+
+export interface ConfinedReceiptExecution {
+  readonly receipts: readonly EvidenceReceipt[];
+  /** W3-1: the primary checkout mutated across the declared commands — typed
+   * proof of a confinement violation. */
+  readonly runnerViolation?: VerificationRunnerViolation;
+}
+
+/**
+ * W3-1 layer 2 + F8 BLOCKER-1, at the boundary that now OWNS declared-command
+ * execution. Two guards, both of which used to wrap the implementor boundary's
+ * duplicate execution of these same commands and which moved here with it:
+ *
+ * 1. **Confinement.** Snapshot the PRIMARY checkout (HEAD + `--ignored`
+ *    porcelain + hooks manifest + config) before the receipts run and re-check
+ *    it after: any drift means a command, or a script it invoked, reached
+ *    outside the worktree. A failing snapshot propagates rather than being
+ *    swallowed — a pre-existing broken primary is an environment problem, not
+ *    the runner's doing.
+ * 2. **Authorship.** The worktree HEAD must still be the commit being verified.
+ *    F8 made "a declared verification command that COMMITS" a hard error at the
+ *    implementor boundary, where such a commit used to silently rebind the
+ *    verifier's binding. That adjudication happens before this point, so it can
+ *    no longer see the vector: the commands run HERE now, against an
+ *    already-bound commit. Verification commands observe; they do not author.
+ */
+export async function executeEvidenceReceiptsUnderConfinement(
+  input: ExecuteEvidenceReceiptsInput & { readonly repoRoot: string },
+): Promise<ConfinedReceiptExecution> {
+  const primaryBefore = await snapshotPrimaryCheckoutState(input.repoRoot);
+  const worktreeHeadBefore = await git.resolveSha(input.cwd, 'HEAD');
+  const receipts = await executeEvidenceReceipts(input);
+  const primaryViolation = await detectPrimaryCheckoutDrift(input.repoRoot, primaryBefore);
+  if (primaryViolation !== undefined) return { receipts, runnerViolation: primaryViolation };
+
+  // Escaping to the primary is the more severe finding, so it is reported
+  // first; this catches the command that stayed inside the worktree but
+  // authored a commit there.
+  const worktreeHeadAfter = await git.resolveSha(input.cwd, 'HEAD');
+  if (worktreeHeadAfter !== worktreeHeadBefore) {
+    return {
+      receipts,
+      runnerViolation: {
+        kind: 'verification_runner_violation',
+        repoRoot: input.repoRoot,
+        headBefore: gitSha(worktreeHeadBefore),
+        headAfter: gitSha(worktreeHeadAfter),
+        changedPaths: [],
+        detail: redactText(
+          `a declared verification command moved the worktree HEAD at ${input.cwd} from ` +
+            `${worktreeHeadBefore} to ${worktreeHeadAfter}; verification commands must observe ` +
+            'the bound implementation commit, never author one',
+        ),
+      },
+    };
+  }
+  return { receipts };
 }
 
 /**

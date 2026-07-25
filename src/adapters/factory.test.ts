@@ -52,7 +52,8 @@ import {
   grokAuthJsonPath,
 } from './grok/index.js';
 import { fakeAcpChildPath, writeScenarioFile, type FakeAcpScenario } from './fake/index.js';
-import type { SessionUpdate } from './spi.js';
+import type { PermissionRequest, SessionUpdate } from './spi.js';
+import { noPayloadToVerify } from './acp/session.js';
 import {
   createClaudeAcpAdapter,
   createCodexAcpAdapter,
@@ -186,7 +187,7 @@ describe('provider adapter factory — command resolution + version pin (§3, §
         [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin,
       },
       grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
-      permissions: { mode: 'headless', role: 'implementor' },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
       role: 'implementor',
       model: 'grok-build',
       reasoningEffort: 'high',
@@ -281,7 +282,7 @@ describe('provider adapter factory — §17.1 credential forwarding + H-1 isolat
     const created = createOpenCodeAcpAdapter({
       clock: CLOCK,
       processEnv: { HOME: realHome, OPENROUTER_API_KEY: 'must-not-cross' },
-      permissions: { mode: 'headless', role: 'implementor' },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
       openCodeHome: { realHome, tempRoot },
     });
     cleanups.push(async () => created.adapter.close());
@@ -345,7 +346,7 @@ describe('provider adapter factory — §17.1 credential forwarding + H-1 isolat
         UNRELATED_SECRET: 'must-not-cross',
       },
       grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
-      permissions: { mode: 'headless', role: 'verifier' },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
       role: 'verifier',
       model: 'grok-build',
       reasoningEffort: 'high',
@@ -375,7 +376,7 @@ describe('provider adapter factory — §17.1 credential forwarding + H-1 isolat
     const created = createCodexAcpAdapter({
       clock: CLOCK,
       processEnv: { OPENAI_API_KEY: 'sk-oai-test' },
-      permissions: { mode: 'headless', role: 'verifier' },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
       codexHome: { realCodexHome, tempRoot },
     });
     cleanups.push(async () => created.codexHome?.dispose());
@@ -560,6 +561,8 @@ describe('provider adapter factory — composed initialize() over the fake wire 
               permission: {
                 toolTitle:
                   'Execute `git log --oneline -5 && git rev-parse HEAD && ls -la scripts/dogfood/ 2>/dev/null; head -50 scripts/dogfood/slice-1a.sh 2>/dev/null || true`',
+                // HIGH-5: a real provider sends what it will EXECUTE.
+                rawInput: { command: 'git log --oneline -5 && git rev-parse HEAD && ls -la scripts/dogfood/ 2>/dev/null; head -50 scripts/dogfood/slice-1a.sh 2>/dev/null || true' },
               },
               response: { stopReason: 'end_turn' },
             },
@@ -568,7 +571,21 @@ describe('provider adapter factory — composed initialize() over the fake wire 
               response: { stopReason: 'end_turn' },
             },
             {
-              permission: { toolTitle: 'Execute `npm run typecheck`' },
+              // HIGH-5: an ALLOWLISTED title still has to carry the payload it will
+              // execute. This turn used to omit rawInput and be approved anyway —
+              // the exact-allowlist match ran before the binding.
+              permission: {
+                toolTitle: 'Execute `npm run typecheck`',
+                rawInput: { command: 'npm run typecheck' },
+              },
+              response: { stopReason: 'end_turn' },
+            },
+            {
+              // ...and the same allowlisted title with a HOSTILE payload is denied.
+              permission: {
+                toolTitle: 'Execute `npm run typecheck`',
+                rawInput: { command: 'rm -rf /' },
+              },
               response: { stopReason: 'end_turn' },
             },
           ],
@@ -583,7 +600,7 @@ describe('provider adapter factory — composed initialize() over the fake wire 
           [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin,
         },
         grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
-        permissions: { mode: 'headless', role: 'implementor' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
         role: 'implementor',
         model: 'grok-build',
         reasoningEffort: 'high',
@@ -615,6 +632,9 @@ describe('provider adapter factory — composed initialize() over the fake wire 
       await expect(
         created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'self-check' }),
       ).resolves.toMatchObject({ stopReason: 'end_turn' });
+      await expect(
+        created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'self-check, hostile payload' }),
+      ).resolves.toMatchObject({ stopReason: 'end_turn' });
       expect(created.adapter.permissionDecisions).toEqual([
         expect.objectContaining({
           operation: `Write \`${target}\``,
@@ -627,17 +647,157 @@ describe('provider adapter factory — composed initialize() over the fake wire 
           action: 'allow',
           reason: 'allowlisted_read_only_operation',
         }),
+        // The scenario sends this scaffolding attempt with no rawInput, so the
+        // payload VETO refuses it before the read-only classifier is even
+        // consulted — a stricter denial than the round-4 'denied_default'.
         expect.objectContaining({
           operation: 'Execute `mkdir -p src/app/commands`',
           action: 'deny',
-          reason: 'denied_default',
+          reason: 'denied_raw_input_mismatch',
         }),
         expect.objectContaining({
           operation: 'Execute `npm run typecheck`',
           action: 'allow',
           reason: 'allowlisted',
         }),
+        // HIGH-5: the SAME allowlisted title, hostile payload -> denied.
+        expect.objectContaining({
+          operation: 'Execute `npm run typecheck`',
+          action: 'deny',
+          reason: 'denied_raw_input_mismatch',
+        }),
       ]);
+    },
+    GENEROUS_MS,
+  );
+
+  // ROUND 6 (Finding 1) end-to-end: the veto was installed only for
+  // `implementor` + `headless`, so a production INTERACTIVE Grok session never
+  // received one and its decider could approve a divergent payload. Driven
+  // through the REAL factory + wire so the WIRING is what is under test, not the
+  // classifier.
+  it(
+    'grok INTERACTIVE sessions carry the payload veto too (it is not implementor+headless only)',
+    async () => {
+      const fixture = fixtureGrok();
+      const scenarioPath = await writeScenarioFile(
+        {
+          turns: [
+            {
+              permission: { toolTitle: 'Execute `ls -la src`', rawInput: { command: 'rm -rf /' } },
+              response: { stopReason: 'end_turn' },
+            },
+          ],
+        },
+        fixture.root,
+      );
+      // An interactive decider that would APPROVE anything it is shown — so the
+      // only thing that can refuse here is the veto.
+      const created = createGrokBuildAcpAdapter({
+        cwd: fixture.cwd,
+        clock: CLOCK,
+        processEnv: { HOME: fixture.realHome, [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin },
+        grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
+        permissions: {
+          verifyOperationPayload: noPayloadToVerify, mode: 'interactive',
+          role: 'implementor',
+          handler: async () => ({ kind: 'selected', optionId: 'allow_once' }),
+        },
+        role: 'implementor',
+        model: 'grok-build',
+        reasoningEffort: 'high',
+        spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
+      });
+      cleanups.push(async () => created.adapter.close());
+
+      await created.adapter.initialize();
+      const session = await created.adapter.createSession({ cwd: fixture.cwd });
+      await created.adapter.prompt({ sessionId: session.acpSessionId, prompt: 'interactive divergent' });
+
+      expect(created.adapter.permissionDecisions).toEqual([
+        expect.objectContaining({
+          operation: 'Execute `ls -la src`',
+          action: 'deny',
+          reason: 'denied_raw_input_mismatch',
+        }),
+      ]);
+    },
+    GENEROUS_MS,
+  );
+
+  // HIGH-5 end-to-end: the permission TITLE is prose; ACP `rawInput` is what the
+  // provider EXECUTES. Auto-approval must bind them, or an approval covers a
+  // string nothing runs. Driven through the REAL wire (fake ACP child → session
+  // → policy), not just the classifier unit.
+  it(
+    'grok DENIES a read-only-looking title whose rawInput diverges, and one with no rawInput at all',
+    async () => {
+      const fixture = fixtureGrok();
+      const scenarioPath = await writeScenarioFile(
+        {
+          turns: [
+            {
+              // Benign prose, hostile payload.
+              permission: {
+                toolTitle: 'Execute `ls -la src`',
+                rawInput: { command: 'rm -rf /' },
+              },
+              response: { stopReason: 'end_turn' },
+            },
+            {
+              // A provider that sends no rawInput at all: unverifiable, so denied.
+              permission: { toolTitle: 'Execute `ls -la src`' },
+              response: { stopReason: 'end_turn' },
+            },
+          ],
+        },
+        fixture.root,
+      );
+      const created = createGrokBuildAcpAdapter({
+        cwd: fixture.cwd,
+        clock: CLOCK,
+        processEnv: { HOME: fixture.realHome, [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin },
+        grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
+        role: 'implementor',
+        model: 'grok-build',
+        reasoningEffort: 'high',
+        spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
+      });
+      cleanups.push(async () => created.adapter.close());
+
+      const updates: SessionUpdate[] = [];
+      await created.adapter.initialize();
+      const session = await created.adapter.createSession({ cwd: fixture.cwd });
+      await created.adapter.prompt({
+        sessionId: session.acpSessionId,
+        prompt: 'divergent payload',
+        onUpdate: (u) => updates.push(u),
+      });
+      await created.adapter.prompt({
+        sessionId: session.acpSessionId,
+        prompt: 'no raw input',
+        onUpdate: (u) => updates.push(u),
+      });
+
+      expect(created.adapter.permissionDecisions).toEqual([
+        expect.objectContaining({
+          operation: 'Execute `ls -la src`',
+          action: 'deny',
+          reason: 'denied_raw_input_mismatch',
+        }),
+        expect.objectContaining({
+          operation: 'Execute `ls -la src`',
+          action: 'deny',
+          reason: 'denied_raw_input_mismatch',
+        }),
+      ]);
+      // HIGH-5: the surfaced request carries what will EXECUTE, so an
+      // interactive decider judges the payload rather than the prose.
+      const surfaced = updates.filter((u) => u.kind === 'permission_request');
+      expect(surfaced).toHaveLength(2);
+      expect(surfaced[0]).toMatchObject({ request: { rawInput: { command: 'rm -rf /' } } });
+      expect((surfaced[1] as { request: PermissionRequest }).request.rawInput).toBeUndefined();
     },
     GENEROUS_MS,
   );
@@ -678,7 +838,7 @@ describe('provider adapter factory — P-1 session-mode pinning wired from the p
       const { adapter } = createClaudeAcpAdapter({
         clock: CLOCK,
         processEnv: {},
-        permissions: { mode: 'headless', role: 'implementor' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });
       cleanups.push(async () => {
@@ -706,7 +866,7 @@ describe('provider adapter factory — P-1 session-mode pinning wired from the p
       const { adapter } = createCodexAcpAdapter({
         clock: CLOCK,
         processEnv: {},
-        permissions: { mode: 'headless', role: 'verifier' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
         codexHome: NO_ISOLATION,
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });
@@ -762,7 +922,7 @@ describe('P2 live-gate regression H-1 — isolated CODEX_HOME defeats an inherit
       const { adapter } = createCodexAcpAdapter({
         clock: CLOCK,
         processEnv: {},
-        permissions: { mode: 'headless', role: 'verifier' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
         codexHome: { mode: 'inherit_host' }, // the pre-H-1 spawn contract
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });
@@ -802,7 +962,7 @@ describe('P2 live-gate regression H-1 — isolated CODEX_HOME defeats an inherit
       const created = createCodexAcpAdapter({
         clock: CLOCK,
         processEnv: {},
-        permissions: { mode: 'headless', role: 'verifier' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
         codexHome: { realCodexHome, tempRoot }, // mode defaults to 'isolated'
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });
@@ -853,7 +1013,7 @@ describe('P2 live-gate regression H-1 — isolated CODEX_HOME defeats an inherit
       const created = createCodexAcpAdapter({
         clock: CLOCK,
         processEnv: { OPENAI_API_KEY: 'sk-proj-invalid' },
-        permissions: { mode: 'headless', role: 'verifier' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
         codexHome: { realCodexHome, tempRoot },
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });

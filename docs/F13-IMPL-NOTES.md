@@ -18,8 +18,12 @@ fatal: Unable to create '/Users/tagtaste/Documents/QBApps/harness-orchestration/
 ```
 
 No attempt was made to bypass that boundary. Consequently the source changes
-below are present in the worktree, but the requested coherent commits could not
-be created and HEAD remains the parent SHA.
+below were present in the worktree but uncommitted at the time of writing.
+
+> **Superseded 2026-07-25.** The work was subsequently committed on codex's
+> behalf from a context that could write the worktree's git metadata, as
+> `49c7e18` and `be5cc49`. HEAD is no longer the parent SHA; the paragraph
+> above describes only the original authoring sandbox.
 
 Intended commit sequence:
 
@@ -179,7 +183,180 @@ the unfixed engine.
 - `src/app/flows/vertical-slice.test.ts:613` proves the normal cross-vendor
   happy path records `{implementor:'codex', verifier:'claude'}`.
 
-## Verification status
+---
+
+# Merge with main (F8–F11), 2026-07-25
+
+F13 was built off `7e4b1ff`. Main advanced to `a77f3da` (itself the F8–F11
+merge), so this branch merges `a77f3da` in rather than rebasing — matching the
+precedent main set for its own track. Three files conflicted; all four hunks
+were resolved semantically, keeping BOTH sides.
+
+## The conflicts, and why each resolved the way it did
+
+**1. `src/app/role-runner.ts` — `RoleSession`.** A pure additive collision: F13
+changed `prompt()`'s return type from `PromptResult` to `RoleTurnResult` (its
+adjudicated turn), and F8 appended `checkpointVerifyHandoff()` immediately
+after it. Neither touches the other's meaning. Kept F13's signature and F8's
+method with its full doc comment, including the BLOCKER-2 note that the write
+is fatal.
+
+**2. `src/app/service.ts` — imports.** F13 widened the `role-runner.js` import
+to bring in `adjudicateRoleTurn`, `AbortedRoleTurn` and `RoleTurnOrigin`; F8
+added `noPayloadToVerify` from the ACP session module on the adjacent line.
+Kept both.
+
+**3 and 4. `src/app/flows/orchestrate.ts` — the verifier's binding.** Both
+hunks are the same collision in two places (the live implementor path and the
+completed-implementor resume path), and this is the one place the two tracks
+genuinely interact rather than merely colliding.
+
+F13 added a line reading the round's host verification result. F8 had, in the
+same statement, *removed* the `git.resolveSha(...)` re-read of mutable HEAD
+that F13's side still contained — its ROUND 9 Blocker 1 and ROUND 8 Blocker 1b
+both established that re-reading HEAD after adjudication discards the very
+guarantee just proven, because a commit landing in the gap becomes the binding.
+
+F8's binding wins in both hunks: `adjudicatedHead ?? …` on the live path,
+`adoptedBinding ?? …` on the resume path. F13's host-result carry survives on
+top, and is now **keyed on that binding**.
+
+That ordering is not cosmetic. `recordImplementationCommit` persists
+`{round, commit, verificationPassed}`, and `persistedHostVerificationPassed`
+re-accepts the host result only on an exact round + commit match. Under F13
+alone, the key was a re-read HEAD, which could drift from what was recorded —
+failing closed, but non-deterministically. Under the merge, the key on both the
+write and the read is F8's receipt-proven commit, which F8 guarantees equals
+the round's `pre_verify_handoff` receipt or the round hard-errors. **The merge
+makes F13's carry-over deterministic rather than merely fail-closed** — the two
+mechanisms reinforce each other, and a reviewer should read those two hunks
+together.
+
+## Where F8 and F13 genuinely interact — read this closely
+
+F8's BLOCKER-1 guard (`adjudicateImplementorDeliverable` refusing when the
+worktree HEAD disagrees with the round's receipt) was built for one concrete
+vector: **a declared verification command that COMMITS**, which used to run
+inside the implementor round, in the window between the receipt and
+adjudication, and silently rebind the verifier.
+
+The double-execution fix below moves declared-command execution out of that
+window entirely. F8's guard is NOT dead — it still refuses any HEAD movement
+between the receipt and adjudication, whatever the cause — but *its motivating
+vector moved*. The commands now run at the verify boundary, against an
+already-bound commit, where adjudication has already happened and cannot see
+them.
+
+So the same invariant is now enforced at the new location:
+`executeEvidenceReceiptsUnderConfinement` records the worktree HEAD before the
+receipts run and refuses if it moved, with the detail "verification commands
+must observe the bound implementation commit, never author one" — F8's rule,
+restated where the commands live now. F8's own test keeps proving the
+adjudicator by mutating through the provisioning seam, which still sits in the
+receipt→adjudication window.
+
+## The double-execution fix (reviewer Medium finding)
+
+**Before, measured on the happy path** (`vertical-slice.test.ts`, spec with two
+criteria declaring one command each), counting invocations of the injected host
+runner:
+
+```text
+{ total: 4, ac1: 2, ac2: 2 }
+```
+
+Each declared command ran twice: once at the implementor boundary
+(`implementor.ts`, via `resolveVerificationCommands`, deduped across criteria)
+and once at the verify boundary (`executeEvidenceReceipts`, per criterion).
+
+**After:**
+
+```text
+{ total: 2, ac1: 1, ac2: 1 }
+```
+
+The receipts are now the sole and authoritative command proof — they are
+post-provisioning, commit-bound, spec-bound and argv-bound, and they are the
+only execution that exists on the paths the implementor round never reaches
+(forced verifier re-entry, verify-only resume). The implementor boundary no
+longer runs the commands at all.
+
+Two signals were produced *by* that duplicate execution, and both moved with
+it rather than being left behind as inert checks — leaving either in place
+while production stopped exercising it is precisely the "safety-critical field
+documented as load-bearing and inert" defect F13 was written to kill:
+
+- **W3-1 primary-checkout confinement** now wraps the receipts. The guard has
+  to observe the commands it confines. All six escape vectors (out-of-worktree
+  write, primary HEAD move, planted `.git/hooks/pre-commit`, mutated
+  `.git/config`, new gitignored file, worktree-cwd reach into the shared common
+  dir) moved with it and are asserted against
+  `executeEvidenceReceiptsUnderConfinement`.
+- **F8's authorship rule** is the worktree-HEAD check described above.
+
+What the implementor boundary still uniquely produces, and still gates on, is
+`provisioningFailed`. `ImplementorResult.verificationPassed` now means exactly
+"the host preconditions this boundary can attest hold", and the §16 gate
+requires both it and a current zero-exit receipt per declared command
+(`#hostReceiptIssue`), so nothing about F13's Defect 1 is weakened: fabricated
+prose still cannot reach `merge_ready`, because the receipt gate is what
+enforces that and it is untouched.
+
+Removed as newly-dead rather than left inert: `ImplementorFlowOptions.runVerification`
+(no production consumer once the boundary stopped executing) and
+`ImplementorResult.runnerViolation` (no producer). `buildImplementorOptions` no
+longer forwards the runner to the implementor.
+
+### Test relocations, stated plainly
+
+- The six W3-1 tests moved from driving `ImplementorFlow` to driving
+  `executeEvidenceReceiptsUnderConfinement`; one new test covers the
+  commit-authoring vector there.
+- `vertical-slice.test.ts`'s verifier-boundary independence test used the
+  implementor-boundary command as its injection hook to flip the verifier's
+  durable desired model mid-round. That hook now fires *after* the boundary
+  check, so the test was re-pointed at a new `onAdapterCreated` seam in the
+  slice factory, which fires as the implementor adapter is created — after loop
+  entry, before verifier dispatch. Confirmed it still discriminates: it fails
+  when the boundary re-check is the only thing standing between the flip and a
+  report claiming independent verification.
+- W1-F4's unit-level form (a command dirtying the tree at the implementor
+  boundary) is no longer reachable and was replaced by an assertion that the
+  round hands over a clean tree. The property itself is still proven
+  end-to-end by "a mutating verification command never yields merge_ready",
+  where the §16 readiness probe — which runs after the receipts — catches the
+  dirt and names the file.
+
+## Green bar after the merge
+
+```text
+$ npm run typecheck
+exit 0
+
+$ npx vitest run
+Tests  1991 passed, 0 failed
+```
+
+Main alone was 1945; F13 alone was 1743 on its older base. The +46 over main is
+accounted for: role-runner.test.ts is new in F13 and contributes its 30-case
+stop-reason × role × fresh/resumed matrix, verifier/vertical-slice/config/
+implementor contribute ~10 more static cases, the remainder comes from
+per-SQLite-driver parameterization, and 2 are new here (the double-execution
+regression and the commit-authoring violation). No test file lost cases.
+
+Symbol survival was re-checked after the merge for both sides
+(`checkpointVerifyHandoff`, `resolveRoundReceiptHead`, `acceptDriftToCommit`,
+`adoptedBinding`, `adjudicatedHead`, `RoundReceiptError`, `addAllExceptNodeModules`,
+`primary_tree_stale`; `adjudicateRoleTurn`, `EvidenceReceipt`, `hostReceipts`,
+`allowSameHarness`, `independence_violation`, `void_verification`,
+`hostVerificationPassed`). Two names from the F8–F11 log — `probeForwardContainment`
+and `isGrokReadOnlyShellToolCall` — are absent, and were verified absent on
+`a77f3da` too: they were superseded within F8–F11's own later rounds, not lost
+here.
+
+---
+
+## Verification status (pre-merge, on the original F13 base)
 
 Green checks completed in this worktree:
 
@@ -218,11 +395,13 @@ mocked globally merely to manufacture a green full-suite result.
 
 ## Explicitly not verified or not done
 
-1. The branch commits could not be created because Git metadata is in the
-   forbidden, non-writable orchestration directory. No push was attempted.
-2. A fully green repository-wide Vitest run could not be obtained under the
-   host process-inspection restriction described above. It must be rerun in an
-   environment where the repository's `ps` characterization tests are allowed.
+1. ~~The branch commits could not be created…~~ **Closed:** committed as
+   `49c7e18` / `be5cc49`. Still no push.
+2. ~~A fully green repository-wide Vitest run could not be obtained…~~
+   **Closed at the merge:** `npx vitest run` is 1991 passed / 0 failed in the
+   merge worktree, where the `ps` process-identity probe is permitted. The
+   `ps` failures above were an artifact of the original authoring sandbox, not
+   of the code.
 3. F13 spec Part 4's provider-native shell-matcher characterization was not
    claimed. The repository can deterministically test the permission strings
    it constructs and its exact generic ACP allowlist, but it has no local

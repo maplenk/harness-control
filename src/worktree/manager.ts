@@ -51,6 +51,7 @@ import { WorktreeError } from './errors.js';
 import {
   defaultProvisionRuntime,
   gcProvisionStages,
+  PROVISION_COMMAND_TIMEOUT_MS,
   provisionWorktreeDeps,
   type ProvisionGit,
   type ProvisionOutcome,
@@ -59,11 +60,19 @@ import {
   type ProvisionWarnSink,
 } from './provision.js';
 
-/** F7: the real committed-HEAD / ignore git plumbing the provisioner uses. */
+/**
+ * F7: the real committed-HEAD / ignore git plumbing the provisioner uses.
+ * F9 (P5): each probe is spawned with the provisioning deadline, so a wedged git
+ * child is KILLED rather than merely abandoned (`provision.ts` separately bounds
+ * the promise, which covers an injected seam that never settles at all).
+ */
 const REAL_PROVISION_GIT: ProvisionGit = {
-  isPathIgnored: git.isPathIgnored,
-  isPathTracked: git.isPathTracked,
-  readFileAtHead: git.readFileAtHead,
+  isPathIgnored: (worktreePath, pathspec) =>
+    git.isPathIgnored(worktreePath, pathspec, PROVISION_COMMAND_TIMEOUT_MS),
+  isPathTracked: (worktreePath, pathspec) =>
+    git.isPathTracked(worktreePath, pathspec, PROVISION_COMMAND_TIMEOUT_MS),
+  readFileAtHead: (worktreePath, relpath) =>
+    git.readFileAtHead(worktreePath, relpath, PROVISION_COMMAND_TIMEOUT_MS),
 };
 
 export interface WorktreeManagerOptions {
@@ -96,6 +105,15 @@ export interface WorktreeManagerOptions {
   readonly provisionRuntime?: ProvisionRuntime;
   /** F7 read-only git plumbing — injectable; defaults to the real `git.ts`. */
   readonly provisionGit?: ProvisionGit;
+  /**
+   * F9 (P5): deadline for every external command / injected seam call on the
+   * provisioning path (default `PROVISION_COMMAND_TIMEOUT_MS`, 10 min — the
+   * verification runner's per-command cap). On expiry provisioning fails closed
+   * and the mutex + advisory lease are released with the unwinding throw, rather
+   * than a stalled `npm ci`/`cp` wedging the run and every peer process forever.
+   * Shrunk in tests to drive a hung seam deterministically.
+   */
+  readonly provisionTimeoutMs?: number;
 }
 
 export interface WorktreeHandle {
@@ -130,6 +148,21 @@ export interface RemoveWorktreeOptions {
   readonly force?: boolean;
 }
 
+export interface ValidateOptions {
+  /**
+   * F8 (A) / BLOCKER-2: the interrupted round's own RECEIPT — the exact commit
+   * it published for itself at its commit boundary. A drifted HEAD is accepted
+   * only if it EQUALS this sha (with ancestry as a corroborating sanity check);
+   * see `validate.ts`'s decision-tree row 3b. Only the INTERRUPTED-IMPLEMENTOR
+   * adoption path supplies it. Absent — every other caller, and an interrupted
+   * round that published no receipt — keeps the strict any-drift-refuses policy.
+   *
+   * Deliberately NOT a boolean: a boolean would re-admit
+   * topology-as-authorization, where any reachable commit satisfies the gate.
+   */
+  readonly acceptDriftToCommit?: GitSha;
+}
+
 /**
  * `GitWorktreeManager.open()` is the only constructor: it verifies
  * `primaryRepoRoot` is really a git repo (§16 item 1) and canonicalizes it
@@ -151,6 +184,7 @@ export class GitWorktreeManager {
   readonly #provisionRuntime: ProvisionRuntime;
   readonly #provisionGit: ProvisionGit;
   readonly #provisionWarn?: ProvisionWarnSink;
+  readonly #provisionTimeoutMs?: number;
 
   private constructor(
     clock: Clock,
@@ -162,6 +196,7 @@ export class GitWorktreeManager {
       readonly runtime: ProvisionRuntime;
       readonly git: ProvisionGit;
       readonly warn?: ProvisionWarnSink;
+      readonly timeoutMs?: number;
     },
   ) {
     this.#clock = clock;
@@ -173,6 +208,7 @@ export class GitWorktreeManager {
     this.#provisionRuntime = provision.runtime;
     this.#provisionGit = provision.git;
     if (provision.warn !== undefined) this.#provisionWarn = provision.warn;
+    if (provision.timeoutMs !== undefined) this.#provisionTimeoutMs = provision.timeoutMs;
   }
 
   static async open(options: WorktreeManagerOptions): Promise<GitWorktreeManager> {
@@ -195,6 +231,7 @@ export class GitWorktreeManager {
         runtime: options.provisionRuntime ?? defaultProvisionRuntime(),
         git: options.provisionGit ?? REAL_PROVISION_GIT,
         ...(options.provisionWarn !== undefined ? { warn: options.provisionWarn } : {}),
+        ...(options.provisionTimeoutMs !== undefined ? { timeoutMs: options.provisionTimeoutMs } : {}),
       },
     );
   }
@@ -409,8 +446,13 @@ export class GitWorktreeManager {
    * `reconcile_mismatch` on `refuse_resume`. `async` for the same reason
    * as `createWorktree`: `#requireHandle` throws synchronously and must
    * surface as a rejection, not a synchronous throw at the call site.
+   * `options` carries the F8 (A) forward-containment opt-in (`ValidateOptions`).
    */
-  async validate(assignmentId: AssignmentId, checkpointWorktreeState?: WorktreeState): Promise<ValidateWorktreeResult> {
+  async validate(
+    assignmentId: AssignmentId,
+    checkpointWorktreeState?: WorktreeState,
+    options: ValidateOptions = {},
+  ): Promise<ValidateWorktreeResult> {
     const handle = this.#requireHandle(assignmentId);
     return this.#mutex
       .runExclusive(this.#primaryRepoRoot, 'other', { assignmentId, worktreePath: handle.worktreePath }, () =>
@@ -418,6 +460,13 @@ export class GitWorktreeManager {
           worktreePath: handle.worktreePath,
           ...(checkpointWorktreeState !== undefined ? { checkpointWorktreeState } : {}),
           wipCommitMessage: `harness-orchestration: WIP reconciliation (assignment ${String(assignmentId)}, ${this.#clock.nowIso()})`,
+          // F8 (A) / BLOCKER-2: the round's published receipt — set ONLY by the
+          // interrupted-implementor adoption path. Every other caller keeps the
+          // strict any-drift-refuses policy (this manager never decides it for
+          // them), and so does that path when no receipt exists.
+          ...(options.acceptDriftToCommit !== undefined
+            ? { acceptDriftToCommit: options.acceptDriftToCommit }
+            : {}),
           // F7 (#1): a WIP/dirty-recovery commit here must EXCLUDE node_modules whenever
           // managed provisioning is ACTIVE — the SAME exclusion the implementor commit
           // uses — so a provisioned, git-ignored toolchain can never enter a §16.3
@@ -514,6 +563,7 @@ export class GitWorktreeManager {
             runtime: this.#provisionRuntime,
             git: this.#provisionGit,
             ...(this.#provisionWarn !== undefined ? { warn: this.#provisionWarn } : {}),
+            ...(this.#provisionTimeoutMs !== undefined ? { commandTimeoutMs: this.#provisionTimeoutMs } : {}),
           }),
         ),
     );
