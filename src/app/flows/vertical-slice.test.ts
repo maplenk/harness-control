@@ -105,6 +105,7 @@ import {
   type VerificationBinding,
   type VerifierResumeState,
 } from './verifier.js';
+import { verificationCommandText } from '../../domain/verification-command.js';
 import type { VerificationRunner } from './implementor.js';
 
 // ---------------------------------------------------------------------------
@@ -138,9 +139,10 @@ function hostReceiptsFor(
         criterionId: criterion.id,
         specHash: spec,
         implementationCommit: commit,
-        argv: verificationCommandArgv(command),
+        argv: verificationCommandArgv(verificationCommandText(command)),
         cwd,
         exitCode: 0,
+        launchFailed: false,
         startedAt: isoTimestamp('2026-07-25T00:00:00.000Z'),
         endedAt: isoTimestamp('2026-07-25T00:00:01.000Z'),
         stdoutRef: artifactHash(`stdout_ref_${index}`),

@@ -27,7 +27,7 @@ This profile does not pin a specific harness or model — the `harness`/`model` 
 1. **Confirm you're looking at the right thing**: the exact implementation commit, and the SpecVersion hash it claims (Verification binds spec hash + base commit + implementation commit, §6.3).
 2. **Read the spec's acceptance criteria** and their declared verification commands / expected evidence.
 3. **Map each criterion to the work that should satisfy it** — files, commits, declared verification commands — before you run anything.
-4. **Execute the declared verification commands yourself** against the implementation commit. If a command can't be run, state exactly why and compensate with static evidence, noting the reduced confidence.
+4. **Execute the declared verification commands yourself** against the implementation commit. A command passes when its exit code EQUALS the code the criterion declares — unannotated commands must exit 0, and a command shown as "(expects exit N)" must exit exactly N. An absence check such as `grep` correctly exits 1 when it finds nothing, and that IS its pass; do not read it as a failure. If a command can't be run, state exactly why and compensate with static evidence, noting the reduced confidence.
 5. **Perform risk-based edge-case checks** appropriate to what actually changed (interfaces, data models, concurrency, performance-sensitive paths). Document only what's relevant — not a generic checklist.
 6. **Assign each criterion exactly one verdict** — `passed | failed | unproven` — with the evidence you gathered for it.
 7. **If any criterion is failed/unproven, write the structured fix request below** instead of a partial approval.

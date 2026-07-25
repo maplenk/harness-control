@@ -104,6 +104,13 @@ import { readdir, readFile } from 'node:fs/promises';
 import type { Clock } from '../../lib/clock.js';
 import type { IdFactory } from '../../lib/id-factory.js';
 import type { AcceptanceCriterion, AcpStopReason } from '../../domain/entities.js';
+import {
+  describeVerificationCommand,
+  verificationCommandExpectedExitCode,
+  verificationCommandText,
+  verificationCommandTexts,
+  type VerificationCommand,
+} from '../../domain/verification-command.js';
 import { gitSha, newIdempotencyKey } from '../../domain/ids.js';
 import type { AssignmentId, GitSha, RunId, SpecHash } from '../../domain/ids.js';
 import { draftEvent, type DomainEvent } from '../../domain/events.js';
@@ -631,8 +638,12 @@ export interface ImplementorContext {
   /**
    * The spec's declared verification commands (§7). When omitted, the flow
    * derives them from the acceptance criteria's `verificationCommands`.
+   *
+   * F15: each entry is a bare command (proven by exit 0) or a
+   * `{ command, expectedExitCode }` declaration. A `readonly string[]` from a
+   * pre-F15 caller is still a valid value.
    */
-  readonly verificationCommands?: readonly string[];
+  readonly verificationCommands?: readonly VerificationCommand[];
 }
 
 export interface ImplementorFlowOptions {
@@ -779,15 +790,28 @@ function boundText(text: string, maxBytes: number): { readonly text: string; rea
   };
 }
 
-function resolveVerificationCommands(context: ImplementorContext): readonly string[] {
+/** The round's declared commands, in first-seen order, deduped by DECLARATION
+ * (same text with two expected codes stays two declarations — the prompt shows
+ * both expectations; the permission allowlist below collapses them). */
+function resolveVerificationCommands(context: ImplementorContext): readonly VerificationCommand[] {
   if (context.verificationCommands !== undefined) return context.verificationCommands;
-  const commands: string[] = [];
+  const commands: VerificationCommand[] = [];
+  const seen = new Set<string>();
   for (const criterion of context.criteria) {
-    for (const command of criterion.verificationCommands) {
-      if (!commands.includes(command)) commands.push(command);
+    for (const declared of criterion.verificationCommands) {
+      const key = `${verificationCommandExpectedExitCode(declared)} ${verificationCommandText(declared)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      commands.push(declared);
     }
   }
   return commands;
+}
+
+/** The §10.2 shell allowlist: command TEXT only — a permission governs what may
+ * be executed, never what the exit code must be. */
+function resolveVerificationCommandTexts(context: ImplementorContext): readonly string[] {
+  return verificationCommandTexts(resolveVerificationCommands(context));
 }
 
 function defaultCommitMessage(handle: WorktreeHandle, context: ImplementorContext): string {
@@ -806,7 +830,10 @@ export function buildImplementorPrompt(context: ImplementorContext, cwd: string)
     context.criteria.length > 0
       ? context.criteria
           .map((c) => {
-            const verify = c.verificationCommands.length > 0 ? c.verificationCommands.join(' && ') : '(none declared)';
+            const verify =
+              c.verificationCommands.length > 0
+                ? c.verificationCommands.map(describeVerificationCommand).join(' && ')
+                : '(none declared)';
             return `- [${String(c.id)}] ${c.description}\n  verification: ${verify}`;
           })
           .join('\n')
@@ -815,7 +842,10 @@ export function buildImplementorPrompt(context: ImplementorContext, cwd: string)
     context.constraints !== undefined && context.constraints.length > 0
       ? context.constraints.map((c) => `- ${c}`).join('\n')
       : '(none)';
-  const commandsBlock = commands.length > 0 ? commands.map((c) => `- ${c}`).join('\n') : '(none declared)';
+  const commandsBlock =
+    commands.length > 0
+      ? commands.map((c) => `- ${describeVerificationCommand(c)}`).join('\n')
+      : '(none declared)';
   const explorationBlock =
     context.explorationArtifact !== undefined && context.explorationArtifact.trim().length > 0
       ? context.explorationArtifact
@@ -913,7 +943,7 @@ export class ImplementorFlow {
     this.#handle = handle;
     this.#context = context;
     this.#options = options;
-    this.allowedShellCommands = resolveVerificationCommands(context);
+    this.allowedShellCommands = resolveVerificationCommandTexts(context);
   }
 
   async run(session: RoleSession): Promise<ImplementorResult> {
@@ -1122,7 +1152,8 @@ export class ImplementorFlow {
       // F13: this boolean is now exactly what THIS boundary can attest — that
       // the host preconditions for the round are sound. Per-command truth is
       // the receipts' job at the verify boundary (`#hostReceiptIssue` requires
-      // a current, zero-exit receipt per declared command on top of this), so
+      // a current receipt per declared command whose exit code matches the code
+      // the criterion DECLARES — F15, `0` unless stated — on top of this), so
       // this no longer folds in command exit codes it did not observe. F7: a
       // provisioning failure never reads as passed.
       verificationPassed: provisioningFailed === undefined,
