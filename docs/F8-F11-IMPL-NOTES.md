@@ -721,10 +721,113 @@ Pre-fix runs were done by stashing ONLY the source files and keeping the tests.
 
 ---
 
+---
+
+# Round 4 — codex round-3 verdict on `37c04a6`
+
+11 → 3 surviving, 8 confirmed. Commit map:
+
+| finding | commit |
+| --- | --- |
+| HIGH-5, Q26 | `346474f` |
+| HIGH-4, HIGH-6 | `af8d5f8` |
+| merge-time prompt defect | `46ac978` |
+
+All three survivors reproduced exactly as reported before being fixed.
+
+## HIGH-5 — the binding was in the wrong place
+
+Confirmed: `decidePermission` checks the exact allowlist BEFORE the read-only
+classifier, and the binding lived INSIDE the classifier. So an allowlisted title
+was approved with a missing or hostile payload and the binding never ran at all.
+The factory test asserting `Execute \`npm run typecheck\`` → `allow/allowlisted`
+with no rawInput was encoding the bug.
+
+The fix moves the binding OUT of the classifier and makes it a VETO
+(`verifyOperationPayload`) evaluated once and applied at every `allow` site
+through a single `approve()` helper — allowlist, read-only classifier, and
+workspace-write — so a future approval path cannot be added that forgets it. A
+throw from the veto is a refusal. `allowReadOnlyOperation` reverts to the pure
+title classifier.
+
+I did **not** lean on the permissions track emptying the implementor allowlist,
+per your note: the veto is unconditional, so the verifier's exact per-criterion
+allowlisted commands are covered by the same gate.
+
+Non-shell titles (`Write`/`Edit`) return true from the veto — there is no shell
+payload to bind, and the workspace-write rule adjudicates those on the path
+itself. Asserted, so the veto can never deny them for lacking a command.
+
+## HIGH-6 — the quarantine trade was wrong, and your mechanism was right
+
+Every step of the rejection checked out: the deadline catch deleted `dst` before
+rethrowing (so the producer recreated it), renaming the parent cannot redirect a
+writer holding the original pathname, and GC swept `quarantine-*` indiscriminately.
+My round-3 test released the producer without asserting where its writes went,
+which is exactly why none of that showed up.
+
+Reworked to the directed shape: **delete and move nothing.** The stage is MARKED
+in place (`.harness-quarantined`, carrying the owning pid and timestamp) and GC
+skips it until a 24h TTL expires; an unreadable or malformed marker is treated as
+LIVE. Since the writer cannot be redirected, leaving the tree where it expects it
+is the only sound option. Stage names are already unique per attempt (`mkdtemp`),
+so a recreated `stage-*` is always that attempt's own directory.
+
+**Where the released producer's writes land** — now asserted, as requested:
+`path.dirname(producerDst)` equals the marked stage directory, and
+`late-write.txt` is readable there after the refusal. Not a resurrected copy
+beside it, not a renamed one. The test also drives a SUBSEQUENT provisioning
+attempt on the same assignment namespace: it succeeds on its own fresh stage, and
+its GC pass leaves both the quarantine marker and the producer's bytes intact.
+
+## HIGH-4 — silent truncation
+
+Confirmed at `provision.ts:1296`: `if (depth > 8) return;`. A native package
+below the cap was never smoked, yet the tree still got a v2 smoke-attested marker
+— unexamined stamped proven, sticky thereafter. Now fails closed
+(`native_toolchain_unproven`, naming the limit and the path), with the cap raised
+to 16 levels.
+
+## Merge-time prompt defect
+
+Fixed on-branch, not at merge. The granting clause ("and the exact declared
+verification commands below") is removed; shell is read-only inspection only.
+
+The coherence assertion is written to hold on **both sides** of the rebase, since
+main's prohibition is not on this branch: at most ONE Hard Rule may speak about
+executing verification commands, and NO rule may GRANT it in any wording. This
+branch has zero, main adds one prohibition, the merge must never have two or a
+grant.
+
+Proof it bites: simulating the contradictory merged state (restoring the clause
+AND adding main's prohibition) fails with `expected 2 to be less than or equal
+to 1`.
+
+## Round-4 regression proofs
+
+| suite | pre-fix | post-fix |
+| --- | --- | --- |
+| `session.test.ts` + `factory.test.ts` (HIGH-5) | pass 68 fail 5 | 446/446 adapters |
+| `provision.test.ts` (HIGH-4, HIGH-6) | pass 77 fail 2 | 79/79 |
+| prompt coherence | fails on simulated merge | passes on branch |
+
+Pre-fix runs stashed ONLY the source files and kept the tests.
+
+## Adjudications recorded
+
+- **Q23** → superseded by HIGH-6 above; the quarantine trade is withdrawn.
+- **Q24** → accepted as-is; fatal receipt publication stands. A durable
+  receipt-retry path is noted as a later option, not built.
+- **Q25** → confirmed; `grokShellPermissionTitle` keeps refusing backticks.
+- **Q26** → applied; the unreachable strip branch is deleted so a future
+  redirection-free allowlist member cannot be stripped as a redirection.
+
+---
+
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1820 passed, 0 failed**, 105 files
+- `npx vitest run` (full, from this worktree) → **1826 passed, 0 failed**, 105 files
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
