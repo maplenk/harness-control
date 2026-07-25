@@ -848,6 +848,14 @@ export function buildImplementorPrompt(context: ImplementorContext, cwd: string)
     // above already forbids using the shell to change files or self-verify, and
     // this line must not read as widening that.
     '- When inspecting the repository with the shell, single-quote pattern/regex arguments and avoid $, backslashes, backticks, and parentheses outside single quotes — such commands cannot be classified read-only and will be denied.',
+    // F14: the classifier admits an absolute path that resolves inside the
+    // worktree, so this is guidance, not a rule the agent can break — a relative
+    // path is simply the form that cannot be got wrong (it needs no realpath
+    // agreement between the path the agent typed and the root the engine holds).
+    // Scoped to INSPECTION, like the quoting line above: the rule before it
+    // already forbids using the shell to change files or self-verify, and this
+    // must not read as widening that.
+    '- When inspecting the repository with the shell, prefer relative paths from the worktree root (`ls -la .`, `head -n 5 docs/plan.md`). An absolute path is accepted only when it resolves inside your assigned worktree; any path outside it is denied.',
     '- The acceptance criteria below are FIXED and shown for context only. You MUST NOT add, remove, or change any acceptance criterion.',
     '- You MUST NOT declare the task complete, verified, or passing. An independent verifier decides that — just do the work and report honestly.',
     '- Do NOT run the verification/build/test commands yourself (e.g. `npm`, `npx`, `node`, typecheck, test) and do NOT try to locate them (no `which`/`find`/PATH probing for node or npm). The host runs them independently AFTER you finish. Such a shell request is likely to be denied, and a denied request ends your turn before your work is committed. Implement with the structured Write/Edit tools, then stop and report.',

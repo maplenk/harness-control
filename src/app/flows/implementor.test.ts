@@ -330,6 +330,21 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
     expect(quotingLine).toMatch(/inspecting the repository/i);
     expect(quotingLine).toMatch(/will be denied/i);
     expect(quotingLine).not.toMatch(/verify|test|build|write|modify/i);
+
+    // F14: located by its OWN content as a LINE, for the same reason as the
+    // quoting rule above — a future prompt edit that reorders or adds bullets
+    // must not break this, and whole-prompt text would. The engine now admits an
+    // absolute path that resolves inside the worktree, but a relative path is
+    // still the form that cannot be got wrong, so the prompt says so. It must
+    // stay scoped to INSPECTION: it may not read as permission to use the shell
+    // to change files or to self-verify.
+    const relativePathLine = prompt
+      .split('\n')
+      .find((line) => line.includes('prefer relative paths'));
+    expect(relativePathLine).toBeDefined();
+    expect(relativePathLine).toMatch(/inspecting the repository/i);
+    expect(relativePathLine).toMatch(/inside your assigned worktree/i);
+    expect(relativePathLine).not.toMatch(/verify|test|build|write|modify|create|delete/i);
     expect(prompt).toMatch(/Do NOT use shell commands such as mkdir, cp, mv, rm, touch/i);
     expect(prompt).toMatch(/MUST NOT declare the task complete/i); // hard rule: cannot mark complete
     expect(prompt).toMatch(/MUST NOT add, remove, or change any acceptance criterion/i); // cannot change criteria
