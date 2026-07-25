@@ -804,16 +804,83 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
     // guard caught the escape, so the round cannot read as host-verified.
     expect(result.receipts).toHaveLength(1);
     expect(result.receipts[0]!.exitCode).toBe(0);
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.kind).toBe('verification_runner_violation');
-    expect(result.runnerViolation!.changedPaths).toContain('planted-outside-worktree.txt');
-    expect(result.runnerViolation!.detail).toMatch(/primary checkout mutated/);
-    expect(String(result.runnerViolation!.headBefore)).toMatch(/^[0-9a-f]{40}$/);
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.kind).toBe('verification_runner_violation');
+    expect(result.runnerViolations[0]!.changedPaths).toContain('planted-outside-worktree.txt');
+    expect(result.runnerViolations[0]!.detail).toMatch(/primary checkout mutated/);
+    expect(String(result.runnerViolations[0]!.headBefore)).toMatch(/^[0-9a-f]{40}$/);
     // SEVERITY SPLIT: escaping to the primary is a blocking violation, not a
     // hard stop. Only an AUTHORED commit carries `authoredCommit`, which the
     // loop turns into `VerificationAuthoredCommitError`. Conflating the two is
     // what downgraded F8's rule.
     expect(result.authoredCommit).toBeUndefined();
+  });
+
+  // THE CONJUNCTION. Each violation was closed in isolation, and the primary
+  // drift branch returned EARLY — so a command doing BOTH never reached the
+  // worktree-HEAD comparison, left `authoredCommit` undefined, and was recorded
+  // as an ordinary blocking violation. That misses the hard stop and lets the
+  // loop continue into remediation, where a later implementation commit can
+  // descend from the verification-authored one: exactly the laundering path the
+  // hard stop exists to close. Detection must never be short-circuited by
+  // another finding.
+  it('a command that BOTH escapes to the primary AND authors a commit reports both, and still hard-stops', async () => {
+    const result = await confined((r) => async (command, cwd) => {
+      fs.writeFileSync(path.join(r.dir, 'planted-and-authored.txt'), 'escaped\n');
+      fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+      execFileSync('git', ['add', '-A'], { cwd });
+      execFileSync('git', ['commit', '--no-verify', '-m', 'authored while also escaping'], {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'verify',
+          GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+          GIT_COMMITTER_NAME: 'verify',
+          GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+        },
+      });
+      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+    });
+
+    // BOTH findings survive — neither check is skipped by the other.
+    expect(result.runnerViolations).toHaveLength(2);
+    expect(result.runnerViolations[0]!.detail).toMatch(/primary checkout mutated/);
+    expect(result.runnerViolations[0]!.changedPaths).toContain('planted-and-authored.txt');
+    expect(result.runnerViolations[1]!.detail).toMatch(/never author one/);
+    // ...and the hard-stop signal is still raised despite the primary finding.
+    expect(result.authoredCommit).toBeDefined();
+  });
+
+  it('an authored commit AND a failing evidence write hard-stops while still surfacing the original cause', async () => {
+    const casFailure = new Error('artifact quota exceeded for run');
+    const result = await confined(
+      () => async (command, cwd) => {
+        fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+        execFileSync('git', ['add', '-A'], { cwd });
+        execFileSync('git', ['commit', '--no-verify', '-m', 'authored before the CAS failed'], {
+          cwd,
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'verify',
+            GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+            GIT_COMMITTER_NAME: 'verify',
+            GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+          },
+        });
+        return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+      },
+      undefined,
+      {
+        record: async () => {
+          throw casFailure;
+        },
+      },
+    );
+
+    // The evidence failure does not suppress the hard-stop signal, and the
+    // hard-stop signal does not discard the original cause.
+    expect(result.authoredCommit).toBeDefined();
+    expect(result.executionError).toBe(casFailure);
   });
 
   it('a confinement violation is still reported when the EVIDENCE WRITE fails', async () => {
@@ -837,8 +904,8 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
     );
 
     // The violation survives the evidence-write failure...
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.changedPaths).toContain('planted-despite-cas-failure.txt');
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.changedPaths).toContain('planted-despite-cas-failure.txt');
     // ...and the original failure is reported rather than swallowed, so the
     // caller records the incident first and then fails the round on it.
     expect(result.executionError).toBe(casFailure);
@@ -852,9 +919,9 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
       return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
     });
 
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.detail).toMatch(/HEAD moved/);
-    expect(String(result.runnerViolation!.headBefore)).not.toBe(String(result.runnerViolation!.headAfter));
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.detail).toMatch(/HEAD moved/);
+    expect(String(result.runnerViolations[0]!.headBefore)).not.toBe(String(result.runnerViolations[0]!.headAfter));
   });
 
   // W3-1(b): three primary mutations that leave HEAD + tracked porcelain
@@ -871,9 +938,9 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
     });
 
     expect(result.receipts[0]!.exitCode).toBe(0); // command exited 0…
-    expect(result.runnerViolation).toBeDefined(); // …but the guard caught it
-    expect(result.runnerViolation!.kind).toBe('verification_runner_violation');
-    expect(result.runnerViolation!.detail).toMatch(/\.git\/hooks manifest changed/);
+    expect(result.runnerViolations).toHaveLength(1); // …but the guard caught it
+    expect(result.runnerViolations[0]!.kind).toBe('verification_runner_violation');
+    expect(result.runnerViolations[0]!.detail).toMatch(/\.git\/hooks manifest changed/);
   });
 
   it('mutating the primary .git/config (git config core.pager) is drift', async () => {
@@ -884,8 +951,8 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
       return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
     });
 
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.detail).toMatch(/\.git\/config changed/);
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.detail).toMatch(/\.git\/config changed/);
   });
 
   it('writing a NEW gitignored file into the primary is drift (--ignored porcelain)', async () => {
@@ -902,8 +969,8 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
       },
     );
 
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.changedPaths).toContain('exfiltrated.log');
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.changedPaths).toContain('exfiltrated.log');
   });
 
   // F8 BLOCKER-1, at its new home. A declared command that COMMITS used to be
@@ -928,12 +995,12 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
       return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
     });
 
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.kind).toBe('verification_runner_violation');
-    expect(result.runnerViolation!.detail).toMatch(/moved the worktree HEAD/);
-    expect(result.runnerViolation!.detail).toMatch(/never author one/);
-    expect(String(result.runnerViolation!.headBefore)).not.toBe(
-      String(result.runnerViolation!.headAfter),
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.kind).toBe('verification_runner_violation');
+    expect(result.runnerViolations[0]!.detail).toMatch(/moved the worktree HEAD/);
+    expect(result.runnerViolations[0]!.detail).toMatch(/never author one/);
+    expect(String(result.runnerViolations[0]!.headBefore)).not.toBe(
+      String(result.runnerViolations[0]!.headAfter),
     );
     // The HARD-STOP signal — this is what the loop escalates to
     // `VerificationAuthoredCommitError` instead of remediating.
@@ -955,8 +1022,8 @@ describe('W3-1 — primary-checkout mutation guard (wraps the declared-command e
       return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
     });
 
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.detail).toMatch(/\.git\/hooks manifest changed/);
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.detail).toMatch(/\.git\/hooks manifest changed/);
   });
 });
 

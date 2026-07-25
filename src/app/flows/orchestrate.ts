@@ -129,12 +129,17 @@ export class VerificationAuthoredCommitError extends Error {
     readonly round: number,
     readonly boundCommit: GitSha,
     readonly authoredCommit: GitSha,
+    /** An evidence-write failure detected in the same execution. Carried as
+     * `cause` so outranking it for the DECISION never hides it from the
+     * operator as the reported cause. */
+    executionError?: unknown,
   ) {
     super(
       `a declared verification command authored a commit in assignment ${String(assignmentId)} ` +
         `round ${round}: the worktree moved from the bound implementation commit ${String(boundCommit)} ` +
         `to ${String(authoredCommit)}. Verification commands must observe the bound commit, never ` +
         'author one; the round is refused rather than remediated so nothing can descend from it.',
+      ...(executionError !== undefined ? [{ cause: executionError }] : []),
     );
   }
 }
@@ -970,50 +975,72 @@ export async function runImplementVerifyLoop(
         clock: deps.clock,
       });
       const hostReceipts = receiptExecution.receipts;
-      const runnerViolation = receiptExecution.runnerViolation;
-      // W3-1: primary-checkout drift is a durable INCIDENT — append it NOW,
-      // before the verifier round renders any verdict, then thread it into the
-      // §16 readiness gate below so an all-verified round still blocks (T23,
-      // never T24). A violation detected before a pause that later re-enters
-      // verify-only (W2-5) is carried by this durable event only — the
-      // in-process readiness wire covers the live path.
-      if (runnerViolation !== undefined) {
+      // ---------------------------------------------------------------------
+      // THE PRECEDENCE RULE for declared-command findings. Detection already
+      // ran EVERY check unconditionally and collected the complete set (see
+      // `executeEvidenceReceiptsUnderConfinement`); this decides ONCE what the
+      // round does about it. Stated explicitly because getting the ordering
+      // wrong has re-opened the same laundering path twice:
+      //
+      //   1. RECORD everything first. Every finding becomes a durable incident
+      //      before any throw, so no decision below can cost the operator an
+      //      incident. Any finding also forces `hostVerificationPassed:false`.
+      //   2. An AUTHORED COMMIT outranks everything else. If one is present the
+      //      round hard-stops, no matter what else was found — including a
+      //      simultaneous primary-checkout escape, which is what previously
+      //      short-circuited the authorship check and let the conjunction slip
+      //      through as an ordinary blocked round.
+      //   3. Otherwise an EVIDENCE-WRITE failure fails the round on its own
+      //      original cause; recording a violation must never replace it.
+      //   4. Otherwise the findings are ordinary blocking violations: they
+      //      thread into the §16 readiness gate below so an all-verified round
+      //      still blocks (T23, never T24).
+      //
+      // A violation detected before a pause that later re-enters verify-only
+      // (W2-5) is carried by the durable events alone — the in-process wire
+      // below covers the live path.
+      // ---------------------------------------------------------------------
+      for (const violation of receiptExecution.runnerViolations) {
         service.ingest(
           verificationRunnerViolationEvent({
             runId: input.runId,
             assignmentId: input.assignmentId,
-            violation: runnerViolation,
+            violation,
             ids: deps.ids,
             clock: deps.clock,
           }),
         );
+      }
+      if (receiptExecution.runnerViolations.length > 0) {
         // A poisoned round must never read as host-verified, exactly as the
         // implementor-boundary guard used to force `verificationPassed:false`.
         hostVerificationPassed = false;
       }
-      // F8 authorship — HARD STOP, at the severity main enforced. A declared
-      // command that COMMITS ends the round here and now. Treating it as an
-      // ordinary blocked verification would let the loop advance into another
-      // same-process implementation round with NO `discardToCommit`, and that
-      // round's commit would descend from — and thereby legitimize — the
-      // command-authored one. The incident above is already durable, so the
-      // audit trail survives the throw. This check is deliberately independent
-      // of the §16 readiness probe, which only runs on the all-verified path
-      // and so would not fire for a round that is already failing.
+      // (2) HARD STOP, at the severity main enforced: a declared command that
+      // COMMITS ends the round here and now. Letting it become an ordinary
+      // blocked verification would advance the loop into another same-process
+      // implementation round with NO `discardToCommit`, and that round's commit
+      // would descend from — and thereby legitimize — the command-authored one.
+      // Deliberately independent of the §16 readiness probe, which runs only on
+      // the all-verified path and so would not fire for an already-failing
+      // round. Any evidence-write failure travels as the `cause` so the
+      // operator still sees it.
       if (receiptExecution.authoredCommit !== undefined) {
         throw new VerificationAuthoredCommitError(
           input.assignmentId,
           round,
           receiptExecution.authoredCommit.before,
           receiptExecution.authoredCommit.after,
+          receiptExecution.executionError,
         );
       }
-      // BLOCKER-2: the evidence-write path failed. Any confinement violation it
-      // might have masked has now been recorded above, so the round can fail on
-      // the original cause without losing the incident.
+      // (3) The evidence-write path failed. Every finding it might have masked
+      // is already durable above, so the round fails on the original cause.
       if (receiptExecution.executionError !== undefined) {
         throw receiptExecution.executionError;
       }
+      // (4) Ordinary blocking violations thread into the §16 gate below.
+      const runnerViolation = receiptExecution.runnerViolations[0];
       const probe = gitMergeReadinessProbe({
         repoRoot: handle.repoRoot,
         worktreePath: handle.worktreePath,

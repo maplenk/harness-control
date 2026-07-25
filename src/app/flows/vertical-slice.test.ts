@@ -1167,6 +1167,97 @@ describe('F8 authorship — a verification command that COMMITS hard-stops the r
 
     await slice.worktrees.removeWorktree(asg);
   });
+
+  // THE CONJUNCTION, end to end. Closing each violation in isolation left the
+  // combined case open: primary drift was detected first and returned early, so
+  // the authorship check never ran and the round took the ordinary blocked path
+  // into remediation — where round 2's commit descends from the
+  // verification-authored one. The hard stop must not be reachable only when
+  // the command is "merely" an author.
+  it('hard-stops even when the command ALSO escapes into the primary checkout', async () => {
+    const allPass = verifierTurn([
+      { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+      { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+    ]);
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+        {
+          writes: [{ relPath: 'src/cli/round2.ts', content: 'export const round2 = true;\n' }],
+          turns: [implementorTurn('Round 2 must not run.')],
+        },
+      ],
+      verifier: [{ turns: [allPass] }, { turns: [allPass] }],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_slice_both_violations');
+
+    let authoredCommit: string | undefined;
+    const escapingAndCommitting: VerificationRunner = async (command, cwd) => {
+      if (authoredCommit === undefined) {
+        fs.writeFileSync(path.join(slice.repo.dir, 'planted-by-verification.txt'), 'escaped\n');
+        fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+        execFileSync('git', ['add', '-A'], { cwd });
+        execFileSync('git', ['commit', '--no-verify', '-m', 'authored while also escaping'], {
+          cwd,
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'verify',
+            GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+            GIT_COMMITTER_NAME: 'verify',
+            GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+          },
+        });
+        authoredCommit = (await git.resolveSha(cwd, 'HEAD')).trim();
+      }
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const thrown: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: escapingAndCommitting,
+        maxRounds: 2,
+      },
+    ).then(() => undefined).catch((caught: unknown) => caught);
+
+    // The authored commit outranks the primary escape: HARD STOP, not a
+    // blocked round that remediation can build on.
+    expect(thrown).toBeInstanceOf(VerificationAuthoredCommitError);
+    expect(slice.created.filter((c) => c.role === 'implementor')).toHaveLength(1);
+    expect(authoredCommit).toBeDefined();
+    const head = (await git.resolveSha(slice.worktrees.handleFor(asg)!.worktreePath, 'HEAD')).trim();
+    expect(head).toBe(authoredCommit);
+
+    // BOTH findings are on the durable audit trail — the hard stop does not
+    // cost the operator the confinement incident.
+    const incidents = dbHandle!.db.events
+      .listByRun(runId)
+      .filter((e) => e.type === 'verification.runner.violation');
+    expect(incidents).toHaveLength(2);
+    const details = incidents.map((e) => (e.payload as unknown as { detail: string }).detail);
+    expect(details.some((d) => /primary checkout mutated/.test(d))).toBe(true);
+    expect(details.some((d) => /never author one/.test(d))).toBe(true);
+
+    await slice.worktrees.removeWorktree(asg);
+  });
 });
 
 describe('W3-1 — a verification command that writes into the PRIMARY checkout never yields merge_ready', () => {

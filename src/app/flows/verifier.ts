@@ -221,12 +221,19 @@ export async function executeEvidenceReceipts(
 
 export interface ConfinedReceiptExecution {
   readonly receipts: readonly EvidenceReceipt[];
-  /** W3-1: the primary checkout mutated across the declared commands, or a
-   * command authored a commit in the worktree — typed proof of a violation. */
-  readonly runnerViolation?: VerificationRunnerViolation;
-  /** F8 authorship: set when the violation is a command-AUTHORED commit. The
-   * caller must HARD-STOP the round on this rather than treating it as an
-   * ordinary blocked verification — see `authoredCommit` handling in
+  /**
+   * EVERY confinement finding, in reporting order: primary-checkout escape
+   * first, then worktree authorship. Empty when the commands stayed confined.
+   *
+   * A LIST, not a single violation, because the checks are independent and a
+   * command can trip both. Reporting only the first-detected one let the
+   * conjunction (escape AND authored commit) masquerade as an ordinary
+   * blocking violation and skip the hard stop entirely.
+   */
+  readonly runnerViolations: readonly VerificationRunnerViolation[];
+  /** F8 authorship: set when one of the findings is a command-AUTHORED commit.
+   * The caller must HARD-STOP the round on this rather than treating it as an
+   * ordinary blocked verification — see the precedence rule in
    * `runImplementVerifyLoop`. */
   readonly authoredCommit?: { readonly before: GitSha; readonly after: GitSha };
   /**
@@ -262,10 +269,19 @@ export interface ConfinedReceiptExecution {
  *    Reported as `authoredCommit` so the caller can hard-stop at F8's original
  *    severity instead of treating it as an ordinary blocked verification.
  *
- * Neither guard may be skipped by a failure in the evidence-write path: the
- * execution error is CAPTURED and returned, not propagated, so a quota
- * rejection or CAS failure cannot mask a confinement violation the commands
- * already caused.
+ * DETECTION IS NEVER SHORT-CIRCUITED. Every check runs unconditionally and all
+ * findings are collected — no early return, and no `catch` that skips a guard:
+ *
+ *   - a failure in the evidence-write path is CAPTURED, not propagated, so a
+ *     quota rejection or CAS failure cannot mask a mutation the commands have
+ *     already made;
+ *   - a primary-checkout escape does not suppress the worktree-authorship
+ *     comparison, and vice versa. A command can do BOTH, and reporting only
+ *     whichever was detected first let that conjunction masquerade as an
+ *     ordinary blocking violation and skip the hard stop.
+ *
+ * Deciding WHAT TO DO about the findings is the caller's job, applied once over
+ * the complete set. This function only observes.
  */
 export async function executeEvidenceReceiptsUnderConfinement(
   input: ExecuteEvidenceReceiptsInput & { readonly repoRoot: string },
@@ -279,43 +295,42 @@ export async function executeEvidenceReceiptsUnderConfinement(
   try {
     receipts = await executeEvidenceReceipts(input);
   } catch (error) {
-    // Captured, NOT rethrown here: the commands may already have run and
-    // mutated something, and the guards below are the only things that would
-    // notice. The caller rethrows this after recording any violation.
     executionError = error;
     threw = true;
   }
-  const failure = threw ? { executionError } : {};
 
+  const runnerViolations: VerificationRunnerViolation[] = [];
+
+  // CHECK 1 — escape into the primary checkout.
   const primaryViolation = await detectPrimaryCheckoutDrift(input.repoRoot, primaryBefore);
-  if (primaryViolation !== undefined) {
-    return { receipts, runnerViolation: primaryViolation, ...failure };
+  if (primaryViolation !== undefined) runnerViolations.push(primaryViolation);
+
+  // CHECK 2 — authorship inside the worktree. Runs whatever check 1 found.
+  const worktreeHeadAfter = await git.resolveSha(input.cwd, 'HEAD');
+  const authored = worktreeHeadAfter !== worktreeHeadBefore;
+  if (authored) {
+    runnerViolations.push({
+      kind: 'verification_runner_violation',
+      repoRoot: input.repoRoot,
+      headBefore: gitSha(worktreeHeadBefore),
+      headAfter: gitSha(worktreeHeadAfter),
+      changedPaths: [],
+      detail: redactText(
+        `a declared verification command moved the worktree HEAD at ${input.cwd} from ` +
+          `${worktreeHeadBefore} to ${worktreeHeadAfter}; verification commands must observe ` +
+          'the bound implementation commit, never author one',
+      ),
+    });
   }
 
-  // Escaping to the primary is the more severe finding, so it is reported
-  // first; this catches the command that stayed inside the worktree but
-  // authored a commit there.
-  const worktreeHeadAfter = await git.resolveSha(input.cwd, 'HEAD');
-  if (worktreeHeadAfter !== worktreeHeadBefore) {
-    return {
-      receipts,
-      runnerViolation: {
-        kind: 'verification_runner_violation',
-        repoRoot: input.repoRoot,
-        headBefore: gitSha(worktreeHeadBefore),
-        headAfter: gitSha(worktreeHeadAfter),
-        changedPaths: [],
-        detail: redactText(
-          `a declared verification command moved the worktree HEAD at ${input.cwd} from ` +
-            `${worktreeHeadBefore} to ${worktreeHeadAfter}; verification commands must observe ` +
-            'the bound implementation commit, never author one',
-        ),
-      },
-      authoredCommit: { before: gitSha(worktreeHeadBefore), after: gitSha(worktreeHeadAfter) },
-      ...failure,
-    };
-  }
-  return { receipts, ...failure };
+  return {
+    receipts,
+    runnerViolations,
+    ...(authored
+      ? { authoredCommit: { before: gitSha(worktreeHeadBefore), after: gitSha(worktreeHeadAfter) } }
+      : {}),
+    ...(threw ? { executionError } : {}),
+  };
 }
 
 /**

@@ -414,6 +414,71 @@ and command execution belongs to the verify boundary.
 Also unchanged and accepted: receipts consume CAS quota per command per round,
 which is F13's intended cost.
 
+## Round 3 — codex round 2 on `ba4bee3`: the conjunction
+
+BLOCKER 3's root fix was confirmed. One blocker remained, and it was the
+**conjunction** of the two violation cases rather than either alone.
+
+Round 2 closed each violation in isolation, and the primary-drift branch
+returned EARLY. So a command that did BOTH — mutated the primary checkout AND
+authored a worktree commit — never reached the authorship comparison, left
+`authoredCommit` undefined, was recorded as an ordinary blocking violation, and
+missed the hard stop. The loop then continued into remediation, where a
+subsequent implementation commit descends from the verification-authored one:
+exactly the laundering path the hard stop was raised to close, re-opened for
+the combined case. Main's receipt-versus-HEAD adjudication had no such bypass.
+
+The same defect had a second face: an authored commit combined with an
+evidence-write failure threw `VerificationAuthoredCommitError` before the
+original execution error, so the cause the operator saw depended on which
+failure happened to be detected first.
+
+### The rule, and it is now written at the decision point
+
+Detection and decision are separated:
+
+**`executeEvidenceReceiptsUnderConfinement` only observes.** Every check runs
+unconditionally and all findings are collected — there is now exactly ONE
+`return` in the function, so nothing can short-circuit anything else. The
+evidence-write failure is captured, the primary-escape check runs, and the
+worktree-authorship check runs regardless of what the escape check found.
+`runnerViolation` became `runnerViolations`, a list, because the checks are
+independent and one command can trip both.
+
+**The caller decides once, over the complete set**, in a documented precedence:
+
+1. **Record everything first.** Every finding becomes a durable incident before
+   any throw, so no decision can cost the operator an incident. Any finding
+   forces `hostVerificationPassed:false`.
+2. **An authored commit outranks everything** — hard stop, regardless of what
+   else was found, including a simultaneous primary escape.
+3. **Otherwise an evidence-write failure fails the round on its own original
+   cause**; recording a violation never replaces it.
+4. **Otherwise** the findings are ordinary blocking violations threaded into
+   the §16 gate.
+
+Where (2) and (3) collide, the execution error travels as the thrown error's
+`cause`, so outranking it for the DECISION never hides it from the operator as
+the reported cause.
+
+### Regressions
+
+The conjunction is driven directly — one command that mutates the primary
+checkout AND authors a commit in the same execution — at both levels: a unit
+test asserting BOTH findings are present and `authoredCommit` is still set, and
+an end-to-end test asserting the loop hard-stops, exactly ONE implementor ran,
+HEAD still equals the authored commit (nothing descended from it), and BOTH
+incidents are on the durable audit trail. A third covers authored-commit plus a
+throwing evidence write: hard stop AND the original cause surfaced.
+
+Confirmed failing on `ba4bee3`: the end-to-end conjunction returned `undefined`
+rather than throwing — the loop had continued into remediation.
+
+The single-case tests are kept and strengthened: each now asserts exactly ONE
+finding rather than merely "defined", which pins the severity split in both
+directions — a primary escape must NOT hard-stop, an authored commit must.
+That split is what caught this class.
+
 ## Green bar after the merge
 
 ```text
@@ -421,7 +486,8 @@ $ npm run typecheck
 exit 0
 
 $ npx vitest run
-Tests  1994 passed, 0 failed   (1991 at 07d4af0, +3 blocker regressions)
+Tests  1997 passed, 0 failed
+  1991 at 07d4af0 → 1994 (+3, round-2 blockers) → 1997 (+3, the conjunction)
 ```
 
 Main alone was 1945; F13 alone was 1743 on its older base. The +46 over main is
