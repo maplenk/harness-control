@@ -25,6 +25,7 @@ import { GitWorktreeManager } from './manager.js';
 import { WorktreeError, isWorktreeError, type WorktreeErrorKind } from './errors.js';
 import { isPathIgnored, isPathTracked, runGit } from './git.js';
 import {
+  buildInstallEnv,
   defaultProvisionRuntime,
   lstatSafe,
   MAX_QUARANTINED_STAGES,
@@ -65,6 +66,7 @@ function findBackups(assignmentStageRoot: string): string[] {
   }
   return found;
 }
+import { isSecretKeyName } from '../redaction/patterns.js';
 import { makeTempGitRepo, type TempGitRepo } from './test-support.js';
 
 const execFileAsync = promisify(execFile);
@@ -738,23 +740,6 @@ describe('F7 AC-5 — isolation, cache purge, idempotency, and the symlink scan'
   // F9 (§4): this row used to prove the `auto` retry-as-install. That retry is gone
   // with the install lane, so `auto` now behaves exactly like `clone` here — which
   // is the point: the config no longer promises a lane it does not have.
-  it('a CLONE containing an escaping link FAILS CLOSED under auto too (no lane switch)', async () => {
-    const repo = track(await makeDepsRepo());
-    await writePrimaryNodeModules(repo.dir, { badLink: 'escaping' });
-    const fake = fakeRuntime();
-    const warnings: ProvisionWarnEvent[] = [];
-    const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
-    const asg = assignmentId('asg_badlink_fallback');
-    const handle = await createAtHead(repo, manager, asg);
-
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-    expect(error.provisioningCause).toBe('unsafe_clone_symlinks');
-    expect(fake.calls).toEqual({ clone: 1, install: 0 });
-    expect(warnings.some((w) => w.kind === 'clone_symlinks_unsafe')).toBe(true);
-    // Nothing landed in the worktree — the unsafe tree never got near it.
-    expect(existsSync(path.join(handle.worktreePath, 'node_modules'))).toBe(false);
-  });
-
   it('a forced-clone strategy with an unsafe link FAILS CLOSED (no install fallback)', async () => {
     const repo = track(await makeDepsRepo());
     await writePrimaryNodeModules(repo.dir, { badLink: 'absolute' });
@@ -2926,6 +2911,65 @@ describe('ROUND 15 REGRESSION 3 — the install lane, gated on the native proof'
     expect(fake.calls.install).toBe(1);
   });
 
+  // ROUND 16 — the last main-succeeds case (R14). Main discarded an unsafe clone
+  // and installed; F9 removed the retry along with the lane. Now that the lane is
+  // back AND gated on the native proof, the original hazard stays closed while a
+  // project whose fresh install is safe provisions again.
+  it("an UNSAFE clone under 'auto' is discarded and installed instead (main does this)", async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir, { badLink: 'absolute' });
+    const fake = fakeRuntime();
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'auto', warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r16_unsafe_auto');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const outcome = await manager.provisionForVerification(asg);
+
+    expect(outcome.strategy).toBe('install');
+    expect(fake.calls.clone).toBe(1); // the clone was attempted…
+    expect(fake.calls.install).toBe(1); // …found unsafe, discarded, and replaced
+    expect(warnings.some((w) => w.kind === 'clone_symlinks_unsafe')).toBe(true);
+    // The escaping link never reached the worktree.
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules', 'abs-link'))).toBe(false);
+  });
+
+  it("an UNSAFE tree is still REFUSED under 'clone' (an explicit lane has no fallback)", async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir, { badLink: 'escaping' });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'clone' });
+    const asg = assignmentId('asg_r16_unsafe_clone');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('unsafe_clone_symlinks');
+    expect(fake.calls.install).toBe(0);
+  });
+
+  it('an install whose OWN tree is unsafe is still refused (the fallback is not an escape hatch)', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir, { badLink: 'absolute' });
+    const fake = fakeRuntime({
+      installImpl: async (cwd) => {
+        const nm = path.join(cwd, 'node_modules');
+        fs.mkdirSync(path.join(nm, '.bin'), { recursive: true });
+        fs.writeFileSync(path.join(nm, '.bin', 'placeholder'), '#!/bin/sh\n');
+        writeInstalledPackage(nm, 'left-pad');
+        await symlink('/etc/passwd', path.join(nm, 'abs-link')); // the install is unsafe too
+      },
+    });
+    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'auto' });
+    const asg = assignmentId('asg_r16_unsafe_both');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('unsafe_clone_symlinks');
+    expect(fake.calls.install).toBe(1); // it retried, re-scanned, and still refused
+  });
+
   it('a primary with no cloneable tree installs rather than refusing', async () => {
     const repo = track(await makeDepsRepo());
     // No primary node_modules: nothing to clone, everything to install.
@@ -2941,10 +2985,70 @@ describe('ROUND 15 REGRESSION 3 — the install lane, gated on the native proof'
   });
 });
 
+// ---------------------------------------------------------------------------
+// ROUND 16 — the install lane's ENVIRONMENT. Two earlier findings, both right:
+// an install that inherits the full orchestrator `process.env` hands credentials
+// to npm, and an install that inherits almost nothing cannot reach a corporate
+// registry through a proxy or a custom CA. The answer is an allowlist.
+// ---------------------------------------------------------------------------
+describe('ROUND 16 — the install environment is an allowlist, not all-or-nothing', () => {
+  it('passes the network/registry variables an install legitimately needs', async () => {
+    const env = buildInstallEnv({
+      PATH: '/usr/bin',
+      HOME: '/home/dev',
+      HTTPS_PROXY: 'http://proxy.corp:3128',
+      http_proxy: 'http://proxy.corp:3128',
+      NO_PROXY: 'localhost,.corp',
+      NODE_EXTRA_CA_CERTS: '/etc/ssl/corp-root.pem',
+      NPM_CONFIG_REGISTRY: 'https://npm.corp/registry',
+      npm_config_userconfig: '/home/dev/.npmrc.corp',
+    });
+
+    expect(env['HTTPS_PROXY']).toBe('http://proxy.corp:3128');
+    expect(env['http_proxy']).toBe('http://proxy.corp:3128');
+    expect(env['NO_PROXY']).toBe('localhost,.corp');
+    expect(env['NODE_EXTRA_CA_CERTS']).toBe('/etc/ssl/corp-root.pem');
+    expect(env['NPM_CONFIG_REGISTRY']).toBe('https://npm.corp/registry');
+    expect(env['npm_config_userconfig']).toBe('/home/dev/.npmrc.corp');
+    expect(env['PATH']).toBe('/usr/bin');
+    expect(env['HOME']).toBe('/home/dev'); // npm reads ~/.npmrc from here
+  });
+
+  it('never passes a credential-shaped variable, whatever its name', async () => {
+    const env = buildInstallEnv({
+      PATH: '/usr/bin',
+      NPM_TOKEN: 'npm_secret',
+      NPM_CONFIG__AUTHTOKEN: 'npm_secret',
+      npm_config__authToken: 'npm_secret',
+      AWS_SECRET_ACCESS_KEY: 'aws_secret',
+      GITHUB_TOKEN: 'gh_secret',
+      ANTHROPIC_API_KEY: 'k',
+    });
+
+    for (const key of Object.keys(env)) expect(isSecretKeyName(key)).toBe(false);
+    expect(Object.values(env)).not.toContain('npm_secret');
+    expect(Object.values(env)).not.toContain('gh_secret');
+  });
+
+  it('the script-less guarantee cannot be undone from the ambient environment', async () => {
+    const env = buildInstallEnv({ PATH: '/usr/bin', npm_config_ignore_scripts: 'false' });
+    expect(env['npm_config_ignore_scripts']).toBe('true');
+  });
+
+  it('does not pass arbitrary orchestrator state', async () => {
+    const env = buildInstallEnv({ PATH: '/usr/bin', ANTHROPIC_BASE_URL: 'https://x', EDITOR: 'vim' });
+    expect(env['ANTHROPIC_BASE_URL']).toBeUndefined();
+    expect(env['EDITOR']).toBeUndefined();
+  });
+});
+
 describe('F9 AC-4 — the config vocabulary means what it says', () => {
   // ROUND 15: the two rows that asserted `'install'` was refused, and that a
   // non-APFS host failed closed, are gone with the removal itself — both cases are
   // asserted as INSTALLS in the `ROUND 15 REGRESSION 3` block above.
+  // ROUND 16: likewise the row asserting `auto` failed closed on an unsafe clone —
+  // it now discards the clone and installs, as main did. What still holds is
+  // asserted there too: `clone` has no fallback, and an unsafe INSTALL is refused.
   it("'clone' with an unsafe-symlink clone result FAILS CLOSED (no silent lane switch)", async () => {
     const repo = track(await makeDepsRepo());
     await writePrimaryNodeModules(repo.dir, { badLink: 'absolute' });
@@ -2957,20 +3061,6 @@ describe('F9 AC-4 — the config vocabulary means what it says', () => {
 
     expect(error.provisioningCause).toBe('unsafe_clone_symlinks');
     expect(fake.calls.install).toBe(0);
-  });
-
-  it("'auto' with an unsafe-symlink clone result ALSO fails closed (auto = clone-or-fail)", async () => {
-    const repo = track(await makeDepsRepo());
-    await writePrimaryNodeModules(repo.dir, { badLink: 'escaping' });
-    const fake = fakeRuntime();
-    const manager = await openManager(repo, { runtime: fake.runtime, provision: 'auto' });
-    const asg = assignmentId('asg_f9_auto_unsafe');
-    await createAtHead(repo, manager, asg);
-
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-
-    expect(error.provisioningCause).toBe('unsafe_clone_symlinks');
-    expect(fake.calls.install).toBe(0); // the OLD auto path retried as install here
   });
 
 

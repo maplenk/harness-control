@@ -47,6 +47,7 @@ import { readdir, readFile, readlink } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
+import { isSecretKeyName } from '../redaction/patterns.js';
 import { createPsClient } from '../supervisor/ps.js';
 import { SystemClock } from '../lib/clock.js';
 import { sha256Hex } from '../artifacts/hash.js';
@@ -80,6 +81,79 @@ export const NATIVE_SMOKE_TIMEOUT_MS = 60 * 1000;
  * `src/adapters`; the two are deliberately identical in spirit.
  */
 const SMOKE_ENV_ALLOWLIST: readonly string[] = ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL'];
+
+/**
+ * ROUND 16 — the environment `npm ci` runs under, as an ALLOWLIST.
+ *
+ * Two earlier findings, both correct, pull in opposite directions: an install
+ * that inherits the full orchestrator `process.env` hands every credential the
+ * orchestrator holds to npm (an asymmetry against the verification runner's
+ * strict §17.1/W3-1 allowlist), while an install that inherits almost nothing
+ * cannot reach a corporate registry through a proxy or a private CA — a pure-JS
+ * project that provisions fine on main then fails with `install_failed`.
+ *
+ * What is passed, and why:
+ *  - `PATH`/`HOME`/temp/locale (the smoke's own basics). `HOME` is load-bearing
+ *    beyond the obvious: npm reads `~/.npmrc` from it, which is how essentially
+ *    every authenticated corporate setup actually authenticates — the token stays
+ *    on disk, scoped to its registry, and never becomes an env var here.
+ *  - proxy vars in both cases, because npm/node read whichever the platform set.
+ *  - `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` / `SSL_CERT_DIR` for a private CA.
+ *    `NODE_TLS_REJECT_UNAUTHORIZED` is deliberately NOT here: it DISABLES
+ *    verification rather than enabling a legitimate one.
+ *  - `npm_config_registry` / `npm_config_userconfig` / `npm_config_cache`, in
+ *    both spellings npm accepts.
+ *
+ * What is NOT passed, and why:
+ *  - Anything credential-shaped (`isSecretKeyName` — the same predicate the
+ *    verification allowlist is validated against), enforced as a filter so the
+ *    list cannot grow one later. This is a deliberate reading of "the standard
+ *    registry-auth vars": `buildViaInstall` copies the round's COMMITTED manifests
+ *    — `.npmrc` included — into the install directory, so the round's own files
+ *    choose which host npm talks to. Passing `NPM_TOKEN` would let an
+ *    implementor-committed `.npmrc` point the organisation's token at a host of
+ *    its choosing. A per-registry token in `~/.npmrc` does not have that problem,
+ *    and `HOME` already provides it.
+ *  - `npm_config_*` as a WILDCARD. It would readmit credential smuggling
+ *    (`npm_config__authToken`) and, worse, `npm_config_ignore_scripts=false`,
+ *    which would silently undo the one hardening this lane depends on. Per-project
+ *    npm configuration belongs in the committed `.npmrc`, which the install
+ *    already receives.
+ */
+const INSTALL_ENV_ALLOWLIST: readonly string[] = [
+  ...SMOKE_ENV_ALLOWLIST,
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'NPM_CONFIG_REGISTRY',
+  'npm_config_registry',
+  'NPM_CONFIG_USERCONFIG',
+  'npm_config_userconfig',
+  'NPM_CONFIG_CACHE',
+  'npm_config_cache',
+];
+
+/**
+ * Builds that environment. Exported so the policy is asserted directly rather
+ * than through a real `npm ci`. `npm_config_ignore_scripts` is stamped LAST, so
+ * no ambient value can undo the script-less guarantee.
+ */
+export function buildInstallEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of INSTALL_ENV_ALLOWLIST) {
+    if (isSecretKeyName(key)) continue; // belt: the list holds none, and cannot grow one
+    const value = source[key];
+    if (value !== undefined) env[key] = value;
+  }
+  env['npm_config_ignore_scripts'] = 'true';
+  return env;
+}
 
 /**
  * HIGH-4 — how many `node_modules` levels the native-build scan will descend.
@@ -247,15 +321,10 @@ export function defaultProvisionRuntime(): ProvisionRuntime {
     async install(cwd) {
       // `--ignore-scripts` is the MVP install-script mitigation (spec §2.2/§5): a
       // manifest the implementor edited cannot run arbitrary lifecycle scripts on
-      // the host during provisioning. F9: this lane has no production caller (see
-      // `ProvisionRuntime.install`); the env is pinned to the smoke allowlist
-      // anyway (codex focus (ii)) so it can never leak orchestrator credentials to
-      // an npm lifecycle if it is ever called again, and it is bounded like `cp`.
-      const env: Record<string, string> = { npm_config_ignore_scripts: 'true' };
-      for (const key of SMOKE_ENV_ALLOWLIST) {
-        const value = process.env[key];
-        if (value !== undefined) env[key] = value;
-      }
+      // the host during provisioning. ROUND 16: the env is an ALLOWLIST — enough
+      // to reach a proxied/private registry, never a credential (see
+      // `INSTALL_ENV_ALLOWLIST`). Bounded like `cp`.
+      const env = buildInstallEnv();
       await execFileAsync(
         'npm',
         ['ci', '--prefer-offline', '--no-audit', '--fund=false', '--ignore-scripts'],
@@ -725,7 +794,7 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
   // instead of deleting it out from under a producer that may still be writing.
   let timedOut = false;
   try {
-    const built = await buildStagedTree({
+    const buildArgs: BuildArgs = {
       stageDir,
       strategy,
       runtime,
@@ -735,19 +804,36 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
       warn,
       git,
       timeoutMs,
-    });
+    };
+    let built = await buildStagedTree(buildArgs);
 
     // Symlink containment scan against the EVENTUAL worktree boundary (H7). A scan
-    // that cannot fully complete THROWS (B6) → fail closed. F9 (§4): an unsafe link
-    // is now a REFUSAL under EVERY strategy — the retry-as-install that `auto` used
-    // to perform is gone with the install lane, so `auto` and `clone` behave
-    // identically here (clone-or-fail-closed) and the config no longer lies about it.
-    const scan: SymlinkContainmentScan = {
-      stageTreeRoot: built.treePath,
+    // that cannot fully complete THROWS (B6) → fail closed.
+    const containment = (treePath: string): SymlinkContainmentScan => ({
+      stageTreeRoot: treePath,
       eventualTreeRoot: nodeModules,
       containmentRoot: worktreePath,
-    };
-    const bad = await scanSymlinkContainment(scan);
+    });
+    let bad = await scanSymlinkContainment(containment(built.treePath));
+
+    // ROUND 16 — an unsafe CLONE under `auto` is discarded and installed instead,
+    // which is what main did. F9 removed the retry along with the install lane, so
+    // a project whose fresh install is perfectly safe was refused because the
+    // PRIMARY's tree happened to hold an escaping link. The hazard that removal
+    // was protecting against — an unprovable tree — is now closed by the artifact
+    // proof, which runs on the install lane too. The re-scan below is what keeps
+    // this from being an escape hatch: if the INSTALL's own tree is unsafe, the
+    // refusal stands.
+    if (bad.length > 0 && strategy === 'auto' && built.strategyTaken === 'clone') {
+      warn({ kind: 'clone_symlinks_unsafe', count: bad.length, sample: bad.slice(0, 5) });
+      try {
+        fs.rmSync(built.treePath, { recursive: true, force: true });
+      } catch {
+        /* the install lane writes to its own subdirectory; a leftover clone is GC'd */
+      }
+      built = { treePath: await buildViaInstall(buildArgs), strategyTaken: 'install' };
+      bad = await scanSymlinkContainment(containment(built.treePath));
+    }
     if (bad.length > 0) {
       warn({ kind: 'clone_symlinks_unsafe', count: bad.length, sample: bad.slice(0, 5) });
       throw failClosed(
