@@ -964,10 +964,14 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
     // Target the handoff checkpoint by reason: the §12.2 completed-turn
     // cadence (W4-1) legitimately writes earlier `cadence` checkpoints as the
     // slice drives its turns, so "the first checkpoint.recorded" is no longer
-    // unambiguous — the resume path wants the pre_verify_handoff one.
+    // unambiguous — the resume path wants the pre_verify_handoff one. F8 (C):
+    // the IMPLEMENTOR round now writes a real `pre_verify_handoff` checkpoint
+    // at its own commit boundary too, so take the LATEST one — the
+    // predecessor-verifier checkpoint this test just appended — exactly as
+    // `resolveResumeCheckpointHash` does (latest-by-sequence).
     const checkpointEvent = db.events
       .listByRun(runId)
-      .find(
+      .findLast(
         (e) =>
           e.type === 'checkpoint.recorded' &&
           (e.payload as { reason?: string }).reason === 'pre_verify_handoff',

@@ -427,7 +427,18 @@ async function adoptWorktree(
             'post-commit dirt discarded, clean asserted (never WIP-committed)',
     );
   } else {
-    const validation = await worktrees.validate(input.assignmentId, resume.checkpoint?.worktree);
+    // F8 (A): this is the INTERRUPTED-implementor branch — the ONE place where a
+    // HEAD ahead of the checkpoint is explainable as the round's own commit
+    // (cadence checkpoints fire at prompt-turn boundaries and therefore record
+    // the PRE-commit head; the implementor commits AFTER its turn loop). Accept
+    // that strict forward motion instead of reading it as tamper; every other
+    // divergence — a rewritten/reset history, an unrelated HEAD, an ancestry
+    // probe that cannot be completed — still refuses (fail-closed, in
+    // `validate.ts`). The completed-implementor and verifier branches above are
+    // unaffected: they bind to an exact commit via `discardToCommit`.
+    const validation = await worktrees.validate(input.assignmentId, resume.checkpoint?.worktree, {
+      acceptForwardContainment: true,
+    });
     recordValidation(validation.outcome, validation.detail, validation.wipCommitSha);
     if (validation.outcome === 'refuse_resume') {
       throw new WorktreeError(

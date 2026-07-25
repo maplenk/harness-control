@@ -355,6 +355,33 @@ export async function isPathTracked(worktreePath: string, pathspec: string): Pro
 }
 
 /**
+ * F8 (A) — true iff `ancestor` is reachable from `descendant`
+ * (`git merge-base --is-ancestor`). Exit 0 → ancestor; exit 1 → the documented
+ * "not an ancestor"; ANY OTHER exit (128 for an unknown/non-commit object name, a
+ * broken object store, -1 for a spawn failure) → THROW.
+ *
+ * The exit-1/exit-128 split is the whole point: §16.3's forward-containment
+ * acceptance may only trust a POSITIVE answer, and must treat an ancestry probe
+ * it could not complete as a REFUSAL, never as "not an ancestor is fine" and
+ * never as an acceptance. Both revs are peeled with `^{commit}` so a tag/tree/
+ * blob name fails loudly here rather than silently answering about the wrong
+ * object. Note git's own semantics make a commit an ancestor of ITSELF; callers
+ * that need STRICT ancestry (this one does) compare the shas first.
+ */
+export async function isAncestor(worktreePath: string, ancestor: string, descendant: string): Promise<boolean> {
+  const { exitCode, stderr } = await runGitStatus(
+    ['merge-base', '--is-ancestor', `${ancestor}^{commit}`, `${descendant}^{commit}`],
+    worktreePath,
+  );
+  if (exitCode === 0) return true;
+  if (exitCode === 1) return false;
+  throw new WorktreeError(
+    'git_command_failed',
+    `git merge-base --is-ancestor ${ancestor} ${descendant} (cwd=${worktreePath}) failed (exit ${exitCode}): ${stderr.trim()}`,
+  );
+}
+
+/**
  * Contents of `relpath` at the worktree's committed HEAD, or `undefined` when the
  * path is GENUINELY absent from HEAD.
  *

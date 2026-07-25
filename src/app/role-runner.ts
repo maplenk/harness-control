@@ -80,6 +80,28 @@ export interface RoleSession {
    * (§17.2) throws `BudgetExceededError` before the turn starts.
    */
   prompt(input: RolePromptInput): Promise<PromptResult>;
+  /**
+   * F8 (C) — §12.2's `pre_verify_handoff` safe boundary, the ONE checkpoint
+   * trigger a FLOW owns (the other four — cadence, pre_pause, pre_model_switch,
+   * pre_graceful_stop — are the service's own turn/pause/stop machinery, and
+   * this seam deliberately cannot request them).
+   *
+   * The flow calls this immediately after it has committed its deliverable and
+   * before handing off to verification, so the §12.2 checkpoint carries the
+   * COMMITTED head. Without it, the last checkpoint of every committing round
+   * is a prompt-turn-boundary one recording the PRE-commit head, and a crash in
+   * the commit→next-checkpoint window leaves the round's own commit looking
+   * like tamper to §16.3 (the F8 (A) forward-containment acceptance is the
+   * belt; this is the suspenders).
+   *
+   * Written through the SAME assembler + cadence-window reset as every other
+   * checkpoint. NON-FATAL by construction (mirrors the cadence hook and the
+   * graceful-stop path): the deliverable is already committed, so a §12.1 quota
+   * rejection or a checkpoint-write failure must never unwind a completed
+   * round — resume re-probes everything under §16.3 regardless. Returns whether
+   * a checkpoint was actually recorded so a flow can report it honestly.
+   */
+  checkpointVerifyHandoff(): Promise<{ readonly written: boolean }>;
 }
 
 // ---------------------------------------------------------------------------

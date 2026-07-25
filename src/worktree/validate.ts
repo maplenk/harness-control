@@ -29,6 +29,7 @@
  *        - current HEAD != checkpoint.headSha                 -> refuse_resume
  *          (a base-commit drift is too ambiguous to auto-reconcile;
  *          PLAN §16.3: "refusal to resume-in-place on mismatch")
+ *          EXCEPT under F8 (A) forward containment — see 3b.
  *        - current HEAD == checkpoint.headSha AND
  *          (statusPorcelain, diffHash) match EXACTLY            -> clean
  *          (worktree is precisely what was honestly checkpointed)
@@ -43,6 +44,26 @@
  *          (new, unaccounted-for divergence beyond what the checkpoint
  *          honestly recorded — e.g. a partial write mid-emergency-kill;
  *          preserved via a WIP commit rather than silently discarded)
+ *   3b. F8 (A) FORWARD CONTAINMENT — `acceptForwardContainment` only (the
+ *       INTERRUPTED-IMPLEMENTOR adoption path, `orchestrate.ts`):
+ *        - checkpoint.headSha is a STRICT git ancestor of current HEAD
+ *          (`git merge-base --is-ancestor`, the shas already differ)
+ *                                                              -> NOT refused
+ *          The drift is implementor-AUTHORED forward motion, not tamper:
+ *          cadence checkpoints fire at prompt-turn boundaries and therefore
+ *          record the PRE-COMMIT head, while the implementor commits AFTER
+ *          its turn loop — so a round that commits and then dies before the
+ *          next checkpoint is drifted-forward BY CONSTRUCTION. Refusing it
+ *          made such a round permanently unresumable (its own commit read as
+ *          tamper). The remaining §16.3 checks then run UNCHANGED: the dirt
+ *          policy decides between `reset_and_recorded` (clean) and
+ *          `wip_committed` (dirty), and `mismatchDetected` is TRUE either way
+ *          — the recorded state genuinely is not what is on disk.
+ *        - ANY non-descendant divergence (a rewritten/amended history, a
+ *          backward reset, an unrelated HEAD) OR an ancestry probe that could
+ *          not be completed (unknown object, corrupt store, any git error)
+ *                                                              -> refuse_resume
+ *          Fail-closed: a probe failure is a REFUSAL, never an acceptance.
  *
  * `refuse_resume` is the ONLY outcome that leaves the worktree still
  * "tainted" from the caller's point of view (`manager.ts` re-taints with
@@ -77,6 +98,16 @@ export interface ValidateWorktreeInput {
    * preserved. Default false — non-F7 callers keep plain `git add -A`.
    */
   readonly excludeNodeModulesFromWip?: boolean;
+  /**
+   * F8 (A): accept implementor-AUTHORED forward motion instead of refusing on
+   * drift alone — see this module's decision tree, row 3b. Set ONLY by the
+   * INTERRUPTED-IMPLEMENTOR adoption path (`orchestrate.ts`'s `adoptWorktree`),
+   * because only there is a HEAD ahead of the checkpoint explainable as the
+   * round's own commit. Every other caller (the CLI `validate` command, any
+   * post-kill reconciliation) leaves it false and keeps the strict
+   * any-drift-refuses policy. Default false.
+   */
+  readonly acceptForwardContainment?: boolean;
 }
 
 export interface ValidateWorktreeResult {
@@ -241,18 +272,38 @@ export async function validateWorktree(input: ValidateWorktreeInput): Promise<Va
     );
   }
 
+  // F8 (A): HEAD drift is a REFUSAL unless it is provably forward motion the
+  // interrupted implementor itself authored (row 3b). `forwardDrift` records
+  // that an accepted drift happened, so everything below reports the mismatch
+  // honestly instead of pretending the checkpoint described this tree.
+  let forwardDrift = false;
   if (initialRead.headSha !== String(checkpoint.headSha)) {
-    return buildResult(
-      'refuse_resume',
+    const containment = await probeForwardContainment(
       worktreePath,
-      initialRead,
-      lockfileCleanupPerformed,
-      true,
-      `HEAD drifted since the last checkpoint (checkpoint=${String(checkpoint.headSha)}, current=${initialRead.headSha}); refusing to resume in place.`,
+      String(checkpoint.headSha),
+      initialRead.headSha,
+      input.acceptForwardContainment ?? false,
     );
+    if (!containment.accepted) {
+      return buildResult(
+        'refuse_resume',
+        worktreePath,
+        initialRead,
+        lockfileCleanupPerformed,
+        true,
+        `HEAD drifted since the last checkpoint (checkpoint=${String(checkpoint.headSha)}, current=${initialRead.headSha}); ` +
+          `${containment.reason} — refusing to resume in place.`,
+      );
+    }
+    forwardDrift = true;
   }
 
+  // An accepted forward drift is never an "exact match": HEAD moved, so the
+  // recorded (statusPorcelain, diffHash) pair describes a DIFFERENT commit and
+  // an incidental equality (e.g. both clean) must not be reported as "matches
+  // the last checkpoint exactly".
   const exactMatch =
+    !forwardDrift &&
     initialRead.statusPorcelain === checkpoint.statusPorcelain &&
     String(initialRead.diffHash) === String(checkpoint.diffHash);
   if (exactMatch) {
@@ -262,7 +313,10 @@ export async function validateWorktree(input: ValidateWorktreeInput): Promise<Va
   if (!initialRead.isDirty) {
     // Checkpoint recorded dirty content that is no longer there: reset to
     // HEAD as a safety no-op on tracked files (nothing to preserve — it is
-    // already clean), then re-read and record the discrepancy honestly.
+    // already clean), then re-read and record the discrepancy honestly. Under
+    // an accepted forward drift this is the SAME no-op against the round's own
+    // commit — HEAD is never moved back (`initialRead.headSha`, not the
+    // checkpoint's), so the deliverable is preserved.
     await git.hardReset(worktreePath, initialRead.headSha);
     const after = await readCurrentState(worktreePath);
     return buildResult(
@@ -271,7 +325,10 @@ export async function validateWorktree(input: ValidateWorktreeInput): Promise<Va
       after ?? initialRead,
       lockfileCleanupPerformed,
       true,
-      'Checkpoint recorded a dirty worktree that is already clean now; reset to HEAD and recorded.',
+      forwardDrift
+        ? `HEAD moved FORWARD from the last checkpoint (${String(checkpoint.headSha)} -> ${initialRead.headSha}, a strict ancestor): ` +
+            'implementor-authored motion accepted; tree is clean at the new HEAD and recorded.'
+        : 'Checkpoint recorded a dirty worktree that is already clean now; reset to HEAD and recorded.',
     );
   }
 
@@ -283,7 +340,47 @@ export async function validateWorktree(input: ValidateWorktreeInput): Promise<Va
     after ?? initialRead,
     lockfileCleanupPerformed,
     true,
-    'Worktree diverged from the last checkpoint beyond what was recorded; preserved as a WIP commit.',
+    forwardDrift
+      ? `HEAD moved FORWARD from the last checkpoint (${String(checkpoint.headSha)} -> ${initialRead.headSha}, a strict ancestor): ` +
+          'implementor-authored motion accepted; post-commit dirt preserved as a WIP commit on top.'
+      : 'Worktree diverged from the last checkpoint beyond what was recorded; preserved as a WIP commit.',
     wipSha,
   );
+}
+
+/**
+ * F8 (A) row 3b — decide whether a HEAD that differs from the checkpoint's is
+ * ACCEPTABLE forward motion. Only ever called with two DIFFERENT shas, so a
+ * positive `isAncestor` answer is STRICT ancestry.
+ *
+ * Fail-closed in three ways: the caller must have opted in; the probe must
+ * answer YES; and an ancestry probe that THROWS (unknown/non-commit checkpoint
+ * object — including the empty sha a non-probed pause records — a corrupt object
+ * store, any git failure) is reported as a refusal carrying the probe's own
+ * message. There is no path on which an error becomes an acceptance.
+ */
+async function probeForwardContainment(
+  worktreePath: string,
+  checkpointSha: string,
+  currentSha: string,
+  optedIn: boolean,
+): Promise<{ readonly accepted: boolean; readonly reason: string }> {
+  if (!optedIn) {
+    return { accepted: false, reason: 'a base-commit drift is too ambiguous to auto-reconcile' };
+  }
+  let isAncestor: boolean;
+  try {
+    isAncestor = await git.isAncestor(worktreePath, checkpointSha, currentSha);
+  } catch (error) {
+    return {
+      accepted: false,
+      reason: `the ancestry probe could not be completed (${error instanceof Error ? error.message : String(error)})`,
+    };
+  }
+  return isAncestor
+    ? { accepted: true, reason: 'the checkpoint is a strict ancestor of HEAD (implementor-authored forward motion)' }
+    : {
+        accepted: false,
+        reason: 'the checkpoint commit is NOT an ancestor of HEAD (rewritten, reset, or diverged history)',
+      };
 }

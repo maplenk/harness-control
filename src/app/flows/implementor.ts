@@ -727,6 +727,12 @@ export interface ImplementorResult {
   readonly postVerificationDirty: boolean;
   /** Bounded dirty-path list (`git status --porcelain`) when dirty; else empty. */
   readonly postVerificationDirtyFiles: readonly string[];
+  /** F8 (C): whether the §12.2 `pre_verify_handoff` checkpoint carrying the
+   * COMMITTED head was actually recorded. `false` means the write was refused
+   * (a §12.1 quota rejection) or failed — reported honestly rather than
+   * assumed, since the round proceeds either way (the commit is already
+   * durable, and F8 (A) accepts the forward drift on resume without it). */
+  readonly verifyHandoffCheckpointed: boolean;
   readonly committed: boolean;
   readonly commitSha?: GitSha;
   /** Stop reason of the last driven turn. */
@@ -976,6 +982,22 @@ export class ImplementorFlow {
     }
     const commit = await commitAll(cwd, commitMessage, commitEnv);
 
+    // --- F8 (C, §12.2): the `pre_verify_handoff` safe-boundary checkpoint ----
+    // IMMEDIATELY after the commit, before the provisioning boundary and the
+    // verify handoff, so a §12.2 checkpoint exists carrying the COMMITTED head.
+    // Every checkpoint taken DURING the round is a prompt-turn-boundary one
+    // (cadence/pause) recording the PRE-commit head, because the commit happens
+    // after the turn loop above — so without this, a crash anywhere in the
+    // commit→next-checkpoint window left the round's own commit looking like
+    // tamper to §16.3 and made it permanently unresumable. It also closes the
+    // flow-to-loop window in which the commit exists but the loop driver has
+    // not yet recorded `lastImplementationCommit`.
+    //
+    // Non-fatal by design (the service's seam never throws): the deliverable is
+    // already durably committed, and F8 (A) accepts the forward drift on resume
+    // even when this checkpoint could not be written.
+    const handoffCheckpoint = await session.checkpointVerifyHandoff();
+
     // Capture the base→HEAD delta from the now-clean committed tree, BEFORE
     // verification runs (a verification build must not pollute the recorded
     // diff). `git diff <base>` over a clean tree is exactly base→HEAD.
@@ -1086,6 +1108,7 @@ export class ImplementorFlow {
       ...(provisioningFailed !== undefined ? { provisioningFailed } : {}),
       postVerificationDirty: postStatus.trim().length > 0,
       postVerificationDirtyFiles,
+      verifyHandoffCheckpointed: handoffCheckpoint.written,
       committed: commit.committed,
       ...(commit.sha !== undefined ? { commitSha: gitSha(commit.sha) } : {}),
       stopReason,

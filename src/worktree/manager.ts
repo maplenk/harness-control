@@ -130,6 +130,20 @@ export interface RemoveWorktreeOptions {
   readonly force?: boolean;
 }
 
+export interface ValidateOptions {
+  /**
+   * F8 (A): accept a HEAD that moved FORWARD from the checkpoint (the
+   * checkpoint's sha is a strict git ancestor of it) instead of refusing on
+   * drift alone — see `validate.ts`'s decision-tree row 3b. Only the
+   * INTERRUPTED-IMPLEMENTOR adoption path sets this: only there is a HEAD ahead
+   * of the checkpoint explainable as the round's OWN commit (cadence
+   * checkpoints record the PRE-commit head; the implementor commits after its
+   * turn loop). Defaults to false — every other caller keeps the strict policy,
+   * and a non-descendant divergence or a failed ancestry probe still refuses.
+   */
+  readonly acceptForwardContainment?: boolean;
+}
+
 /**
  * `GitWorktreeManager.open()` is the only constructor: it verifies
  * `primaryRepoRoot` is really a git repo (§16 item 1) and canonicalizes it
@@ -409,8 +423,13 @@ export class GitWorktreeManager {
    * `reconcile_mismatch` on `refuse_resume`. `async` for the same reason
    * as `createWorktree`: `#requireHandle` throws synchronously and must
    * surface as a rejection, not a synchronous throw at the call site.
+   * `options` carries the F8 (A) forward-containment opt-in (`ValidateOptions`).
    */
-  async validate(assignmentId: AssignmentId, checkpointWorktreeState?: WorktreeState): Promise<ValidateWorktreeResult> {
+  async validate(
+    assignmentId: AssignmentId,
+    checkpointWorktreeState?: WorktreeState,
+    options: ValidateOptions = {},
+  ): Promise<ValidateWorktreeResult> {
     const handle = this.#requireHandle(assignmentId);
     return this.#mutex
       .runExclusive(this.#primaryRepoRoot, 'other', { assignmentId, worktreePath: handle.worktreePath }, () =>
@@ -418,6 +437,10 @@ export class GitWorktreeManager {
           worktreePath: handle.worktreePath,
           ...(checkpointWorktreeState !== undefined ? { checkpointWorktreeState } : {}),
           wipCommitMessage: `harness-orchestration: WIP reconciliation (assignment ${String(assignmentId)}, ${this.#clock.nowIso()})`,
+          // F8 (A): opt-in forward containment — set ONLY by the interrupted-
+          // implementor adoption path. Every other caller keeps the strict
+          // any-drift-refuses policy (this manager never decides it for them).
+          acceptForwardContainment: options.acceptForwardContainment ?? false,
           // F7 (#1): a WIP/dirty-recovery commit here must EXCLUDE node_modules whenever
           // managed provisioning is ACTIVE — the SAME exclusion the implementor commit
           // uses — so a provisioned, git-ignored toolchain can never enter a §16.3

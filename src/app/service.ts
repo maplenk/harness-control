@@ -5598,7 +5598,42 @@ export class OrchestrationService {
         await this.#maybeCadenceCheckpoint(ctx);
         return result;
       },
+      // F8 (C): the §12.2 `pre_verify_handoff` boundary, exposed to the FLOW
+      // (see `RoleSession.checkpointVerifyHandoff`). Closed over the SAME
+      // `ctx` the cadence hook uses, so the checkpoint is assembled from the
+      // live worktree (`ctx.cwd`) and bound to this dispatch's
+      // assignment/round/spec exactly like every other checkpoint — the flow
+      // never touches the assembler, the CAS, or the event log itself.
+      checkpointVerifyHandoff: () => this.#writeVerifyHandoffCheckpoint(ctx),
     };
+  }
+
+  /**
+   * F8 (C) — write the §12.2 `pre_verify_handoff` checkpoint on behalf of a
+   * flow that has just committed its deliverable. The reason has existed in the
+   * vocabulary (`state.ts`'s `CheckpointReason`, `cadence.ts`'s
+   * `BOUNDARY_REASON`) since W4-1 with no writer in production code; this is it.
+   *
+   * Mirrors `#maybeCadenceCheckpoint` exactly — same assembler, same
+   * `OPERATION_IDLE` honesty (a completed commit interrupts nothing), same
+   * `ingest` of the resulting `checkpoint.recorded`, same cadence-window reset
+   * (inside `#writeStopCheckpoint`) — and is NON-FATAL for the same reason the
+   * cadence hook and the T22 graceful-stop checkpoint are: the work is already
+   * durably committed, so failing the round because a checkpoint could not be
+   * stored would be strictly worse than resuming without it (F8 (A)'s
+   * forward-containment acceptance covers exactly that case). A failure is
+   * counted on the supervision-error meter rather than swallowed silently.
+   */
+  async #writeVerifyHandoffCheckpoint(ctx: SpawnContext): Promise<{ readonly written: boolean }> {
+    try {
+      const checkpoint = await this.#writeStopCheckpoint(ctx, 'pre_verify_handoff', OPERATION_IDLE);
+      if (checkpoint.event === undefined) return { written: false }; // §12.1 quota rejection
+      this.ingest(checkpoint.event as DomainEvent);
+      return { written: true };
+    } catch {
+      this.#supervisionIngestErrors += 1;
+      return { written: false };
+    }
   }
 
   #foldUsageUpdate(
