@@ -1917,6 +1917,24 @@ settles most of them: `nativeBuildPackages`, `proveePrimaryTree`, `nativeArtifac
 and the smoke **do not exist on main**, so any refusal they make is a refusal main
 never makes and must be positive identification or nothing.
 
+**Reproduce the inventory mechanically** (so the count can be checked rather than
+trusted):
+
+```
+awk '/failClosed\(/{print NR": "$0}' src/worktree/provision.ts
+```
+
+25 raise sites survive the sweep — 24 `throw failClosed(...)` plus ONE `reject`,
+`withDeadline`'s deadline at `:360`, which an inventory grepping only for `throw`
+misses. Every one is in the table below. Three further `throw`s in the file are
+NOT refusal decisions and are excluded deliberately: `:422` and `:884` rethrow an
+error the caller's own catch adjudicates, and `:2079`
+(`throw new Error('not a JSON object')`) is internal control flow caught two
+lines down and converted into converted-site 4's warning. The refusal vocabulary
+does not leave this file: `native_toolchain_unproven` / `primary_tree_stale`
+appear elsewhere only in `errors.ts` (the cause union) and `cli/commands.ts` (the
+remedy hints).
+
 ### Converted this round (9 sites)
 
 | # | site | what it used to refuse | why that was wrong |
@@ -1935,7 +1953,7 @@ Sites 5 and 6 are DEFENCE IN DEPTH only: the main-era symlink containment scan
 walks the same directories and refuses first on an unreadable one (as it does on
 main), so they are unreachable end-to-end. Stated rather than claimed as covered.
 
-### Kept, with the justification for each (20 sites)
+### Kept, with the justification for each (25 sites)
 
 **Positive identification — the proof working:**
 
@@ -2024,6 +2042,31 @@ rather than enabling a legitimate one.
 with a missing binding still REFUSES, and a pure-JS project on the install lane
 still SUCCEEDS. Nothing in this round traded the proof for a regression.
 
+## Independent re-verification of this round
+
+The round-16 commits were written by one agent and verified by a second before
+hand-off, so the following were re-derived from scratch rather than inherited:
+
+- **The inventory.** Re-enumerated from the file (the `awk` above) rather than
+  read off the table: 25 raise sites, all present in the table. The audit was
+  exhaustive; only its heading was miscounted (it said 20, because it counted the
+  table's prose groups and missed that `withDeadline` rejects rather than throws).
+  Corrected above — the classification of every site is unchanged.
+- **The fails-on-parent proof for items 1 and 2**, reconstructed exactly (`d0d2b0f`'s
+  `provision.ts` + `a110d4c`'s `provision.test.ts`) and re-run: `2 failed | 8 passed`.
+  The multi-prebuild row fails on the parent with the false refusal itself —
+  `could not dlopen the compiled artifact of 'multi-native' (3 found)` — while the
+  artifacts it could not load are `prebuilds/linux-x64` and `prebuilds/win32-ia32`
+  on a macOS host, i.e. exactly the variants no wrapper would ever select here.
+  That is the regression stated in codex's finding 2, reproduced.
+- **The green bar**, re-run in full from this worktree (counts below).
+- **The decisive pair**, run on their own: `PASS (2) FAIL (0)`.
+
+Per house rule 7, the source files were restored by copying back from a
+scratchpad snapshot — never `git checkout --` — and the round-16 symbols were
+grepped afterwards to confirm the fix survived the simulation (`git diff HEAD`
+empty, `ROUND 16` × 11, `buildInstallEnv` × 2, `complete = false` × 2).
+
 ---
 
 # Final residual list for the merge record
@@ -2056,6 +2099,10 @@ still SUCCEEDS. Nothing in this round traded the proof for a regression.
 - `npx vitest run` (full, from this worktree) → **1941 passed, 0 failed**, 106
   files. Round 16 added 9 tests and deleted 4 that encoded reversed behaviour
   (1934 → 1941).
+
+Both re-run independently at hand-off and reproduced exactly: typecheck exit 0,
+`Test Files 106 passed (106)`, `Tests 1941 passed (1941)`, 0 failed, 0 skipped
+at file level.
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
