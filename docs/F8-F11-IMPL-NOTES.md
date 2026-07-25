@@ -1742,6 +1742,157 @@ the strictness was TARGETED, not removed.
 
 ---
 
+---
+
+# Round 15 — codex verdict on `3290548`
+
+Regressions 2 and 3 of round 14 confirmed closed. This round's headline is not a
+regression at all, and it changes what the branch is for. Commit map:
+
+| item | commit |
+| --- | --- |
+| **The decorative smoke** — F9 did not detect the failure it was built for | `855c7ff` |
+| REGRESSION 1 — a negated ignore pattern read as "ignored" | `24c6f05` |
+| REGRESSIONS 2 + 4 — lockfile and depth exhaustion are indeterminate | `1467f9b` |
+| REGRESSION 3 — the install lane restored, gated on the native proof | `8e756c0` |
+
+## F9 DID NOT DETECT THE FAILURE IT WAS BUILT FOR
+
+The smoke did `require(target)` and called that a proof. **better-sqlite3 loads
+its native binding only when its exported constructor is invoked**
+(`lib/database.js:48`, inside `new Database(...)`). Verified here at runtime by
+hooking `process.dlopen`:
+
+```
+requiring better-sqlite3...
+--- require RETURNED (any dlopen above?) ---     <- none
+  DLOPEN -> ./node_modules/better-sqlite3/build/Release/better_sqlite3.node
+--- constructor RETURNED ---
+```
+
+So the entire native proof passed on precisely the tree F9 exists to reject: the
+script-less install that left better-sqlite3 with no binding, turned 58 of 122
+persistence tests red, and kept typecheck green. Fourteen rounds of hardening
+produced a guard that would not have caught the original bug.
+
+The synthetic fixture is why it went unnoticed. It required its missing `.node`
+at MODULE SCOPE, which no real native package does — so the fixture failed at
+`require` time and the proof looked like it worked.
+
+**The fix proves the ARTIFACT.** Not the API: invoking arbitrary constructors is
+arbitrary code execution, the same objection that keeps us from executing a
+`bin`. A package that declares a native build must SHIP a compiled `*.node`, and
+that artifact must `dlopen` — which is exactly what a lazily-loading package does
+when its API is first used, without needing to know that API.
+
+| state | outcome |
+| --- | --- |
+| no artifact, scan complete | **REFUSE** (2) — this is the tree F9 exists for |
+| no artifact, scan incomplete | indeterminate (3) — warn, proceed |
+| artifact present, `dlopen` fails | **REFUSE** (2) — truncated download, wrong arch |
+| artifact `dlopen`s | PROVEN |
+
+The shared fixture now models the real dependency: `native` packages load their
+addon lazily inside a constructor, and `built:true` plants a REAL compiled addon
+copied from this repo's own tree (nothing synthetic satisfies `dlopen`).
+`built:false` strips any artifact, so "unbuilt" means it.
+
+**DECISIVE TEST (a)** — `ROUND 15 > DECISIVE (a)`: the real better-sqlite3 (its
+own manifest, its own `lib/`, its own `binding.gyp`, no `build/`) copied from this
+repo. The test asserts, on BOTH sides, that `require('better-sqlite3')` prints
+`LOADED` while `new Database(':memory:')` prints `CTOR-FAILS` — the decorative
+pass is now documented in the suite itself — and then asserts provisioning
+REFUSES. **On the parent it provisioned successfully.**
+
+## REGRESSION 1 — a negated pattern means NOT ignored
+
+Mine, from round 14. `check-ignore -v` reports the matching pattern verbatim with
+its leading `!`, and a negated match means the path is explicitly NOT ignored (the
+plain form exits 1 for it — verified on git 2.55). Reading every non-empty pattern
+as "ignored" inverted exactly the case the syntax exists for, so a vendored tree
+deliberately re-included through a negation was classified as wholly the engine's
+and unstaged. `git.ts:403` now skips a pattern beginning with `!`.
+
+The fixture uses the gitignore-documented shape (exclude `dir/*`, re-include a
+direct child), because git cannot re-include anything under an excluded
+DIRECTORY. A first attempt passed for the wrong reason — an unmatched sibling kept
+the root mixed — which is recorded because the shape of the fixture IS the test.
+
+## REGRESSION 2 — the principle at the file level, and a round-8 reversal
+
+An unreadable, unsupported or unparseable lockfile, a null/primitive descriptor,
+and a declared package with no entry are now INDETERMINATE: one loud warning
+naming what could not be read, then the PRESENCE proof still runs. Yarn, pnpm and
+any future npm format are trees main clones and verifies.
+
+**This reverses round 8's Blocker 2 disposition, deliberately.** The defect round 8
+fixed was the SILENT downgrade to presence-only; refusing was a heavier remedy
+than the disease. The loudness is kept, the refusal is not. Refusing a single
+missing entry was also incoherent once a wholly unreadable lockfile proceeds: a
+more informative lockfile must not be treated more harshly. A genuinely missing
+PACKAGE still refuses — asserted.
+
+## REGRESSION 4 — the depth cap reversed, and why
+
+Round 4 made the native-scan depth cap fail closed because a silent truncation
+still produced a smoke-attested marker. **That was correct when this proof was the
+only guard, and is wrong under the governing principle**: a tree nested past OUR
+limit is one main clones and verifies, so refusing lets the scan's limit — not the
+tree — decide the run. Depth exhaustion now warns `proof_indeterminate` naming the
+path and proceeds. The silence round 4 objected to is still gone.
+
+## REGRESSION 3 — the install lane is back, gated on the proof
+
+F9 removed it because `npm ci --ignore-scripts` cannot build a native dependency.
+True, and too broad: a script-less install is fine for a project with NO native
+dependencies, which is most of them. The removal unconditionally refused three
+things main does successfully — `provision:'install'`, a round whose implementor
+changed the manifests, and any host without APFS copy-on-write.
+
+The hazard was never the lane, it was stamping the lane's output PROVEN. The lane
+returns; the artifact proof decides. Every way of being clone-INELIGIBLE now falls
+through to install, as main did: no copy-on-write, no cloneable primary, an
+unreadable clone source, a primary whose dependency set is not this round's, or a
+clone that fails at runtime. **The clone is an optimisation over the install, not
+a precondition for running.**
+
+**DECISIVE TEST (b)** — a pure-JS project on `provision:'install'` provisions,
+`strategy: 'install'`, marked `v3`. Its pair asserts the gate: an install that
+produces an unbuilt native package is still refused `native_toolchain_unproven`,
+with `install` called exactly once — the lane RAN and the proof rejected its
+output.
+
+**This round DELETES code.** Gone rather than left unreachable:
+`INSTALL_PROVISIONING_REMOVED_MESSAGE`, the schema refinement, the programmatic
+belt, `manifestDivergenceFailure` + `divergedManifestNames` (74 lines), and the
+three causes they raised (`deps_changed_in_worktree`,
+`primary_manifests_diverged`, `manifest_divergence_unclassified`) with their CLI
+hints. One cause added: `install_failed`, for a lane that ran and failed. Net
+source diff for the round is negative.
+
+**Not restored, deliberately:** the unsafe-symlink retry-as-install. An absolute
+or worktree-escaping symlink is positively identified as a containment hazard —
+outcome (2), not a shape we failed to understand — and codex has confirmed that
+refusal across several rounds. It is the one main-succeeds case this round leaves
+refusing, flagged rather than quietly kept.
+
+Thirteen existing rows encoded the removal and were flipped or deleted with it.
+Each kept its real invariant: never CLONE a hollow, drifted or unreadable source
+(now: install instead); a failed build leaves the prior tree intact (now faulting
+BOTH lanes, since a failed clone falls back).
+
+## Round-15 regression proofs
+
+| item | command | on parent | after |
+| --- | --- | --- | --- |
+| smoke | `provision.test.ts -t "ROUND 15"` | PASS 1 FAIL 2 — the real unbuilt better-sqlite3 tree PROVISIONED; a corrupt artifact PROVISIONED | 3/3 |
+| 1 | `git.test.ts -t "NEGATED"` | FAIL — the re-included file was unstaged | 1/1 |
+| 2 | `provision.test.ts -t "warns and PROCEEDS"` | PASS 0 FAIL 9 — each refused with its lockfile reason | 9/9 |
+| 4 | `provision.test.ts -t "DEEPER"` | FAIL — "nests deeper than 16 levels" | 1/1 |
+| 3 | `provision.test.ts -t "ROUND 15 REGRESSION 3"` | PASS 0 FAIL 5 — each with its verbatim removal refusal | 5/5 |
+
+---
+
 # Final residual list for the merge record
 
 | # | residual | disposition |
@@ -1756,18 +1907,20 @@ the strictness was TARGETED, not removed.
 | R8 | No deterministic test for Blocker 1's race window; the invariant is asserted instead. | **Known untested invariant** (codex: coverage debt, not a defect) |
 | R9 | Closed in round 13 (ITEM 1): the unignored/unmarked/untracked ROOT tree is excluded again, as main did. A NESTED unignored, unmarked, untracked tree is still committed — which is what main did too, since main's exclusion was root-only. | — |
 | R10 | **(ITEM 2):** an assignment that accumulates 8 quarantined stages cannot provision until a TTL expires or the stages are cleared. Fail-closed, named cause, CLI remedy; unreachable on main, which has no deadline to time out. | Accepted (codex) |
-| R11 | **New (round 14):** `proof_indeterminate` warnings are emitted per BUILD, not per round — a v3 marker short-circuit does not re-emit them for a tree already built with an unprovable package. Nothing is hidden that a rebuild would not reveal. | Stated consequence |
-| R12 | **New (round 14):** a native package that ships only a CLI `bin` is never proven, by choice — executing a CLI is not a smoke. It warns and proceeds, exactly as main provisions it. | Deliberate, documented |
+| R11 | **(round 14):** `proof_indeterminate` warnings are emitted per BUILD, not per round — a v3 marker short-circuit does not re-emit them for a tree already built with an unprovable package. Nothing is hidden that a rebuild would not reveal. | Stated consequence |
+| R12 | **(round 14):** a native package that ships only a CLI `bin` is never proven, by choice — executing a CLI is not a smoke. It warns and proceeds, exactly as main provisions it. | Deliberate, documented |
+| R13 | **New (round 15):** a package that declares a native build (`binding.gyp` or a gyp-style install script) but legitimately ships NO `.node` — e.g. one whose addon is optional with a JS fallback — is refused. That is the same rule that catches unbuilt better-sqlite3, and I could not find a way to separate the two by inspection. Narrower than it sounds: the package must both declare a native build AND ship no artifact anywhere in its own directory. | Accepted cost of the real proof |
+| R14 | **New (round 15):** the unsafe-symlink refusal is the one remaining case where main succeeds (it retried as install) and this branch refuses. Kept as outcome (2) — an escaping symlink is a positively identified containment hazard, not an unfamiliar shape. | For codex to rule on |
+| R15 | **New (round 15):** the restored install lane runs `npm ci --ignore-scripts`, so a native dependency it installs is unbuilt BY CONSTRUCTION and the artifact proof will refuse the round. A native project on `provision:'install'` therefore cannot provision — deliberately: the alternative is running arbitrary lifecycle scripts from a dependency tree inside the orchestrator. Clone (from a properly installed primary) remains the lane for native projects. | Deliberate, documented |
 
 ---
 
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1927 passed, 0 failed**, 106
-  files (1916 → 1927: eleven new tests — three for REGRESSION 1, five for
-  REGRESSION 2, three for REGRESSION 3, of which three across the round are
-  same-on-both-sides pins)
+- `npx vitest run` (full, from this worktree) → **1934 passed, 0 failed**, 106
+  files. Round 15 added 15 tests and deleted 8 that encoded removed behaviour
+  (1927 → 1934).
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
