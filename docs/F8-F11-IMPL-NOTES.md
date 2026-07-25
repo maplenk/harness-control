@@ -1179,10 +1179,95 @@ malformed and path-divergent payload shapes.
 
 ---
 
+---
+
+# Round 8 (final) — codex round-7 verdict on `373f219`
+
+Two HIGH merge-blockers, both closed. Commit map:
+
+| finding | commit |
+| --- | --- |
+| Blocker 1 (live-path receipt + TOCTOU) + the LOW propagation fix | `22ea489` |
+| Blocker 2 (unusable lock data) | `b0b9262` |
+
+Both were the same shape, and it is the shape this whole branch has been about:
+**a guard that degrades silently when its precondition is absent, instead of
+failing closed.**
+
+## Blocker 1 — the receipt was authoritative everywhere except where it was written
+
+Deterministic, not a race. On a round-ONE no-op the receipt and the diff are
+captured BEFORE the declared verification commands run. A command that creates
+and COMMITS code leaves a clean tree, so the no-commit branch saw empty
+`changedFiles`/`diff`/`postVerificationDirty` and completed the round — and the
+command-created commit became both `lastImplementationCommit` and the verifier's
+binding, disagreeing with the receipt.
+
+**(a) Adjudication.** `adjudicateImplementorDeliverable` now takes the round's
+receipt and returns `no_deliverable` when `hostHead` disagrees, checked BEFORE
+every other branch. `runRole` persists that stage atomically and throws. Wired at
+both adjudication sites.
+
+> **Implication, stated as instructed:** a declared verification command that
+> COMMITS is now a HARD ERROR rather than a silent rebinding. Verification
+> commands are meant to observe, not author; this makes that structural instead of
+> assumed. A spec whose verification command commits will fail loudly and must be
+> changed.
+
+**(b) TOCTOU.** The completed-implementor resume branch forced the worktree to a
+receipt-derived commit and then RE-READ HEAD, so anything moving HEAD in between
+became the binding — discarding the guarantee just established. `adoptWorktree`
+now returns the binding it forced and the branch uses it verbatim.
+
+## Blocker 2 — the version proof was conditional on its own precondition
+
+`lockedRootVersions` returned an EMPTY MAP for a missing/malformed/unsupported
+lockfile, and an absent entry SKIPPED the comparison. Yarn, pnpm, no lockfile, a
+malformed `package-lock.json`, or an unrecognised entry each degraded silently to
+presence-only — cloning a stale tree and stamping it v2.
+
+Now: unusable lock data returns a REASON and the caller REFUSES
+(`primary_tree_stale`, naming what could not be read and why, before any clone,
+with no marker written). A declared package with no resolved entry is a defect,
+not a skip. Unsupported formats say so explicitly rather than proceeding.
+
+npm v1/v2/v3 root entries are unchanged — only the fallthrough closed. A
+v1-lockfile test pins that recognition still works.
+
+**Stated limit, not expanded:** transitive dependency versions remain unverified.
+The root set is what the fingerprint covers and what verification commands reach
+for.
+
+## Documented residuals — for the merge record
+
+Everything below is knowingly left open. None is a regression against main.
+
+| # | residual | why left |
+| --- | --- | --- |
+| R1 | **Veto universality's syntactic defeat** — the typed no-op can be combined with an interactive handler by direct generic construction. Production Grok is safe: `buildGrokMediation` overwrites last. | Judged non-blocking this round; instructed not to touch. |
+| R2 | **Claude/Codex payload-binding gap** — both carry `noPayloadToVerify`, yet their tool calls do carry executable payloads (Claude's `Bash(command)`). Now a typed, greppable statement rather than a silent hole. | Tracked separately; needs a per-provider classifier. |
+| R3 | **Quarantine retention** — GC only runs from the per-assignment provisioning preflight and `gcProvisionStages` (whose only caller, `removeWorktree`, has no production callers). An assignment that times out and never provisions again keeps its stage. | Accepted round 5; needs a GC entry point that does not exist. |
+| R4 | **`factory.ts` `prepared.dispose()` unguarded** — can mask a primary failure during home-isolation teardown. | Accepted round 7 (masking family). |
+| R5 | **`quarantineStage`'s `warn(...)` can throw from the timeout `finally`** — the marker write and `probe.self()` are guarded, the sink is not. | Accepted round 7. |
+| R6 | **Transitive dependency versions unverified** (Blocker 2 above). | Explicitly scoped out. |
+| R7 | **F13** — role-independent stop-reason adjudication, host-attested evidence receipts. | Out of the LAND window by direction. |
+
+## Round-8 regression proofs
+
+| blocker | method | pre-fix |
+| --- | --- | --- |
+| 1 | receipt comparison neutered | 2 fail (both drivers) |
+| 2 | refusal neutered to presence-only | pass 90 fail 4 |
+
+Blocker 1's test drives codex's actual path — round-one no-op plus a verification
+command that commits, asserting refusal — not a synthetic disagreement.
+
+---
+
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1891 passed, 0 failed**, 106 files
+- `npx vitest run` (full, from this worktree) → **1898 passed, 0 failed**, 106 files
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
