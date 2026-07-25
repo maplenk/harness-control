@@ -611,3 +611,62 @@ describe('Grok command resolution and minimum version', () => {
     expect(parseGrokVersion('other 0.2.106')).toBeUndefined();
   });
 });
+
+// ===========================================================================
+// `git tag -l` / `git branch --list` — list-mode reads.
+//
+// FOUND LIVE, twice, on dogfood run `run_c4648778` (round 1 and its resume).
+// The implementor's first turn asked to run
+//   git show --stat <tag> …; git rev-parse <tag> …; git tag -l 'dogfood/*' …
+// Every other segment classified read-only. `git tag` was simply not on the
+// list, and a compound command is admitted only when EVERY segment is — so the
+// whole request was denied, the implementor treated the denial as fatal, and
+// the round closed `no_deliverable` with nothing written. The approved spec had
+// explicitly granted "run read-only git commands", so the SPEC promised a
+// permission the ENGINE refused.
+//
+// These subcommands cannot be added outright: `git tag NAME` CREATES a tag and
+// `git branch NAME` creates a branch. Admission therefore requires an explicit
+// `-l`/`--list` AND the absence of every mutating flag — two conditions, not
+// one, because `git branch -l -d main` satisfies the first and still deletes.
+// ===========================================================================
+describe('isGrokReadOnlyShellPermissionTitle — git list-mode subcommands', () => {
+  const admits = (command: string): boolean =>
+    isGrokReadOnlyShellPermissionTitle(`Execute \`${command}\``, undefined);
+
+  it.each([
+    'git tag -l',
+    'git tag --list',
+    "git tag -l 'dogfood/*'",
+    'git branch -l',
+    'git branch --list',
+    'git tag -l 2>/dev/null | head -n 20',
+  ])('ADMITS the pure list read: %s', (command) => {
+    expect(admits(command)).toBe(true);
+  });
+
+  it.each([
+    'git tag v1.0', // creates a tag
+    'git tag', // bare form; no list flag, so not judgeable as a read
+    'git branch feature', // creates a branch
+    'git branch',
+    'git tag -a v1 -m x', // annotated tag creation
+    'git branch -l -d main', // list flag present AND a delete
+    'git branch --list -D main',
+    'git tag -l -f v1', // force-overwrite an existing tag
+    'git branch -l --set-upstream-to=origin/main',
+    'git branch -l -m old new', // rename
+  ])('REFUSES the mutating form: %s', (command) => {
+    expect(admits(command)).toBe(false);
+  });
+
+  it('admits the exact compound request that closed run_c4648778 round 1 as no_deliverable', () => {
+    expect(
+      admits(
+        "git show dogfood/b0-first-implementor-commit --stat 2>/dev/null; " +
+          "git rev-parse dogfood/b0-first-implementor-commit 2>/dev/null; " +
+          "git tag -l 'dogfood/*' 2>/dev/null | head -n 20",
+      ),
+    ).toBe(true);
+  });
+});

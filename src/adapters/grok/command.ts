@@ -330,9 +330,51 @@ function hasEscapingPathArgument(
   });
 }
 
+/**
+ * Subcommands that READ in list mode but WRITE in their bare form: `git tag -l`
+ * lists tags, `git tag NAME` CREATES one; `git branch --list` lists, `git branch
+ * NAME` creates. They are admitted only with an explicit list flag, because with
+ * `-l`/`--list` every positional is a glob PATTERN and no form of the command
+ * can create a ref.
+ *
+ * Found live: an implementor's first turn ran
+ * `git show --stat <tag> …; git rev-parse <tag> …; git tag -l 'dogfood/*' …`.
+ * Every other segment classified read-only; `git tag` was not on the list, and
+ * because a compound command is admitted only when EVERY segment is, the whole
+ * request was denied. The implementor treated the denial as fatal and stopped
+ * with no deliverable — twice, on the round and on its resume.
+ */
+const GIT_LIST_MODE_SUBCOMMANDS = new Set(['tag', 'branch']);
+const GIT_LIST_FLAGS = new Set(['-l', '--list']);
+/**
+ * Present-tense refusal, not a fallback: a list flag alone is NOT sufficient,
+ * because `git branch -l -d NAME` still deletes. Requiring `-l` and refusing
+ * every mutating flag are two different conditions and both must hold.
+ */
+const GIT_LIST_MODE_MUTATING_FLAGS = new Set([
+  '-d', '-D', '--delete',
+  '-m', '-M', '--move',
+  '-C', '--copy',
+  '-f', '--force',
+  '-a', '-s', '-u', '--annotate', '--sign', '--local-user',
+  '--edit', '--create-reflog', '--set-upstream', '--set-upstream-to', '--unset-upstream',
+]);
+
 function isSafeGitRead(argv: readonly string[]): boolean {
   const subcommand = argv[1];
-  if (subcommand === undefined || !SAFE_GIT_READ_SUBCOMMANDS.has(subcommand)) return false;
+  if (subcommand === undefined) return false;
+  if (!SAFE_GIT_READ_SUBCOMMANDS.has(subcommand)) {
+    // Not a plain read. It may still be a list-mode read — but ONLY with an
+    // explicit list flag. Absent one, refuse: `git tag v1` creates a tag, and
+    // guessing from the shape of the positionals is exactly the inference that
+    // turns a write into an "apparently safe" read.
+    if (!GIT_LIST_MODE_SUBCOMMANDS.has(subcommand)) return false;
+    const args = argv.slice(2);
+    if (!args.some((arg) => GIT_LIST_FLAGS.has(arg))) return false;
+    if (args.some((arg) => GIT_LIST_MODE_MUTATING_FLAGS.has(arg) || arg.startsWith('--set-upstream-to='))) {
+      return false;
+    }
+  }
   return !argv.slice(2).some((arg) =>
     arg === '-c' ||
     arg === '--ext-diff' ||
