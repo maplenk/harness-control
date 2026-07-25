@@ -46,13 +46,14 @@
  *   `config_option_update`, `current_mode_update` normalize into typed
  *   events; unknown kinds still pass through un-dropped.
  */
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 import type { AcpStopReason, TurnUsage } from '../../domain/entities.js';
 import { acpSessionId, nativeSessionId, type AcpSessionId } from '../../domain/ids.js';
 import type { RoleName } from '../../domain/state.js';
 import { SystemClock, type Clock } from '../../lib/clock.js';
 import type { IsoTimestamp } from '../../lib/clock.js';
+import { resolvesInsideRoot } from '../../lib/path-containment.js';
 import { referenceClassifyError } from '../fake/in-process.js';
 import {
   AdapterError,
@@ -206,24 +207,6 @@ export function isWriteOperation(operation: string | undefined): boolean {
   return !READ_ONLY_OPERATION_RE.test(operation);
 }
 
-function isPathInside(root: string, candidate: string): boolean {
-  const relative = path.relative(root, candidate);
-  return (
-    relative === '' ||
-    (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
-  );
-}
-
-function nearestExistingAncestor(candidate: string): string | undefined {
-  let current = candidate;
-  for (;;) {
-    if (existsSync(current)) return current;
-    const parent = path.dirname(current);
-    if (parent === current) return undefined;
-    current = parent;
-  }
-}
-
 /**
  * Grok's ACP permission title for a structured edit is path-qualified rather
  * than a stable tool id. Accept only the two observed structured verbs, one
@@ -231,6 +214,11 @@ function nearestExistingAncestor(candidate: string): string | undefined {
  * ancestor resolves inside the canonical assigned worktree. This rejects
  * traversal and symlink escapes before Grok's process sandbox independently
  * enforces the same workspace boundary.
+ *
+ * F14: the containment computation itself now lives in `lib/path-containment.ts`
+ * — unchanged, but SHARED, because the Grok read-only shell classifier must
+ * answer the identical question about absolute path ARGUMENTS and a second copy
+ * of a security boundary is a second copy to forget to fix.
  */
 export function isWorkspaceWriteOperation(
   operation: string | undefined,
@@ -241,14 +229,7 @@ export function isWorkspaceWriteOperation(
   if (match === null) return false;
   const requested = match[1];
   if (requested === undefined || !path.isAbsolute(requested)) return false;
-  try {
-    const realRoot = realpathSync(workspaceRoot);
-    const ancestor = nearestExistingAncestor(requested);
-    if (ancestor === undefined) return false;
-    return isPathInside(realRoot, realpathSync(ancestor));
-  } catch {
-    return false;
-  }
+  return resolvesInsideRoot(workspaceRoot, requested);
 }
 
 /**

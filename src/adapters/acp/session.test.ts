@@ -373,6 +373,28 @@ describe('permission mediation decision core (§10.2, T20)', () => {
       policy: { allow: [], workspaceWriteRoot: root },
     } as const;
 
+    // F14 (found while consolidating containment): a `..` that FOLLOWS a symlink
+    // is not undone by the symlink — `<root>/escape/..` is the parent of
+    // `outside`, not `<root>`. This rule admitted it anyway, because Node's
+    // `realpathSync` is not POSIX `realpath(3)`: it `path.resolve`s first, which
+    // collapses the `..` LEXICALLY back to `<root>` before any symlink is
+    // touched. Measured on the parent commit, this exact title returned `true`
+    // and the write lands in the worktree's PARENT directory.
+    const lexicalEscapeTitle = `Write \`${root}/escape/../pwned.txt\``;
+    expect(isWorkspaceWriteOperation(lexicalEscapeTitle, root)).toBe(false);
+    expect(decidePermission(policy, lexicalEscapeTitle).action).toBe('deny');
+
+    // F14 round 3: `\` is a FILENAME byte on darwin (`"os": ["darwin"]`), so
+    // `<root>\` names a SIBLING of the worktree, not the worktree. A containment
+    // helper that stripped it as a separator answered about `<root>` and this
+    // rule returned `allowlisted_workspace_write` for a write landing outside.
+    await writeFile(`${root}\\`, 'outside\n', 'utf8');
+    const backslashSiblingTitle = `Write \`${root}\\\``;
+    expect(isWorkspaceWriteOperation(backslashSiblingTitle, root)).toBe(false);
+    expect(decidePermission(policy, backslashSiblingTitle).action).toBe('deny');
+    // ...while a backslash INSIDE a name is just a name.
+    expect(isWorkspaceWriteOperation(`Write \`${root}/we\\ird.txt\``, root)).toBe(true);
+
     expect(isWorkspaceWriteOperation(insideTitle, root)).toBe(true);
     expect(decidePermission(policy, insideTitle)).toEqual({
       action: 'allow',

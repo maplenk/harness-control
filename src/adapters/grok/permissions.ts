@@ -71,7 +71,20 @@ export function buildGrokMediation(input: GrokMediationInput): VetoedMediation {
                 ...(input.allowedShellCommands ?? []).map(grokShellPermissionTitle),
               ]),
             ],
-            allowReadOnlyOperation: isGrokReadOnlyShellPermissionTitle,
+            // F14: the classifier is BOUND to the assignment worktree here —
+            // the same root the structured-write rule uses on the next line,
+            // and the same absolute path the implementor prompt confines the
+            // agent to. Before this binding it judged absolute paths with no
+            // root at all and therefore refused every one of them, including
+            // the worktree the prompt had just named; the agent's first
+            // exploration command was denied and the turn ended before any work
+            // was committed. `isGrokReadOnlyShellPermissionTitle` requires the
+            // root parameter, so this closure is the only way to satisfy
+            // `allowReadOnlyOperation`'s single-argument shape — a future call
+            // site cannot re-acquire the old behaviour by simply passing the
+            // function reference.
+            allowReadOnlyOperation: (operation: string): boolean =>
+              isGrokReadOnlyShellPermissionTitle(operation, input.cwd),
             workspaceWriteRoot: input.cwd,
           },
         }
