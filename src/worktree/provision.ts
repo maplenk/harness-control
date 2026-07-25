@@ -1641,13 +1641,24 @@ function proveePrimaryTree(
         const version = (raw as { version?: unknown }).version;
         if (typeof version === 'string') installed = version;
       }
-    } catch {
-      // An unreadable/malformed installed manifest is not evidence of a match.
-      defects.push({ name, detail: `installed package.json is unreadable or malformed (lockfile wants ${expected})` });
+    } catch (error) {
+      // ROUND 16 (the sweep): an unreadable or malformed installed manifest is not
+      // evidence of a match — and it is not evidence of a MISMATCH either. The
+      // package is present; we simply cannot read its version. Refusing here made
+      // one unreadable file inside node_modules end a run that main completes.
+      indeterminate.push({
+        name,
+        detail: `its installed package.json could not be read or parsed (${messageOf(error)}), so its version cannot be compared with the lockfile's ${expected}`,
+      });
       continue;
     }
     if (installed === undefined) {
-      defects.push({ name, detail: `installed package.json declares no version (lockfile wants ${expected})` });
+      // Readable, but it declares no `version`. npm tolerates that; we simply have
+      // nothing to compare.
+      indeterminate.push({
+        name,
+        detail: `its installed package.json declares no version, so nothing can be compared with the lockfile's ${expected}`,
+      });
     } else if (installed !== expected) {
       defects.push({ name, detail: `installed ${installed}, lockfile resolved ${expected}` });
     }
@@ -1889,7 +1900,16 @@ function nativeArtifacts(pkgDir: string): { readonly artifacts: string[]; readon
   const artifacts: string[] = [];
   let complete = true;
   const walk = (dir: string, depth: number): void => {
-    if (depth > NATIVE_ARTIFACT_SCAN_DEPTH || artifacts.length >= MAX_NATIVE_ARTIFACTS) return;
+    if (artifacts.length >= MAX_NATIVE_ARTIFACTS) return; // enough found; not a gap
+    if (depth > NATIVE_ARTIFACT_SCAN_DEPTH) {
+      // ROUND 16: stopping is NOT looking. Round 15 returned here silently and
+      // then declared "no artifact", so a valid addon stored deeper than the
+      // traversal goes — `node-gyp-build` layouts nest by runtime/ABI/platform —
+      // was reported as never built. The same rule the native-package scan's own
+      // depth cap follows: exhaustion is indeterminate, never absence.
+      complete = false;
+      return;
+    }
     let entries: Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -1948,17 +1968,23 @@ function nativeBuildPackages(treePath: string, warn: ProvisionWarnSink): NativeP
     try {
       manifestRaw = fs.readFileSync(path.join(dir, 'package.json'), 'utf8');
     } catch (error) {
-      // ROUND 5 (#3 audit): only a GENUINE absence is a skip — a cache dir, a
-      // stray file, `.bin`. Any OTHER read error (EACCES, EIO) is a package we
-      // could not examine, and an unexamined package cannot be attested.
+      // Only a GENUINE absence is a silent skip — a cache dir, a stray file, `.bin`.
+      //
+      // ROUND 16 (the sweep): any OTHER read error (EACCES, EIO) used to REFUSE,
+      // on the reasoning that "a package we could not examine cannot be attested".
+      // That inverts the rule: not being able to look is not a finding. Main never
+      // opens these manifests at all, so a tree it clones and verifies was refused
+      // because ONE file inside node_modules was unreadable. Outcome (3).
       const code = (error as NodeJS.ErrnoException).code;
       if (code === 'ENOENT' || code === 'ENOTDIR') return;
-      throw failClosed(
-        `the native-build scan could not read ${path.join(dir, 'package.json')}: ${messageOf(error)}. ` +
-          'A package we could not examine cannot be attested; refusing rather than marking the tree proven.',
-        `unreadable manifest for ${specifier}`,
-        'native_toolchain_unproven',
-      );
+      warn({
+        kind: 'proof_indeterminate',
+        subject: dir,
+        reason:
+          `its package.json could not be read (${messageOf(error)}), so this package was not examined for a native ` +
+          'build step and is NOT proven. Proceeding as main does.',
+      });
+      return;
     }
     let parsed: Record<string, unknown>;
     try {
@@ -1968,14 +1994,20 @@ function nativeBuildPackages(treePath: string, warn: ProvisionWarnSink): NativeP
       }
       parsed = value as Record<string, unknown>;
     } catch (error) {
-      // A malformed manifest inside a tree we are attesting is a corrupt tree —
-      // the same fail-closed posture `parsePackageJson` (B3) already takes.
-      throw failClosed(
-        `the native-build scan could not parse ${path.join(dir, 'package.json')}: ${messageOf(error)}. ` +
-          'A package whose manifest is corrupt cannot be attested.',
-        `malformed manifest for ${specifier}`,
-        'native_toolchain_unproven',
-      );
+      // ROUND 16 (the sweep): a malformed manifest INSIDE node_modules used to be
+      // treated as a corrupt tree. It is not evidence about this round: main never
+      // parses these files, and a half-written manifest for some package the round
+      // may not even load cannot be shown to break anything. (The committed
+      // manifests at HEAD are different — those are this round's INPUT, and
+      // `parsePackageJson`'s B3 refusal for them is untouched.)
+      warn({
+        kind: 'proof_indeterminate',
+        subject: dir,
+        reason:
+          `its package.json could not be parsed (${messageOf(error)}), so this package was not examined for a ` +
+          'native build step and is NOT proven. Proceeding as main does.',
+      });
+      return;
     }
     const scripts = parsed['scripts'];
     if (scripts === null || typeof scripts !== 'object') return;
@@ -2023,11 +2055,19 @@ function nativeBuildPackages(treePath: string, warn: ProvisionWarnSink): NativeP
     try {
       entries = fs.readdirSync(root, { withFileTypes: true });
     } catch (error) {
-      throw failClosed(
-        `could not enumerate the staged node_modules at ${root} to derive its native-build packages: ${messageOf(error)}`,
-        'staged tree unreadable',
-        'native_toolchain_unproven',
-      );
+      // ROUND 16 (the sweep): a directory we cannot enumerate is a directory we
+      // did not examine, not a broken tree. (Reachability note: the main-era
+      // symlink containment scan walks these same directories and refuses first
+      // on an unreadable one — as it does on main — so this is defence in depth
+      // for the race where a directory becomes unreadable between the two walks.)
+      warn({
+        kind: 'proof_indeterminate',
+        subject: root,
+        reason:
+          `it could not be enumerated (${messageOf(error)}), so no package under it was examined for a native ` +
+          'build step. Proceeding as main does.',
+      });
+      return;
     }
     const visit = (dir: string, specifier: string, name: string): void => {
       consider(dir, specifier, name);
@@ -2046,12 +2086,15 @@ function nativeBuildPackages(treePath: string, warn: ProvisionWarnSink): NativeP
           // while the tree still received a v2 (smoke-attested) marker — an
           // unexamined subtree stamped proven. Enumeration and depth must have
           // the same posture: a scan that could not complete attests nothing.
-          throw failClosed(
-            `the native-build scan could not enumerate ${path.join(root, entry.name)}: ${messageOf(error)}. ` +
-              'A subtree we could not examine cannot be attested; refusing rather than marking the tree proven.',
-            `unreadable scope directory ${entry.name}`,
-            'native_toolchain_unproven',
-          );
+          // ROUND 16 (the sweep): same rule, same reachability note as above.
+          warn({
+            kind: 'proof_indeterminate',
+            subject: path.join(root, entry.name),
+            reason:
+              `this scope directory could not be enumerated (${messageOf(error)}), so the packages under it were ` +
+              'not examined for a native build step. Proceeding as main does.',
+          });
+          continue;
         }
         for (const child of scoped) {
           if (child.isDirectory()) {
@@ -2142,8 +2185,20 @@ async function runNativeSmoke(
       // `process.dlopen` is exactly what a lazily-loading package does when its
       // API is first used, without needing to know that API — no constructor to
       // guess, no arbitrary code to execute beyond the addon's own init.
+      //
+      // ROUND 16: ONE artifact loading is the proof. Requiring EVERY one to load
+      // refused a package shipping per-platform/per-ABI prebuilds (`prebuildify`,
+      // `node-gyp-build`), where by construction only one variant is loadable on
+      // this host and the wrapper selects it — a package main installs and uses.
+      // Since we cannot know which variant the wrapper picks, a single successful
+      // load is sufficient evidence that the build step produced something this
+      // host can load; only ZERO loadable artifacts is positive evidence of
+      // breakage.
       const dlopenScript =
-        `for (const f of ${JSON.stringify(scan.artifacts)}) { process.dlopen({exports:{}}, f); }`;
+        `const files=${JSON.stringify(scan.artifacts)};const errs=[];` +
+        'for (const f of files) { try { process.dlopen({exports:{}}, f); process.exit(0); } ' +
+        'catch (err) { errs.push(f + ": " + ((err && err.message) || String(err))); } }' +
+        'console.error(errs.join("\\n"));process.exit(1);';
       await execFileAsync(process.execPath, ['-e', dlopenScript], {
         cwd: pkg.dir,
         env,
@@ -2155,9 +2210,9 @@ async function runNativeSmoke(
         ? ((error as { stderr: string }).stderr).trim().split('\n').slice(0, 6).join(' | ')
         : messageOf(error);
       throw failClosed(
-        `provisioned node_modules for ${treePath} could not dlopen the compiled artifact of '${pkg.dir}' ` +
-          `(${scan.artifacts.length} found): the build is present but unloadable — a truncated download, a build ` +
-          `for the wrong architecture, or a broken toolchain. Refusing to verify against it: ${stderr}`,
+        `provisioned node_modules for ${treePath} could not dlopen ANY of the ${scan.artifacts.length} compiled ` +
+          `artifact(s) of '${pkg.dir}': the build is present but nothing it produced loads here — a truncated ` +
+          `download, a build for the wrong architecture, or a broken toolchain. Refusing to verify against it: ${stderr}`,
         `dlopen failed for ${pkg.dir}`,
         'native_toolchain_unproven',
       );
@@ -2261,10 +2316,12 @@ export function lstatSafe(target: string): fs.Stats | undefined {
 function statFollowingSafe(target: string): fs.Stats | undefined {
   try {
     return fs.statSync(target);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') return undefined;
-    throw failClosed(`could not stat ${target}: ${messageOf(error)}`, `stat ${target} failed (${code ?? 'unknown'})`);
+  } catch {
+    // ROUND 16 (the sweep): EVERY failure here — a dangling link, a permission
+    // error, a loop — means the same thing, "we could not examine the target",
+    // and the sole caller already reports that as indeterminate. Throwing turned
+    // an unexaminable SYMLINK TARGET into a refusal main never makes.
+    return undefined;
   }
 }
 

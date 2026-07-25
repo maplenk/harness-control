@@ -1694,7 +1694,10 @@ describe('F9 AC-2 — a stale primary tree is never cloned (primary_tree_stale)'
     expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
   });
 
-  it('a package whose installed manifest is unreadable is refused (not assumed to match)', async () => {
+  // ROUND 16 (the sweep) — REVERSED with the same reasoning: the package is
+  // PRESENT and we simply cannot read its version. That is not evidence of a
+  // mismatch, and main compares nothing at all.
+  it('a package whose installed manifest is unreadable is INDETERMINATE (present, unverifiable)', async () => {
     const repo = track(await makeTempGitRepo('harness-f9-unread-'));
     await repo.writeFile('.gitignore', 'node_modules/\n');
     await repo.writeFile(
@@ -1717,18 +1720,19 @@ describe('F9 AC-2 — a stale primary tree is never cloned (primary_tree_stale)'
     );
     await repo.commitAll('deps with a pinned lockfile');
     const nm = await writePrimaryNodeModules(repo.dir);
-    // The lockfile pins a version, so the installed manifest MUST be readable to
-    // prove it — an unreadable one is not evidence of a match.
+    // The lockfile pins a version and the installed manifest cannot be read — so
+    // nothing can be COMPARED. That is not evidence of a mismatch.
     fs.writeFileSync(path.join(nm, 'left-pad', 'package.json'), '{ not json');
     const fake = fakeRuntime();
-    const manager = await openManager(repo, { runtime: fake.runtime });
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
     const asg = assignmentId('asg_f9_version_unreadable');
     await createAtHead(repo, manager, asg);
 
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-    expect(error.provisioningCause).toBe('primary_tree_stale');
-    expect(error.message).toContain('left-pad');
-    expect(fake.calls.clone).toBe(0); // refused BEFORE cloning
+    expect((await manager.provisionForVerification(asg)).provisioned).toBe(true);
+    const named = warnings.filter((w) => w.kind === 'proof_indeterminate');
+    expect(named.some((w) => (w as { subject: string }).subject === 'left-pad')).toBe(true);
+    expect(named.map((w) => (w as { reason: string }).reason).join(' ')).toMatch(/could not be read or parsed/i);
   });
 
   // ROUND 8 (Blocker 2) made unusable lock data a REFUSAL, because it had been a
@@ -2205,6 +2209,49 @@ describe('ROUND 15 — the native proof is the compiled ARTIFACT, not a successf
     expect((smoked as { packages: readonly string[] }).packages.some((p) => p.endsWith('fake-native'))).toBe(true);
   });
 
+  // ROUND 16 — the same sweep, applied to the proof's OWN limits and to the
+  // observations it cannot complete. Every refusal below used to fire on a tree
+  // MAIN clones and uses.
+  it('an artifact stored DEEPER than the scan limit is indeterminate, never "no artifact"', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'deep-native': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad'] });
+    writeInstalledPackage(nm, 'deep-native', { native: true, built: false });
+    // A real addon, stored 7 directories down — deeper than the traversal goes.
+    // `node-gyp-build`-style layouts nest by runtime/ABI/platform and get close.
+    const deep = path.join(nm, 'deep-native', 'a', 'b', 'c', 'd', 'e', 'f', 'g');
+    fs.mkdirSync(deep, { recursive: true });
+    fs.copyFileSync(realNativeAddon(), path.join(deep, 'bind.node'));
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r16_deep_artifact');
+    await createAtHead(repo, manager, asg);
+
+    // Stopping the traversal is not evidence of absence.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    const indeterminate = warnings.filter((w) => w.kind === 'proof_indeterminate');
+    expect(indeterminate.some((w) => /deep-native/.test((w as { subject: string }).subject))).toBe(true);
+  });
+
+  it('a package shipping MULTIPLE prebuilds is proven by one that loads, not refused for one that does not', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'multi-native': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad'] });
+    writeInstalledPackage(nm, 'multi-native', { native: true, built: true }); // the loadable one
+    // The shape `prebuildify`/`node-gyp-build` produce: one directory per
+    // platform/ABI, of which THIS host can load exactly one. The others are
+    // foreign objects here and always have been.
+    const prebuilds = path.join(nm, 'multi-native', 'prebuilds');
+    for (const target of ['linux-x64', 'win32-ia32']) {
+      fs.mkdirSync(path.join(prebuilds, target), { recursive: true });
+      fs.writeFileSync(path.join(prebuilds, target, 'node.napi.node'), `not loadable on this host (${target})\n`);
+    }
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_r16_multi_prebuild');
+    await createAtHead(repo, manager, asg);
+
+    // Main installs and uses this package; the wrapper picks the right variant.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+  });
+
   it('an artifact that exists but CANNOT be dlopened is refused (a corrupt or wrong-arch build)', async () => {
     const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'fake-native': '1.0.0' } }));
     const nm = await writePrimaryNodeModules(repo.dir, {
@@ -2442,13 +2489,12 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     expect((depthWarn as { subject: string }).subject).toContain('node_modules');
   });
 
-  it('an UNREADABLE package manifest fails the scan closed (never silently omitted)', async () => {
-    // Round 4 swallowed read/enumeration failures during the native scan, so a
-    // package it could not examine was simply omitted while the tree STILL got a
-    // v2 (smoke-attested) marker — the same silent-truncation shape the depth cap
-    // now refuses. A manifest is the reachable case: the symlink containment scan
-    // (which runs first) reads DIRECTORIES, so an unreadable directory refuses
-    // there, but it never opens a package.json.
+  // ROUND 16 (the sweep) — REVERSED. Round 5 made these refuse so a package the
+  // scan could not examine was never silently omitted from a smoke-attested tree.
+  // The silence was the defect; the refusal was the over-correction. Main never
+  // opens these manifests at all, so one unreadable or half-written file inside
+  // node_modules ended a run main completes. They are now LOUD and non-fatal.
+  it('an UNREADABLE package manifest is indeterminate — named, never silently omitted', async () => {
     const repo = track(await makeDepsRepo());
     await writePrimaryNodeModules(repo.dir);
     let staged: string | undefined;
@@ -2459,21 +2505,22 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
         fs.chmodSync(staged, 0o000);
       },
     });
-    const manager = await openManager(repo, { runtime: fake.runtime });
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
     const asg = assignmentId('asg_manifest_unreadable');
     const handle = await createAtHead(repo, manager, asg);
 
     try {
-      const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-      expect(error.provisioningCause).toBe('native_toolchain_unproven');
-      expect(error.message).toContain('left-pad');
-      expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
+      expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+      expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(true);
+      const named = warnings.filter((w) => w.kind === 'proof_indeterminate');
+      expect(named.some((w) => /left-pad/.test((w as { subject: string }).subject))).toBe(true);
     } finally {
       if (staged !== undefined && existsSync(staged)) fs.chmodSync(staged, 0o644);
     }
   });
 
-  it('a MALFORMED package manifest fails the scan closed', async () => {
+  it('a MALFORMED package manifest is indeterminate — named, never silently omitted', async () => {
     const repo = track(await makeDepsRepo());
     await writePrimaryNodeModules(repo.dir);
     const fake = fakeRuntime({
@@ -2482,13 +2529,14 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
         fs.writeFileSync(path.join(dst, 'left-pad', 'package.json'), '{ not json');
       },
     });
-    const manager = await openManager(repo, { runtime: fake.runtime });
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
     const asg = assignmentId('asg_manifest_malformed');
     await createAtHead(repo, manager, asg);
 
-    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
-    expect(error.provisioningCause).toBe('native_toolchain_unproven');
-    expect(error.message).toContain('left-pad');
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    const named = warnings.filter((w) => w.kind === 'proof_indeterminate');
+    expect(named.some((w) => /left-pad/.test((w as { subject: string }).subject))).toBe(true);
   });
 
   it('an unreadable scope DIRECTORY is refused before the tree can be marked', async () => {
