@@ -26,7 +26,7 @@
  *    root) happens on the way in and cannot skip it.
  */
 import type { RoleName } from '../../domain/state.js';
-import type { PermissionMediationConfig, VerifyOperationPayload } from '../acp/session.js';
+import { noPayloadToVerify, type PermissionMediationConfig, type VerifyOperationPayload } from '../acp/session.js';
 import { grokShellPayloadMatchesTitle, grokShellPermissionTitle, isGrokReadOnlyShellPermissionTitle } from './command.js';
 
 /**
@@ -56,7 +56,10 @@ export interface GrokMediationInput {
  * `undefined`, so there is no "no config, no veto" path either.
  */
 export function buildGrokMediation(input: GrokMediationInput): VetoedMediation {
-  const base: PermissionMediationConfig = input.permissions ?? { mode: 'headless' };
+  // The placeholder veto here is REPLACED unconditionally by the real one on
+  // the final return; it exists only so the intermediate value typechecks.
+  const base: PermissionMediationConfig =
+    input.permissions ?? { mode: 'headless', verifyOperationPayload: noPayloadToVerify };
   const shaped: PermissionMediationConfig =
     input.role === 'implementor' && base.mode === 'headless'
       ? {

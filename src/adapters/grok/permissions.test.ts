@@ -15,7 +15,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { RoleName } from '../../domain/state.js';
-import { decidePermission, type PermissionMediationConfig } from '../acp/session.js';
+import { decidePermission, noPayloadToVerify, type PermissionMediationConfig } from '../acp/session.js';
 import { buildGrokMediation } from './permissions.js';
 
 const ROLES: readonly (RoleName | undefined)[] = [undefined, 'coordinator', 'implementor', 'verifier'];
@@ -23,15 +23,15 @@ const ROLES: readonly (RoleName | undefined)[] = [undefined, 'coordinator', 'imp
 /** Every mediation shape a caller can hand the Grok factory. */
 const MEDIATIONS: ReadonlyArray<{ readonly label: string; readonly permissions?: PermissionMediationConfig }> = [
   { label: 'no mediation supplied at all' },
-  { label: 'headless, no policy', permissions: { mode: 'headless' } },
+  { label: 'headless, no policy', permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless' } },
   {
     label: 'headless with an exact allowlist',
-    permissions: { mode: 'headless', policy: { allow: ['Execute `npm run typecheck`'] } },
+    permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: ['Execute `npm run typecheck`'] } },
   },
-  { label: 'interactive, no handler', permissions: { mode: 'interactive' } },
+  { label: 'interactive, no handler', permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'interactive' } },
   {
     label: 'interactive with a configured handler',
-    permissions: { mode: 'interactive', handler: async () => ({ kind: 'cancelled' as const }) },
+    permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'interactive', handler: async () => ({ kind: 'cancelled' as const }) },
   },
 ];
 
@@ -71,9 +71,35 @@ describe('buildGrokMediation — the payload veto is universal', () => {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // ROUND 7 (Finding 3) — the enumeration above covers HELPER inputs. The hole
+  // was a CONSTRUCTOR: the publicly exported generic `AcpStdioAdapter` accepted
+  // an arbitrary Grok harnessId/spawn plus an OPTIONAL-veto mediation config, so
+  // building one directly with an approve-all interactive handler bypassed
+  // `buildGrokMediation` entirely and compiled fine.
+  //
+  // The fix is a TYPE obligation at the construction site, so this test is a
+  // compile-time assertion as much as a runtime one: the object literal below
+  // cannot omit `verifyOperationPayload` and still typecheck. `noPayloadToVerify`
+  // exists so "this path has no payload to bind" is a stated decision someone
+  // typed, never an absence.
+  // -------------------------------------------------------------------------
+  it('a mediation config cannot be constructed without SOME veto decision', () => {
+    // Every field here is required by the type; dropping the last line is a
+    // compile error, which is the actual enforcement.
+    const explicitNoop: PermissionMediationConfig = {
+      mode: 'interactive',
+      handler: async () => ({ kind: 'selected', optionId: 'allow_once' }),
+      verifyOperationPayload: noPayloadToVerify,
+    };
+    expect(explicitNoop.verifyOperationPayload).toBe(noPayloadToVerify);
+    // The named no-op is honest about what it does: it binds nothing.
+    expect(noPayloadToVerify('Execute `ls`', { command: 'rm -rf /' })).toBe(true);
+  });
+
   it('shapes the implementor headless policy exactly as before (allowlist + classifier + write root)', () => {
     const config = buildGrokMediation({
-      permissions: { mode: 'headless', policy: { allow: ['keep me'] } },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: ['keep me'] } },
       role: 'implementor',
       cwd: '/repo/worktree',
       allowedShellCommands: ['npm run typecheck'],
@@ -86,7 +112,7 @@ describe('buildGrokMediation — the payload veto is universal', () => {
 
   it('leaves a NON-implementor policy untouched apart from the veto', () => {
     const supplied: PermissionMediationConfig = {
-      mode: 'headless',
+      verifyOperationPayload: noPayloadToVerify, mode: 'headless',
       role: 'verifier',
       policy: { allow: ['Execute `npm test`'] },
     };

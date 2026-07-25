@@ -25,6 +25,7 @@ import {
 import { homedir, tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { createOpenCodeAcpAdapter } from '../src/adapters/factory.js';
+import { noPayloadToVerify } from '../src/adapters/acp/session.js';
 import { openCodeAuthJsonPath } from '../src/adapters/opencode/index.js';
 import { applyRoleModel, resolveRoleModel } from '../src/app/model-resolution.js';
 
@@ -130,7 +131,7 @@ async function main(): Promise<void> {
     created = createOpenCodeAcpAdapter({
       cwd: repo,
       processEnv: { HOME: sourceHome },
-      permissions: { mode: 'headless', role: 'implementor' },
+      permissions: { mode: 'headless', role: 'implementor', verifyOperationPayload: noPayloadToVerify },
       openCodeHome: { realHome: sourceHome, tempRoot: isolatedRoot },
     });
     const { adapter } = created;

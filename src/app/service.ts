@@ -217,6 +217,7 @@ import {
   type CostProjectionState,
 } from './cost.js';
 import type { PermissionMediation, RoleRunner, RoleSession } from './role-runner.js';
+import { noPayloadToVerify } from '../adapters/acp/session.js';
 import {
   COST_PROJECTION,
   ENGINE_STATE_PROJECTION,
@@ -5899,12 +5900,21 @@ export function toPermissionConfig(
   mediation: PermissionMediation,
   role: RoleName,
 ): PermissionMediationConfig {
+  // ROUND 7: the veto is REQUIRED at every construction site, so this generic
+  // mapping must state its decision. It passes the explicit no-op because it is
+  // provider-AGNOSTIC — it does not know what a payload looks like for the
+  // harness that will run. Provider factories layer their own veto OVER this:
+  // `buildGrokMediation` replaces it with the real title/payload binding for
+  // every Grok session. Claude/Codex have no payload-binding classifier yet, so
+  // for them this no-op is the honest current state and a visible, reviewable
+  // gap rather than a silent absence (see the notes' residuals).
   if (mediation.mode === 'interactive') {
-    return { mode: 'interactive', role, handler: mediation.onRequest };
+    return { mode: 'interactive', role, handler: mediation.onRequest, verifyOperationPayload: noPayloadToVerify };
   }
   return {
     mode: 'headless',
     role,
+    verifyOperationPayload: noPayloadToVerify,
     ...(mediation.allow !== undefined ? { policy: { allow: mediation.allow } } : {}),
   };
 }

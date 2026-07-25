@@ -136,11 +136,29 @@ export interface HeadlessPermissionPolicy {
  */
 export type VerifyOperationPayload = (operation: string | undefined, rawInput: unknown) => boolean;
 
+/**
+ * ROUND 7 — the EXPLICIT no-op veto, for an approval surface that genuinely has
+ * no payload to bind (a provider whose tool calls carry no executable command).
+ *
+ * It exists so that "this path has nothing to verify" is a DECISION someone
+ * typed at the construction site, never an absence that nobody noticed. Four
+ * consecutive review rounds found a different construction path with no veto,
+ * each time because the field was optional somewhere; making it required and
+ * supplying this for the honest exceptions is what ends that.
+ *
+ * Never use it to silence a path that DOES carry a payload — that is precisely
+ * the fail-open this vocabulary was introduced to prevent.
+ */
+export const noPayloadToVerify: VerifyOperationPayload = () => true;
+
 export type PermissionMediationConfig =
   | {
       readonly mode: 'interactive';
       readonly role?: RoleName;
-      readonly verifyOperationPayload?: VerifyOperationPayload;
+      /** REQUIRED (round 7): pass `noPayloadToVerify` to state that this surface
+       * has no payload to bind. Optionality here is what let four separate
+       * construction paths reach an approval with no veto at all. */
+      readonly verifyOperationPayload: VerifyOperationPayload;
       /**
        * Interactive surface. When present, invoked per request (the outcome
        * is forwarded to the agent). When absent, the request is surfaced via
@@ -151,7 +169,8 @@ export type PermissionMediationConfig =
   | {
       readonly mode: 'headless';
       readonly role?: RoleName;
-      readonly verifyOperationPayload?: VerifyOperationPayload;
+      /** REQUIRED (round 7) — see the interactive variant. */
+      readonly verifyOperationPayload: VerifyOperationPayload;
       /** Omitted policy = empty allowlist = default DENY everything. */
       readonly policy?: HeadlessPermissionPolicy;
     };
@@ -259,15 +278,13 @@ export function decidePermission(
   // an unreadable title is "not a shell request" or "a shell request we cannot
   // read" is the veto's job, not this function's (see
   // `grokShellPayloadMatchesTitle`).
-  if (config.verifyOperationPayload !== undefined) {
-    let vetoed: boolean;
-    try {
-      vetoed = config.verifyOperationPayload(operation, rawInput) !== true;
-    } catch {
-      vetoed = true;
-    }
-    if (vetoed) return { action: 'deny', reason: 'denied_raw_input_mismatch' };
+  let vetoed: boolean;
+  try {
+    vetoed = config.verifyOperationPayload(operation, rawInput) !== true;
+  } catch {
+    vetoed = true;
   }
+  if (vetoed) return { action: 'deny', reason: 'denied_raw_input_mismatch' };
   if (config.mode === 'interactive') {
     return { action: 'interactive', reason: 'interactive' };
   }
@@ -1140,7 +1157,10 @@ export class AcpStdioAdapter implements HarnessAdapter {
     // Surface on the update stream regardless of mode (observability, T20).
     this.#routeUpdate(sessionKey, { kind: 'permission_request', request });
 
-    const config = this.#options.permissions ?? { mode: 'headless' };
+    // No mediation configured at all = default-deny (empty allowlist, no
+    // classifier, no write root), so there is no approval path for a veto to
+    // gate; the explicit no-op states that rather than leaving a hole.
+    const config = this.#options.permissions ?? { mode: 'headless', verifyOperationPayload: noPayloadToVerify };
     // HIGH-5: hand the classifier the tool call's `rawInput` — the payload the
     // provider actually executes — alongside the human-readable title.
     const decision = decidePermission(config, title, toolCall?.['rawInput']);

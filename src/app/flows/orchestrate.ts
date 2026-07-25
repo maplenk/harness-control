@@ -350,6 +350,31 @@ function carriedVerifierState(
  *    dirt is never preserved work.
  * The single-writer lease is held on return.
  */
+/**
+ * ROUND 7 (Finding 1) — the durable binding a COMPLETED implementor round
+ * re-enters verification against.
+ *
+ * The receipt (the round's own `pre_verify_handoff` checkpoint) is authoritative:
+ * it is the round asserting which commit it stands behind. The round-scoped
+ * `lastImplementationCommit` pointer is equally durable but written LATER by the
+ * loop driver, so it is accepted only when it AGREES with the receipt — a
+ * disagreement means one of the two records is stale, which is not a state to
+ * silently pick a winner in.
+ *
+ * `undefined` = no durable source; the caller REFUSES. There is deliberately no
+ * fallback to current HEAD: that is authorization by topology.
+ */
+function completedImplementorBinding(
+  receipt: GitSha | undefined,
+  persistedForRound: GitSha | undefined,
+): GitSha | undefined {
+  if (receipt !== undefined) {
+    if (persistedForRound !== undefined && String(persistedForRound) !== String(receipt)) return undefined;
+    return receipt;
+  }
+  return persistedForRound;
+}
+
 async function adoptWorktree(
   deps: ImplementVerifyLoopDeps,
   input: ImplementVerifyLoopInput,
@@ -403,19 +428,33 @@ async function adoptWorktree(
     const forced =
       resume.round.role === 'verifier'
         ? resume.round.implementationCommit
-        : // The persisted host-verified implementation commit — used ONLY when it was
-          // recorded FOR THIS round (#1, round-4: round-scoped). Otherwise (never
-          // recorded, OR a STALE record left by an earlier round whose successor
-          // completed at a NEW commit but crashed before updating it) fall back to the
-          // current worktree HEAD, which is exactly the resuming completed round's
-          // durable commit — no WIP commit has run yet at adoption. Never reset/verify
-          // a commit from a DIFFERENT round.
-          persisted !== undefined && persisted.round === resume.round.round
-          ? persisted.commit
-          : gitSha(await git.resolveSha(facts.worktreePath, 'HEAD'));
+        : // ROUND 7 (Finding 1) — the COMPLETED-implementor path is bound to a
+          // DURABLE source, never to bare current HEAD. It used to fall back to
+          // `git rev-parse HEAD` whenever no round-scoped
+          // `lastImplementationCommit` existed, so a crash between `runRole`
+          // recording completion and the loop recording that pointer let ANY
+          // commit subsequently appended to the worktree become the verification
+          // binding. That is the original F8 defect — topology is not
+          // authorization — on the other resume path.
+          //
+          // The round's `pre_verify_handoff` RECEIPT is consulted FIRST: it is
+          // what the round itself published for the commit it stands behind.
+          // `lastImplementationCommit` is accepted only when it AGREES with the
+          // receipt (or when no receipt exists, since it is equally durable and
+          // round-scoped). Neither present → REFUSE below.
+          completedImplementorBinding(
+            service.resolveRoundReceiptHead(input.runId, resume.round.round, input.assignmentId),
+            persisted !== undefined && persisted.round === resume.round.round ? persisted.commit : undefined,
+          );
     if (forced === undefined) {
-      throw new LoopCompositionError(
-        'resume re-entry of a verifier round requires its persisted implementationCommit (W2-5 immutable binding)',
+      throw new WorktreeError(
+        'requires_validation',
+        resume.round.role === 'verifier'
+          ? 'resume re-entry of a verifier round requires its persisted implementationCommit (W2-5 immutable binding)'
+          : `resume re-entry of COMPLETED implementor round ${resume.round.round} has no durable binding: neither a ` +
+            'pre_verify_handoff receipt nor a round-scoped lastImplementationCommit was recorded. Refusing rather ' +
+            'than verifying whatever the worktree HEAD happens to be — a commit this round did not publish is ' +
+            'never adopted. The commit is intact in the worktree for an operator to inspect.',
       );
     }
     await worktrees.discardToCommit(input.assignmentId, forced);

@@ -657,6 +657,85 @@ describe.each(DRIVER_KINDS)('resume mode — F8 (A) receipt-bound drift acceptan
     expect(rig.worktrees.taintsFor(asg)).toContain('reconcile_mismatch');
   });
 
+  // -------------------------------------------------------------------------
+  // ROUND 7 (Finding 1) — the COMPLETED-implementor resume path had the SAME
+  // topology-as-authorization defect the interrupted path was fixed for. When no
+  // round-scoped `lastImplementationCommit` existed it fell back to bare current
+  // HEAD, so a crash between `runRole` recording completion and the loop
+  // recording that pointer let ANY subsequently-appended commit become the
+  // verification binding.
+  // -------------------------------------------------------------------------
+  it('a COMPLETED round with no pointer binds to its RECEIPT, not to a foreign HEAD', async () => {
+    const rig = await openRig(
+      {
+        implementor: [
+          {
+            writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+            turns: [implementorTurn('done')],
+          },
+        ],
+        // The verifier rate-limits, so the loop PAUSES with implementor round 1
+        // already `completed` and its receipt published — the real crash window.
+        verifier: [{ turns: [{ errorEnvelope: rateLimitErrorEnvelope() }] }],
+      },
+      driver,
+    );
+    const paused: unknown = await runImplementVerifyLoop(loopDeps(rig), loopInput(rig)).catch((e: unknown) => e);
+    expect(paused).toBeInstanceOf(LimitPausedError);
+    const worktreePath = rig.service.getImplementVerifyLoopState(rig.runId)!.worktree!.worktreePath;
+
+    // The RECEIPT is the round's own assertion of what it stands behind.
+    const receipt = rig.service.resolveRoundReceiptHead(rig.runId, 1, assignmentId(`asg_${rig.runId}`));
+    expect(receipt).toBeDefined();
+    const authored = String(receipt);
+
+    // Simulate the crash window: the round-scoped pointer was never written...
+    const loopState = rig.service.getImplementVerifyLoopState(rig.runId)!;
+    const { lastImplementationCommit: _dropped, ...factsWithoutPointer } = loopState.worktree!;
+    rig.service.saveImplementVerifyLoopState(rig.runId, { ...loopState, worktree: factsWithoutPointer });
+    // ...and a FOREIGN commit was appended to the worktree afterwards.
+    fs.writeFileSync(path.join(worktreePath, 'foreign.ts'), 'export const foreign = 1;\n', 'utf8');
+    const foreign = await commitInWorktree(worktreePath, 'a foreign commit');
+    expect(foreign).not.toBe(authored);
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round: { round: 1, role: 'implementor', stage: 'completed', specHash: SPEC_HASH } },
+    }).catch(() => undefined);
+
+    // The binding came from the RECEIPT: the worktree is forced back to the
+    // authored commit, and the foreign commit never becomes the verified head.
+    expect(await git.resolveSha(worktreePath, 'HEAD')).toBe(authored);
+    expect(await git.resolveSha(worktreePath, 'HEAD')).not.toBe(foreign);
+  });
+
+  it('a COMPLETED round with NEITHER durable source REFUSES (never verifies bare HEAD)', async () => {
+    const rig = await openRig({
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [{ errorEnvelope: rateLimitErrorEnvelope() }],
+        },
+      ],
+    });
+    const { round: interrupted, worktreePath } = await pauseInterruptedImplementor(rig);
+    // No receipt was ever published (the round died mid-turn) and no pointer was
+    // recorded — but the durable round says `completed`, so resume re-enters at
+    // verification. There is nothing durable to bind to.
+    await commitInWorktree(worktreePath, 'whatever happened to be here');
+    const round = { ...interrupted, stage: 'completed' as const };
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const thrown: unknown = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round },
+    }).catch((e: unknown) => e);
+
+    expect(thrown).toMatchObject({ kind: 'requires_validation' });
+    expect(String(thrown)).toMatch(/no durable binding/i);
+  });
+
   it('AC-2: a TAMPERED worktree whose HEAD is NOT a descendant of the checkpoint still refuses', async () => {
     const rig = await openRig(
       {

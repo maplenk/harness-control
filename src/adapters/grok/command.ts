@@ -379,9 +379,33 @@ export function isGrokReadOnlyShellPermissionTitle(operation: string): boolean {
  * ever produce a DENIAL, never an approval.
  */
 export function grokRawShellCommand(rawInput: unknown): string | undefined {
-  if (rawInput === null || typeof rawInput !== 'object' || Array.isArray(rawInput)) return undefined;
-  const command = (rawInput as Record<string, unknown>)['command'];
-  return typeof command === 'string' ? command : undefined;
+  const field = readPayloadField(rawInput, 'command');
+  return field.kind === 'string' ? field.value : undefined;
+}
+
+/**
+ * ROUND 7 (Finding 4) — reading ONE payload field, distinguishing the three
+ * outcomes that matter: the field is a usable string, the field is ABSENT, or
+ * the field is PRESENT BUT MALFORMED.
+ *
+ * Collapsing the last two into `undefined` is the same logical error corrected
+ * twice already at other layers: absence can be evidence about an operation's
+ * kind, but a value we could not read never is. `{command: 42}` said something
+ * about this call and we failed to understand it; treating that as "there is no
+ * command here" is exactly the inference a fail-closed gate must not make.
+ */
+type PayloadField =
+  | { readonly kind: 'string'; readonly value: string }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'malformed' };
+
+function readPayloadField(rawInput: unknown, name: string): PayloadField {
+  if (rawInput === undefined || rawInput === null) return { kind: 'absent' };
+  if (typeof rawInput !== 'object' || Array.isArray(rawInput)) return { kind: 'malformed' };
+  const record = rawInput as Record<string, unknown>;
+  if (!(name in record) || record[name] === undefined) return { kind: 'absent' };
+  const value = record[name];
+  return typeof value === 'string' ? { kind: 'string', value } : { kind: 'malformed' };
 }
 
 /**
@@ -446,18 +470,42 @@ type GrokOperationClass =
  * two rules cannot disagree about what a structured file operation looks like.
  */
 function classifyGrokOperation(operation: string | undefined, rawInput: unknown): GrokOperationClass {
-  const executed = grokRawShellCommand(rawInput);
   if (operation === undefined) return { kind: 'unknown' };
+  const command = readPayloadField(rawInput, 'command');
   const titled = commandFromPermissionTitle(operation);
-  if (titled !== undefined) return { kind: 'shell', titled, executed };
-  if (executed === undefined && STRUCTURED_FILE_TITLE_RE.test(operation.trim())) {
-    return { kind: 'structured_file' };
+  if (titled !== undefined) {
+    return { kind: 'shell', titled, executed: command.kind === 'string' ? command.value : undefined };
   }
-  return { kind: 'unknown' };
+
+  // ROUND 7 (Finding 4): a structured file operation is recognised only when the
+  // payload is POSITIVELY free of a command. A MALFORMED command
+  // (`{command: 42}`) is not an absent one — we failed to read something that
+  // was there — so it can only be `unknown`.
+  if (command.kind !== 'absent') return { kind: 'unknown' };
+  const titledPath = STRUCTURED_FILE_TITLE_RE.exec(operation.trim())?.[1];
+  if (titledPath === undefined) return { kind: 'unknown' };
+
+  // ...and BIND the path the title asserts. Without this the veto never compared
+  // `rawInput.path` to the title's, so `Write \`<inside-worktree>\`` carrying
+  // `{path: "<outside>"}` passed both the veto and the title-based
+  // workspace-containment check — which inspects the TITLE — making that
+  // containment check decorative. Every field the title asserts must be bound,
+  // not just the command.
+  const payloadPath = readPayloadField(rawInput, 'path');
+  switch (payloadPath.kind) {
+    case 'absent':
+      // Nothing asserted twice; the workspace rule adjudicates the title's path.
+      return { kind: 'structured_file' };
+    case 'string':
+      return payloadPath.value === titledPath ? { kind: 'structured_file' } : { kind: 'unknown' };
+    case 'malformed':
+      return { kind: 'unknown' };
+  }
 }
 
-/** Mirrors `isWorkspaceWriteOperation`'s title shape (see `acp/session.ts`). */
-const STRUCTURED_FILE_TITLE_RE = /^(?:Write|Edit) `[^`\r\n]+`$/;
+/** Mirrors `isWorkspaceWriteOperation`'s title shape (see `acp/session.ts`),
+ * capturing the asserted path so the payload can be bound to it. */
+const STRUCTURED_FILE_TITLE_RE = /^(?:Write|Edit) `([^`\r\n]+)`$/;
 
 export interface ResolvedGrokCommand {
   readonly command: string;

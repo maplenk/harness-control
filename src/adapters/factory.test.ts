@@ -53,6 +53,7 @@ import {
 } from './grok/index.js';
 import { fakeAcpChildPath, writeScenarioFile, type FakeAcpScenario } from './fake/index.js';
 import type { PermissionRequest, SessionUpdate } from './spi.js';
+import { noPayloadToVerify } from './acp/session.js';
 import {
   createClaudeAcpAdapter,
   createCodexAcpAdapter,
@@ -186,7 +187,7 @@ describe('provider adapter factory — command resolution + version pin (§3, §
         [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin,
       },
       grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
-      permissions: { mode: 'headless', role: 'implementor' },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
       role: 'implementor',
       model: 'grok-build',
       reasoningEffort: 'high',
@@ -281,7 +282,7 @@ describe('provider adapter factory — §17.1 credential forwarding + H-1 isolat
     const created = createOpenCodeAcpAdapter({
       clock: CLOCK,
       processEnv: { HOME: realHome, OPENROUTER_API_KEY: 'must-not-cross' },
-      permissions: { mode: 'headless', role: 'implementor' },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
       openCodeHome: { realHome, tempRoot },
     });
     cleanups.push(async () => created.adapter.close());
@@ -345,7 +346,7 @@ describe('provider adapter factory — §17.1 credential forwarding + H-1 isolat
         UNRELATED_SECRET: 'must-not-cross',
       },
       grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
-      permissions: { mode: 'headless', role: 'verifier' },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
       role: 'verifier',
       model: 'grok-build',
       reasoningEffort: 'high',
@@ -375,7 +376,7 @@ describe('provider adapter factory — §17.1 credential forwarding + H-1 isolat
     const created = createCodexAcpAdapter({
       clock: CLOCK,
       processEnv: { OPENAI_API_KEY: 'sk-oai-test' },
-      permissions: { mode: 'headless', role: 'verifier' },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
       codexHome: { realCodexHome, tempRoot },
     });
     cleanups.push(async () => created.codexHome?.dispose());
@@ -599,7 +600,7 @@ describe('provider adapter factory — composed initialize() over the fake wire 
           [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin,
         },
         grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
-        permissions: { mode: 'headless', role: 'implementor' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
         role: 'implementor',
         model: 'grok-build',
         reasoningEffort: 'high',
@@ -698,7 +699,7 @@ describe('provider adapter factory — composed initialize() over the fake wire 
         processEnv: { HOME: fixture.realHome, [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin },
         grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
         permissions: {
-          mode: 'interactive',
+          verifyOperationPayload: noPayloadToVerify, mode: 'interactive',
           role: 'implementor',
           handler: async () => ({ kind: 'selected', optionId: 'allow_once' }),
         },
@@ -757,7 +758,7 @@ describe('provider adapter factory — composed initialize() over the fake wire 
         clock: CLOCK,
         processEnv: { HOME: fixture.realHome, [GROK_PROVIDER_BIN_ENV_VAR]: fixture.bin },
         grokHome: { realHome: fixture.realHome, tempRoot: fixture.tempRoot },
-        permissions: { mode: 'headless', role: 'implementor' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
         role: 'implementor',
         model: 'grok-build',
         reasoningEffort: 'high',
@@ -837,7 +838,7 @@ describe('provider adapter factory — P-1 session-mode pinning wired from the p
       const { adapter } = createClaudeAcpAdapter({
         clock: CLOCK,
         processEnv: {},
-        permissions: { mode: 'headless', role: 'implementor' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor' },
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });
       cleanups.push(async () => {
@@ -865,7 +866,7 @@ describe('provider adapter factory — P-1 session-mode pinning wired from the p
       const { adapter } = createCodexAcpAdapter({
         clock: CLOCK,
         processEnv: {},
-        permissions: { mode: 'headless', role: 'verifier' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
         codexHome: NO_ISOLATION,
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });
@@ -921,7 +922,7 @@ describe('P2 live-gate regression H-1 — isolated CODEX_HOME defeats an inherit
       const { adapter } = createCodexAcpAdapter({
         clock: CLOCK,
         processEnv: {},
-        permissions: { mode: 'headless', role: 'verifier' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
         codexHome: { mode: 'inherit_host' }, // the pre-H-1 spawn contract
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });
@@ -961,7 +962,7 @@ describe('P2 live-gate regression H-1 — isolated CODEX_HOME defeats an inherit
       const created = createCodexAcpAdapter({
         clock: CLOCK,
         processEnv: {},
-        permissions: { mode: 'headless', role: 'verifier' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
         codexHome: { realCodexHome, tempRoot }, // mode defaults to 'isolated'
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });
@@ -1012,7 +1013,7 @@ describe('P2 live-gate regression H-1 — isolated CODEX_HOME defeats an inherit
       const created = createCodexAcpAdapter({
         clock: CLOCK,
         processEnv: { OPENAI_API_KEY: 'sk-proj-invalid' },
-        permissions: { mode: 'headless', role: 'verifier' },
+        permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier' },
         codexHome: { realCodexHome, tempRoot },
         spawnOverride: { command: process.execPath, args: [fakeAcpChildPath(), scenarioPath] },
       });

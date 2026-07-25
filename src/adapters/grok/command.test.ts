@@ -312,6 +312,30 @@ describe('grokShellPayloadMatchesTitle — the payload veto', () => {
     expect(grokShellPayloadMatchesTitle('Execute `ls`', 'not an object')).toBe(false);
   });
 
+  it('ROUND 7: a MALFORMED command is not an ABSENT one — it is unknown, and refused', () => {
+    // Collapsing malformed into absent made `{command: 42}` read as 'no command
+    // here', so a Write title carrying it was waved through as structured_file.
+    expect(grokShellPayloadMatchesTitle('Write `/repo/a.ts`', { command: 42 })).toBe(false);
+    expect(grokShellPayloadMatchesTitle('Write `/repo/a.ts`', { command: { nested: 1 } })).toBe(false);
+    expect(grokShellPayloadMatchesTitle('Write `/repo/a.ts`', ['array'])).toBe(false);
+    expect(grokShellPayloadMatchesTitle('Write `/repo/a.ts`', 'a string payload')).toBe(false);
+  });
+
+  it('ROUND 7: the PATH the title asserts is bound too (the containment check is not decorative)', () => {
+    // `isWorkspaceWriteOperation` checks the TITLE's path, so a payload writing
+    // somewhere else entirely passed both it and the veto.
+    expect(
+      grokShellPayloadMatchesTitle('Write `/repo/wt/a.ts`', { path: '/etc/passwd' }),
+    ).toBe(false);
+    expect(
+      grokShellPayloadMatchesTitle('Edit `/repo/wt/a.ts`', { path: '/repo/wt/../../outside.ts' }),
+    ).toBe(false);
+    expect(grokShellPayloadMatchesTitle('Write `/repo/wt/a.ts`', { path: 42 })).toBe(false);
+    // A payload agreeing with the title is fine, as is one asserting no path.
+    expect(grokShellPayloadMatchesTitle('Write `/repo/wt/a.ts`', { path: '/repo/wt/a.ts' })).toBe(true);
+    expect(grokShellPayloadMatchesTitle('Write `/repo/wt/a.ts`', undefined)).toBe(true);
+  });
+
   it('does NOT veto a non-shell operation (there is no shell payload to bind)', () => {
     // Structured Write/Edit titles are adjudicated by the workspace-write rule;
     // the shell payload veto must not deny them for lacking a shell command.
