@@ -109,7 +109,23 @@ const SAFE_GIT_READ_SUBCOMMANDS = new Set([
 
 interface ShellToken {
   readonly value: string;
+  /** The token contained AT LEAST ONE quoted span. Never sufficient on its own —
+   * see `unquotedRedirect` (BLOCKER-1). */
   readonly quoted: boolean;
+  /**
+   * BLOCKER-1: the token contains a `>` or `<` that appeared OUTSIDE quotes,
+   * i.e. a real shell redirection OPERATOR. Tracked per CHARACTER because a
+   * token can mix quoted and unquoted spans with no whitespace between them
+   * (`echo '$HOME'>owned.txt` is ONE token), and a single whole-token `quoted`
+   * flag let such a token inherit blanket-quoted status — which
+   * `stripSafeRedirections` read as "no redirection here", classifying a real
+   * WRITE as read-only.
+   *
+   * This mirrors the shell's own rule exactly: token recognition happens BEFORE
+   * quote removal, so an operator is one that appears outside quotes. A `>` the
+   * user quoted is an ordinary argument byte and stays admissible.
+   */
+  readonly unquotedRedirect: boolean;
 }
 
 function splitShellSegments(command: string): readonly string[] | undefined {
@@ -183,11 +199,16 @@ function tokenizeShellSegment(segment: string): readonly ShellToken[] | undefine
   let quote: "'" | '"' | undefined;
   let value = '';
   let quoted = false;
+  // BLOCKER-1: per-CHARACTER provenance. Set only by a `>`/`<` seen while NOT
+  // inside quotes, so a token that mixes spans (`'$HOME'>owned.txt`) can never
+  // launder its operator through the whole-token `quoted` flag.
+  let unquotedRedirect = false;
   const push = (): void => {
     if (value.length === 0 && !quoted) return;
-    tokens.push({ value, quoted });
+    tokens.push({ value, quoted, unquotedRedirect });
     value = '';
     quoted = false;
+    unquotedRedirect = false;
   };
 
   for (const char of segment) {
@@ -222,6 +243,9 @@ function tokenizeShellSegment(segment: string): readonly ShellToken[] | undefine
       push();
       continue;
     }
+    // Unquoted (we are past every in-quote branch above): a redirection
+    // character here is a real OPERATOR, whatever else the token contains.
+    if (char === '>' || char === '<') unquotedRedirect = true;
     value += char;
   }
   if (quote !== undefined) return undefined;
@@ -229,11 +253,30 @@ function tokenizeShellSegment(segment: string): readonly ShellToken[] | undefine
   return tokens.length > 0 ? tokens : undefined;
 }
 
+/**
+ * Drop the STANDALONE safe null redirections and refuse every other redirection.
+ *
+ * BLOCKER-1: the decision is driven by `token.unquotedRedirect` — per-character
+ * provenance — not by the whole-token `quoted` flag. A token is dropped as a
+ * safe null redirection only when it is STRUCTURALLY standalone: entirely
+ * unquoted AND exactly one of the allowlisted forms. `echo x'2>/dev/nul'l` is a
+ * mixed token that merely resembles one, and is refused. A `>`/`<` that appeared
+ * INSIDE quotes never sets the flag, so `rg -n '>' src` keeps passing it through
+ * as the ordinary argument the shell will pass to the program.
+ */
 function stripSafeRedirections(tokens: readonly ShellToken[]): readonly string[] | undefined {
   const argv: string[] = [];
   for (const token of tokens) {
-    if (!token.quoted && SAFE_NULL_REDIRECTIONS.has(token.value)) continue;
-    if (!token.quoted && (token.value.includes('>') || token.value.includes('<'))) return undefined;
+    if (!token.quoted && !token.unquotedRedirect && SAFE_NULL_REDIRECTIONS.has(token.value)) {
+      // Unreachable in practice (an allowlisted form contains `>`, so the flag is
+      // set) — kept so the "entirely unquoted, exactly allowlisted" reading holds
+      // if the allowlist ever gains a redirection-free entry.
+      continue;
+    }
+    if (token.unquotedRedirect) {
+      if (!token.quoted && SAFE_NULL_REDIRECTIONS.has(token.value)) continue;
+      return undefined;
+    }
     argv.push(token.value);
   }
   return argv.length > 0 ? argv : undefined;

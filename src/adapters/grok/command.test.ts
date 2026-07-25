@@ -188,6 +188,45 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
     expect(isGrokReadOnlyShellPermissionTitle("Execute `cat '../outside.txt'`")).toBe(false);
   });
 
+  // -------------------------------------------------------------------------
+  // BLOCKER-1 — a token that MIXES quoted and unquoted parts must not inherit
+  // blanket-quoted status.
+  //
+  // `tokenizeShellSegment` set ONE `quoted` flag for the whole token, so
+  // `echo '$HOME'>owned.txt` produced a single token `$HOME>owned.txt` marked
+  // quoted — and `stripSafeRedirections` only checks for `>` when a token is
+  // NOT quoted. The classifier therefore returned read-only for a command that
+  // sh really does execute as a WRITE. `<` escaped this only by accident (the
+  // segment splitter rejects `<` outside quotes; `>` was never in that list).
+  //
+  // The rule that fixes it is exactly sh's own: token recognition happens
+  // BEFORE quote removal, so a redirection operator is one that appears
+  // OUTSIDE quotes. Provenance is therefore tracked per CHARACTER.
+  // -------------------------------------------------------------------------
+  it.each([
+    ['the reported bypass verbatim', "Execute `echo '$HOME'>owned.txt`"],
+    ['the same shape without a $ (the hole predates the F11 widening)', "Execute `echo 'x'>owned.txt`"],
+    ['a DOUBLE-quoted mixed token', 'Execute `echo "x">owned.txt`'],
+    ['append redirection', "Execute `echo 'x'>>owned.txt`"],
+    ['fd-qualified write', "Execute `cat 'a'2>owned`"],
+    ['a mixed token that only LOOKS like a safe null redirection', "Execute `echo x'2>/dev/nul'l>owned.txt`"],
+    ['no whitespace anywhere between the quoted part and the operator', "Execute `ls'>'x>owned.txt`"],
+  ])('refuses a WRITE hidden by mixed quoting: %s', (_label, operation) => {
+    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(false);
+  });
+
+  it.each([
+    ['a standalone safe null redirection', 'Execute `ls -la 2>/dev/null`'],
+    ['a standalone 1>/dev/null', 'Execute `head -5 f 1>/dev/null`'],
+    ['a standalone >/dev/null', 'Execute `head -5 f >/dev/null`'],
+    ['a > wholly INSIDE single quotes (a literal argument, not an operator)', "Execute `rg -n '>' src`"],
+    ['a > inside a longer single-quoted pattern', "Execute `rg -n 'a>b' src`"],
+    ['a quoted token that merely looks like a redirection is a FILENAME', "Execute `cat f '2>/dev/null'`"],
+    ['a > quoted mid-token is still not an operator (sh recognises operators pre-quote-removal)', "Execute `echo x'2>/dev/null'`"],
+  ])('still admits %s', (_label, operation) => {
+    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(true);
+  });
+
   it('control characters are refused inside single quotes too (a NUL is never a literal)', () => {
     // CR/LF cannot even reach the scanner (the `Execute ...` wrapper excludes
     // them), but a NUL can — and single-quoting must not make it acceptable.
