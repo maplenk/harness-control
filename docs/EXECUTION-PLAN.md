@@ -41,11 +41,15 @@ slice(i):
               run-slice.sh call require-preflight.sh, which refuses without a
               complete verdict=pass record binding this HEAD, this dist digest
               (dist/ is gitignored and mutable — the commit alone does not
-              identify what will execute), this toolchain, and the same resolved
-              role triple + config sha, <30 min old. SKIP_BUILD=1 records are
+              identify what will execute), this toolchain, the same resolved role
+              triple, the same EFFECTIVE config, the same canonical store + log
+              dirs, and a matching attempt claim, <30 min old. At `run` the
+              config is read from the RUN's persisted config, not the ambient
+              $CONFIG the CLI ignores there. SKIP_BUILD=1 records are
               "diagnostic" and rejected; incomplete records are rejected.
-              Roles/config resolve in ONE place (scripts/dogfood/lib.sh) so the
-              gate and the spend paths cannot drift.
+              Roles/config/digest/containment resolve in ONE place
+              (scripts/dogfood/lib.sh) so the gate and the spend paths cannot
+              drift, and containment is re-checked at every spend entry point.
               Then: budget sanity · SECTION/SLICE/PATHS written · plan SHA pinned.
               REPO FREEZE begins at `start` — no commits and no tracked-file edits
               until the run is terminal. Queue doc edits in the scratchpad.
