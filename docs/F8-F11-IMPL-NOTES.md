@@ -27,6 +27,14 @@ section are where I want the review pressure.
 
 ## F8 — resumable interrupted implementor rounds
 
+> Path note for anyone reading the F8 spec draft alongside this: the cadence
+> module is `src/checkpoint/cadence.ts`, NOT `src/domain/cadence.ts` (the draft's
+> line references `:27`/`:38` are correct; only the directory was wrong). The
+> `CheckpointReason` union itself does live in `src/domain/state.ts:349-354`. The
+> draft's claim that `pre_verify_handoff` had ZERO production writers is
+> confirmed: the only writer was `#writeStopCheckpoint`, reachable solely from
+> `pre_pause` / `pre_graceful_stop` / `cadence` call sites.
+
 ### (A) Forward-containment acceptance in §16.3
 
 **What changed**
@@ -240,10 +248,33 @@ npx vitest run src/app/flows/implementor.test.ts -t "F10"
   -> PASS (0) FAIL (1): the flow's own commit with an IGNORED node_modules.
 ```
 
-`src/worktree/git.test.ts` is NEW. These two paths had only fake-git coverage
-(`git-stable.test.ts` covers just the stable HEAD/status read), and every
-pre-existing node_modules test used an UNIGNORED or TRACKED tree — which never
-triggers the git 2.55 path. That is precisely why the regression shipped.
+`src/worktree/git.test.ts` is NEW.
+
+**Why the bug shipped — corrected diagnosis.** Not "the flow tests fake git";
+they do not. `implementor.test.ts` drives this helper against REAL git
+(`makeTempGitRepo`, :188). The suite was **fixture-shape-blind**: the four
+conditions needed to trigger the git 2.55 path never co-occurred in one test.
+
+| file | real git | committed `node_modules/` rule | node_modules present | calls the staging helper |
+| --- | --- | --- | --- | --- |
+| `implementor.test.ts` (pre-F10) | yes | **no** — its only rule was `*.log` (:836), so its node_modules fixtures were UNIGNORED and the old pathspec exited 0 | yes | yes |
+| `provision.test.ts` | yes | **yes** (:105 etc.) | yes | **no** — it never calls the staging helper |
+| `git-stable.test.ts` | yes | no | no | no (stable HEAD/status read only) |
+
+So the new regression test deliberately combines all four in ONE test, and the
+F10 flow-level test in `implementor.test.ts` commits a real `node_modules/` rule
+for the same reason.
+
+Two behaviours captured while verifying, both now asserted:
+
+- `git add` stages the non-excluded paths and THEN exits 1 with the ignored-path
+  advice — so pre-fix the helper threw over a HALF-STAGED index and the commit
+  never ran. The main test now asserts the post-fix absence of that half-state
+  (index is exactly the work, the commit lands, the tree ends clean); the CONTROL
+  test asserts the pre-fix half-state explicitly.
+- `git reset --quiet -- node_modules` with a non-matching pathspec is a clean
+  rc=0 no-op, so calling it is safe regardless. (The implementation still only
+  calls it when the index scan found something, which is strictly cheaper.)
 
 **Open questions for codex**
 
@@ -403,14 +434,27 @@ rollback/crash-recovery rows now fault the CLONE, since that is the only build.
 
 ## F11 — the grok read-only shell classifier rejected quoted regexes
 
-### The bug
+### The bug — and the fact that it lives in TWO places
 
-`splitShellSegments` and `tokenizeShellSegment` (`src/adapters/grok/command.ts`)
-both scanned for `$`, `\` and a backtick BEFORE consulting quote state, so those
-bytes were fatal ANYWHERE — including inside SINGLE quotes, where POSIX
-guarantees no parameter expansion, no command substitution and no escape
-processing. A read-only search whose pattern is a regex was therefore
+The `$`/`\`/backtick scan is DUPLICATED. `splitShellSegments` has one
+(`command.ts:130` pre-fix) and `tokenizeShellSegment` has its own
+(`:179-181` pre-fix), each positioned BEFORE that function's own quote tracking.
+Both scanned those bytes as fatal ANYWHERE — including inside SINGLE quotes,
+where POSIX guarantees no parameter expansion, no command substitution and no
+escape processing. A read-only search whose pattern is a regex was therefore
 unclassifiable: `rg -n '3A\.1|…'` → permission denied → implementor turn dead.
+
+**Fixing either site alone accomplishes nothing.**
+`isGrokReadOnlyShellPermissionTitle` runs BOTH (split → tokenize → strip
+redirections → classify) and a rejection at either stage is a denial. Verified
+by experiment: with ONLY `splitShellSegments` reordered,
+`src/adapters/grok/command.test.ts` still reported `pass 35 fail 4` —
+byte-identical to the wholly-unfixed state. Both sites are reordered, and every
+assertion in the F11 block drives the FULL pipeline rather than a single
+scanner, so a one-site fix cannot green them. A dedicated test
+("needs BOTH scanners fixed") pins this with a single-segment command, where the
+splitter has nothing to split and the tokenizer's own scan is the only thing
+that can reject.
 
 ### What changed
 

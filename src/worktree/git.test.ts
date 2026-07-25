@@ -54,15 +54,35 @@ async function stagedPaths(worktreePath: string): Promise<string[]> {
 }
 
 describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)', () => {
+  // THE regression test. It is the FOUR-WAY combination that no pre-existing test
+  // had, which is exactly why the bug shipped into production:
+  //   (1) REAL git — not a fake seam;
+  //   (2) a COMMITTED `node_modules/` ignore rule;
+  //   (3) a node_modules tree PRESENT on disk;
+  //   (4) a call to the actual staging helper.
+  // The suite was fixture-shape-blind, not fake-git-blind: `implementor.test.ts`
+  // drives this helper against real git, but its only ignore rule was `*.log`, so
+  // its node_modules fixtures were UNIGNORED and the old pathspec exited 0 there;
+  // `provision.test.ts` writes the real `node_modules/` rule but never calls the
+  // staging helper. Neither file ever held all four at once.
   it('stages the work when a git-IGNORED node_modules is present on disk (the exact production failure)', async () => {
     const r = await repoWithIgnore('node_modules/\n');
     plantNodeModules(r.dir, 'node_modules'); // what F7 provisioning leaves behind
     await r.writeFile('src/feature.ts', 'export const feature = true;\n');
     await r.writeFile('src/app.ts', 'export const app = 2;\n');
 
+    // Must not throw. Pre-fix this rejected with the git 2.55 ignored-path advice
+    // AFTER git had already staged the non-excluded paths — see the CONTROL test
+    // below — so the round's work sat in the index with the commit never reached.
     await addAllExceptNodeModules(r.dir);
 
+    // No half-state: the index is EXACTLY the work, and the commit really lands.
     expect(await stagedPaths(r.dir)).toEqual(['src/app.ts', 'src/feature.ts']);
+    const sha = await r.commitAll('the round commits cleanly');
+    expect(sha).toMatch(/^[0-9a-f]{40}$/);
+    const committed = (await r.run(['show', '--name-only', '--format=', 'HEAD'])).trim().split('\n');
+    expect(committed).toEqual(['src/app.ts', 'src/feature.ts']);
+    expect((await r.statusPorcelain()).trim()).toBe(''); // nothing left staged or dirty
   });
 
   it('preserves full -A semantics: adds, modifications AND deletions', async () => {

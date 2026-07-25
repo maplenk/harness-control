@@ -125,6 +125,24 @@ describe('isGrokReadOnlyShellPermissionTitle', () => {
   // Outside single quotes (INCLUDING inside double quotes, where the shell does
   // expand) the conservative rejection is unchanged.
   // -------------------------------------------------------------------------
+  // The PRE-quote character scan is DUPLICATED: `splitShellSegments` has one and
+  // `tokenizeShellSegment` has its own. Fixing either alone changes nothing,
+  // because `isGrokReadOnlyShellPermissionTitle` runs BOTH (split -> tokenize ->
+  // strip redirections -> classify) and a rejection at either stage is a denial.
+  // Every assertion in this block deliberately drives that FULL pipeline rather
+  // than a single scanner, so a one-site fix cannot green them.
+  //
+  // Verified by experiment: with ONLY `splitShellSegments` reordered, this file
+  // still reported `pass 35 fail 4` — byte-identical to the wholly-unfixed
+  // state. Both sites are load-bearing.
+  it('needs BOTH scanners fixed: a single-segment command still depends on the tokenizer', () => {
+    // No `;`/`|`/`&&` anywhere, so the SPLITTER has nothing to split — if only it
+    // were reordered, the tokenizer's own scan would still reject this command.
+    const operation = "Execute `rg -n 'a\\.b|c$' src`";
+    expect(operation).not.toContain(';');
+    expect(isGrokReadOnlyShellPermissionTitle(operation)).toBe(true);
+  });
+
   it('accepts the exact command whose denial killed the implementor turn (single-quoted regex)', () => {
     expect(
       isGrokReadOnlyShellPermissionTitle(
