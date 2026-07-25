@@ -2069,6 +2069,114 @@ empty, `ROUND 16` × 11, `buildInstallEnv` × 2, `complete = false` × 2).
 
 ---
 
+---
+
+# Round 17 — codex verdict on `f41aee4`: three of the 25 were misclassified
+
+All four round-16 fixes CONFIRMED, the decisive pair CONFIRMED intact, 22 of 25
+classifications correct. The three that were wrong share one shape, and it is the
+round-16 error one level deeper:
+
+> **Round 16** fixed the sites that concluded without looking.
+> **Round 17** fixes the sites that looked, STOPPED EARLY or FAILED TO SEE, and
+> then concluded anyway.
+
+In each, the ABSENCE of a positive result was read as positive evidence of
+absence, when the search itself was BOUNDED or the observation FAILED.
+
+## Reclassification 1 — the artifact cap truncated the search, then judged it
+
+`:2298` refused "nothing it produced loads here" whenever no artifact `dlopen`ed.
+Round 16 gated the ZERO-artifact branch on `scan.complete` but left the
+zero-LOADABLE branch ungated — and `complete` was never set false by the
+8-artifact cap at all, which round 16's own comment called "enough found; not a
+gap". It is a gap. A `prebuildify`/`node-gyp-build` package ships one artifact per
+platform/ABI; if the cap is reached before the scan meets the one THIS host loads,
+the only artifacts judged are foreign variants that could never load here, and the
+refusal fires on a package main installs and uses.
+
+Both halves fixed: the artifact cap now records why it stopped exactly as the
+depth cap does, and "zero loadable" may refuse ONLY over a complete scan.
+
+## Reclassification 2 — a wrapper failing is not a build failing
+
+`:2349` refused when a package's declared root entry did not load. But control
+reaches that point only AFTER an artifact of the same package has already
+`dlopen`ed, so the build demonstrably produced something this host loads. A
+wrapper that then refuses to initialise is reporting on the smoke ENVIRONMENT —
+absent runtime configuration, an unmet precondition, a conditional export
+resolving differently under a minimal env — not on whether the package was built.
+
+The case the refusal was written for is untouched: a genuinely missing binding
+means NO artifact, which `:2260` refuses over a complete scan. That is where the
+decisive better-sqlite3 row lands, and it still refuses.
+
+**One existing row was flipped, not deleted** — `F9 HIGH-4`'s ESM-only broken
+entry point. Its own fixture gives the reason: it deliberately ships a REAL
+compiled artifact, because the row is about WHICH SPECIFIER resolves, never about
+the build. Its real invariant (the require→import fallback must not become a way
+to pass without proving loading) now lives in the artifact check; what the row
+still pins is the DIAGNOSTIC — both attempts reported, plus the new explicit
+`artifact LOADED` clause, so the operator is not told a half-truth.
+
+## Reclassification 3 — "could not inspect" is not "stale"
+
+`lstatSafe` (`:2391`) fails closed on EACCES/EIO, and round 16 justified it as
+"identical on main". True of the helper, false of the CALLER: the version proof at
+`:1681` does not exist on main, so an unreadable scope directory or a flaky mount
+became a hard refusal placed AHEAD of main's own clone-then-install fallback.
+
+Fixed at the call site ONLY — the inspection failure is pushed onto the existing
+`indeterminate` list, so it warns per package and the presence proof continues.
+`lstatSafe` itself is unchanged, and its pre-existing main-era callers (the
+tracked/ignored/symlink safety preflight) still fail closed, which is correct
+because main makes those same checks.
+
+## The warning detail
+
+`complete: boolean` lost WHY the traversal stopped, so the warning could only say
+it "could not read part of the package". `nativeArtifacts` now returns
+`incompleteReason` — the depth limit and the path, the artifact cap, or the
+unreadable directory and its errno — and every indeterminate warning quotes it.
+The point of warn-and-proceed is that the operator can tell what was not proven.
+
+## Round-17 regression proofs
+
+Written first, run against `f41aee4`, all three failing with the false refusal
+itself (`vitest run src/worktree/provision.test.ts -t "ROUND 17"` → PASS 0 FAIL 3):
+
+| # | fixture (a tree MAIN provisions) | refusal on parent |
+| --- | --- | --- |
+| 1 | 12 foreign prebuild variants, more than the 8-artifact cap | `could not dlopen ANY of the 8 compiled artifact(s)` — the count IS the cap |
+| 2 | real loadable addon; wrapper throws without `PICKY_NATIVE_HOME` | `could not LOAD 'picky-native' … was never built` — demonstrably false |
+| 3 | declared `@acme/widget` under a scope dir with no search permission | `could not lstat …/@acme/widget: EACCES` |
+
+Fixture note for 3: the clone cannot copy through the same unreadable directory,
+so the test supplies the install lane main itself falls back to, and asserts
+`strategy: 'install'`. That the version proof no longer refuses is proven by
+getting past it at all.
+
+**Both decisive tests still green**: `-t "DECISIVE"` → PASS 2 FAIL 0. The
+lazily-loading better-sqlite3-shaped tree with a missing binding still REFUSES
+(no artifact, complete scan), and pure-JS forced install still SUCCEEDS.
+
+## The audit table, updated
+
+Three rows move from **positive identification** to **outcome (3)**, leaving 22
+kept refusals:
+
+| site | was | is now |
+| --- | --- | --- |
+| `:2298` zero of N artifacts `dlopen` | positive | positive **only over a complete scan**; truncated → indeterminate |
+| `:2349` declared root entry fails to load | positive | **indeterminate** — an artifact already loaded; refusal moved entirely to `:2260` |
+| `:1681`→`:2391` inspection error in the version proof | "identical on main" | **indeterminate at this caller**; `lstatSafe` unchanged for main-era callers |
+
+`:2260` (no artifact, scan complete) is now the ONLY native-proof refusal, which
+is the right shape: it is the one case that is positive evidence, and the one the
+decisive test covers.
+
+---
+
 # Final residual list for the merge record
 
 | # | residual | disposition |
@@ -2090,19 +2198,24 @@ empty, `ROUND 16` × 11, `buildInstallEnv` × 2, `complete = false` × 2).
 | R15 | **(round 15):** the restored install lane runs `npm ci --ignore-scripts`, so a native dependency it installs is unbuilt BY CONSTRUCTION and the artifact proof will refuse the round. A native project on `provision:'install'` therefore cannot provision — deliberately: the alternative is running arbitrary lifecycle scripts from a dependency tree inside the orchestrator. Clone (from a properly installed primary) remains the lane for native projects. | Deliberate, documented |
 | R16 | **New (round 16):** the install environment carries no credential-shaped variable, so a private registry that authenticates ONLY through `NPM_TOKEN`-style env vars (rather than `~/.npmrc`) will fail to install. Reasoning in full above: the round's own committed `.npmrc` chooses the registry host, so an env token is an exfiltration path the on-disk one is not. | Deliberate, reasoning recorded |
 | R17 | **New (round 16):** two converted sites (an unreadable scanned tree root and an unreadable `@scope` directory) are unreachable end-to-end, because the main-era symlink containment scan refuses on an unreadable directory first. Converted for coherence; not covered by a test, and said so. | Stated, uncovered |
+| R18 | **New (round 17):** the native proof is now DELIBERATELY weaker in two cases it used to refuse. (a) A package whose artifact loads but whose wrapper is genuinely broken is no longer caught — indistinguishable, by inspection, from a wrapper that merely needs runtime configuration the smoke env lacks. (b) A package with more artifacts than the 8-artifact cap, ALL of them genuinely unloadable, is now indeterminate rather than refused, because the scan cannot tell "all broken" from "the good one is past the cap". Neither is a regression against main, which runs no proof at all; both are a reduction in proof STRENGTH versus round 16, taken because the alternative refuses valid trees. The decisive case — declares a native build, ships NO artifact, scan complete — still refuses. | Deliberate, cost of not refusing valid trees |
+| R13 note | R13's shape is unchanged but its guard is now stated exactly: the refusal requires a COMPLETE traversal (round 16) over a package with ZERO artifacts anywhere in its own directory. | — |
 
 ---
 
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1941 passed, 0 failed**, 106
-  files. Round 16 added 9 tests and deleted 4 that encoded reversed behaviour
-  (1934 → 1941).
+- `npx vitest run` (full, from this worktree) → **1944 passed, 0 failed**, 106
+  files.
 
-Both re-run independently at hand-off and reproduced exactly: typecheck exit 0,
-`Test Files 106 passed (106)`, `Tests 1941 passed (1941)`, 0 failed, 0 skipped
-at file level.
+Round-by-round: round 16 added 9 tests and deleted 4 that encoded reversed
+behaviour (1934 → 1941); round 17 added 3 regression tests and flipped 1 that
+encoded reclassification 2 (1941 → 1944).
+
+The round-16 bar was re-run independently at hand-off and reproduced exactly
+(`Tests 1941 passed`); the round-17 bar above is `Test Files 106 passed (106)`,
+`Tests 1944 passed (1944)`, exit 0.
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
