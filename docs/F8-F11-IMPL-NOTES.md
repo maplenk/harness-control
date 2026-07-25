@@ -512,10 +512,219 @@ branch; only `$`, `\` and the backtick were checked before it.
 
 ---
 
+---
+
+# Round 2 — codex NEEDS-FIX on `77ea93e`
+
+Eleven findings. Per-finding fix, proof, and disputes below. Commit map:
+
+| finding | commit |
+| --- | --- |
+| BLOCKER-1 | `3ae9c96` |
+| BLOCKER-2 | `a03e782` |
+| HIGH-5, MED-9 | `5e65168` |
+| HIGH-3, HIGH-4, HIGH-6, MED-7, MED-8, LOW-10, LOW-11 | `df5b8d9` |
+
+## BLOCKER-1 — a mixed-quote token laundered a redirection operator
+
+`tokenizeShellSegment` set ONE `quoted` flag per token, and
+`stripSafeRedirections` only looked for `>`/`<` on a NOT-quoted token. Tokens can
+mix quoted and unquoted spans with no whitespace between them, so
+`echo '$HOME'>owned.txt` became one token marked quoted and classified READ-ONLY
+for a command sh executes as a WRITE.
+
+Probe before the fix — broader than reported: `>`, `>>` and `2>owned` all
+returned true. `<` escaped only by accident (the segment splitter rejects `<`
+outside quotes; `>` was never in that list).
+
+**The hole predates F11.** `echo 'x'>owned.txt` (no `$`) bypassed the pre-F11
+classifier identically. F11 widened the reachable payloads; it did not create the
+bug. Both shapes are asserted.
+
+Fix: per-CHARACTER provenance. `ShellToken.unquotedRedirect` is set only by a
+`>`/`<` seen outside quotes; a token is dropped as a safe null redirection only
+when STRUCTURALLY standalone (entirely unquoted AND exactly allowlisted), and any
+other token carrying the flag is refused. This mirrors the shell's own rule —
+token recognition happens BEFORE quote removal.
+
+Preserved and asserted: standalone `2>/dev/null` / `1>/dev/null` / `>/dev/null`;
+`rg -n '>' src` (a quoted `>` is an argument); a quoted redirection-looking token
+used as a FILENAME; and `echo x'2>/dev/null'`, which sh does not treat as a
+redirection either.
+
+Proof: `pass 48 fail 6` on `77ea93e` → 54/54.
+
+## BLOCKER-2 — topology-as-authorization
+
+Ancestry proves REACHABILITY, not AUTHORSHIP. Confirmed pre-fix: a foreign
+descendant appended to the worktree was ADOPTED, and `taintsFor` came back empty
+— `emergency_kill` cleared along with everything else.
+
+Fixed exactly as directed:
+
+- **(a) receipt is fatal.** `#writeVerifyHandoffCheckpoint` no longer swallows.
+  An artifact-write throw AND a §12.1 quota rejection (no event) both raise the
+  new typed `RoundReceiptError`. Tested via an `Err`-returning artifact store —
+  the subtler branch, since it is a rejection rather than a throw.
+- **(b) receipt-bound acceptance.** `acceptForwardContainment: boolean` became
+  `acceptDriftToCommit?: GitSha`. Deliberately not a boolean: a boolean re-admits
+  authorization-by-reachability. HEAD must EQUAL the receipt; ancestry remains
+  only as a corroborating sanity check on top.
+- **(c) taint clears only on receipt match.** Proven by planting
+  `emergency_kill`, resuming without a receipt, and asserting BOTH
+  `emergency_kill` and `reconcile_mismatch` survive.
+
+New `resolveRoundReceiptHead(runId, round, assignment)` derives the receipt from
+the LOG (latest `pre_verify_handoff` matching role+round+assignment), never a
+mutable pointer, and rejects the empty-sha sentinel. `adoptWorktree` falls back
+to the round-scoped `lastImplementationCommit`. Both are round-SCOPED — a
+receipt from another round authorizes nothing (asserted).
+
+**Consequence I am logging, not disputing:** the commit→receipt window is now a
+REFUSAL rather than an acceptance. That is the intended trade (resume only what
+we can prove we authored), and the window is milliseconds because publishing
+happens immediately after `commitAll` and is fatal-on-failure. It does mean my
+round-1 open question #3 (round scoping) is now answered structurally rather
+than left open.
+
+Proof: orchestrate-resume `pass 12 fail 5` on `3ae9c96` → 37/37 with validate.
+
+## HIGH-5 — title vs rawInput
+
+`decidePermission` only ever saw the human-readable TITLE. `allowReadOnlyOperation`
+now takes `(operation, rawInput)` — REQUIRED, so no caller can classify without
+the payload — and the session hands it `toolCall.rawInput`. New
+`isGrokReadOnlyShellToolCall` is the authorization entry point the factory wires:
+it recovers the command from `rawInput`, requires it BYTE-IDENTICAL to the
+title's, and only then classifies. `isGrokReadOnlyShellPermissionTitle` stays as
+the pure classifier so its suite keeps testing one thing.
+
+Denies on: absent/null rawInput, non-object, array, missing or non-string
+`command`, any divergence (including a trailing space). A matching rawInput never
+rescues a non-read-only command. Also driven END-TO-END through the fake ACP wire
+(the child now forwards a scenario's `rawInput`), not only as a unit.
+
+## MED-9 — the outer title regex
+
+`/^Execute \`([^\`\r\n]+)\`$/` forbade a backtick anywhere in the interior, so a
+literal backtick inside single quotes could never classify. Replaced with a
+structural prefix/suffix parse taking the first prefix and last suffix, so inner
+backticks are unambiguous. The scanners still reject an UNQUOTED backtick and all
+control bytes; the wrapper still requires the exact verb, a non-empty interior,
+and no CR/LF.
+
+**Logged asymmetry:** `grokShellPermissionTitle` (the allowlist BUILDER) still
+refuses backticks in a declared verification command. That is an input
+restriction on SPEC content, not a classification bug — and it means a
+backtick-bearing title can only arrive from the provider, which is exactly the
+path MED-9 opens to classification. Say the word if you want the builder relaxed
+too.
+
+## HIGH-3 — legacy marker short-circuit
+
+v1 markers recorded only the fingerprint, so an install-lane tree carried a
+matching marker and skipped the smoke — P2 surviving the upgrade. Marker proof
+format is now versioned; only v2 (fingerprint + smoke attestation)
+short-circuits. A v1 marker re-proves the tree IN PLACE (no rebuild) and upgrades
+on success, or refuses `native_toolchain_unproven`.
+
+## HIGH-4 — the native filter
+
+A package with a `binding.gyp` and NO `scripts` object still gets an implicit
+`node-gyp rebuild` from npm; the filter required a scripts object first and
+returned early. `binding.gyp` is now decisive on its own, checked BEFORE any
+script lookup. The walk recurses nested `node_modules` and names a nested package
+by its NESTED specifier — requiring bare `b` would resolve the hoisted copy and
+prove the wrong artifact.
+
+This also answers round-1 open question #13 (transitive natives) in the
+affirmative for the smoke. `proveePrimaryTree` still checks only root-declared
+names; the smoke is what covers transitive natives.
+
+## HIGH-6 — withDeadline cannot cancel
+
+Confirmed (it was my own #18). `withDeadline` stops WAITING; the producer keeps
+running. A timed-out stage is now QUARANTINED — atomic same-filesystem rename to
+`quarantine-*`, out of the active namespace — and never force-deleted; a failed
+rename leaves it in place, still safer than racing an unknown writer. Proven with
+a producer that writes into the stage AFTER the deadline fires.
+
+**Partial against the directive.** The prescription's first choice was threading
+AbortSignal/kill handles through `runtime.install`/`cloneDir`/`runGit` and
+awaiting confirmed termination. I implemented the stated fallback (quarantine)
+rather than that, because `ProvisionRuntime` is an INJECTED seam: the harness
+cannot make an arbitrary implementation abortable, and awaiting "confirmed
+termination" of a seam that never settles is exactly the unbounded wait the
+deadline exists to escape. The default runtime's own `execFile` calls DO carry
+`timeout`, so the real `cp`/`npm` children are killed; quarantine covers the
+injected-seam case the kill cannot reach. Flagging explicitly for your call.
+
+## MED-7 — dropped cause at the verifier boundary
+
+`toProvisioningFailure` now copies `provisioningCause`, so the same failure no
+longer prints two different next steps depending on which boundary raised it.
+
+## MED-8 — untyped refusal + magic pathspec + a test that never reached it
+
+Two real defects, both confirmed against real git:
+
+- the targeted reset used raw pathspecs, so `:(top)foo/node_modules` was parsed
+  as pathspec MAGIC — the reset matched nothing, exited 0, and left node_modules
+  STAGED. Every pathspec is now `:(literal)`-prefixed.
+- the refusal was `git_command_failed`, which is wrong (no git command failed).
+  New kind `node_modules_still_staged`, raised by a new exported
+  `assertIndexFreeOfNodeModules` so the invariant is checkable on its own.
+
+The old test never reached the branch (a stale `index.lock` made `git add` throw
+first). Replaced by: a magic-pathspec test (the shape that genuinely reached the
+branch pre-fix), a test driving the guard directly, and a no-op-reset case that
+makes the second index read load-bearing.
+
+## LOW-10 / LOW-11
+
+LOW-10: both new F8 blocks run under `describe.each(await availableDriverKinds())`
+with the driver threaded through `setup()`/`openRig()`. Only one driver is
+available in this environment, so the fan-out is 1 here; it widens automatically
+elsewhere.
+
+LOW-11: the F11 guidance is asserted as a LINE located by its own content — never
+whole-prompt text or position — so an unrelated prompt rebase cannot break it,
+and the assertion pins that it stays scoped to repository INSPECTION. The line
+was reworded to "When inspecting the repository with the shell…".
+
+## Round-2 regression proofs
+
+| suite | pre-fix | post-fix |
+| --- | --- | --- |
+| `grok/command.test.ts` (BLOCKER-1) | pass 48 fail 6 | 54/54 |
+| `orchestrate-resume.test.ts` (BLOCKER-2) | pass 12 fail 5 | 37/37 with validate |
+| `provision.test.ts` (HIGH-3/4/6) | pass 71 fail 7 | 78/78 |
+| `git.test.ts` (MED-8) | pass 11 fail 3 | 14/14 |
+
+Pre-fix runs were done by stashing ONLY the source files and keeping the tests.
+
+## Round-2 open questions
+
+23. **HIGH-6 shape** — quarantine instead of true cancellation, for the reason
+    above. Accept, or do you want `ProvisionRuntime` to grow a mandatory
+    `AbortSignal` parameter (a breaking seam change affecting every test fake)?
+24. **BLOCKER-2 fatal receipt** — a round that commits but cannot record its
+    receipt now fails and is not auto-resumable. The commit is durable and an
+    operator can recover, but this converts an artifact-store hiccup into a
+    stopped run. Confirm that is the intended severity.
+25. **MED-9 builder asymmetry** — should `grokShellPermissionTitle` also accept
+    backticks, or is refusing them in spec-declared commands correct?
+26. **BLOCKER-1 residue** — `stripSafeRedirections` retains one branch that is
+    unreachable while every allowlisted null redirection contains `>`. Kept so
+    the "entirely unquoted, exactly allowlisted" reading stays true if the
+    allowlist ever gains a redirection-free entry. Delete instead?
+
+---
+
 ## Green bar
 
 - `npm run typecheck` → exit 0
-- `npx vitest run` (full, from this worktree) → **1767 passed, 0 failed**
+- `npx vitest run` (full, from this worktree) → **1820 passed, 0 failed**, 105 files
 
 Provisioning for this worktree was an APFS copy-on-write clone of the primary's
 `node_modules` (`cp -c -R`); no `npm install`/`npm ci` was run anywhere, and the
