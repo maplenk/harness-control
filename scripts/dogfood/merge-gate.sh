@@ -53,7 +53,15 @@ echo "  main @ $BASE_BEFORE (clean)"
 # ---------------------------------------------------------------------------
 # 1. The run must actually be merge_ready, and its verdict must be `passed`.
 #    A merge_ready phase is necessary, not sufficient: the engine emits a
-#    readiness RECORD, and an `unproven` verdict is not a pass.
+#    readiness RECORD, and `ready:false` with blockers is not a pass.
+#
+#    FIELD NAMES ARE LOAD-BEARING HERE. They come from `mergeReadinessView`
+#    (src/cli/commands.ts:1384) and are `ready` / `verifiedCommit` / `blockers`
+#    / `specApprovedBy`. An earlier draft of this script guessed `verdict` and
+#    `implementationCommit`; both are absent, so it would have refused a
+#    genuinely ready run — a false refusal at the worst possible moment. If the
+#    view changes, this parser must change with it, which is why the read below
+#    fails LOUDLY on an unrecognised shape instead of defaulting.
 # ---------------------------------------------------------------------------
 step "1. run state"
 STATUS_JSON="$LOGDIR/merge-gate-$STAMP-status.json"
@@ -63,20 +71,35 @@ STATUS_JSON="$LOGDIR/merge-gate-$STAMP-status.json"
 # `read` returns non-zero at EOF, which `set -e` would treat as fatal, so the
 # node side emits a trailing newline AND the read is guarded. Without both, the
 # gate exits 1 here with no message.
-read -r PHASE VERDICT COMMIT < <(node - "$STATUS_JSON" <<'NODE'
+read -r PHASE READY SIGNER COMMIT < <(node - "$STATUS_JSON" <<'NODE'
 const b = (o => o.json ?? o)(JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8')));
-const mr = b.mergeReadiness ?? b.merge_readiness ?? {};
-const commit = mr.implementationCommit ?? mr.commit ?? b.implementationCommit ?? '';
-console.log([b.phase ?? '?', mr.verdict ?? b.verdict ?? 'absent', commit || '-'].join(' '));
+const mr = b.mergeReadiness;
+// Distinguish "no readiness record yet" from "a record whose shape I cannot
+// read" — the first is an ordinary not-ready state, the second is a bug in
+// this parser and must never be reported as a verdict.
+const ready = mr === undefined ? 'absent' : (mr.ready === true ? 'true' : (mr.ready === false ? 'false' : 'UNPARSEABLE'));
+const commit = mr?.verifiedCommit ?? '-';
+console.log([b.phase ?? '?', ready, mr?.specApprovedBy ?? '-', commit || '-'].join(' '));
 NODE
 ) || true
 [ -n "${PHASE:-}" ] || die "could not parse run status from $STATUS_JSON"
-echo "  phase=$PHASE  verdict=$VERDICT  commit=$COMMIT"
+echo "  phase=$PHASE  ready=$READY  specApprovedBy=$SIGNER  verifiedCommit=$COMMIT"
+[ "$READY" != "UNPARSEABLE" ] \
+  || die "the readiness record has a shape this gate cannot read — mergeReadinessView changed.
+     Fix the parser in this script rather than overriding; a gate that guesses is worse than none."
 [ "$PHASE" = "merge_ready" ] || die "phase is '$PHASE', not merge_ready — nothing to gate"
-if [ "$VERDICT" != "passed" ] && [ "${ALLOW_UNPROVEN:-0}" != "1" ]; then
-  die "verdict is '$VERDICT', not 'passed'. An unproven verdict is NOT a pass. Re-read the
-     readiness record; set ALLOW_UNPROVEN=1 only with a written reason."
+if [ "$READY" != "true" ] && [ "${ALLOW_UNPROVEN:-0}" != "1" ]; then
+  die "the readiness record says ready=$READY. Blockers are listed in $STATUS_JSON.
+     Set ALLOW_UNPROVEN=1 only with a written reason."
 fi
+# B2: say who approved the INTENT. Not a blocker — an auto-approved run can be
+# perfectly merge-ready — but the human merging must not have to dig for it.
+case "$SIGNER" in
+  auto)    echo "  ! spec approval was AUTO — the ENGINE approved this spec; NO human reviewed the";
+           echo "    INTENT. Review WHAT was built, not only that it verified.";;
+  unknown) echo "  ! spec approval is UNKNOWN — the event log cannot substantiate who approved this.";
+           echo "    That is worse news than 'the engine did'. Read the run's approval events before merging.";;
+esac
 
 # ---------------------------------------------------------------------------
 # 2. Locate the verified commit. The engine names assignment branches
@@ -182,11 +205,15 @@ echo "  clean"
 # 8. Record the new base SHA for the next run's manifest.
 # ---------------------------------------------------------------------------
 MANIFEST="$LOGDIR/merge-gate-$STAMP.manifest.json"
-node - "$MANIFEST" "$RUN_ID" "$BASE_BEFORE" "$BASE_AFTER" "$MERGE_REF" "$ASG_BRANCH" "$VERDICT" "$FILES" <<'NODE'
+node - "$MANIFEST" "$RUN_ID" "$BASE_BEFORE" "$BASE_AFTER" "$MERGE_REF" "$ASG_BRANCH" "$READY" "$SIGNER" "$FILES" <<'NODE'
 const fs = require('fs');
-const [out, runId, baseBefore, baseAfter, verified, branch, verdict, files] = process.argv.slice(2);
+const [out, runId, baseBefore, baseAfter, verified, branch, ready, signer, files] = process.argv.slice(2);
 fs.writeFileSync(out, JSON.stringify({
-  gate: 'dogfood-merge-gate', runId, verdict,
+  gate: 'dogfood-merge-gate', runId,
+  readinessReady: ready === 'true',
+  // Recorded, not just displayed: months from now the question "did a human
+  // review the intent of this commit?" is answerable only from here.
+  specApprovedBy: signer,
   baseShaBefore: baseBefore, baseShaAfter: baseAfter,
   verifiedCommit: verified, assignmentBranch: branch,
   testFilesDiscovered: Number(files),
