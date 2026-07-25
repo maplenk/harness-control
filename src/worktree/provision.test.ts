@@ -1886,6 +1886,167 @@ describe('F9 AC-2 — a stale primary tree is never cloned (primary_tree_stale)'
   });
 });
 
+// ---------------------------------------------------------------------------
+// ROUND 14 REGRESSION 2 — a `file:` dependency is a normal npm shape.
+//
+// npm installs one as a SYMLINK to its target directory and records it in the
+// lockfile as a LINK descriptor: `{"resolved": "<target path>", "link": true}`
+// with no version, the version living on a separate entry keyed by that path
+// (docs.npmjs.com/cli/v11/configuring-npm/package-lock-json). Both halves of the
+// proof rejected it — the installed entry is not a directory by `lstat`, and the
+// descriptor resolves no version — so a tree MAIN clones and uses was refused.
+//
+// THE GOVERNING PRINCIPLE these tests exist to pin: the proof may never refuse
+// what main accepts. It interprets what it can, refuses what it can positively
+// show to be stale, and WARNS-AND-PROCEEDS on a shape it does not understand.
+// ---------------------------------------------------------------------------
+describe('ROUND 14 REGRESSION 2 — linked (`file:`) dependencies are proven, or unprovable, but never refused', () => {
+  /**
+   * A repo declaring `left-pad` plus a `file:` dependency on an in-repo package,
+   * installed the way npm installs one: a relative symlink in node_modules.
+   * `linkEntry` is the lockfile's `node_modules/local-pkg` descriptor and
+   * `targetEntry` the separate entry it points at (omitted = uninterpretable).
+   */
+  async function repoWithFileDep(opts: {
+    readonly linkEntry: Record<string, unknown>;
+    readonly targetEntry?: Record<string, unknown>;
+    readonly installedVersion?: string;
+    readonly dangling?: boolean;
+  }): Promise<TempGitRepo> {
+    const repo = track(await makeTempGitRepo('harness-f9-filedep-'));
+    await repo.writeFile('.gitignore', 'node_modules/\n');
+    await repo.writeFile(
+      'package.json',
+      `${JSON.stringify(
+        {
+          name: 'x',
+          version: '1.0.0',
+          dependencies: { 'left-pad': '1.0.0', 'local-pkg': 'file:packages/local-pkg' },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await repo.writeFile(
+      'package-lock.json',
+      `${JSON.stringify(
+        {
+          name: 'x',
+          version: '1.0.0',
+          lockfileVersion: 3,
+          requires: true,
+          packages: {
+            '': { name: 'x' },
+            'node_modules/left-pad': { version: '1.0.0' },
+            'node_modules/local-pkg': opts.linkEntry,
+            ...(opts.targetEntry !== undefined ? { 'packages/local-pkg': opts.targetEntry } : {}),
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    // The link TARGET is committed source, so it exists in the worktree too.
+    if (opts.dangling !== true) {
+      await repo.writeFile(
+        'packages/local-pkg/package.json',
+        `${JSON.stringify({ name: 'local-pkg', version: opts.installedVersion ?? '2.3.4', main: 'index.js' }, null, 2)}\n`,
+      );
+      await repo.writeFile('packages/local-pkg/index.js', 'module.exports = { local: true };\n');
+    }
+    await repo.commitAll('a file: dependency');
+    const nm = await writePrimaryNodeModules(repo.dir);
+    // Exactly what `npm install` leaves behind for `file:packages/local-pkg`.
+    await symlink('../packages/local-pkg', path.join(nm, 'local-pkg'));
+    return repo;
+  }
+
+  it('a symlinked `file:` dep whose LINK descriptor resolves is PROVEN and provisions (main clones it fine)', async () => {
+    const repo = await repoWithFileDep({
+      linkEntry: { resolved: 'packages/local-pkg', link: true },
+      targetEntry: { name: 'local-pkg', version: '2.3.4' },
+    });
+    const fake = fakeRuntime();
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r14_filedep_ok');
+    await createAtHead(repo, manager, asg);
+
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    // INTERPRETED, not skipped: nothing was declared unprovable.
+    expect(warnings.filter((w) => w.kind === 'proof_indeterminate')).toEqual([]);
+  });
+
+  it('…and the SAME shape at the wrong version is still REFUSED (interpretation is real, not a skip)', async () => {
+    const repo = await repoWithFileDep({
+      linkEntry: { resolved: 'packages/local-pkg', link: true },
+      targetEntry: { name: 'local-pkg', version: '2.3.4' }, // lockfile says 2.3.4…
+      installedVersion: '1.0.0', // …the linked target is 1.0.0
+    });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_r14_filedep_stale');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('primary_tree_stale');
+    expect(error.message).toContain('local-pkg');
+    expect(error.message).toContain('2.3.4');
+    expect(fake.calls.clone).toBe(0);
+  });
+
+  it('an UNINTERPRETABLE link descriptor warns and proceeds — it never refuses', async () => {
+    const repo = await repoWithFileDep({
+      // A link whose target entry is not in the lockfile at all: a descriptor we
+      // cannot interpret, which is not evidence that anything is wrong.
+      linkEntry: { resolved: 'packages/local-pkg', link: true },
+    });
+    const fake = fakeRuntime();
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r14_filedep_opaque');
+    await createAtHead(repo, manager, asg);
+
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    const indeterminate = warnings.filter((w) => w.kind === 'proof_indeterminate');
+    expect(indeterminate).toHaveLength(1);
+    // Loud and specific: WHAT could not be interpreted, and about which package.
+    expect(indeterminate[0]).toMatchObject({ subject: 'local-pkg' });
+    expect((indeterminate[0] as { reason: string }).reason).toMatch(/link/i);
+  });
+
+  it('a link descriptor with no `resolved` at all is likewise unprovable, not a defect', async () => {
+    const repo = await repoWithFileDep({ linkEntry: { link: true } });
+    const fake = fakeRuntime();
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r14_filedep_noresolved');
+    await createAtHead(repo, manager, asg);
+
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    expect(warnings.filter((w) => w.kind === 'proof_indeterminate')).toHaveLength(1);
+  });
+
+  it('a package DECLARED but wholly ABSENT from the tree is still a REFUSAL (no entry is not a descriptor)', async () => {
+    // The distinction the principle turns on: an entry we cannot INTERPRET is a
+    // shape we do not understand, but a declared package with no directory at all
+    // is a positively identified stale tree — F9's whole reason to exist.
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0', chalk: '5.0.0' } }));
+    await writePrimaryNodeModules(repo.dir, { packages: ['left-pad'] });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_r14_absent_still_refuses');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('primary_tree_stale');
+    expect(error.message).toContain('chalk');
+    expect(fake.calls.clone).toBe(0);
+  });
+});
+
 describe('F9 AC-5 — an unbuilt native dependency is caught BEFORE the tree is marked', () => {
   it('a script-bearing package that cannot be loaded → native_toolchain_unproven, no marker (never sticky)', async () => {
     const repo = track(
@@ -2279,6 +2440,103 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     expect((smoked as { packages: readonly string[] }).packages.some((p) => p.endsWith('esm-native'))).toBe(true);
   });
 
+  // ROUND 14 REGRESSION 3 — Node lets a package define exported SUBPATHS with no
+  // root entry at all (nodejs.org/api/packages.html#subpath-exports), and lets a
+  // package ship only a CLI. The smoke asked for the bare name and nothing else,
+  // so neither `require(name)` nor `import(name)` could ever resolve and a tree
+  // MAIN clones and uses was refused. Under the governing principle: prove it by
+  // any mechanism the package DECLARES; if it declares none we can load, warn and
+  // proceed — never refuse.
+  it('a native package exporting only a SUBPATH is proven through that subpath', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0', 'subpath-native': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad', 'subpath-native'] });
+    const dir = path.join(nm, 'subpath-native');
+    fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
+    fs.writeFileSync(path.join(dir, 'addon.js'), 'module.exports = { native: true };\n');
+    fs.rmSync(path.join(dir, 'index.js'), { force: true });
+    // No `main`, and `exports` declares no '.' — `require('subpath-native')` can
+    // only ever throw ERR_PACKAGE_PATH_NOT_EXPORTED.
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      `${JSON.stringify(
+        {
+          name: 'subpath-native',
+          version: '1.0.0',
+          exports: { './addon': './addon.js' },
+          scripts: { install: 'node-gyp rebuild' },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const fake = fakeRuntime();
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r14_subpath');
+    await createAtHead(repo, manager, asg);
+
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    // PROVEN, not merely tolerated: it is in the smoke attestation and nothing was
+    // declared unprovable.
+    const smoked = warnings.find((w) => w.kind === 'native_smoke_passed');
+    expect((smoked as { packages: readonly string[] }).packages.some((p) => p.endsWith('subpath-native'))).toBe(true);
+    expect(warnings.filter((w) => w.kind === 'proof_indeterminate')).toEqual([]);
+  });
+
+  it('a native package with NO loadable entry (a CLI only) warns and proceeds — it never refuses', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0', 'cli-native': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad', 'cli-native'] });
+    const dir = path.join(nm, 'cli-native');
+    fs.writeFileSync(path.join(dir, 'binding.gyp'), '{ "targets": [] }\n');
+    fs.writeFileSync(path.join(dir, 'cli.js'), '#!/usr/bin/env node\nconsole.log("hi");\n');
+    fs.rmSync(path.join(dir, 'index.js'), { force: true });
+    // Ships a CLI and nothing importable: no `main`, no `exports`, no index.js.
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      `${JSON.stringify(
+        {
+          name: 'cli-native',
+          version: '1.0.0',
+          bin: { 'cli-native': './cli.js' },
+          scripts: { install: 'node-gyp rebuild' },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const fake = fakeRuntime();
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: fake.runtime, warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r14_cli_only');
+    await createAtHead(repo, manager, asg);
+
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    const indeterminate = warnings.filter((w) => w.kind === 'proof_indeterminate');
+    expect(indeterminate).toHaveLength(1);
+    expect((indeterminate[0] as { subject: string }).subject).toContain('cli-native');
+    expect((indeterminate[0] as { reason: string }).reason).toMatch(/no .*entry|bin/i);
+  });
+
+  it('a package that DECLARES a root entry which fails to load is still REFUSED (better-sqlite3 keeps working)', async () => {
+    // The pair to the two above: the fallback must not become a way to pass
+    // without loading anything. This is our real dependency's shape — a `main`
+    // that dlopens a binding that was never built.
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'real-native': '1.0.0' } }));
+    await writePrimaryNodeModules(repo.dir, {
+      packages: ['left-pad', 'real-native'],
+      native: { name: 'real-native', built: false },
+    });
+    const fake = fakeRuntime();
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_r14_declared_root_broken');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('native_toolchain_unproven');
+    expect(error.message).toContain('real-native');
+  });
+
   it('an ESM-only native package whose entry point is BROKEN is still refused', async () => {
     // The fallback proves loading; it must not become a way to pass without one.
     const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0', 'esm-native': '1.0.0' } }));
@@ -2310,9 +2568,10 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
 
     expect(error.provisioningCause).toBe('native_toolchain_unproven');
     // BOTH attempts are reported, so the operator is not told a half-truth about
-    // which mechanism failed.
-    expect(error.message).toMatch(/require:/);
-    expect(error.message).toMatch(/import:/);
+    // which mechanism failed. ROUND 14: each attempt now names the TARGET it
+    // tried, since a package can declare several.
+    expect(error.message).toMatch(/require esm-native:/);
+    expect(error.message).toMatch(/import esm-native:/);
   });
 });
 

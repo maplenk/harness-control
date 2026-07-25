@@ -157,7 +157,13 @@ export type ProvisionWarnEvent =
    * started until a stage's TTL releases it. Nothing is deleted. */
   | { readonly kind: 'quarantine_cap_reached'; readonly retained: number; readonly cap: number }
   /** F9: the runtime native smoke loaded these packages from the staged tree. */
-  | { readonly kind: 'native_smoke_passed'; readonly packages: readonly string[] };
+  | { readonly kind: 'native_smoke_passed'; readonly packages: readonly string[] }
+  /**
+   * ROUND 14 — outcome (3) of the governing principle: the proof met a shape it
+   * could not interpret and PROCEEDED (main's behaviour) instead of refusing.
+   * Never silent: it names the subject and exactly what was uninterpretable.
+   */
+  | { readonly kind: 'proof_indeterminate'; readonly subject: string; readonly reason: string };
 
 export type ProvisionWarnSink = (event: ProvisionWarnEvent) => void;
 
@@ -692,7 +698,7 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
     // it. Both halves throw rather than degrade: version defects refuse
     // `primary_tree_stale`, an unloadable toolchain refuses
     // `native_toolchain_unproven`.
-    assertRootVersionsProven(nodeModules, wtManifests, worktreePath, 'the worktree');
+    assertRootVersionsProven(nodeModules, wtManifests, worktreePath, 'the worktree', warn);
     await runNativeSmoke(nodeModules, warn, timeoutMs);
     fs.writeFileSync(path.join(nodeModules, PROVISION_MARKER_FILE), markerV3(fingerprint), 'utf8');
     return proven(
@@ -1109,7 +1115,7 @@ async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; str
   const declared = declaredRootPackages(args.wtManifests);
   // ROUND 7 (Finding 2): at VERSION granularity — a name check alone let a
   // dependency bumped without reinstalling pass on its OLD directory.
-  assertRootVersionsProven(primaryNodeModules, args.wtManifests, primaryRepoRoot, 'the primary checkout');
+  assertRootVersionsProven(primaryNodeModules, args.wtManifests, primaryRepoRoot, 'the primary checkout', args.warn);
 
   const dst = path.join(args.stageDir, 'node_modules');
   try {
@@ -1464,6 +1470,37 @@ function failClosed(message: string, detail: string, cause?: ProvisioningCause):
 
 // ---------------------------------------------------------------------------
 // F9 — proving the tree
+//
+// THE GOVERNING PRINCIPLE (round 14) — READ THIS BEFORE MAKING THE PROOF STRICTER
+//
+//   The proof may never refuse something MAIN accepts.
+//
+// Its job is to strengthen confidence where it CAN prove something, not to
+// require that every project match a layout we anticipated. So every check here
+// has exactly three outcomes, and the third is the one that keeps being
+// forgotten:
+//
+//   1. PROVEN            — the check passed. Proceed.
+//   2. POSITIVELY STALE  — the check can SHOW the tree is wrong (a declared
+//                          package with no directory at all, an installed
+//                          version that disagrees with the lockfile, a declared
+//                          entry point that fails to load). REFUSE. This is
+//                          F9's whole reason to exist and must keep working.
+//   3. INDETERMINATE     — the check met a SHAPE IT DOES NOT UNDERSTAND: an
+//                          unrecognised lock descriptor, an installed entry that
+//                          is a symlink, a package with no loadable root entry,
+//                          or whatever npm does next. Degrade to main's
+//                          behaviour — PROCEED — and `warn` with
+//                          `proof_indeterminate`, naming the package and exactly
+//                          what could not be interpreted.
+//
+// (3) is NOT the silent degradation earlier rounds rejected: it is explicit,
+// logged, per-package, and provably no worse than the status quo. Rounds 10-14
+// each found another legitimate npm shape a stricter proof falsely refused —
+// `file:` dependencies installed as symlinks, v2/v3 lockfile `link` descriptors
+// that omit the usual fields, packages exporting only a subpath. npm's surface is
+// wider than any enumeration we write, so the next unfamiliar shape must land in
+// (3) by construction rather than becoming the next regression.
 // ---------------------------------------------------------------------------
 /** The root-level `dependencies` + `devDependencies` NAMES a manifest declares. */
 function declaredRootPackages(manifests: ManifestSet): string[] {
@@ -1526,6 +1563,7 @@ function assertRootVersionsProven(
   manifests: ManifestSet,
   root: string,
   label: string,
+  warn: ProvisionWarnSink,
 ): void {
   const locked = lockedRootVersions(manifests);
   if (!locked.ok) {
@@ -1538,7 +1576,23 @@ function assertRootVersionsProven(
       'primary_tree_stale',
     );
   }
-  const defects = proveePrimaryTree(treeNodeModules, declaredRootPackages(manifests), locked.versions);
+  const { defects, indeterminate } = proveePrimaryTree(
+    treeNodeModules,
+    declaredRootPackages(manifests),
+    locked.versions,
+    locked.indeterminate,
+  );
+  // Outcome (3), reported per package before any refusal decision: these are
+  // installed but unproven, and the run PROCEEDS exactly as main would.
+  for (const item of indeterminate) {
+    warn({
+      kind: 'proof_indeterminate',
+      subject: item.name,
+      reason:
+        `${item.detail}; its version is therefore NOT proven against the lockfile. Proceeding as main does ` +
+        `(${label}'s node_modules at ${treeNodeModules}).`,
+    });
+  }
   if (defects.length === 0) return;
   const named = defects
     .slice(0, 8)
@@ -1559,20 +1613,51 @@ function proveePrimaryTree(
   primaryNodeModules: string,
   declared: readonly string[],
   lockedVersions: ReadonlyMap<string, string>,
-): PrimaryTreeDefect[] {
+  uninterpretable: ReadonlyMap<string, string>,
+): { readonly defects: PrimaryTreeDefect[]; readonly indeterminate: PrimaryTreeDefect[] } {
   const defects: PrimaryTreeDefect[] = [];
+  const indeterminate: PrimaryTreeDefect[] = [];
   for (const name of declared) {
     // A package name is a posix path fragment ('@scope/pkg'); join it as such.
     const dir = path.join(primaryNodeModules, ...name.split('/'));
-    if (lstatSafe(dir)?.isDirectory() !== true) {
+    const entry = lstatSafe(dir);
+    if (entry === undefined) {
+      // Positively stale (outcome 2): nothing is installed under this name.
       defects.push({ name, detail: 'no directory in the primary node_modules' });
+      continue;
+    }
+    if (entry.isSymbolicLink()) {
+      // ROUND 14 (REGRESSION 2): npm installs a `file:` dependency as a SYMLINK
+      // to its target directory — a normal layout, not a defect. Resolve through
+      // it (the manifest read below follows the link too). A target we cannot
+      // examine is outcome (3), not evidence of staleness: the link may be
+      // satisfied by a checkout step outside this tree's view, and main proceeds.
+      if (statFollowingSafe(dir)?.isDirectory() !== true) {
+        indeterminate.push({
+          name,
+          detail: 'it is installed as a SYMLINK (a file:/link dependency) whose target is not a directory we can examine',
+        });
+        continue;
+      }
+    } else if (!entry.isDirectory()) {
+      defects.push({ name, detail: 'no directory in the primary node_modules' });
+      continue;
+    }
+    const uninterpretableReason = uninterpretable.get(name);
+    if (uninterpretableReason !== undefined) {
+      // Outcome (3): the package is installed, but the LOCKFILE says nothing this
+      // engine can compare against. Proceed as main does, loudly.
+      indeterminate.push({ name, detail: uninterpretableReason });
       continue;
     }
     const expected = lockedVersions.get(name);
     if (expected === undefined) {
       // ROUND 8 (Blocker 2): no resolved version for a DECLARED package means the
       // lockfile cannot prove this package at all. Skipping the comparison is the
-      // same silent downgrade the empty-map fallback was.
+      // same silent downgrade the empty-map fallback was. ROUND 14 keeps this a
+      // DEFECT deliberately: reaching here means the lockfile has no entry for the
+      // name whatsoever (an entry we merely could not interpret was routed above),
+      // which is the lockfile positively disagreeing with the manifest.
       defects.push({ name, detail: 'the lockfile resolves no version for it (unrecognised or absent entry)' });
       continue;
     }
@@ -1594,7 +1679,7 @@ function proveePrimaryTree(
       defects.push({ name, detail: `installed ${installed}, lockfile resolved ${expected}` });
     }
   }
-  return defects;
+  return { defects, indeterminate };
 }
 
 /**
@@ -1616,7 +1701,18 @@ function proveePrimaryTree(
 const SUPPORTED_LOCKFILE_VERSIONS: ReadonlySet<number> = new Set([1, 2, 3]);
 
 type LockVersions =
-  | { readonly ok: true; readonly versions: ReadonlyMap<string, string> }
+  | {
+      readonly ok: true;
+      readonly versions: ReadonlyMap<string, string>;
+      /**
+       * ROUND 14 — outcome (3): entries that EXIST but whose version this engine
+       * cannot read, mapped to why. Distinct from a name with NO entry at all,
+       * which stays a defect (round 8's Blocker 2): an uninterpretable descriptor
+       * is a shape we do not understand, while a missing one is the lockfile
+       * positively disagreeing with the manifest.
+       */
+      readonly indeterminate: ReadonlyMap<string, string>;
+    }
   | { readonly ok: false; readonly reason: string };
 
 function lockedRootVersions(manifests: ManifestSet): LockVersions {
@@ -1655,16 +1751,46 @@ function lockedRootVersions(manifests: ManifestSet): LockVersions {
     };
   }
   const versions = new Map<string, string>();
+  const indeterminate = new Map<string, string>();
   const packages = record.packages;
   if (packages !== null && typeof packages === 'object' && !Array.isArray(packages)) {
-    for (const [key, value] of Object.entries(packages as Record<string, unknown>)) {
+    const entries = packages as Record<string, unknown>;
+    for (const [key, value] of Object.entries(entries)) {
       if (!key.startsWith('node_modules/')) continue;
       const name = key.slice('node_modules/'.length);
       if (name.includes('node_modules/')) continue;
-      if (value !== null && typeof value === 'object') {
-        const version = (value as { version?: unknown }).version;
-        if (typeof version === 'string') versions.set(name, version);
+      if (value === null || typeof value !== 'object') continue;
+      const entry = value as { version?: unknown; link?: unknown; resolved?: unknown };
+      if (typeof entry.version === 'string') {
+        versions.set(name, entry.version);
+        continue;
       }
+      // ROUND 14 (REGRESSION 2): a `file:` dependency is recorded as a LINK
+      // descriptor — no version of its own, `resolved` naming a SEPARATE entry
+      // keyed by the target's path, which carries the version. Interpreting that
+      // is two lookups, so the linked package is PROVEN like any other rather
+      // than merely tolerated.
+      if (entry.link === true) {
+        const target = typeof entry.resolved === 'string' ? entries[entry.resolved] : undefined;
+        const targetVersion =
+          target !== null && typeof target === 'object' ? (target as { version?: unknown }).version : undefined;
+        if (typeof targetVersion === 'string') {
+          versions.set(name, targetVersion);
+          continue;
+        }
+        indeterminate.set(
+          name,
+          typeof entry.resolved === 'string'
+            ? `the lockfile records it as a LINK to '${entry.resolved}', and that entry declares no version this engine can read`
+            : 'the lockfile records it as a LINK with no `resolved` target path',
+        );
+        continue;
+      }
+      // Outcome (3): an entry we do not recognise is not evidence of a defect.
+      indeterminate.set(
+        name,
+        'its lockfile entry declares no version and is not a link descriptor this engine recognises',
+      );
     }
   }
   const deps = record.dependencies;
@@ -1676,7 +1802,7 @@ function lockedRootVersions(manifests: ManifestSet): LockVersions {
       }
     }
   }
-  return { ok: true, versions };
+  return { ok: true, versions, indeterminate };
 }
 
 /**
@@ -1709,6 +1835,75 @@ function lockedRootVersions(manifests: ManifestSet): LockVersions {
 interface NativePackage {
   readonly dir: string;
   readonly name: string;
+  /**
+   * ROUND 14 (REGRESSION 3) — every specifier this package DECLARES as a way in:
+   * the bare name, plus each concrete `exports` subpath. The smoke proves the
+   * addon LOADS by any of them.
+   */
+  readonly targets: readonly string[];
+  /**
+   * Whether the manifest declares a ROOT entry (`main`, or an `exports` that
+   * resolves `.`). This is what separates outcome (2) from outcome (3): a
+   * declared root entry that fails to load is a package positively shown to be
+   * broken (better-sqlite3 unbuilt) and REFUSES; a package that declares no way
+   * in we can load is a shape we cannot prove, which warns and proceeds.
+   */
+  readonly declaresRootEntry: boolean;
+  /** Only for the operator message: it ships a CLI and nothing importable. */
+  readonly binOnly: boolean;
+}
+
+/**
+ * ROUND 14 (REGRESSION 3) — derive the declared ways INTO a package. Node lets a
+ * package define exported subpaths with no root entry at all, and lets a package
+ * ship only a `bin`; asking solely for the bare name made both unprovable by
+ * construction and therefore refused, though main clones and uses them.
+ *
+ * A wildcard subpath (`./*`) is skipped: it needs a concrete match to resolve, so
+ * it is not a specifier we can try. A `bin` is NOT executed — running an
+ * arbitrary CLI inside the orchestrator is not a smoke, it is arbitrary
+ * side effects — so a bin-only package lands in outcome (3) instead.
+ */
+function loadPlanFor(parsed: Record<string, unknown> | undefined, name: string): Omit<NativePackage, 'dir' | 'name'> {
+  const targets = [name];
+  if (parsed === undefined) return { targets, declaresRootEntry: false, binOnly: false };
+  let declaresRootEntry = typeof parsed['main'] === 'string';
+  const exported = parsed['exports'];
+  if (typeof exported === 'string') {
+    declaresRootEntry = true;
+  } else if (exported !== null && typeof exported === 'object' && !Array.isArray(exported)) {
+    const keys = Object.keys(exported as Record<string, unknown>);
+    // `.` names the root explicitly; a map with NO subpath keys is a CONDITIONS
+    // object, which IS the root entry ({"import": …, "require": …}).
+    if (keys.includes('.') || (keys.length > 0 && !keys.some((key) => key.startsWith('.')))) {
+      declaresRootEntry = true;
+    }
+    for (const key of keys) {
+      if (!key.startsWith('./') || key.includes('*')) continue;
+      targets.push(`${name}${key.slice(1)}`);
+    }
+  }
+  const bin = parsed['bin'];
+  const declaresBin = typeof bin === 'string' || (bin !== null && typeof bin === 'object');
+  return { targets, declaresRootEntry, binOnly: !declaresRootEntry && targets.length === 1 && declaresBin };
+}
+
+/**
+ * The manifest of a package we already decided to smoke, read BEST-EFFORT.
+ *
+ * Deliberately not fail-closed: the `binding.gyp` branch of the scan admits a
+ * package without ever reading its manifest, so making this strict would refuse
+ * trees the scan already accepted. An unreadable manifest here simply yields no
+ * declared targets beyond the bare name, and the load attempt decides.
+ */
+function readManifestBestEffort(dir: string): Record<string, unknown> | undefined {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    return value as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
 }
 
 function nativeBuildPackages(treePath: string): NativePackage[] {
@@ -1722,7 +1917,7 @@ function nativeBuildPackages(treePath: string): NativePackage[] {
     // `scripts` object first (and returning early without one) skipped exactly
     // the packages whose build npm supplies for them.
     if (fs.existsSync(path.join(dir, 'binding.gyp'))) {
-      found.push({ dir, name });
+      found.push({ dir, name, ...loadPlanFor(readManifestBestEffort(dir), name) });
       void specifier;
       return;
     }
@@ -1765,7 +1960,7 @@ function nativeBuildPackages(treePath: string): NativePackage[] {
       .map((hook) => (scripts as Record<string, unknown>)[hook])
       .filter((value): value is string => typeof value === 'string');
     if (hooks.some((script) => /node-gyp|node-pre-gyp|prebuild|cmake-js/i.test(script))) {
-      found.push({ dir, name });
+      found.push({ dir, name, ...loadPlanFor(parsed, name) });
       void specifier;
     }
   };
@@ -1879,6 +2074,7 @@ async function runNativeSmoke(
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
   }
+  const proven: string[] = [];
   for (const pkg of packages) {
     try {
       // REGRESSION 1: resolve from the package's OWN package.json, so a bare
@@ -1886,23 +2082,24 @@ async function runNativeSmoke(
       // `parent/node_modules/child` instead asked Node for a SUBPATH of the
       // parent, which a parent declaring `exports` rejects outright.
       //
-      // ROUND 13 (ITEM 4): and prove the addon LOADS by whichever mechanism the
-      // PACKAGE declares, not by one specifier form. `require` alone refused a
-      // valid ESM-only native package — ERR_PACKAGE_PATH_NOT_EXPORTED when its
-      // `exports` declares only an `import` condition, ERR_REQUIRE_ESM /
-      // ERR_REQUIRE_ASYNC_MODULE for a module entry point — a tree main clones and
-      // uses without complaint. The dynamic `import()` fallback cannot launder a
-      // genuinely broken addon: importing a CJS package evaluates it through the
-      // same CommonJS loader, so a missing `.node` binding fails identically (a
-      // test drives exactly that). Both errors are reported, so the operator is
-      // never told a half-truth about which mechanism failed.
+      // ROUND 13 (ITEM 4) and ROUND 14 (REGRESSION 3): prove the addon LOADS by
+      // whichever mechanism the PACKAGE declares, not by one specifier form.
+      // `require` of the bare name alone refused a valid ESM-only package
+      // (ERR_PACKAGE_PATH_NOT_EXPORTED / ERR_REQUIRE_ESM) and any package whose
+      // `exports` names only subpaths — trees main clones and uses. Each declared
+      // target is tried with require and then dynamic import; the FIRST success
+      // proves the package. None of this can launder a broken addon: importing a
+      // CJS package evaluates it through the same CommonJS loader, so a missing
+      // `.node` binding fails identically (a test drives exactly that), and every
+      // attempted error is reported.
       const script =
         'const {createRequire}=require("node:module");' +
-        `const name=${JSON.stringify(pkg.name)};` +
-        `try{createRequire(${JSON.stringify(path.join(pkg.dir, 'package.json'))})(name);}catch(err){` +
-        'import(name).catch((esmErr)=>{process.exitCode=1;' +
-        'console.error("require: "+(err&&err.message));' +
-        'console.error("import: "+(esmErr&&esmErr.message));});}';
+        `const req=createRequire(${JSON.stringify(path.join(pkg.dir, 'package.json'))});` +
+        `const targets=${JSON.stringify(pkg.targets)};` +
+        '(async()=>{const errs=[];for(const t of targets){' +
+        'try{req(t);process.exit(0);}catch(err){errs.push("require "+t+": "+((err&&err.message)||String(err)));}' +
+        'try{await import(t);process.exit(0);}catch(err){errs.push("import "+t+": "+((err&&err.message)||String(err)));}' +
+        '}console.error(errs.join("\\n"));process.exit(1);})();';
       await execFileAsync(process.execPath, ['-e', script], {
         // The package's OWN directory: a bare `import()` from the eval module
         // resolves against cwd, and Node's node_modules walk from here reaches the
@@ -1914,20 +2111,37 @@ async function runNativeSmoke(
         timeout: Math.min(timeoutMs, NATIVE_SMOKE_TIMEOUT_MS),
         maxBuffer: 4 * 1024 * 1024,
       });
+      proven.push(pkg.dir);
     } catch (error) {
       const stderr = typeof (error as { stderr?: unknown }).stderr === 'string'
         ? ((error as { stderr: string }).stderr).trim().split('\n').slice(0, 6).join(' | ')
         : messageOf(error);
-      throw failClosed(
-        `provisioned node_modules for ${treePath} could not LOAD '${pkg.dir}', which declares a native build step — ` +
-          'the package is present but was never built (a script-less install cannot build it). Refusing to verify ' +
-          `against an unproven toolchain: ${stderr}`,
-        `native smoke failed for ${pkg.dir}`,
-        'native_toolchain_unproven',
-      );
+      if (pkg.declaresRootEntry) {
+        // Outcome (2) — POSITIVELY broken: the package declares a root entry and
+        // that entry does not load. This is the better-sqlite3 case F9 exists for.
+        throw failClosed(
+          `provisioned node_modules for ${treePath} could not LOAD '${pkg.dir}', which declares a native build step — ` +
+            'the package is present but was never built (a script-less install cannot build it). Refusing to verify ' +
+            `against an unproven toolchain: ${stderr}`,
+          `native smoke failed for ${pkg.dir}`,
+          'native_toolchain_unproven',
+        );
+      }
+      // Outcome (3) — the package declares no way in that we can load: subpath
+      // wildcards only, a CLI `bin` (which we will not EXECUTE as a smoke), or a
+      // shape npm has yet to teach us. Main provisions this tree without a smoke
+      // at all, so refusing would be strictly worse than the status quo.
+      warn({
+        kind: 'proof_indeterminate',
+        subject: pkg.dir,
+        reason:
+          `it declares a native build step but ${pkg.binOnly ? 'ships only a CLI `bin`' : 'no root entry'} this ` +
+          'engine can load, so its build is NOT proven. Proceeding as main does. Attempts: ' +
+          stderr,
+      });
     }
   }
-  warn({ kind: 'native_smoke_passed', packages: packages.map((pkg) => pkg.dir) });
+  if (proven.length > 0) warn({ kind: 'native_smoke_passed', packages: proven });
 }
 
 /**
@@ -1948,6 +2162,23 @@ export function lstatSafe(target: string): fs.Stats | undefined {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ENOTDIR') return undefined;
     throw failClosed(`could not lstat ${target}: ${messageOf(error)}`, `lstat ${target} failed (${code ?? 'unknown'})`);
+  }
+}
+
+/**
+ * ROUND 14 — `lstatSafe`'s exact contract, but FOLLOWING symlinks. npm installs a
+ * `file:` dependency as a symlink to its target directory, so the installed-entry
+ * check must be able to look through one; a dangling link reports `undefined`
+ * (the caller treats that as indeterminate, never as staleness) while a real FS
+ * error still fails closed.
+ */
+function statFollowingSafe(target: string): fs.Stats | undefined {
+  try {
+    return fs.statSync(target);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return undefined;
+    throw failClosed(`could not stat ${target}: ${messageOf(error)}`, `stat ${target} failed (${code ?? 'unknown'})`);
   }
 }
 
