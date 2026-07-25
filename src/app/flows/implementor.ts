@@ -58,8 +58,9 @@
  *  2. **Primary-checkout mutation guard**: the flow snapshots the PRIMARY
  *     repo before the commands and re-checks after; ANY drift produces the
  *     typed `verification_runner_violation` — the round's verification fails
- *     honestly (`verificationPassed:false`), the §16 readiness gate blocks
- *     on it (verifier flow), and the loop driver records the durable
+ *     honestly (`verificationPassed:false`); the loop binds that host result
+ *     to the exact round/commit, the §16 readiness gate blocks on it, and the
+ *     loop driver records the durable
  *     `verification.runner.violation` incident event. The snapshot covers
  *     HEAD, `git status --porcelain --ignored` (so a NEW gitignored file is
  *     drift, not just tracked-tree edits), a content manifest of the primary
@@ -397,7 +398,7 @@ export interface VerificationRunnerViolation {
 /** Cap on the recorded changed-path list of a runner violation. */
 const MAX_VIOLATION_CHANGED_PATHS = 20;
 
-interface PrimaryCheckoutState {
+export interface PrimaryCheckoutState {
   readonly head: string;
   readonly porcelain: string;
   /** Content manifest of the primary `.git/hooks` directory (name:hash lines). */
@@ -453,7 +454,7 @@ async function snapshotGitHooksManifest(hooksDir: string): Promise<string> {
   return lines.join('\n');
 }
 
-async function snapshotPrimaryCheckoutState(repoRoot: string): Promise<PrimaryCheckoutState> {
+export async function snapshotPrimaryCheckoutState(repoRoot: string): Promise<PrimaryCheckoutState> {
   const commonDir = await resolvePrimaryCommonDir(repoRoot);
   return {
     head: await resolveSha(repoRoot, 'HEAD'),
@@ -487,7 +488,7 @@ function porcelainChangedPaths(before: string, after: string): string[] {
  * typed violation on ANY drift (HEAD moved, porcelain changed, or the primary
  * became unreadable — the catastrophic drift case); `undefined` when clean.
  */
-async function detectPrimaryCheckoutDrift(
+export async function detectPrimaryCheckoutDrift(
   repoRoot: string,
   before: PrimaryCheckoutState,
 ): Promise<VerificationRunnerViolation | undefined> {
@@ -635,8 +636,6 @@ export interface ImplementorContext {
 }
 
 export interface ImplementorFlowOptions {
-  /** Defaults to `defaultVerificationRunner()`. Injected in tests. */
-  readonly runVerification?: VerificationRunner;
   /** Commit message for the implementor's work commit. */
   readonly commitMessage?: string;
   /** Author/committer identity for the commit (never relies on ambient config). */
@@ -711,24 +710,23 @@ export interface ImplementorResult {
   /** base→HEAD unified diff (bounded to `maxDiffBytes`). */
   readonly diff: string;
   readonly diffTruncated: boolean;
-  /** Per-command results of the spec's declared verification commands (§8). */
+  /** Always EMPTY: the declared commands run at the verify boundary, where the
+   * evidence receipts record each execution. Kept so the round report's shape
+   * is stable for consumers that still read it. */
   readonly verification: readonly VerificationCommandResult[];
-  /** True iff every declared verification command passed (vacuously true if
-   * none) AND the W3-1 primary-checkout guard saw no drift. */
+  /** True iff the host preconditions THIS boundary can attest hold — i.e.
+   * post-commit provisioning succeeded. Per-command truth belongs to the F13
+   * receipts at the verify boundary; the §16 gate requires both. */
   readonly verificationPassed: boolean;
-  /** W3-1: the primary checkout mutated across the verification commands —
-   * typed proof of a confinement violation. Forces `verificationPassed:false`;
-   * the loop driver records the durable incident event and the §16 readiness
-   * gate blocks on it. */
-  readonly runnerViolation?: VerificationRunnerViolation;
-  /** F7 (spec §2.4): post-commit dependency provisioning failed — the host
-   * self-check runner was SKIPPED (fail closed) and the loop driver halts before
-   * verifier dispatch with the terminal `provisioning_failed` outcome. Forces
+  /** F7 (spec §2.4): post-commit dependency provisioning failed — no host
+   * command may run for this round, and the loop driver halts before verifier
+   * dispatch with the terminal `provisioning_failed` outcome. Forces
    * `verificationPassed:false`. */
   readonly provisioningFailed?: ProvisioningFailure;
-  /** W1-F4: the verification commands left the worktree dirty AFTER the
-   * recorded commit — that content is in NO commit, so the §16 readiness
-   * gate blocks merge on it. */
+  /** W1-F4: the round left the worktree dirty AFTER the recorded commit — that
+   * content is in NO commit, so the §16 readiness gate blocks merge on it.
+   * Command-created dirt is caught by that gate instead, which probes after
+   * the receipts have run. */
   readonly postVerificationDirty: boolean;
   /** Bounded dirty-path list (`git status --porcelain`) when dirty; else empty. */
   readonly postVerificationDirtyFiles: readonly string[];
@@ -1075,51 +1073,28 @@ export class ImplementorFlow {
       }
     }
 
-    // --- Run the spec's declared verification commands (§8) -----------------
-    const runVerification = this.#options.runVerification ?? defaultVerificationRunner();
-    const maxOutputBytes = this.#options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
-    // Fail closed: no host command runs when provisioning could not be proven.
-    const commands = provisioningFailed === undefined ? resolveVerificationCommands(this.#context) : [];
-    // W3-1 layer 2: snapshot the PRIMARY checkout (HEAD + porcelain) BEFORE
-    // the commands run — drift across them is a confinement violation. A
-    // failing snapshot here propagates: a pre-existing broken primary is an
-    // environment problem, not the runner's doing.
-    const primaryBefore =
-      commands.length > 0 ? await snapshotPrimaryCheckoutState(handle.repoRoot) : undefined;
+    // --- The spec's declared verification commands do NOT run here ----------
+    // F13: the per-command EVIDENCE RECEIPTS are the authoritative execution
+    // proof, and they run at the VERIFY boundary — after that boundary's own
+    // provisioning, bound to the adjudicated implementation commit, and on the
+    // paths this flow never reaches (forced verifier re-entry, verify-only
+    // resume). Running the same commands here as well executed every declared
+    // command TWICE per round: double wall-clock and cost, NON-IDEMPOTENT
+    // commands (migrations, port binders, quota-consuming calls) run twice, and
+    // the waste compounding across remediation rounds.
+    //
+    // The W3-1 primary-checkout confinement guard MOVED WITH THE EXECUTION —
+    // it now wraps the receipts (`executeEvidenceReceiptsUnderConfinement`),
+    // because a guard has to observe the commands it confines. It is NOT
+    // retained here as an inert leftover.
     const verification: VerificationCommandResult[] = [];
-    for (const command of commands) {
-      let outcome: VerificationCommandOutcome;
-      try {
-        outcome = await runVerification(command, cwd);
-      } catch (error) {
-        // A misbehaving runner must not lose the (already committed) work.
-        outcome = { exitCode: 127, stdout: '', stderr: String(error), launchFailed: true };
-      }
-      verification.push({
-        command,
-        exitCode: outcome.exitCode,
-        // §17.1 REDACT BEFORE TRUNCATE (same invariant as the diff above).
-        stdout: boundText(redactText(outcome.stdout), maxOutputBytes).text,
-        stderr: boundText(redactText(outcome.stderr), maxOutputBytes).text,
-        passed: outcome.exitCode === 0 && !outcome.launchFailed,
-        launchFailed: outcome.launchFailed,
-      });
-    }
 
-    // W3-1 layer 2: re-check the PRIMARY checkout against the pre-command
-    // snapshot. Any drift (HEAD moved, porcelain changed, primary unreadable)
-    // is the typed violation: verification fails honestly below and the
-    // caller records the durable incident + blocks §16 readiness.
-    const runnerViolation =
-      primaryBefore !== undefined
-        ? await detectPrimaryCheckoutDrift(handle.repoRoot, primaryBefore)
-        : undefined;
-
-    // W1-F4: the commit-then-verify order is deliberate (the recorded diff
-    // must never be polluted by a verification build), so a command that
-    // MUTATES the tree leaves content behind that is in NO commit. Snapshot
-    // the worktree status now — the §16 readiness gate blocks on exactly
-    // this dirt, and the report names it honestly.
+    // W1-F4: the recorded diff must never be polluted by a verification build,
+    // so this snapshot is taken after the commit and after provisioning. It no
+    // longer sees command-created dirt (the commands run at the verify
+    // boundary now) — what it still catches is dirt the IMPLEMENTOR's own turn
+    // or the provisioning step left uncommitted. Command-created dirt is caught
+    // by the §16 readiness gate, which probes after the receipts have run.
     const postStatus = await statusPorcelain(cwd);
     const postVerificationDirtyFiles = porcelainPaths(postStatus).slice(
       0,
@@ -1136,12 +1111,13 @@ export class ImplementorFlow {
       diff: bounded.text,
       diffTruncated: bounded.truncated,
       verification,
-      // W3-1: a runner violation fails verification even when every command
-      // exited 0 — a poisoned round must never read as self-check-passed. F7: a
-      // provisioning failure likewise never reads as passed (no command ran).
-      verificationPassed:
-        provisioningFailed === undefined && verification.every((v) => v.passed) && runnerViolation === undefined,
-      ...(runnerViolation !== undefined ? { runnerViolation } : {}),
+      // F13: this boolean is now exactly what THIS boundary can attest — that
+      // the host preconditions for the round are sound. Per-command truth is
+      // the receipts' job at the verify boundary (`#hostReceiptIssue` requires
+      // a current, zero-exit receipt per declared command on top of this), so
+      // this no longer folds in command exit codes it did not observe. F7: a
+      // provisioning failure never reads as passed.
+      verificationPassed: provisioningFailed === undefined,
       ...(provisioningFailed !== undefined ? { provisioningFailed } : {}),
       postVerificationDirty: postStatus.trim().length > 0,
       postVerificationDirtyFiles,

@@ -54,7 +54,10 @@ import type { RunPhase } from '../../domain/state.js';
 import * as git from '../../worktree/git.js';
 import { GitWorktreeManager, WorktreeError, type WorktreeHandle } from '../../worktree/index.js';
 import { redactText } from '../../redaction/index.js';
-import type { RoleModelSpec } from '../model-resolution.js';
+import {
+  resolveVerificationRoles,
+  type RoleModelSpec,
+} from '../model-resolution.js';
 import {
   AutoRespawnSignal,
   LimitPausedError,
@@ -67,6 +70,7 @@ import type { RoleRoundProjection } from '../projections.js';
 import type { RoleRunner } from '../role-runner.js';
 import {
   describeImplementorRoundDiagnostic,
+  defaultVerificationRunner,
   ImplementorFlow,
   verificationRunnerViolationEvent,
   type ImplementorContext,
@@ -77,6 +81,7 @@ import {
 } from './implementor.js';
 import {
   formatFixRequests,
+  executeEvidenceReceiptsUnderConfinement,
   gitMergeReadinessProbe,
   runVerification,
   type EvidenceRecorder,
@@ -104,6 +109,72 @@ export class LoopCompositionError extends Error {
 // by `runRole` when it adjudicates a round `no_deliverable` ATOMICALLY with the
 // round-completion write). Re-exported here so existing importers keep working.
 export { NoDeliverableError } from '../service.js';
+
+/**
+ * F8 authorship, enforced at the verify boundary: a declared verification
+ * command created a commit in the worktree.
+ *
+ * A HARD STOP, matching the severity main enforced when these commands still
+ * ran inside the implementor round and its adjudicator threw `NoDeliverableError`
+ * on the receipt/HEAD disagreement. The round must not continue into
+ * remediation: a subsequent implementation round would commit ON TOP of the
+ * command-authored commit, making it an ancestor of the delivered work and
+ * laundering exactly what F8 refused. Verification commands observe the bound
+ * implementation commit; they never author one.
+ */
+/**
+ * The post-command worktree HEAD could not be read, so whether a declared
+ * verification command authored a commit is INDETERMINATE.
+ *
+ * Fails the round closed rather than proceeding: a read that did not complete
+ * is not an observation that HEAD stayed put, and the alternative — treating it
+ * as "unchanged" — is precisely how the authorship guard would be silently
+ * bypassed by a broken tree. Distinct from `VerificationAuthoredCommitError`
+ * because claiming a commit nobody observed would be its own fabrication.
+ */
+export class VerificationHeadUnreadableError extends Error {
+  override readonly name: string = 'VerificationHeadUnreadableError';
+  constructor(
+    readonly assignmentId: AssignmentId,
+    readonly round: number,
+    readonly worktreePath: string,
+  ) {
+    super(
+      `could not read the post-command worktree HEAD at ${worktreePath} for assignment ` +
+        `${String(assignmentId)} round ${round}. Whether a declared verification command authored ` +
+        'a commit is therefore unproven, and the round is refused rather than assumed clean.',
+    );
+  }
+}
+
+export class VerificationAuthoredCommitError extends Error {
+  override readonly name: string = 'VerificationAuthoredCommitError';
+  constructor(
+    readonly assignmentId: AssignmentId,
+    readonly round: number,
+    readonly boundCommit: GitSha,
+    readonly authoredCommit: GitSha,
+    /** TRUE when the evidence-write path ALSO failed during the same execution.
+     * A BOOLEAN, never a check on the error value: `throw undefined` and
+     * `Promise.reject(undefined)` are legal, so testing the value would drop the
+     * only indication that evidence execution failed at all. The authored commit
+     * outranks it for the DECISION; the operator must still be told. */
+    readonly evidenceExecutionFailed: boolean = false,
+    executionError?: unknown,
+  ) {
+    super(
+      `a declared verification command authored a commit in assignment ${String(assignmentId)} ` +
+        `round ${round}: the worktree moved from the bound implementation commit ${String(boundCommit)} ` +
+        `to ${String(authoredCommit)}. Verification commands must observe the bound commit, never ` +
+        'author one; the round is refused rather than remediated so nothing can descend from it.' +
+        (evidenceExecutionFailed
+          ? ' The evidence-write path ALSO failed during this execution — the authored commit ' +
+            'outranks it for the refusal, but that failure is real and is carried as the cause.'
+          : ''),
+      ...(evidenceExecutionFailed ? [{ cause: executionError }] : []),
+    );
+  }
+}
 
 /**
  * F2: adjudicate an implementor round's deliverable — called by `runRole` at
@@ -225,6 +296,8 @@ export interface ImplementVerifyLoopResult {
   readonly worktree: WorktreeHandle;
   /** The final implementation commit (last round's worktree HEAD). */
   readonly implementationCommit: GitSha;
+  /** Non-fatal independence warnings (only possible under the explicit opt-out). */
+  readonly warnings: readonly string[];
   /** The last §16 readiness report computed (criteria-verified rounds only).
    * `ready === true` iff the run reached `merge_ready` (W1-F1); a NOT-ready
    * report carries the blockers that forced the round back to T23 — or, on
@@ -532,6 +605,17 @@ export async function runImplementVerifyLoop(
 ): Promise<ImplementVerifyLoopResult> {
   const { service, worktrees } = deps;
   const resume = input.resume;
+  const allowSameHarness =
+    service.getRunConfig(input.runId)?.verification.allowSameHarness ?? false;
+  const independenceWarnings = new Set<string>();
+  const initialRoleResolution = resolveVerificationRoles(
+    service.effectiveRoleSpec(input.runId, 'implementor', input.implementor),
+    service.effectiveRoleSpec(input.runId, 'verifier', input.verifier),
+    allowSameHarness,
+  );
+  for (const warning of initialRoleResolution.warnings) {
+    independenceWarnings.add(warning);
+  }
 
   const entryPhase = service.status(input.runId).phase;
   if (resume === undefined) {
@@ -670,6 +754,7 @@ export async function runImplementVerifyLoop(
         skipImplement && reentry !== undefined && reentry.round.role === 'verifier' ? reentry.round : undefined;
 
       let implementation: ImplementorResult | undefined;
+      let hostVerificationPassed = false;
       if (!skipImplement) {
         // --- Dispatch the implementor round (W2-3 pending/active split) ------
         // The workflow REMAINS at its previous stable phase
@@ -781,10 +866,17 @@ export async function runImplementVerifyLoop(
         // for an implementor round before this point.
         implementationCommit =
           adjudicatedHead ?? gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
-        // F7 (#1): PERSIST this host-verified implementation commit (ROUND-SCOPED)
-        // BEFORE the fail-closed break so a completed implementor round that later
-        // RESUMES (re-entering at verification) resets the adopted worktree to EXACTLY
+        // F7 (#1): PERSIST this implementation commit (ROUND-SCOPED) BEFORE the
+        // fail-closed break so a completed implementor round that later RESUMES
+        // (re-entering at verification) resets the adopted worktree to EXACTLY
         // it — never WIP-committing post-commit dirt onto a new, unadjudicated HEAD.
+        //
+        // Deliberately NO host verdict travels with it. A provisioning failure is
+        // evidence about the attempt that failed, not about any later one, and
+        // the verify boundary below re-provisions unconditionally and fails
+        // closed. Persisting a negative let a superseded attempt outlive itself
+        // and force every command-bearing criterion `unproven` on a resume whose
+        // tree had just been re-proven.
         recordImplementationCommit(deps, input, round, implementationCommit);
 
         // F7 (§2.4) FAIL CLOSED: the implementor's post-commit provisioning could
@@ -799,24 +891,6 @@ export async function runImplementVerifyLoop(
           break;
         }
 
-        // W3-1: the confinement guard's primary-checkout drift is a durable
-        // INCIDENT — append it NOW (before the verifier round renders any
-        // verdict), then thread the violation into the §16 readiness gate
-        // below so an all-verified round still blocks (T23, never T24). A
-        // violation detected before a pause that later re-enters verify-only
-        // (W2-5) is carried by this durable event only — the in-process
-        // readiness wire covers the live path.
-        if (implementation.runnerViolation !== undefined) {
-          service.ingest(
-            verificationRunnerViolationEvent({
-              runId: input.runId,
-              assignmentId: input.assignmentId,
-              violation: implementation.runnerViolation,
-              ids: deps.ids,
-              clock: deps.clock,
-            }),
-          );
-        }
       } else if (forcedVerifierRound !== undefined) {
         const boundCommit = forcedVerifierRound.implementationCommit;
         if (boundCommit === undefined) {
@@ -859,8 +933,24 @@ export async function runImplementVerifyLoop(
       // otherwise (skipImplement paths, or a discardToCommit that changed HEAD) it
       // does the real work against the forced/committed HEAD. A rejection FAILS
       // CLOSED — no verifier dispatch, no `merge_ready`. -------------------------
+      let provisioningMarker = '';
       try {
-        await worktrees.provisionForVerification(input.assignmentId);
+        const provisioned = await worktrees.provisionForVerification(
+          input.assignmentId,
+        );
+        provisioningMarker = `${provisioned.strategy}:${
+          provisioned.fingerprint.length > 0
+            ? provisioned.fingerprint
+            : 'operator-managed'
+        }`;
+        // F13: THIS is the host attestation the §16 gate consumes, and it is
+        // derived from the tree that was just proven — never from a verdict a
+        // previous attempt persisted. Provisioning here is unconditional and
+        // fails closed (the `catch` below halts the round), so reaching this
+        // line IS the proof for this round, on every entry: fresh, remediation,
+        // resume, failover and auto-respawn alike. A confinement violation
+        // detected across the declared commands downgrades it below.
+        hostVerificationPassed = true;
       } catch (error) {
         // M9: implementationCommit is already the host-read HEAD for this round.
         provisioningFailure = { ...toProvisioningFailure(error, handle), round, implementationCommit };
@@ -870,15 +960,134 @@ export async function runImplementVerifyLoop(
       // --- Independently verify (T23/T24). W2-3 split: the run stays at
       // `implementing` through the verifier's spawn+pin; runVerification's
       // dispatch advances `implementing → verifying` after pins succeed. ---
+      const effectiveImplementorSpec = service.effectiveRoleSpec(
+        input.runId,
+        'implementor',
+        input.implementor,
+      );
+      const effectiveVerifierSpec = service.effectiveRoleSpec(
+        input.runId,
+        'verifier',
+        input.verifier,
+      );
+      const roleResolution = resolveVerificationRoles(
+        effectiveImplementorSpec,
+        effectiveVerifierSpec,
+        allowSameHarness,
+      );
+      for (const warning of roleResolution.warnings) {
+        independenceWarnings.add(warning);
+      }
       const binding: VerificationBinding = {
         assignmentId: input.assignmentId,
         specHash: input.specHash,
         baseCommit: handle.baseSha,
         implementationCommit,
+        resolvedHarnesses: roleResolution.resolvedHarnesses,
         repoRoot: handle.repoRoot,
         worktreeBranch: handle.branch,
         destinationRef: destinationLabel,
       };
+      // F13: the ONE execution of the spec's declared commands per round. It
+      // runs HERE — post-provisioning, bound to the adjudicated implementation
+      // commit — and the implementor boundary no longer re-runs them. W3-1: the
+      // primary-checkout confinement guard wraps this execution, because this
+      // is where the commands now run.
+      const receiptExecution = await executeEvidenceReceiptsUnderConfinement({
+        runId: input.runId,
+        criteria: input.criteria,
+        binding,
+        cwd: handle.worktreePath,
+        repoRoot: handle.repoRoot,
+        runner:
+          input.runVerificationCommands ?? defaultVerificationRunner(),
+        evidence: input.evidence,
+        provisioningMarker,
+        ids: deps.ids,
+        clock: deps.clock,
+      });
+      const hostReceipts = receiptExecution.receipts;
+      // ---------------------------------------------------------------------
+      // THE PRECEDENCE RULE for declared-command findings. Detection already
+      // ran EVERY check unconditionally and collected the complete set (see
+      // `executeEvidenceReceiptsUnderConfinement`); this decides ONCE what the
+      // round does about it. Stated explicitly because getting the ordering
+      // wrong has re-opened the same laundering path twice:
+      //
+      //   1. RECORD everything first. Every finding becomes a durable incident
+      //      before any throw, so no decision below can cost the operator an
+      //      incident. Any finding also forces `hostVerificationPassed:false`.
+      //   2. An AUTHORED COMMIT outranks everything else. If one is present the
+      //      round hard-stops, no matter what else was found — including a
+      //      simultaneous primary-checkout escape, which is what previously
+      //      short-circuited the authorship check and let the conjunction slip
+      //      through as an ordinary blocked round.
+      //   3. Otherwise an EVIDENCE-WRITE failure fails the round on its own
+      //      original cause; recording a violation must never replace it.
+      //      Branch on the FLAG, never on the error value — `throw undefined`
+      //      is legal, and `!== undefined` reads it as "did not throw".
+      //   4. Otherwise an UNREADABLE post-command HEAD fails the round closed:
+      //      it makes authorship INDETERMINATE, and "I could not look" is never
+      //      "nothing happened". It cannot use (2), which would claim a commit
+      //      nobody observed.
+      //   5. Otherwise the findings are ordinary blocking violations: they
+      //      thread into the §16 readiness gate below so an all-verified round
+      //      still blocks (T23, never T24).
+      //
+      // A violation detected before a pause that later re-enters verify-only
+      // (W2-5) is carried by the durable events alone — the in-process wire
+      // below covers the live path.
+      // ---------------------------------------------------------------------
+      for (const violation of receiptExecution.runnerViolations) {
+        service.ingest(
+          verificationRunnerViolationEvent({
+            runId: input.runId,
+            assignmentId: input.assignmentId,
+            violation,
+            ids: deps.ids,
+            clock: deps.clock,
+          }),
+        );
+      }
+      if (receiptExecution.runnerViolations.length > 0) {
+        // A poisoned round must never read as host-verified, exactly as the
+        // implementor-boundary guard used to force `verificationPassed:false`.
+        hostVerificationPassed = false;
+      }
+      // (2) HARD STOP, at the severity main enforced: a declared command that
+      // COMMITS ends the round here and now. Letting it become an ordinary
+      // blocked verification would advance the loop into another same-process
+      // implementation round with NO `discardToCommit`, and that round's commit
+      // would descend from — and thereby legitimize — the command-authored one.
+      // Deliberately independent of the §16 readiness probe, which runs only on
+      // the all-verified path and so would not fire for an already-failing
+      // round. Any evidence-write failure travels as the `cause` so the
+      // operator still sees it.
+      if (receiptExecution.authoredCommit !== undefined) {
+        throw new VerificationAuthoredCommitError(
+          input.assignmentId,
+          round,
+          receiptExecution.authoredCommit.before,
+          receiptExecution.authoredCommit.after,
+          receiptExecution.executionFailed,
+          receiptExecution.executionError,
+        );
+      }
+      // (3) The evidence-write path failed. Every finding it might have masked
+      // is already durable above, so the round fails on the original cause.
+      // Branches on the FLAG: `throw undefined` is legal and must not read as
+      // success just because the captured value is `undefined`.
+      if (receiptExecution.executionFailed) {
+        throw receiptExecution.executionError;
+      }
+      // (4) The post-command HEAD could not be read, so we cannot say whether a
+      // command authored a commit. Fail closed on the indeterminate answer
+      // rather than proceeding as if the tree were unchanged.
+      if (receiptExecution.headReadFailed) {
+        throw new VerificationHeadUnreadableError(input.assignmentId, round, handle.worktreePath);
+      }
+      // (5) Ordinary blocking violations thread into the §16 gate below.
+      const runnerViolation = receiptExecution.runnerViolations[0];
       const probe = gitMergeReadinessProbe({
         repoRoot: handle.repoRoot,
         worktreePath: handle.worktreePath,
@@ -901,11 +1110,13 @@ export async function runImplementVerifyLoop(
         runId: input.runId,
         // P4b wave 2 FAILOVER: verify on the EFFECTIVE spec (ladder rung or run
         // default), same as the implementor half.
-        verifierSpec: service.effectiveRoleSpec(input.runId, 'verifier', input.verifier),
+        verifierSpec: effectiveVerifierSpec,
         cwd: handle.worktreePath,
         binding,
         criteria: input.criteria,
         evidence: input.evidence,
+        hostVerificationPassed,
+        hostReceipts,
         ...(input.explorationIndex !== undefined ? { explorationIndex: input.explorationIndex } : {}),
         ...(resumeFrom !== undefined ? { resumeFrom } : {}),
         mergeReadinessProbe: probe,
@@ -913,11 +1124,9 @@ export async function runImplementVerifyLoop(
         // so `harness recheck` re-runs the SAME probe from a fresh process.
         probeDestinationRef: destinationRef,
         approvedSpecHash: input.specHash,
-        // W3-1: a runner-confinement violation from THIS round's implementor
-        // half blocks the §16 readiness gate.
-        ...(implementation?.runnerViolation !== undefined
-          ? { runnerViolation: implementation.runnerViolation }
-          : {}),
+        // W3-1: a runner-confinement violation observed across THIS round's
+        // declared-command execution blocks the §16 readiness gate.
+        ...(runnerViolation !== undefined ? { runnerViolation } : {}),
         dispatch: {
           round,
           // A resumed verifier round may already sit at `verifying` (its
@@ -1041,6 +1250,7 @@ export async function runImplementVerifyLoop(
           : outcomeOf(finalPhase),
     worktree: handle,
     implementationCommit,
+    warnings: [...independenceWarnings],
     ...(mergeReadiness !== undefined ? { mergeReadiness } : {}),
     ...(provisioningFailure !== undefined ? { provisioningFailure } : {}),
   };
@@ -1110,7 +1320,10 @@ function recordImplementationCommit(
     ...loopState,
     // ROUND-SCOPED so a resume can only trust it for the SAME round (#1, round-4):
     // a record left stale by an earlier round never resets/verifies the wrong commit.
-    worktree: { ...loopState.worktree, lastImplementationCommit: { round, commit } },
+    worktree: {
+      ...loopState.worktree,
+      lastImplementationCommit: { round, commit },
+    },
   });
 }
 
@@ -1123,12 +1336,9 @@ function ensureLeased(worktrees: GitWorktreeManager, assignmentId: AssignmentId)
 }
 
 function buildImplementorOptions(input: ImplementVerifyLoopInput): ImplementorFlowOptions {
-  return {
-    ...(input.implementorOptions ?? {}),
-    ...(input.runVerificationCommands !== undefined
-      ? { runVerification: input.runVerificationCommands }
-      : {}),
-  };
+  // `runVerificationCommands` no longer reaches the implementor: the declared
+  // commands run once, at the verify boundary, under the evidence receipts.
+  return { ...(input.implementorOptions ?? {}) };
 }
 
 /**

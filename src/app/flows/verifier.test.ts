@@ -39,17 +39,30 @@ import {
   specVersionId,
   type ArtifactHash,
 } from '../../domain/ids.js';
-import type { AcceptanceCriterion, CriterionResult, WorktreeState } from '../../domain/entities.js';
+import type {
+  AcceptanceCriterion,
+  AcpStopReason,
+  CriterionResult,
+  EvidenceReceipt,
+  WorktreeState,
+} from '../../domain/entities.js';
 import {
   InProcessFakeAdapter,
   type ConfigOptionDescriptor,
   type InProcessTurnScript,
 } from '../../adapters/index.js';
 import { DeterministicIdFactory } from '../../lib/id-factory.js';
-import { ManualClock } from '../../lib/clock.js';
-import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
+import { isoTimestamp, ManualClock } from '../../lib/clock.js';
+import { unwrap } from '../../lib/result.js';
+import {
+  availableDriverKinds,
+  openTestDatabase,
+  type TestDatabaseHandle,
+} from '../../persistence/test-support.js';
 import { buildCheckpointContent } from '../../checkpoint/content.js';
 import { makeTempGitRepo } from '../../worktree/test-support.js';
+import type { PsClient } from '../../supervisor/index.js';
+import { redactText } from '../../redaction/index.js';
 import { OrchestrationService, type RoleAdapterFactory } from '../service.js';
 import type { Harness, RoleModelSpec } from '../model-resolution.js';
 import { CLEAN_PINNED_WORKSPACE_GIT, createRunFixture } from '../test-support.js';
@@ -60,12 +73,14 @@ import {
   buildVerification,
   buildVerifierPrompt,
   deriveRequiredTestsPassed,
+  executeEvidenceReceipts,
   formatFixRequests,
   gitMergeReadinessProbe,
   parseVerifierReport,
   recheckMergeReadiness,
   runVerification,
   splitReadinessBlockers,
+  verificationCommandArgv,
   verificationTriggerEvent,
   type EvidenceRecorder,
   type GitMergeFacts,
@@ -77,6 +92,10 @@ import {
 } from './verifier.js';
 import type { RunId } from '../../domain/ids.js';
 import type { Verification } from '../../domain/entities.js';
+import {
+  MERGE_READINESS_BLOCKED_PROJECTION,
+  type MergeReadinessBlockedState,
+} from '../projections.js';
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -143,16 +162,59 @@ function fixedProbe(facts: GitMergeFacts): MergeReadinessProbe {
 // Small builders
 // ---------------------------------------------------------------------------
 const CLAUDE_LOW: RoleModelSpec = { harness: 'claude', model: 'opus', effort: 'low' };
+const DRIVER_KINDS = await availableDriverKinds();
 const SPEC_HASH = specHash('spec_hash_1');
 const IMPL_COMMIT = gitSha('a'.repeat(40));
 const BASE_COMMIT = gitSha('b'.repeat(40));
+const NO_PROCESS_PS: PsClient = {
+  sampleProcessTree: () => undefined,
+  sampleIdentity: () => undefined,
+  isAlive: () => false,
+};
 
 function crit(id: string, commands: readonly string[] = [`run-${id}`]): AcceptanceCriterion {
   return { id: criterionId(id), description: `Criterion ${id}`, verificationCommands: commands };
 }
 
+function receiptsFor(
+  criteria: readonly AcceptanceCriterion[],
+  runId: RunId,
+  overrides: Partial<EvidenceReceipt> = {},
+): readonly EvidenceReceipt[] {
+  let index = 0;
+  return criteria.flatMap((criterion) =>
+    criterion.verificationCommands.map((command) => {
+      index += 1;
+      return {
+        receiptId: `receipt_${index}`,
+        receiptRef: artifactHash(`receipt_ref_${index}`),
+        runId,
+        criterionId: criterion.id,
+        specHash: SPEC_HASH,
+        implementationCommit: IMPL_COMMIT,
+        argv: verificationCommandArgv(command),
+        cwd: '/worktree',
+        exitCode: 0,
+        startedAt: isoTimestamp('2026-07-25T00:00:00.000Z'),
+        endedAt: isoTimestamp('2026-07-25T00:00:01.000Z'),
+        stdoutRef: artifactHash(`stdout_${index}`),
+        stderrRef: artifactHash(`stderr_${index}`),
+        outputDigest: `digest_${index}`,
+        toolchain: {
+          node: 'v22.0.0',
+          platform: 'darwin',
+          arch: 'arm64',
+          provisioningMarker: 'clone:fingerprint',
+        },
+        ...overrides,
+      };
+    }),
+  );
+}
+
 function reportTurn(
   rows: ReadonlyArray<{ id: string; verdict: string; evidence?: string; fix?: string }>,
+  stopReason: AcpStopReason = 'end_turn',
 ): InProcessTurnScript {
   const payload = {
     criteria: rows.map((r) => ({
@@ -162,7 +224,10 @@ function reportTurn(
       ...(r.fix !== undefined ? { fix: r.fix } : {}),
     })),
   };
-  return { updates: [{ kind: 'agent_message_chunk', text: JSON.stringify(payload) }], result: { stopReason: 'end_turn' } };
+  return {
+    updates: [{ kind: 'agent_message_chunk', text: JSON.stringify(payload) }],
+    result: { stopReason },
+  };
 }
 
 function binding(overrides: Partial<VerificationBinding> = {}): VerificationBinding {
@@ -171,6 +236,7 @@ function binding(overrides: Partial<VerificationBinding> = {}): VerificationBind
     specHash: SPEC_HASH,
     baseCommit: BASE_COMMIT,
     implementationCommit: IMPL_COMMIT,
+    resolvedHarnesses: { implementor: 'codex', verifier: 'claude' },
     repoRoot: '/repo',
     worktreeBranch: 'harness/asg_1',
     destinationRef: 'main',
@@ -221,6 +287,7 @@ async function setup(turns?: readonly InProcessTurnScript[]): Promise<{
     db,
     ids,
     adapterFactory: factory,
+    supervision: { ps: NO_PROCESS_PS, selfPid: 41_001 },
     workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
   });
   const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: CLAUDE_LOW });
@@ -270,6 +337,80 @@ describe('verifier prompt + report parsing (§8)', () => {
   });
 });
 
+describe.each(DRIVER_KINDS)(
+  'F13 host evidence receipts — %s persistence',
+  (driverKind) => {
+    it('stores redacted, quota-accounted command output and receipt bodies in CAS', async () => {
+      dbHandle = await openTestDatabase({ kind: driverKind, file: false });
+      const db = dbHandle.db;
+      const ids = new DeterministicIdFactory();
+      const { factory } = makeFakeFactory();
+      const service = new OrchestrationService({
+        db,
+        ids,
+        adapterFactory: factory,
+        supervision: { ps: NO_PROCESS_PS, selfPid: 41_002 },
+        workspaceGit: CLEAN_PINNED_WORKSPACE_GIT,
+      });
+      const { runId } = createRunFixture(service, {
+        goal: 'receipt persistence',
+        workspacePath: '/ws',
+        coordinator: CLAUDE_LOW,
+      });
+      const recorder: EvidenceRecorder = {
+        async record(input) {
+          const content = redactText(input.content);
+          return unwrap(
+            db.artifacts.write({
+              bytes: Buffer.from(content, 'utf8'),
+              kind: 'evidence',
+              redacted: true,
+              ...(input.runId !== undefined ? { runId: input.runId } : {}),
+            }),
+          ).hash;
+        },
+      };
+      const receipts = await executeEvidenceReceipts({
+        runId,
+        criteria: [crit('C1', ['run-C1'])],
+        binding: binding(),
+        cwd: '/worktree',
+        runner: async () => ({
+          exitCode: 0,
+          stdout: 'OPENAI_API_KEY=sk-proj-super-secret-value\n12 tests passed\n',
+          stderr: '',
+          launchFailed: false,
+        }),
+        evidence: recorder,
+        provisioningMarker: 'clone:dependency-fingerprint',
+        ids,
+        clock: db.clock,
+      });
+
+      expect(receipts).toHaveLength(1);
+      const receipt = receipts[0]!;
+      expect(receipt.argv).toEqual(verificationCommandArgv('run-C1'));
+      expect(receipt.toolchain.provisioningMarker).toBe(
+        'clone:dependency-fingerprint',
+      );
+      expect(db.artifacts.usedBytesForRun(runId)).toBeGreaterThan(0);
+      for (const ref of [
+        receipt.stdoutRef,
+        receipt.stderrRef,
+        receipt.receiptRef,
+      ]) {
+        const artifact = db.artifacts.get(ref);
+        const bytes = db.artifacts.readBytes(ref);
+        expect(artifact?.redacted).toBe(true);
+        expect(bytes).toBeDefined();
+        expect(Buffer.from(bytes!).toString('utf8')).not.toContain(
+          'sk-proj-super-secret-value',
+        );
+      }
+    });
+  },
+);
+
 // ===========================================================================
 // Flow: mixed verdicts → remediation (T23)
 // ===========================================================================
@@ -293,6 +434,8 @@ describe('verifier flow — mixed verdicts drive remediation (T23, §8)', () => 
       binding: binding(),
       criteria: [crit('C1'), crit('C2')],
       evidence: recorder,
+      hostVerificationPassed: true,
+      hostReceipts: receiptsFor([crit('C1'), crit('C2')], runId),
       ids,
       clock: db.clock,
     });
@@ -325,6 +468,263 @@ describe('verifier flow — mixed verdicts drive remediation (T23, §8)', () => 
 // Flow: all pass → merge_ready (T24) with evidence
 // ===========================================================================
 describe('verifier flow — all criteria verified → merge_ready (T24, §16)', () => {
+  it('fabricated verifier prose with no passing host execution cannot reach merge_ready (F13 AC-4)', async () => {
+    const turns = [
+      reportTurn([
+        {
+          id: 'C1',
+          verdict: 'passed',
+          evidence: 'Fabricated claim: run-C1 exited 0 with 147 passing tests.',
+        },
+      ]),
+    ];
+    const { service, db, ids, runId } = await setup(turns);
+    await driveToVerifying(service, runId);
+    const { recorder } = fakeEvidence();
+
+    const result = await runVerification({
+      engine: service,
+      runId,
+      verifierSpec: CLAUDE_LOW,
+      cwd: '/worktree',
+      binding: binding(),
+      criteria: [crit('C1')],
+      evidence: recorder,
+      mergeReadinessProbe: fixedProbe(goodFacts()),
+      ids,
+      clock: db.clock,
+      // Regression-first compatibility seam: the parent signature does not
+      // declare this field and therefore ignores the host's failed result.
+      // F13 makes it required and load-bearing.
+      hostVerificationPassed: false,
+      hostReceipts: [],
+    });
+
+    expect(result.gathering.outcome).toBe('blocked');
+    expect(result.verification.criteria[0]).toMatchObject({
+      criterionId: criterionId('C1'),
+      verdict: 'unproven',
+    });
+    expect(result.mergeReadiness).toBeUndefined();
+    expect(result.transition.status).toBe('applied');
+    if (result.transition.status === 'applied') expect(result.transition.transitionId).toBe('T23');
+    expect(service.status(runId).phase).toBe('needs_remediation');
+    expect(db.events.listByRun(runId).map((event) => event.type)).not.toContain(
+      'verification.completed.passed',
+    );
+  });
+
+  it('a passing transitional host boolean without per-command receipts is unproven (F13 AC-1)', async () => {
+    const turns = [
+      reportTurn([
+        {
+          id: 'C1',
+          verdict: 'passed',
+          evidence: 'Claimed run-C1 output copied into verifier prose.',
+        },
+      ]),
+    ];
+    const { service, db, ids, runId } = await setup(turns);
+    await driveToVerifying(service, runId);
+    const { recorder } = fakeEvidence();
+
+    const result = await runVerification({
+      engine: service,
+      runId,
+      verifierSpec: CLAUDE_LOW,
+      cwd: '/worktree',
+      binding: binding(),
+      criteria: [crit('C1')],
+      evidence: recorder,
+      hostVerificationPassed: true,
+      hostReceipts: [],
+      mergeReadinessProbe: fixedProbe(goodFacts()),
+      ids,
+      clock: db.clock,
+    } as Parameters<typeof runVerification>[0]);
+
+    expect(result.verification.criteria).toEqual([
+      expect.objectContaining({
+        criterionId: criterionId('C1'),
+        verdict: 'unproven',
+        note: expect.stringContaining('host receipt'),
+      }),
+    ]);
+    expect(result.gathering.outcome).toBe('blocked');
+    expect(result.mergeReadiness).toBeUndefined();
+    expect(result.transition.status).toBe('applied');
+    if (result.transition.status === 'applied') expect(result.transition.transitionId).toBe('T23');
+    expect(service.status(runId).phase).toBe('needs_remediation');
+  });
+
+  // The two LIVE false-positive vectors (spec triage): the model emits a
+  // complete, parseable, passing report and THEN terminates abnormally. Both
+  // must void the whole attempt — a `max_tokens` truncation is only fail-safe
+  // by accident (unparseable payload), so it proves nothing about these.
+  it.each(['refusal', 'max_turn_requests'] as const)(
+    'voids a complete passing verifier report when the turn stops with %s (F13 AC-5)',
+    async (abnormalStop) => {
+    const criteria = [crit('C1'), crit('C2')];
+    const turns = [
+      reportTurn(
+        [
+          {
+            id: 'C1',
+            verdict: 'passed',
+            evidence: 'Complete parseable prose claims the receipt satisfies C1.',
+          },
+          {
+            id: 'C2',
+            verdict: 'passed',
+            evidence: 'Complete parseable prose claims the receipt satisfies C2.',
+          },
+        ],
+        abnormalStop,
+      ),
+    ];
+    const { service, db, ids, runId } = await setup(turns);
+    await driveToVerifying(service, runId);
+    const { recorder } = fakeEvidence();
+
+    const result = await runVerification({
+      engine: service,
+      runId,
+      verifierSpec: CLAUDE_LOW,
+      cwd: '/worktree',
+      binding: binding(),
+      criteria,
+      evidence: recorder,
+      hostVerificationPassed: true,
+      hostReceipts: receiptsFor(criteria, runId),
+      mergeReadinessProbe: fixedProbe(goodFacts()),
+      ids,
+      clock: db.clock,
+    });
+
+    expect(result.gathering.stopReason).toBe(abnormalStop);
+    expect(result.gathering.outcome).toBe('blocked');
+    expect(result.verification.criteria).toEqual(
+      ['C1', 'C2'].map((id) =>
+        expect.objectContaining({
+          criterionId: criterionId(id),
+          verdict: 'unproven',
+          evidenceRefs: [],
+          note: expect.stringContaining(abnormalStop),
+        }),
+      ),
+    );
+    expect(result.mergeReadiness).toBeUndefined();
+    expect(service.status(runId).phase).toBe('needs_remediation');
+  },
+  );
+
+  it.each([
+    {
+      name: 'non-zero exit',
+      overrides: { exitCode: 1 } satisfies Partial<EvidenceReceipt>,
+      note: 'exited 1',
+    },
+    {
+      name: 'stale spec hash',
+      overrides: {
+        specHash: specHash('stale_spec_hash'),
+      } satisfies Partial<EvidenceReceipt>,
+      note: 'stale',
+    },
+    {
+      name: 'stale implementation commit',
+      overrides: {
+        implementationCommit: gitSha('c'.repeat(40)),
+      } satisfies Partial<EvidenceReceipt>,
+      note: 'stale',
+    },
+  ])('$name receipt plus a passed model verdict is unproven (F13 AC-2/AC-3)', async ({
+    overrides,
+    note,
+  }) => {
+    const criteria = [crit('C1')];
+    const turns = [
+      reportTurn([
+        {
+          id: 'C1',
+          verdict: 'passed',
+          evidence: 'Verifier narrative says the command passed.',
+        },
+      ]),
+    ];
+    const { service, db, ids, runId } = await setup(turns);
+    await driveToVerifying(service, runId);
+    const { recorder } = fakeEvidence();
+    const hostReceipts = receiptsFor(criteria, runId, overrides);
+
+    const result = await runVerification({
+      engine: service,
+      runId,
+      verifierSpec: CLAUDE_LOW,
+      cwd: '/worktree',
+      binding: binding(),
+      criteria,
+      evidence: recorder,
+      hostVerificationPassed: true,
+      hostReceipts,
+      mergeReadinessProbe: fixedProbe(goodFacts()),
+      ids,
+      clock: db.clock,
+    });
+
+    expect(result.verification.criteria[0]).toMatchObject({
+      criterionId: criterionId('C1'),
+      verdict: 'unproven',
+      note: expect.stringContaining(note),
+    });
+    expect(result.verification.evidenceReceipts).toEqual(hostReceipts);
+    expect(result.gathering.fixRequests[0]).toMatchObject({
+      criterionId: criterionId('C1'),
+      verdict: 'unproven',
+    });
+    expect(result.gathering.fixRequests[0]?.requestedChange).toBeUndefined();
+    expect(result.transition.status).toBe('applied');
+    if (result.transition.status === 'applied') expect(result.transition.transitionId).toBe('T23');
+    expect(service.status(runId).phase).toBe('needs_remediation');
+  });
+
+  it('requires one current receipt for every declared command', async () => {
+    const criteria = [crit('C1', ['run-one', 'run-two'])];
+    const turns = [
+      reportTurn([
+        {
+          id: 'C1',
+          verdict: 'passed',
+          evidence: 'Verifier narrative claims both commands passed.',
+        },
+      ]),
+    ];
+    const { service, db, ids, runId } = await setup(turns);
+    await driveToVerifying(service, runId);
+    const { recorder } = fakeEvidence();
+
+    const result = await runVerification({
+      engine: service,
+      runId,
+      verifierSpec: CLAUDE_LOW,
+      cwd: '/worktree',
+      binding: binding(),
+      criteria,
+      evidence: recorder,
+      hostVerificationPassed: true,
+      hostReceipts: receiptsFor(criteria, runId).slice(0, 1),
+      mergeReadinessProbe: fixedProbe(goodFacts()),
+      ids,
+      clock: db.clock,
+    });
+
+    expect(result.verification.criteria[0]).toMatchObject({
+      verdict: 'unproven',
+      note: expect.stringContaining('Missing host receipt'),
+    });
+    expect(service.status(runId).phase).toBe('needs_remediation');
+  });
+
   it('all passed with evidence → verification.completed.passed → merge_ready + a ready MergeReadiness', async () => {
     const turns = [
       reportTurn([
@@ -344,6 +744,8 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
       binding: binding(),
       criteria: [crit('C1'), crit('C2')],
       evidence: recorder,
+      hostVerificationPassed: true,
+      hostReceipts: receiptsFor([crit('C1'), crit('C2')], runId),
       mergeReadinessProbe: fixedProbe(goodFacts()),
       ids,
       clock: db.clock,
@@ -368,6 +770,9 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
     expect(mr.specHash).toBe(SPEC_HASH);
     expect(mr.baseCommit).toBe(BASE_COMMIT);
     expect(mr.verifiedCommit).toBe(IMPL_COMMIT);
+    expect(mr.evidenceReceiptRefs).toEqual(
+      result.verification.evidenceReceipts.map((receipt) => receipt.receiptRef),
+    );
     expect(mr.worktreeClean).toBe(true); // W1-F4 clean-worktree gate held
     expect(mr.blockers).toEqual([]); // ready ⇒ no blockers (W1-F1)
     expect(result.fixRequests).toEqual([]); // nothing to remediate
@@ -398,6 +803,8 @@ describe('verifier flow — all criteria verified → merge_ready (T24, §16)', 
       binding: binding(),
       criteria: [crit('C1')],
       evidence: recorder,
+      hostVerificationPassed: true,
+      hostReceipts: receiptsFor([crit('C1')], runId),
       explorationIndex,
       mergeReadinessProbe: fixedProbe(goodFacts()),
       ids,
@@ -433,6 +840,8 @@ describe('verifier flow — missing evidence blocks merge_ready (§19 test 12)',
       binding: binding(),
       criteria: [crit('C1'), crit('C2')],
       evidence: recorder,
+      hostVerificationPassed: true,
+      hostReceipts: receiptsFor([crit('C1'), crit('C2')], runId),
       mergeReadinessProbe: fixedProbe(goodFacts()),
       ids,
       clock: db.clock,
@@ -493,6 +902,8 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
       binding: binding(),
       criteria,
       evidence: recorder,
+      hostVerificationPassed: true,
+      hostReceipts: receiptsFor(criteria, runId),
       ...(options.resumeFrom !== undefined ? { resumeFrom: options.resumeFrom } : {}),
       ...(options.facts !== undefined ? { mergeReadinessProbe: fixedProbe(options.facts) } : {}),
       ids,
@@ -650,6 +1061,8 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
         binding: binding(),
         criteria,
         evidence: recorder,
+        hostVerificationPassed: true,
+        hostReceipts: receiptsFor(criteria, runId),
         mergeReadinessProbe: fixedProbe({ ...goodFacts(), currentImplementationCommit: gitSha('d'.repeat(40)) }),
         ids,
         clock: db.clock,
@@ -716,6 +1129,8 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
         binding: binding(),
         criteria,
         evidence: recorder,
+        hostVerificationPassed: true,
+        hostReceipts: receiptsFor(criteria, runId),
         // no mergeReadinessProbe
         ids,
         clock: db.clock,
@@ -790,6 +1205,63 @@ describe('W1-F1/W2-2 — the merge_ready gate asserts the FULL §16 readiness, s
       expect(updated.blockers).toEqual(['the base commit drifted (destination advanced)']);
       // SAME immutable verification — recheck re-ran ONLY the git probe.
       expect(updated.verification.id).toBe(blocked.verification.id);
+    });
+
+    // An event-sourced store holds records written by every prior version of
+    // the code. `merge_readiness_blocked` projections created by MAIN carry
+    // neither `Verification.evidenceReceipts` nor
+    // `VerificationBinding.resolvedHarnesses` — both are F13 additions. The read
+    // path returned that JSON unvalidated and `buildMergeReadiness` called
+    // `.map` on the missing array, so a run MAIN could recheck successfully
+    // after its destination was cleaned instead threw and was STRANDED.
+    it('a MAIN-shaped blocked projection rechecks instead of throwing, and never fabricates attestation', async () => {
+      const outcome = await blockedRound();
+      const current = outcome.service.getMergeReadinessBlocked(outcome.runId)!;
+
+      // Rewrite the persisted projection into MAIN's exact shape: strip the two
+      // F13 fields, as a record written before they existed simply would not
+      // have them. `requiredTestsPassed` stays TRUE, which is what main
+      // persisted from model evidence alone.
+      const legacy = JSON.parse(JSON.stringify(current)) as Record<string, unknown>;
+      const legacyVerification = legacy['verification'] as Record<string, unknown>;
+      const legacyBinding = legacy['binding'] as Record<string, unknown>;
+      delete legacyVerification['evidenceReceipts'];
+      delete legacyBinding['resolvedHarnesses'];
+      delete (legacy['mergeReadiness'] as Record<string, unknown>)['evidenceReceiptRefs'];
+      delete (legacy['mergeReadiness'] as Record<string, unknown>)['resolvedHarnesses'];
+      legacy['requiredTestsPassed'] = true;
+      outcome.db.projections.save(
+        outcome.runId,
+        MERGE_READINESS_BLOCKED_PROJECTION,
+        legacy as unknown as MergeReadinessBlockedState,
+      );
+
+      // Read back THROUGH the service boundary — that is where migration must
+      // happen, because every caller goes through it.
+      const blocked = outcome.service.getMergeReadinessBlocked(outcome.runId)!;
+      expect(blocked.verification.evidenceReceipts).toEqual([]);
+
+      // The destination is clean now: on main this recheck succeeded.
+      const recheck = await recheckMergeReadiness({
+        engine: outcome.service,
+        runId: outcome.runId,
+        blocked,
+        probe: fixedProbe(goodFacts()),
+        ids: outcome.ids,
+        clock: outcome.db.clock,
+      });
+
+      // It COMPLETES rather than throwing — the run is no longer stranded...
+      expect(recheck.mergeReadiness.evidenceReceiptRefs).toEqual([]);
+      // ...but an absent receipt set is not a pass. A record that predates
+      // attestation carries no proof, so it cannot be reported as attested.
+      expect(recheck.outcome).toBe('still_blocked');
+      expect(recheck.mergeReadiness.ready).toBe(false);
+      expect(
+        recheck.mergeReadiness.blockers.some((b) => /verification commands were not run\/passed/.test(b)),
+      ).toBe(true);
+      // And it must not claim an independence pair it never recorded.
+      expect(recheck.mergeReadiness.resolvedHarnesses).toBeUndefined();
     });
 
     it('ready → T24 is ingested NOW: run → merge_ready, read-model resolved', async () => {
@@ -904,6 +1376,8 @@ describe('verifier flow — successor resumes from checkpoint alone (§19 test 2
       binding: binding(),
       criteria: [crit('C1'), crit('C2')],
       evidence: recorder,
+      hostVerificationPassed: true,
+      hostReceipts: receiptsFor([crit('C1'), crit('C2')], runId),
       resumeFrom,
       mergeReadinessProbe: fixedProbe(goodFacts()),
       ids,
@@ -944,6 +1418,7 @@ describe('buildMergeReadiness — §16 gate (§19 test 18)', () => {
       outcome,
       verifiedCriterionIds: [criterionId('C1')],
       carriedCriterionIds: [],
+      hostReceipts: [],
     };
     return buildVerification({ runId: mkRunId('run_1'), binding: binding(), gathering, ids, clock });
   }
@@ -1072,6 +1547,7 @@ describe('verification trigger event + requiredTests derivation', () => {
         outcome: 'all_verified',
         verifiedCriterionIds: [criterionId('C1')],
         carriedCriterionIds: [],
+        hostReceipts: [],
       },
       ids,
       clock,
@@ -1106,6 +1582,7 @@ describe('verification trigger event + requiredTests derivation', () => {
         outcome: 'blocked',
         verifiedCriterionIds: [criterionId('C1'), criterionId('C2')],
         carriedCriterionIds: [],
+        hostReceipts: [],
       },
       ids,
       clock,

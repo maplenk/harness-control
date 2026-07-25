@@ -914,6 +914,55 @@ describe('resume mode — interrupted verifier round', () => {
     );
   });
 
+  // A provisioning failure is evidence about the ATTEMPT that failed, never
+  // about a later one. The verify boundary re-provisions unconditionally and
+  // fails closed, so by the time the receipts run the tree has been proven
+  // afresh. A negative left behind by a superseded attempt must not outlive it
+  // and force every command-bearing criterion to `unproven` — that is the
+  // indeterminate-becomes-refusal class, in F13's territory.
+  it('a superseded provisioning failure does not outlive its attempt on resume', async () => {
+    const rig = await openRig({
+      implementor: [
+        {
+          writes: [{ relPath: 'src/feature.ts', content: 'export const feature = true;\n' }],
+          turns: [implementorTurn('done')],
+        },
+      ],
+      verifier: [
+        { writes: [], turns: [{ errorEnvelope: rateLimitErrorEnvelope() }] },
+        { turns: [PASS_BOTH] },
+      ],
+    });
+    const { round, implementationCommit } = await pauseVerifierRound(rig);
+
+    // The durable round-scoped record carries the commit and NOTHING about
+    // host verification. That is the fix: there is no field for a superseded
+    // attempt's negative to survive in. If a host verdict is ever persisted
+    // here again, this assertion is the tripwire.
+    const loopState = rig.service.getImplementVerifyLoopState(rig.runId)!;
+    expect(Object.keys(loopState.worktree!.lastImplementationCommit!).sort()).toEqual([
+      'commit',
+      'round',
+    ]);
+
+    expect(rig.service.resume(rig.runId).status).toBe('applied');
+    const result = await runImplementVerifyLoop(loopDeps(rig), {
+      ...loopInput(rig),
+      resume: { round },
+      // Bounded to the re-entry round: with the stale negative gating, this
+      // round blocks and the loop would otherwise cascade into a remediation
+      // round that has no implementor script left.
+      maxRounds: 1,
+    });
+
+    // Current provisioning succeeded and the current receipts pass against the
+    // current bound commit — that is the current truth, so the round verifies.
+    expect(result.outcome).toBe('merge_ready');
+    for (const criterion of result.rounds[0]!.verification.verification.criteria) {
+      expect(criterion.verdict).toBe('passed');
+    }
+  });
+
   it('checkpointed passed criteria carry ONLY with same-spec/commit-bound evidence (and never otherwise)', async () => {
     const rig = await openRig({
       implementor: [

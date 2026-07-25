@@ -43,6 +43,7 @@ import type { Clock } from '../lib/clock.js';
 import type { IdFactory } from '../lib/id-factory.js';
 import {
   DurableDesiredModelStore,
+  IndependenceViolationError,
   LimitPausedError,
   RUN_META_PROJECTION,
   ResumeEligibilityError,
@@ -1094,6 +1095,7 @@ function loopResultOutput(
     rounds: result.rounds.length,
     implementationCommit: String(result.implementationCommit),
     worktreePath: result.worktree.worktreePath,
+    warnings: result.warnings,
     plan: {
       implementor: resolvedView(resolveRoleModel(implementor)),
       verifier: resolvedView(resolveRoleModel(verifier)),
@@ -1110,6 +1112,7 @@ function loopResultOutput(
     `  implementation commit: ${String(result.implementationCommit)}`,
     `  worktree: ${result.worktree.worktreePath}`,
   ];
+  for (const warning of result.warnings) lines.push(`  warning: ${warning}`);
   if (mr !== undefined) {
     lines.push(`  merge-readiness: ${mr.ready ? 'READY' : 'NOT READY'} (§16 — the harness never merges).`);
     for (const command of mr.manualIntegrationCommands) lines.push(`    ${command}`);
@@ -1228,11 +1231,13 @@ function mergeReadinessView(mr: MergeReadiness): Record<string, unknown> {
     verifiedCommit: String(mr.verifiedCommit),
     baseCommit: String(mr.baseCommit),
     specHash: String(mr.specHash),
+    resolvedHarnesses: mr.resolvedHarnesses,
     destinationClean: mr.destinationClean,
     worktreeClean: mr.worktreeClean,
     baseDrifted: mr.baseDrifted,
     conflicts: mr.conflicts,
     requiredTestsPassed: mr.requiredTestsPassed,
+    evidenceReceiptRefs: mr.evidenceReceiptRefs.map(String),
     blockers: mr.blockers,
     manualIntegrationCommands: mr.manualIntegrationCommands,
   };
@@ -2515,6 +2520,23 @@ function errorOutput(kind: string, runId: RunId | undefined, error: unknown): Co
   // surfaces (human text and the stable `--json` payload) regardless of
   // where the error originated.
   const message = redactText(error instanceof Error ? error.message : String(error));
+  if (error instanceof IndependenceViolationError) {
+    return finish(
+      kind,
+      {
+        ...(runId !== undefined ? { runId } : {}),
+        error: {
+          name,
+          code: error.code,
+          message,
+          implementor: error.implementor,
+          verifier: error.verifier,
+        },
+      },
+      `error: ${message}`,
+      1,
+    );
+  }
   return finish(
     kind,
     { ...(runId !== undefined ? { runId } : {}), error: { name, message } },

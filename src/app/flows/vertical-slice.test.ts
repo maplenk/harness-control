@@ -25,6 +25,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -38,11 +39,20 @@ import {
   segmentId as mkSegmentId,
   type ArtifactHash,
   type CriterionId,
+  type GitSha,
   type RunId,
+  type SpecHash,
 } from '../../domain/ids.js';
-import type { CriterionCheckpointState, WorktreeState } from '../../domain/entities.js';
+import type {
+  AcceptanceCriterion,
+  CriterionCheckpointState,
+  EvidenceReceipt,
+  WorktreeState,
+} from '../../domain/entities.js';
+import { isoTimestamp } from '../../lib/clock.js';
 import { DeterministicIdFactory, RandomIdFactory } from '../../lib/id-factory.js';
 import { unwrap } from '../../lib/result.js';
+import { DEFAULT_ENGINE_CONFIG } from '../../config/schema.js';
 import { openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
 import { ArtifactStore } from '../../artifacts/store.js';
 import { loadProfileFile, type Profile } from '../../config/profile.js';
@@ -63,6 +73,12 @@ import {
   snapshotPrimaryCheckout,
   type TempGitRepo,
 } from '../../worktree/test-support.js';
+import type { PsClient } from '../../supervisor/index.js';
+import { DurableDesiredModelStore } from '../desired-model-store.js';
+import {
+  AdvisoryGitLease,
+  createPsLeaseProbe,
+} from '../../worktree/advisory-lease.js';
 import {
   OrchestrationService,
   type RoleAdapterFactory,
@@ -77,12 +93,14 @@ import {
   NoDeliverableError,
   runImplementVerifyLoop,
   toProvisioningFailure,
+  VerificationAuthoredCommitError,
 } from './orchestrate.js';
 import type { ImplementorResult } from './implementor.js';
 import {
   gitMergeReadinessProbe,
   runVerification,
   VerifierRunner,
+  verificationCommandArgv,
   type EvidenceRecorder,
   type VerificationBinding,
   type VerifierResumeState,
@@ -96,6 +114,48 @@ const COORDINATOR: RoleModelSpec = { harness: 'claude', model: 'opus', effort: '
 const IMPLEMENTOR: RoleModelSpec = { harness: 'codex', model: 'gpt-5.6-terra', effort: 'medium' };
 const VERIFIER: RoleModelSpec = { harness: 'claude', model: 'sonnet', effort: 'medium' };
 const PROFILE_PATH = fileURLToPath(new URL('../../../profiles/coordinator.md', import.meta.url));
+const NO_PROCESS_PS: PsClient = {
+  sampleProcessTree: () => undefined,
+  sampleIdentity: () => undefined,
+  isAlive: () => false,
+};
+
+function hostReceiptsFor(
+  criteria: readonly AcceptanceCriterion[],
+  runId: RunId,
+  spec: SpecHash,
+  commit: GitSha,
+  cwd: string,
+): readonly EvidenceReceipt[] {
+  let index = 0;
+  return criteria.flatMap((criterion) =>
+    criterion.verificationCommands.map((command) => {
+      index += 1;
+      return {
+        receiptId: `receipt_${index}`,
+        receiptRef: artifactHash(`receipt_ref_${index}`),
+        runId,
+        criterionId: criterion.id,
+        specHash: spec,
+        implementationCommit: commit,
+        argv: verificationCommandArgv(command),
+        cwd,
+        exitCode: 0,
+        startedAt: isoTimestamp('2026-07-25T00:00:00.000Z'),
+        endedAt: isoTimestamp('2026-07-25T00:00:01.000Z'),
+        stdoutRef: artifactHash(`stdout_ref_${index}`),
+        stderrRef: artifactHash(`stderr_ref_${index}`),
+        outputDigest: `digest_${index}`,
+        toolchain: {
+          node: 'v22.0.0',
+          platform: 'darwin',
+          arch: 'arm64',
+          provisioningMarker: 'clone:fingerprint',
+        },
+      };
+    }),
+  );
+}
 
 function configOptionsFor(harness: Harness): ConfigOptionDescriptor[] {
   if (harness === 'claude') {
@@ -204,11 +264,17 @@ interface CreatedAdapter {
   readonly prompts: string[];
 }
 
-function makeSliceFactory(scripts: {
-  readonly coordinator?: readonly AdapterScript[];
-  readonly implementor?: readonly AdapterScript[];
-  readonly verifier?: readonly AdapterScript[];
-}): { factory: RoleAdapterFactory; created: CreatedAdapter[] } {
+function makeSliceFactory(
+  scripts: {
+    readonly coordinator?: readonly AdapterScript[];
+    readonly implementor?: readonly AdapterScript[];
+    readonly verifier?: readonly AdapterScript[];
+  },
+  /** Fires as each role's adapter is created — a seam for asserting behaviour
+   * that depends on state changing mid-run (e.g. a failover recorded during
+   * the implementor round, after loop entry and before verifier dispatch). */
+  onAdapterCreated?: (role: string) => void,
+): { factory: RoleAdapterFactory; created: CreatedAdapter[] } {
   const created: CreatedAdapter[] = [];
   const cursors: Record<string, number> = {};
   const factory: RoleAdapterFactory = {
@@ -237,6 +303,7 @@ function makeSliceFactory(scripts: {
         return orig(input);
       };
       created.push({ role, options, adapter, prompts });
+      onAdapterCreated?.(role);
       return { adapter, dispose: (): Promise<void> => adapter.close() };
     },
   };
@@ -303,16 +370,38 @@ async function openSlice(scripts: {
   readonly coordinator?: readonly AdapterScript[];
   readonly implementor?: readonly AdapterScript[];
   readonly verifier?: readonly AdapterScript[];
-}): Promise<Slice> {
+}, options: {
+  readonly allowSameHarness?: boolean;
+  readonly onAdapterCreated?: (role: string) => void;
+} = {}): Promise<Slice> {
   repo = await makeTempGitRepo('harness-slice-');
   dbHandle = await openTestDatabase({ kind: 'better-sqlite3', file: true });
   casDir = await mkdtemp(path.join(tmpdir(), 'harness-slice-cas-'));
-  worktrees = await GitWorktreeManager.open({ primaryRepoRoot: repo.dir, clock: dbHandle.db.clock });
+  worktrees = await GitWorktreeManager.open({
+    primaryRepoRoot: repo.dir,
+    clock: dbHandle.db.clock,
+    advisoryLease: new AdvisoryGitLease({
+      lockDir: path.join(repo.dir, '.git', 'vertical-slice-worktree-op.lock'),
+      probe: createPsLeaseProbe(NO_PROCESS_PS, 42_001),
+    }),
+  });
   const ids = new DeterministicIdFactory();
   const flowIds = new DeterministicIdFactory();
   const store = new ArtifactStore({ rootDir: casDir, clock: dbHandle.db.clock, ids: flowIds });
-  const { factory, created } = makeSliceFactory(scripts);
-  const service = new OrchestrationService({ db: dbHandle.db, ids, adapterFactory: factory });
+  const { factory, created } = makeSliceFactory(scripts, options.onAdapterCreated);
+  const service = new OrchestrationService({
+    db: dbHandle.db,
+    ids,
+    adapterFactory: factory,
+    config: {
+      ...DEFAULT_ENGINE_CONFIG,
+      verification: {
+        ...DEFAULT_ENGINE_CONFIG.verification,
+        allowSameHarness: options.allowSameHarness ?? false,
+      },
+    },
+    supervision: { ps: NO_PROCESS_PS, selfPid: 42_001 },
+  });
   const profileResult = loadProfileFile(PROFILE_PATH);
   if (!profileResult.ok) throw new Error(`coordinator profile failed to load: ${JSON.stringify(profileResult.error)}`);
   return {
@@ -360,6 +449,254 @@ async function coordinateAndApprove(slice: Slice): Promise<{ runId: RunId; outco
 // PLAN §19 test 19 — full offline slice → merge_ready
 // ===========================================================================
 describe('PLAN §19 test 19 — goal → spec → approve → implement → verify → merge_ready (offline, fakes)', () => {
+  it('refuses same-harness implementor/verifier profiles by default (F13 AC-6)', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'claimed check-ac1 passed' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'claimed check-ac2 passed' },
+            ]),
+          ],
+        },
+      ],
+    });
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const sameHarnessVerifier: RoleModelSpec = {
+      harness: 'codex',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+    };
+
+    const error: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: assignmentId('asg_same_harness_refused'),
+        implementor: IMPLEMENTOR,
+        verifier: sameHarnessVerifier,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+      },
+    ).then(() => undefined).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: 'independence_violation',
+      implementor: expect.objectContaining({
+        harness: 'codex',
+        model: 'gpt-5.6-terra',
+      }),
+      verifier: expect.objectContaining({
+        harness: 'codex',
+        model: 'gpt-5.6-sol',
+      }),
+    });
+    expect(slice.created.map((created) => created.role)).toEqual(['coordinator']);
+  });
+
+  // The loop-entry check cannot see a pair that only becomes same-harness LATER:
+  // a `switch_harness` failover re-points a role's effective profile mid-round.
+  // The verifier-boundary re-check is the only thing between that and a report
+  // asserting independent cross-vendor verification.
+  it('refuses a same-harness pair that only appears at the verifier boundary', async () => {
+    // Fires as the IMPLEMENTOR adapter is created — after the loop-entry check
+    // has already accepted the independent pair, and before the verifier
+    // boundary re-check — and re-points the VERIFIER at the implementor's
+    // harness, exactly as a `switch_harness` failover mid-round would.
+    const flipVerifierToImplementorHarness = (role: string): void => {
+      if (role !== 'implementor') return;
+      new DurableDesiredModelStore(dbHandle!.db).set({
+        runId: String(runId),
+        role: 'verifier',
+        harness: 'codex',
+        model: 'gpt-5.6-sol',
+        requestedAt: '2026-07-25T00:00:00.000Z',
+      });
+    };
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'observed check-ac1 pass' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'observed check-ac2 pass' },
+            ]),
+          ],
+        },
+      ],
+    }, { onAdapterCreated: flipVerifierToImplementorHarness });
+    // The entry pair is independent (codex implements / claude verifies), so
+    // the loop-entry check passes and only the boundary re-check can catch it.
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+
+    const error: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: assignmentId('asg_boundary_independence'),
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+      },
+    ).then(() => undefined).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: 'independence_violation',
+      implementor: expect.objectContaining({ harness: 'codex', model: 'gpt-5.6-terra' }),
+      verifier: expect.objectContaining({ harness: 'codex', model: 'gpt-5.6-sol' }),
+    });
+    // The implementor DID run — this is the boundary check, not the entry check.
+    expect(slice.created.map((created) => created.role)).toEqual([
+      'coordinator',
+      'implementor',
+    ]);
+  });
+
+  it('honors verification.allowSameHarness and warns on same-model use (F13 AC-7/W4-1)', async () => {
+    const slice = await openSlice(
+      {
+        coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+        implementor: [
+          {
+            writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+            turns: [implementorTurn('Implemented --verbose.')],
+          },
+        ],
+        verifier: [
+          {
+            turns: [
+              verifierTurn([
+                { id: 'AC-1', verdict: 'passed', evidence: 'observed check-ac1 pass' },
+                { id: 'AC-2', verdict: 'passed', evidence: 'observed check-ac2 pass' },
+              ]),
+            ],
+          },
+        ],
+      },
+      { allowSameHarness: true },
+    );
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: assignmentId('asg_same_harness_allowed'),
+        implementor: IMPLEMENTOR,
+        verifier: { ...IMPLEMENTOR },
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: PASS_VERIFY,
+      },
+    );
+
+    expect(result.outcome).toBe('merge_ready');
+    expect(result.warnings).toEqual([
+      expect.stringContaining('cross-vendor independence is disabled'),
+      expect.stringContaining('same model'),
+    ]);
+    expect(result.mergeReadiness?.resolvedHarnesses).toEqual({
+      implementor: 'codex',
+      verifier: 'codex',
+    });
+  });
+
+  it('executes each declared verification command exactly ONCE on a happy-path round', async () => {
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+      ],
+      verifier: [
+        {
+          turns: [
+            verifierTurn([
+              { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+              { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+            ]),
+          ],
+        },
+      ],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const executed: string[] = [];
+    const countingVerify: VerificationRunner = async (command) => {
+      executed.push(command);
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const result = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: assignmentId('asg_single_exec'),
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: countingVerify,
+      },
+    );
+
+    expect(result.outcome).toBe('merge_ready');
+    // The F13 receipts are the authoritative command proof — post-provisioning
+    // and commit-bound. The implementor boundary re-running the same commands
+    // doubled wall-clock and cost, executed NON-IDEMPOTENT commands (migrations,
+    // port binders, quota-consuming calls) twice, and compounded across
+    // remediation rounds.
+    expect({
+      total: executed.length,
+      ac1: executed.filter((c) => c.includes('ac1')).length,
+      ac2: executed.filter((c) => c.includes('ac2')).length,
+    }).toEqual({ total: 2, ac1: 1, ac2: 1 });
+  });
+
   it('composes the whole loop end to end and reaches a READY merge-readiness in one round', async () => {
     const slice = await openSlice({
       coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
@@ -419,6 +756,10 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
     expect(mr!.ready).toBe(true);
     expect(mr!.specHash).toBe(outcome.specVersion.contentHash);
     expect(String(mr!.verifiedCommit)).toBe(String(result.implementationCommit));
+    expect(mr!.resolvedHarnesses).toEqual({
+      implementor: 'codex',
+      verifier: 'claude',
+    });
     expect(mr!.manualIntegrationCommands.some((c) => c.includes('merge --no-ff'))).toBe(true);
 
     // --- The verifier bound to the EXACT worktree HEAD (host-read) ----------
@@ -426,8 +767,19 @@ describe('PLAN §19 test 19 — goal → spec → approve → implement → veri
     expect(worktreeHead).toBe(String(result.implementationCommit));
     expect(result.rounds[0]!.implementation!.commitSha).toBeDefined();
 
-    // --- Every criterion is backed by the verifier's OWN evidence (§8) ------
-    expect(records.map((r) => r.criterionId).sort()).toEqual(['AC-1', 'AC-2']);
+    // --- Every criterion is backed by the verifier's OWN narrative evidence
+    // (the same sink now also contains stdout/stderr/receipt CAS objects).
+    const narrativeRefs = new Set(
+      result.rounds[0]!.verification.verification.criteria.flatMap((criterion) =>
+        criterion.evidenceRefs.map(String),
+      ),
+    );
+    expect(
+      records
+        .filter((record) => narrativeRefs.has(record.hash))
+        .map((record) => record.criterionId)
+        .sort(),
+    ).toEqual(['AC-1', 'AC-2']);
     for (const c of result.rounds[0]!.verification.verification.criteria) {
       expect(c.verdict).toBe('passed');
       expect(c.evidenceRefs).toHaveLength(1);
@@ -670,9 +1022,10 @@ describe('W1-F1/W1-F4 — a mutating verification command never yields merge_rea
     expect(result.rounds).toHaveLength(2);
     expect(slice.service.status(runId).counters.remediationRounds).toBe(2);
 
-    // --- W1-F4: the implementor report caught the post-commit dirt ----------
-    expect(result.rounds[0]!.implementation!.postVerificationDirty).toBe(true);
-    expect(result.rounds[0]!.implementation!.postVerificationDirtyFiles).toContain('verify-side-effect.txt');
+    // --- W1-F4: the implementor round handed over a CLEAN tree; the dirt is
+    // created later, by the declared commands at the verify boundary, which is
+    // where the §16 readiness probe below catches it and names the file. -----
+    expect(result.rounds[0]!.implementation!.postVerificationDirty).toBe(false);
 
     // --- The §16 report is honest: not ready, blocker names the file --------
     const mr = result.mergeReadiness!;
@@ -714,6 +1067,283 @@ describe('W1-F1/W1-F4 — a mutating verification command never yields merge_rea
 // checkout: typed violation, durable incident event, §16 readiness blocked
 // (T23), never merge_ready.
 // ===========================================================================
+describe('F8 authorship — a verification command that COMMITS hard-stops the run', () => {
+  // F8 spent a full round establishing that a declared verification command
+  // which COMMITS is a HARD ERROR, never a silent rebinding: on main the
+  // implementor round's adjudicator threw `NoDeliverableError` immediately.
+  // The commands run at the verify boundary now, past that adjudication, so
+  // the rule has to be re-enforced here at the SAME severity. Downgrading it
+  // to an ordinary blocked verification lets the loop advance into another
+  // same-process implementation round WITHOUT `discardToCommit` — and a later
+  // implementor commit then descends from, and thereby legitimizes, the
+  // command-authored commit.
+  it('ends the round immediately and never lets a later commit descend from the authored one', async () => {
+    const allPass = verifierTurn([
+      { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+      { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+    ]);
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+        // A SECOND implementation round must never happen. If it does, its
+        // commit descends from the command-authored one and launders it.
+        {
+          writes: [{ relPath: 'src/cli/round2.ts', content: 'export const round2 = true;\n' }],
+          turns: [implementorTurn('Round 2 must not run.')],
+        },
+      ],
+      verifier: [{ turns: [allPass] }, { turns: [allPass] }],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_slice_authored_commit');
+
+    let authoredCommit: string | undefined;
+    const committingVerify: VerificationRunner = async (command, cwd) => {
+      if (authoredCommit === undefined) {
+        fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+        execFileSync('git', ['add', '-A'], { cwd });
+        execFileSync('git', ['commit', '--no-verify', '-m', 'authored by a verification command'], {
+          cwd,
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'verify',
+            GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+            GIT_COMMITTER_NAME: 'verify',
+            GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+          },
+        });
+        authoredCommit = (await git.resolveSha(cwd, 'HEAD')).trim();
+      }
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const thrown: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: committingVerify,
+        maxRounds: 2,
+      },
+    ).then(() => undefined).catch((caught: unknown) => caught);
+
+    // HARD STOP: the loop does not return a blocked result it can remediate
+    // from — it ends the run, exactly as main's adjudicator did.
+    expect(thrown).toBeInstanceOf(VerificationAuthoredCommitError);
+
+    // Exactly ONE implementor ran. A second implementation round is the whole
+    // danger: its commit would descend from the authored one.
+    expect(slice.created.filter((c) => c.role === 'implementor')).toHaveLength(1);
+
+    // Nothing was built on top of the command-authored commit.
+    expect(authoredCommit).toBeDefined();
+    const head = (await git.resolveSha(slice.worktrees.handleFor(asg)!.worktreePath, 'HEAD')).trim();
+    expect(head).toBe(authoredCommit);
+
+    // The durable incident is still recorded BEFORE the run ends, so the
+    // operator audit trail survives the hard stop.
+    const incidents = dbHandle!.db.events
+      .listByRun(runId)
+      .filter((e) => e.type === 'verification.runner.violation');
+    expect(incidents).toHaveLength(1);
+    expect((incidents[0]!.payload as unknown as { detail: string }).detail).toMatch(
+      /never author one/,
+    );
+
+    await slice.worktrees.removeWorktree(asg);
+  });
+
+  // THE CONJUNCTION, end to end. Closing each violation in isolation left the
+  // combined case open: primary drift was detected first and returned early, so
+  // the authorship check never ran and the round took the ordinary blocked path
+  // into remediation — where round 2's commit descends from the
+  // verification-authored one. The hard stop must not be reachable only when
+  // the command is "merely" an author.
+  // The undefined-rejection hole, on the ONE branch that still tested the error
+  // VALUE rather than the flag. `Promise.reject(undefined)` is legal, so an
+  // evidence-write failure coinciding with an authored commit lost every
+  // indication that evidence execution had failed at all: the authored commit
+  // correctly outranks it for the DECISION, but the operator must still be told.
+  it('reports the evidence-execution failure even when it rejects with UNDEFINED alongside an authored commit', async () => {
+    const bothPass = verifierTurn([
+      { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+      { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+    ]);
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+        {
+          writes: [{ relPath: 'src/cli/round2.ts', content: 'export const round2 = true;\n' }],
+          turns: [implementorTurn('Round 2 must not run.')],
+        },
+      ],
+      verifier: [{ turns: [bothPass] }, { turns: [bothPass] }],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const asg = assignmentId('asg_slice_authored_undefined_reject');
+
+    let didAuthor = false;
+    const committingVerify: VerificationRunner = async (command, cwd) => {
+      if (!didAuthor) {
+        fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+        execFileSync('git', ['add', '-A'], { cwd });
+        execFileSync('git', ['commit', '--no-verify', '-m', 'authored before the CAS rejected'], {
+          cwd,
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'verify',
+            GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+            GIT_COMMITTER_NAME: 'verify',
+            GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+          },
+        });
+        didAuthor = true;
+      }
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const thrown: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        // Rejects with UNDEFINED — the exact value that reads as "did not throw"
+        // to any check written against the error instead of the flag.
+        evidence: {
+          record: (): Promise<never> => Promise.reject(undefined),
+        },
+        runVerificationCommands: committingVerify,
+        maxRounds: 2,
+      },
+    ).then(() => undefined).catch((caught: unknown) => caught);
+
+    // The authored commit still outranks it: HARD STOP, one implementor only.
+    expect(thrown).toBeInstanceOf(VerificationAuthoredCommitError);
+    expect(slice.created.filter((c) => c.role === 'implementor')).toHaveLength(1);
+    // ...and the evidence-execution failure is STILL reported, even though the
+    // rejected value is `undefined`.
+    const error = thrown as VerificationAuthoredCommitError;
+    expect(error.evidenceExecutionFailed).toBe(true);
+    expect(error.message).toMatch(/evidence-write path ALSO failed/);
+    expect('cause' in error).toBe(true);
+
+    await slice.worktrees.removeWorktree(asg);
+  });
+
+  it('hard-stops even when the command ALSO escapes into the primary checkout', async () => {
+    const allPass = verifierTurn([
+      { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+      { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+    ]);
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+        {
+          writes: [{ relPath: 'src/cli/round2.ts', content: 'export const round2 = true;\n' }],
+          turns: [implementorTurn('Round 2 must not run.')],
+        },
+      ],
+      verifier: [{ turns: [allPass] }, { turns: [allPass] }],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const { recorder } = fakeEvidence();
+    const asg = assignmentId('asg_slice_both_violations');
+
+    let authoredCommit: string | undefined;
+    const escapingAndCommitting: VerificationRunner = async (command, cwd) => {
+      if (authoredCommit === undefined) {
+        fs.writeFileSync(path.join(slice.repo.dir, 'planted-by-verification.txt'), 'escaped\n');
+        fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+        execFileSync('git', ['add', '-A'], { cwd });
+        execFileSync('git', ['commit', '--no-verify', '-m', 'authored while also escaping'], {
+          cwd,
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'verify',
+            GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+            GIT_COMMITTER_NAME: 'verify',
+            GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+          },
+        });
+        authoredCommit = (await git.resolveSha(cwd, 'HEAD')).trim();
+      }
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const thrown: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        evidence: recorder,
+        runVerificationCommands: escapingAndCommitting,
+        maxRounds: 2,
+      },
+    ).then(() => undefined).catch((caught: unknown) => caught);
+
+    // The authored commit outranks the primary escape: HARD STOP, not a
+    // blocked round that remediation can build on.
+    expect(thrown).toBeInstanceOf(VerificationAuthoredCommitError);
+    expect(slice.created.filter((c) => c.role === 'implementor')).toHaveLength(1);
+    expect(authoredCommit).toBeDefined();
+    const head = (await git.resolveSha(slice.worktrees.handleFor(asg)!.worktreePath, 'HEAD')).trim();
+    expect(head).toBe(authoredCommit);
+
+    // BOTH findings are on the durable audit trail — the hard stop does not
+    // cost the operator the confinement incident.
+    const incidents = dbHandle!.db.events
+      .listByRun(runId)
+      .filter((e) => e.type === 'verification.runner.violation');
+    expect(incidents).toHaveLength(2);
+    const details = incidents.map((e) => (e.payload as unknown as { detail: string }).detail);
+    expect(details.some((d) => /primary checkout mutated/.test(d))).toBe(true);
+    expect(details.some((d) => /never author one/.test(d))).toBe(true);
+
+    await slice.worktrees.removeWorktree(asg);
+  });
+});
+
 describe('W3-1 — a verification command that writes into the PRIMARY checkout never yields merge_ready', () => {
   it('records the typed violation + durable incident and blocks §16 readiness (T23) despite all criteria verifying', async () => {
     const allPass = verifierTurn([
@@ -769,12 +1399,13 @@ describe('W3-1 — a verification command that writes into the PRIMARY checkout 
     expect(result.finalPhase).toBe('needs_remediation');
     expect(slice.service.status(runId).phase).toBe('needs_remediation');
 
-    // --- The round report carries the typed violation, self-check failed ----
+    // --- The implementor round itself is sound: it committed, and its own
+    // boundary (provisioning) raised nothing. The escape happened in the
+    // declared commands, which now run once at the VERIFY boundary — so the
+    // violation surfaces from there, as the durable incident asserted below.
     const impl = result.rounds[0]!.implementation!;
-    expect(impl.runnerViolation).toBeDefined();
-    expect(impl.runnerViolation!.kind).toBe('verification_runner_violation');
-    expect(impl.runnerViolation!.changedPaths).toContain('planted-by-verification.txt');
-    expect(impl.verificationPassed).toBe(false); // commands exited 0; the guard failed it
+    expect(impl.committed).toBe(true);
+    expect(impl.provisioningFailed).toBeUndefined();
 
     // --- The durable incident event landed BEFORE the verifier verdict ------
     const events = dbHandle!.db.events.listByRun(runId);
@@ -795,7 +1426,8 @@ describe('W3-1 — a verification command that writes into the PRIMARY checkout 
     );
     expect(incidentSeq).toBeLessThan(verdictSeq);
 
-    // --- §16 blocked: criteria ALL verified, the violation blocker forced T23
+    // --- F13: a poisoned host execution voids model-authored passes. T23
+    // records both criteria as unproven in addition to the typed blocker.
     const failed = events.filter((e) => e.type === 'verification.completed.failed');
     expect(failed).toHaveLength(1);
     const t23Payload = failed[0]!.payload as unknown as {
@@ -804,28 +1436,27 @@ describe('W3-1 — a verification command that writes into the PRIMARY checkout 
       readinessBlockers?: readonly string[];
     };
     expect(t23Payload.failedCriteria).toEqual([]);
-    expect(t23Payload.unprovenCriteria).toEqual([]);
-    expect(
-      t23Payload.readinessBlockers?.some((b) => b.startsWith('verification-runner violation')),
-    ).toBe(true);
+    expect(t23Payload.unprovenCriteria).toEqual(['AC-1', 'AC-2']);
     expect(events.map((e) => e.type)).not.toContain('verification.completed.passed');
 
-    // --- The readiness report is honest: not ready, both blockers present ---
-    const mr = result.mergeReadiness!;
-    expect(mr.ready).toBe(false);
-    expect(mr.blockers.some((b) => b.startsWith('verification-runner violation'))).toBe(true);
-    expect(mr.destinationClean).toBe(false); // the planted file also dirtied the destination
+    // Host-unproven criteria do not produce a merge-readiness artifact at all;
+    // the durable violation incident above remains the operator audit trail.
+    expect(result.mergeReadiness).toBeUndefined();
 
-    // --- The remediation payload tells the next round exactly what happened -
-    expect(
-      result.rounds[0]!.verification.fixRequests.some(
-        (fr) =>
-          fr.kind === 'integration_blocker' &&
-          fr.summary.startsWith('verification-runner violation') &&
-          fr.requestedChange !== undefined &&
-          /strictly inside the assignment worktree/.test(fr.requestedChange),
-      ),
-    ).toBe(true);
+    // The failed host execution maps both criteria to unproven; the durable
+    // typed incident above carries the confinement-specific remediation detail.
+    expect(result.rounds[0]!.verification.fixRequests).toEqual([
+      expect.objectContaining({
+        kind: 'criterion',
+        verdict: 'unproven',
+        summary: expect.stringContaining('Host verification did not pass'),
+      }),
+      expect.objectContaining({
+        kind: 'criterion',
+        verdict: 'unproven',
+        summary: expect.stringContaining('Host verification did not pass'),
+      }),
+    ]);
 
     await slice.worktrees.removeWorktree(asg);
   });
@@ -874,7 +1505,7 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
         criteria,
         taskScope: 'Implement --verbose.',
       },
-      { runVerification: PASS_VERIFY },
+      {},
     );
     const implResult = await slice.service.runRole(
       runId,
@@ -895,8 +1526,19 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
     const { recorder, records } = fakeEvidence();
     const ac1Runner = new VerifierRunner({
       criteria: [criteria[0]!], // AC-1 only
+      runId,
+      specHash,
       implementationCommit: implCommit,
+      cwd: handle.worktreePath,
       evidence: recorder,
+      hostReceipts: hostReceiptsFor(
+        [criteria[0]!],
+        runId,
+        specHash,
+        implCommit,
+        handle.worktreePath,
+      ),
+      hostVerificationPassed: true,
     });
     const ac1Gathering = await slice.service.runRole(runId, ac1Runner, VERIFIER, handle.worktreePath);
     expect(ac1Gathering.criteria[0]!.verdict).toBe('passed');
@@ -953,7 +1595,12 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
         { turns: [verifierTurn([{ id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' }])] },
       ],
     });
-    const successor = new OrchestrationService({ db, ids: successorIds, adapterFactory: successorFactory });
+    const successor = new OrchestrationService({
+      db,
+      ids: successorIds,
+      adapterFactory: successorFactory,
+      supervision: { ps: NO_PROCESS_PS, selfPid: 42_002 },
+    });
 
     // §12.3: ORCHESTRATOR state is recovered from the event log (phase=verifying).
     const recovered = successor.recover(runId);
@@ -1003,6 +1650,7 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
       specHash,
       baseCommit: handle.baseSha,
       implementationCommit: implCommit,
+      resolvedHarnesses: { implementor: 'codex', verifier: 'claude' },
       repoRoot: handle.repoRoot,
       worktreeBranch: handle.branch,
       destinationRef: 'main',
@@ -1022,6 +1670,14 @@ describe('PLAN §19 test 22 — kill mid-run; successor resumes from the checkpo
       binding,
       criteria,
       evidence: successorRecorder,
+      hostVerificationPassed: true,
+      hostReceipts: hostReceiptsFor(
+        criteria,
+        runId,
+        specHash,
+        implCommit,
+        handle.worktreePath,
+      ),
       resumeFrom,
       mergeReadinessProbe: probe,
       approvedSpecHash: specHash,
@@ -1717,7 +2373,10 @@ describe('F7 — provisioning fail-closed halts the loop before verifier dispatc
     const state = slice.service.getImplementVerifyLoopState(runId)!;
     slice.service.saveImplementVerifyLoopState(runId, {
       ...state,
-      worktree: { ...state.worktree!, lastImplementationCommit: { round: 0, commit: slice.baseCommit } },
+      worktree: {
+        ...state.worktree!,
+        lastImplementationCommit: { round: 0, commit: slice.baseCommit },
+      },
     });
 
     const round = slice.service.getRoleRound(runId)!;

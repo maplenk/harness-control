@@ -26,6 +26,7 @@ import type {
   SessionHandle,
   SessionUpdate,
 } from '../adapters/spi.js';
+import type { AcpStopReason } from '../domain/entities.js';
 import type { AppliedConfigOption, ResolvedRoleModel } from './model-resolution.js';
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,56 @@ export interface RolePromptInput {
   readonly onUpdate?: (update: SessionUpdate) => void;
 }
 
+export type RoleTurnOrigin = 'fresh' | 'resumed';
+export type AbortedTurnDisposition =
+  | 'retry'
+  | 'no_deliverable'
+  | 'void_verification';
+
+export type CompletedRoleTurn = PromptResult & {
+  readonly kind: 'completed';
+  readonly stopReason: 'end_turn';
+  readonly origin: RoleTurnOrigin;
+};
+
+export type AbortedRoleTurn = PromptResult & {
+  readonly kind: 'aborted';
+  readonly stopReason: Exclude<AcpStopReason, 'end_turn'>;
+  readonly origin: RoleTurnOrigin;
+  readonly disposition: AbortedTurnDisposition;
+};
+
+export type RoleTurnResult = CompletedRoleTurn | AbortedRoleTurn;
+
+/**
+ * F13 AC-5: the shared, role-discriminated stop gate. Only `end_turn` can
+ * complete a turn. Every other ACP stop is an abort; role policy decides
+ * whether the surrounding flow retries, produces no deliverable, or voids
+ * verification. Origin is audit data, never an exemption.
+ */
+export function adjudicateRoleTurn(
+  role: RoleName,
+  origin: RoleTurnOrigin,
+  result: PromptResult,
+): RoleTurnResult {
+  if (result.stopReason === 'end_turn') {
+    return { ...result, kind: 'completed', stopReason: 'end_turn', origin };
+  }
+  const disposition: AbortedTurnDisposition =
+    role === 'coordinator'
+      ? 'retry'
+      : role === 'implementor'
+        ? 'no_deliverable'
+        : 'void_verification';
+  return {
+    ...result,
+    kind: 'aborted',
+    stopReason: result.stopReason,
+    origin,
+    disposition,
+  };
+}
+
 export interface RoleSession {
   readonly runId: RunId;
   readonly role: RoleName;
@@ -74,12 +125,14 @@ export interface RoleSession {
   /** Working directory for this role (workspace for read-only roles; the
    * assigned worktree for the implementor). */
   readonly cwd: string;
+  /** Whether this session is a fresh dispatch or a durable resume re-entry. */
+  readonly turnOrigin: RoleTurnOrigin;
   /**
    * Drive one prompt turn. At most one in-flight per session (§6.2). Usage is
    * folded into the run's cost projection; a pre-turn estimated-budget refusal
    * (§17.2) throws `BudgetExceededError` before the turn starts.
    */
-  prompt(input: RolePromptInput): Promise<PromptResult>;
+  prompt(input: RolePromptInput): Promise<RoleTurnResult>;
   /**
    * F8 (C) — §12.2's `pre_verify_handoff` safe boundary, the ONE checkpoint
    * trigger a FLOW owns (the other four — cadence, pre_pause, pre_model_switch,

@@ -78,7 +78,13 @@ const CRITERIA: readonly AcceptanceCriterion[] = [
 const NOOP_DELAY = async (): Promise<void> => undefined;
 
 function cfg(restarts: Record<string, unknown>): EngineConfig {
-  return unwrap(parseEngineConfig({ restarts }));
+  // These crash/restart fixtures intentionally exercise a single Claude vendor.
+  return unwrap(
+    parseEngineConfig({
+      restarts,
+      verification: { allowSameHarness: true },
+    }),
+  );
 }
 
 function configOptionsFor(harness: Harness): ConfigOptionDescriptor[] {

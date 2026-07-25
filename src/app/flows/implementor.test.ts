@@ -17,7 +17,15 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { artifactHash, assignmentId, criterionId, gitSha, specHash, type ArtifactHash } from '../../domain/ids.js';
+import {
+  artifactHash,
+  assignmentId,
+  criterionId,
+  gitSha,
+  runId,
+  specHash,
+  type ArtifactHash,
+} from '../../domain/ids.js';
 import { DeterministicIdFactory } from '../../lib/id-factory.js';
 import { availableDriverKinds, openTestDatabase, type TestDatabaseHandle } from '../../persistence/test-support.js';
 import type { DriverKind } from '../../persistence/database.js';
@@ -54,6 +62,11 @@ import {
   type RunImplementorInput,
 } from './implementor.js';
 import { adjudicateImplementorDeliverable } from './deliverable.js';
+import {
+  executeEvidenceReceiptsUnderConfinement,
+  type ConfinedReceiptExecution,
+  type EvidenceRecorder,
+} from './verifier.js';
 import { err } from '../../lib/result.js';
 
 // ---------------------------------------------------------------------------
@@ -244,7 +257,6 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
       assignmentId: asg,
       implementor: CODEX_IMPLEMENTOR,
       baseCommit: gitSha(await r.headSha()), context: baseContext(),
-      options: { runVerification: PASS_VERIFY },
     };
     const result = await runImplementor({ service, worktrees: wt }, input);
 
@@ -255,15 +267,15 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
     expect(result.diff).toContain('the new feature flag');
     expect(result.diffTruncated).toBe(false);
 
-    // --- verification commands ran; results captured honestly -------------
-    expect(result.verification).toHaveLength(1);
-    expect(result.verification[0]).toMatchObject({ command: 'echo verify-c1', exitCode: 0, passed: true });
+    // --- the declared commands do NOT run at this boundary: they run once at
+    // the verify boundary, where the receipts record each execution. What this
+    // boundary still attests is that provisioning held.
+    expect(result.verification).toEqual([]);
     expect(result.verificationPassed).toBe(true);
-    // W1-F4: clean (side-effect-free) commands leave no post-verification dirt.
+    expect(result.provisioningFailed).toBeUndefined();
+    // W1-F4: the round leaves no uncommitted dirt behind its own commit.
     expect(result.postVerificationDirty).toBe(false);
     expect(result.postVerificationDirtyFiles).toEqual([]);
-    // W3-1: a confined command trips no primary-checkout guard.
-    expect(result.runnerViolation).toBeUndefined();
 
     // --- the agent's own narrative (risks live here) captured -------------
     expect(result.agentMessages.join('\n')).toContain('Risk');
@@ -362,7 +374,6 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()),
         context: baseContext(),
-        options: { runVerification: PASS_VERIFY },
       },
     ).catch((caught: unknown) => caught);
 
@@ -390,7 +401,6 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         implementor: CODEX_IMPLEMENTOR,
         // Runtime callers can still bypass the required TypeScript field.
         context: baseContext(),
-        options: { runVerification: PASS_VERIFY },
       } as never,
     ).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(WorktreeError);
@@ -419,7 +429,6 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: other,
         context: baseContext(),
-        options: { runVerification: PASS_VERIFY },
       },
     ).catch((e: unknown) => e);
 
@@ -449,7 +458,6 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: pinned,
         context: baseContext(),
-        options: { runVerification: PASS_VERIFY },
       },
     ).catch((e: unknown) => e);
 
@@ -479,33 +487,34 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()),
         context: baseContext({ verificationCommands: ['run-the-suite'] }),
-        options: { runVerification: failing },
       },
     );
 
     // Work is still committed (the implementor never withholds its diff)...
     expect(result.committed).toBe(true);
     expect(result.changedFiles).toEqual(['partial.txt']);
-    // ...but the failing self-check is reported honestly, not marked passing.
-    expect(result.verification[0]).toMatchObject({ command: 'run-the-suite', exitCode: 1, passed: false });
-    expect(result.verificationPassed).toBe(false);
+    // ...and this boundary makes no claim about the declared commands: it does
+    // not run them. A failing command produces a non-zero RECEIPT at the verify
+    // boundary, which drives the criterion to `unproven` (verifier.test.ts AC-2).
+    expect(result.verification).toEqual([]);
     // The implementor cannot mark completion; the run stays where it was.
     expect(service.status(runId).phase).toBe('created');
 
     await wt.removeWorktree(asg);
   });
 
-  it('W1-F4: a verification command that MUTATES the tree is caught — the dirt is named and is in NO commit', async () => {
+  // W1-F4's unit-level form is gone with the duplicate execution: a verification
+  // command can no longer dirty the tree at THIS boundary, because it does not
+  // run here. The property is proven end-to-end instead, where the mutation now
+  // happens — vertical-slice.test.ts, "a mutating verification command never
+  // yields merge_ready": the §16 readiness gate probes after the receipts have
+  // run, blocks, and names the file.
+  it('leaves no dirt of its own behind the recorded commit', async () => {
     const { service, worktrees: wt, repo: r } = await setup({
       writes: [{ relPath: 'feature.txt', content: 'the real work\n' }],
       turns: [REPORTING_TURN],
     });
     const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
-    // Simulates a build-style self-check that writes into the worktree.
-    const mutating: VerificationRunner = async (command, cwd) => {
-      fs.writeFileSync(path.join(cwd, 'generated.lock'), 'produced by the verification build\n');
-      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
-    };
     const asg = assignmentId('asg_impl_mutating');
 
     const result = await runImplementor(
@@ -515,18 +524,15 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()), context: baseContext(),
-        options: { runVerification: mutating },
       },
     );
 
-    // The commit-then-verify order held: the recorded commit/diff carry ONLY
-    // the implementation — the mutation never pollutes them.
+    // The commit carries ONLY the implementation, and the round hands the
+    // verify boundary a clean tree to execute the declared commands against.
     expect(result.committed).toBe(true);
     expect(result.changedFiles).toEqual(['feature.txt']);
-    expect(result.diff).not.toContain('generated.lock');
-    // ...and the post-verification snapshot catches the dirt, naming the file.
-    expect(result.postVerificationDirty).toBe(true);
-    expect(result.postVerificationDirtyFiles).toContain('generated.lock');
+    expect(result.postVerificationDirty).toBe(false);
+    expect(result.postVerificationDirtyFiles).toEqual([]);
 
     await wt.removeWorktree(asg); // manager removal defaults to --force
   });
@@ -544,7 +550,6 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
         assignmentId: asg,
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()), context: baseContext(),
-        options: { runVerification: PASS_VERIFY },
       },
     );
 
@@ -567,7 +572,7 @@ describe('ImplementorFlow — worktree-confined implementation (§8, §16, §19 
 
     await runImplementor(
       { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext(), options: { runVerification: PASS_VERIFY } },
+      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext() },
     );
 
     const handle = wt.handleFor(asg);
@@ -736,177 +741,333 @@ describe('W4-7 — verification timeout kills the descendant process group', () 
   });
 });
 
-describe('W3-1 — primary-checkout mutation guard', () => {
-  it('an out-of-worktree write into the PRIMARY checkout is a typed violation and fails verification honestly', async () => {
-    const { service, worktrees: wt, repo: r } = await setup({
-      writes: [{ relPath: 'feature.txt', content: 'legitimate in-worktree work\n' }],
-      turns: [REPORTING_TURN],
-    });
-    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
-    // Simulates the proven probe: a verification command (or a script it
-    // invokes) writing OUTSIDE the worktree into the primary checkout.
-    const escaping: VerificationRunner = async (command) => {
-      fs.writeFileSync(path.join(r.dir, 'planted-outside-worktree.txt'), 'runner escaped the worktree\n');
-      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
-    };
-    const asg = assignmentId('asg_impl_w3_escape');
-
-    const result = await runImplementor(
-      { service, worktrees: wt },
-      {
-        runId,
-        assignmentId: asg,
-        implementor: CODEX_IMPLEMENTOR,
-        baseCommit: gitSha(await r.headSha()), context: baseContext(),
-        options: { runVerification: escaping },
-      },
-    );
-
-    // Every command exited 0 — but the guard caught the escape, so the
-    // self-check fails honestly with the typed violation.
-    expect(result.verification[0]!.passed).toBe(true);
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.kind).toBe('verification_runner_violation');
-    expect(result.runnerViolation!.changedPaths).toContain('planted-outside-worktree.txt');
-    expect(result.runnerViolation!.detail).toMatch(/primary checkout mutated/);
-    expect(String(result.runnerViolation!.headBefore)).toMatch(/^[0-9a-f]{40}$/);
-    expect(result.verificationPassed).toBe(false);
-    // The work itself is still committed and reported (never withheld).
-    expect(result.committed).toBe(true);
-
-    await wt.removeWorktree(asg);
-  });
-
-  it('a HEAD move in the primary checkout across the commands is drift (even with a clean porcelain)', async () => {
-    const { service, worktrees: wt, repo: r } = await setup({
+describe('W3-1 — primary-checkout mutation guard (wraps the declared-command execution)', () => {
+  // The spec's declared commands run exactly ONCE per round, at the VERIFY
+  // boundary, inside `executeEvidenceReceiptsUnderConfinement`. The guard
+  // snapshots the primary checkout (HEAD + `--ignored` porcelain + hooks
+  // manifest + config hash) before that execution and re-checks it after, so a
+  // command — or a script it invokes — that reaches outside the worktree is a
+  // typed violation. These are the same escape vectors the guard covered while
+  // the implementor boundary still duplicated this execution; the guard moved
+  // with the commands rather than being left behind as an inert check.
+  async function confined(
+    makeRunner: (repo: TempGitRepo) => VerificationRunner,
+    prepare?: (repo: TempGitRepo) => Promise<void>,
+    evidence?: EvidenceRecorder,
+  ): Promise<ConfinedReceiptExecution> {
+    const { worktrees: wt, repo: r } = await setup({
       writes: [{ relPath: 'feature.txt', content: 'work\n' }],
       turns: [REPORTING_TURN],
     });
-    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
-    const committing: VerificationRunner = async (command) => {
-      fs.writeFileSync(path.join(r.dir, 'sneaky.txt'), 'committed into the primary\n');
-      await r.commitAll('malicious commit from a verification command');
-      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
-    };
-    const asg = assignmentId('asg_impl_w3_head');
+    if (prepare !== undefined) await prepare(r);
+    const asg = assignmentId('asg_w3_confined');
+    const handle = await wt.createWorktree({
+      assignmentId: asg,
+      baseCommit: gitSha(await r.headSha()),
+    });
+    try {
+      return await executeEvidenceReceiptsUnderConfinement({
+        runId: runId('run_w3'),
+        criteria: [
+          {
+            id: criterionId('AC-1'),
+            description: 'a criterion whose declared command is host-executed',
+            verificationCommands: ['declared-check'],
+          },
+        ],
+        binding: {
+          specHash: specHash('spec_w3'),
+          implementationCommit: gitSha(await r.headSha()),
+        },
+        cwd: handle.worktreePath,
+        repoRoot: handle.repoRoot,
+        runner: makeRunner(r),
+        evidence: evidence ?? { record: async () => artifactHash('sha256:w3-evidence') },
+        provisioningMarker: 'clone:w3',
+        ids: new DeterministicIdFactory(),
+        clock: dbHandle!.db.clock,
+      });
+    } finally {
+      // A test may deliberately destroy the worktree to force a git read to
+      // fail; cleanup must not mask the assertion.
+      await wt.removeWorktree(asg).catch(() => undefined);
+    }
+  }
 
-    const result = await runImplementor(
-      { service, worktrees: wt },
+  // TOTALITY ON THE EXCEPTIONAL PATH. "Collect everything, decide once" held
+  // for normal control flow but leaked on the exceptional one: the post-command
+  // HEAD read can THROW, and that bypassed the sole return entirely — silently
+  // discarding a primary-checkout violation that had already been observed.
+  it('a post-command HEAD read that THROWS does not discard findings already observed', async () => {
+    const result = await confined((r) => async (command, cwd) => {
+      // Escape into the primary FIRST, so there is a real finding to lose...
+      fs.writeFileSync(path.join(r.dir, 'planted-then-head-unreadable.txt'), 'escaped\n');
+      // ...then make the post-command HEAD read fail.
+      fs.rmSync(path.join(cwd, '.git'), { recursive: true, force: true });
+      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+    });
+
+    // The already-observed escape survives the failed read...
+    expect(
+      result.runnerViolations.some((v) => v.changedPaths.includes('planted-then-head-unreadable.txt')),
+    ).toBe(true);
+    // ...and the unreadable HEAD is itself a finding, not silence. It must not
+    // be read as "HEAD did not move": we could not look, which is not an
+    // observation that nothing happened.
+    expect(result.runnerViolations.some((v) => /could not read the post-command/i.test(v.detail))).toBe(
+      true,
+    );
+    expect(result.headReadFailed).toBe(true);
+    // We cannot claim authorship we were unable to observe.
+    expect(result.authoredCommit).toBeUndefined();
+  });
+
+  it('an evidence write that rejects with UNDEFINED is still a failure, not a silent success', async () => {
+    // `throw undefined` / `Promise.reject(undefined)` is legal. Testing
+    // `executionError !== undefined` treats it as "did not throw" — the same
+    // absence-vs-observation confusion this branch keeps paying for.
+    const result = await confined(
+      () => async (command) => ({
+        exitCode: 0,
+        stdout: `ran: ${command}`,
+        stderr: '',
+        launchFailed: false,
+      }),
+      undefined,
       {
-        runId,
-        assignmentId: asg,
-        implementor: CODEX_IMPLEMENTOR,
-        baseCommit: gitSha(await r.headSha()), context: baseContext(),
-        options: { runVerification: committing },
+        record: async () => {
+          // eslint-disable-next-line @typescript-eslint/no-throw-literal
+          throw undefined;
+        },
       },
     );
 
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.detail).toMatch(/HEAD moved/);
-    expect(String(result.runnerViolation!.headBefore)).not.toBe(String(result.runnerViolation!.headAfter));
-    expect(result.verificationPassed).toBe(false);
+    expect(result.executionFailed).toBe(true);
+    expect(result.executionError).toBeUndefined();
+    expect(result.receipts).toEqual([]);
+  });
 
-    await wt.removeWorktree(asg);
+  it('an out-of-worktree write into the PRIMARY checkout is a typed violation', async () => {
+    // Simulates the proven probe: a declared command (or a script it invokes)
+    // writing OUTSIDE the worktree into the primary checkout.
+    const result = await confined((r) => async (command) => {
+      fs.writeFileSync(path.join(r.dir, 'planted-outside-worktree.txt'), 'runner escaped the worktree\n');
+      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+    });
+
+    // The command exited 0 and its receipt records that honestly — but the
+    // guard caught the escape, so the round cannot read as host-verified.
+    expect(result.receipts).toHaveLength(1);
+    expect(result.receipts[0]!.exitCode).toBe(0);
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.kind).toBe('verification_runner_violation');
+    expect(result.runnerViolations[0]!.changedPaths).toContain('planted-outside-worktree.txt');
+    expect(result.runnerViolations[0]!.detail).toMatch(/primary checkout mutated/);
+    expect(String(result.runnerViolations[0]!.headBefore)).toMatch(/^[0-9a-f]{40}$/);
+    // SEVERITY SPLIT: escaping to the primary is a blocking violation, not a
+    // hard stop. Only an AUTHORED commit carries `authoredCommit`, which the
+    // loop turns into `VerificationAuthoredCommitError`. Conflating the two is
+    // what downgraded F8's rule.
+    expect(result.authoredCommit).toBeUndefined();
+  });
+
+  // THE CONJUNCTION. Each violation was closed in isolation, and the primary
+  // drift branch returned EARLY — so a command doing BOTH never reached the
+  // worktree-HEAD comparison, left `authoredCommit` undefined, and was recorded
+  // as an ordinary blocking violation. That misses the hard stop and lets the
+  // loop continue into remediation, where a later implementation commit can
+  // descend from the verification-authored one: exactly the laundering path the
+  // hard stop exists to close. Detection must never be short-circuited by
+  // another finding.
+  it('a command that BOTH escapes to the primary AND authors a commit reports both, and still hard-stops', async () => {
+    const result = await confined((r) => async (command, cwd) => {
+      fs.writeFileSync(path.join(r.dir, 'planted-and-authored.txt'), 'escaped\n');
+      fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+      execFileSync('git', ['add', '-A'], { cwd });
+      execFileSync('git', ['commit', '--no-verify', '-m', 'authored while also escaping'], {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'verify',
+          GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+          GIT_COMMITTER_NAME: 'verify',
+          GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+        },
+      });
+      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+    });
+
+    // BOTH findings survive — neither check is skipped by the other.
+    expect(result.runnerViolations).toHaveLength(2);
+    expect(result.runnerViolations[0]!.detail).toMatch(/primary checkout mutated/);
+    expect(result.runnerViolations[0]!.changedPaths).toContain('planted-and-authored.txt');
+    expect(result.runnerViolations[1]!.detail).toMatch(/never author one/);
+    // ...and the hard-stop signal is still raised despite the primary finding.
+    expect(result.authoredCommit).toBeDefined();
+  });
+
+  it('an authored commit AND a failing evidence write hard-stops while still surfacing the original cause', async () => {
+    const casFailure = new Error('artifact quota exceeded for run');
+    const result = await confined(
+      () => async (command, cwd) => {
+        fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+        execFileSync('git', ['add', '-A'], { cwd });
+        execFileSync('git', ['commit', '--no-verify', '-m', 'authored before the CAS failed'], {
+          cwd,
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'verify',
+            GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+            GIT_COMMITTER_NAME: 'verify',
+            GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+          },
+        });
+        return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+      },
+      undefined,
+      {
+        record: async () => {
+          throw casFailure;
+        },
+      },
+    );
+
+    // The evidence failure does not suppress the hard-stop signal, and the
+    // hard-stop signal does not discard the original cause.
+    expect(result.authoredCommit).toBeDefined();
+    expect(result.executionError).toBe(casFailure);
+  });
+
+  it('a confinement violation is still reported when the EVIDENCE WRITE fails', async () => {
+    // The commands run BEFORE the three evidence writes (stdout, stderr,
+    // receipt body). A §12.1 quota rejection or CAS failure used to throw
+    // straight past drift detection, so the primary-checkout mutation the
+    // command had ALREADY made went unrecorded — and a later retry would
+    // baseline the mutated checkout. The guards must not be skippable by it.
+    const casFailure = new Error('artifact quota exceeded for run');
+    const result = await confined(
+      (r) => async (command) => {
+        fs.writeFileSync(path.join(r.dir, 'planted-despite-cas-failure.txt'), 'escaped\n');
+        return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+      },
+      undefined,
+      {
+        record: async () => {
+          throw casFailure;
+        },
+      },
+    );
+
+    // The violation survives the evidence-write failure...
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.changedPaths).toContain('planted-despite-cas-failure.txt');
+    // ...and the original failure is reported rather than swallowed, so the
+    // caller records the incident first and then fails the round on it.
+    expect(result.executionError).toBe(casFailure);
+    expect(result.receipts).toEqual([]);
+  });
+
+  it('a HEAD move in the primary checkout across the commands is drift (even with a clean porcelain)', async () => {
+    const result = await confined((r) => async (command) => {
+      fs.writeFileSync(path.join(r.dir, 'sneaky.txt'), 'committed into the primary\n');
+      await r.commitAll('malicious commit from a verification command');
+      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+    });
+
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.detail).toMatch(/HEAD moved/);
+    expect(String(result.runnerViolations[0]!.headBefore)).not.toBe(String(result.runnerViolations[0]!.headAfter));
   });
 
   // W3-1(b): three primary mutations that leave HEAD + tracked porcelain
   // UNCHANGED and so evaded the pre-fix snapshot (which hashed only HEAD +
   // `git status --porcelain`). The extended snapshot (hooks manifest + config
-  // hash + `--ignored` porcelain) catches each. Without the fix these all
-  // report `runnerViolation === undefined` and `verificationPassed === true`.
+  // hash + `--ignored` porcelain) catches each.
   it('planting a primary .git/hooks/pre-commit is drift (persistent-RCE vector)', async () => {
-    const { service, worktrees: wt, repo: r } = await setup({
-      writes: [{ relPath: 'feature.txt', content: 'work\n' }],
-      turns: [REPORTING_TURN],
-    });
-    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
-    // A verification command (or a script it invokes) plants a hook in the
-    // primary .git/hooks — it would execute on the next primary commit.
-    const plantingHook: VerificationRunner = async (command) => {
+    const result = await confined((r) => async (command) => {
+      // A declared command (or a script it invokes) plants a hook in the
+      // primary .git/hooks — it would execute on the next primary commit.
       const hook = path.join(r.dir, '.git', 'hooks', 'pre-commit');
       fs.writeFileSync(hook, '#!/bin/sh\nexfiltrate-secrets\n', { mode: 0o755 });
       return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
-    };
-    const asg = assignmentId('asg_impl_w3_hook');
+    });
 
-    const result = await runImplementor(
-      { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext(), options: { runVerification: plantingHook } },
-    );
-
-    expect(result.verification[0]!.passed).toBe(true); // command exited 0…
-    expect(result.runnerViolation).toBeDefined(); // …but the guard caught it
-    expect(result.runnerViolation!.kind).toBe('verification_runner_violation');
-    expect(result.runnerViolation!.detail).toMatch(/\.git\/hooks manifest changed/);
-    expect(result.verificationPassed).toBe(false); // §16 readiness blocks on this
-
-    await wt.removeWorktree(asg);
+    expect(result.receipts[0]!.exitCode).toBe(0); // command exited 0…
+    expect(result.runnerViolations).toHaveLength(1); // …but the guard caught it
+    expect(result.runnerViolations[0]!.kind).toBe('verification_runner_violation');
+    expect(result.runnerViolations[0]!.detail).toMatch(/\.git\/hooks manifest changed/);
   });
 
   it('mutating the primary .git/config (git config core.pager) is drift', async () => {
-    const { service, worktrees: wt, repo: r } = await setup({
-      writes: [{ relPath: 'feature.txt', content: 'work\n' }],
-      turns: [REPORTING_TURN],
-    });
-    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
-    const mutatingConfig: VerificationRunner = async (command) => {
+    const result = await confined((r) => async (command) => {
       // `git config core.pager <payload>` writes .git/config — HEAD + porcelain
       // are untouched. Uses git plumbing (argv, no shell) into the primary.
       execFileSync('git', ['config', 'core.pager', 'evil-payload'], { cwd: r.dir });
       return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
-    };
-    const asg = assignmentId('asg_impl_w3_config');
+    });
 
-    const result = await runImplementor(
-      { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext(), options: { runVerification: mutatingConfig } },
-    );
-
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.detail).toMatch(/\.git\/config changed/);
-    expect(result.verificationPassed).toBe(false);
-
-    await wt.removeWorktree(asg);
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.detail).toMatch(/\.git\/config changed/);
   });
 
   it('writing a NEW gitignored file into the primary is drift (--ignored porcelain)', async () => {
-    const { service, worktrees: wt, repo: r } = await setup({
-      writes: [{ relPath: 'feature.txt', content: 'work\n' }],
-      turns: [REPORTING_TURN],
-    });
-    // Commit a .gitignore so the planted file is IGNORED — plain
-    // `git status --porcelain` would NOT list it; only `--ignored` does.
-    await r.writeFile('.gitignore', '*.log\n');
-    await r.commitAll('add gitignore');
-    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
-    const writingIgnored: VerificationRunner = async (command) => {
-      fs.writeFileSync(path.join(r.dir, 'exfiltrated.log'), 'gitignored payload\n');
-      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
-    };
-    const asg = assignmentId('asg_impl_w3_ignored');
-
-    const result = await runImplementor(
-      { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext(), options: { runVerification: writingIgnored } },
+    const result = await confined(
+      (r) => async (command) => {
+        fs.writeFileSync(path.join(r.dir, 'exfiltrated.log'), 'gitignored payload\n');
+        return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+      },
+      // Commit a .gitignore so the planted file is IGNORED — plain
+      // `git status --porcelain` would NOT list it; only `--ignored` does.
+      async (r) => {
+        await r.writeFile('.gitignore', '*.log\n');
+        await r.commitAll('add gitignore');
+      },
     );
 
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.changedPaths).toContain('exfiltrated.log');
-    expect(result.verificationPassed).toBe(false);
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.changedPaths).toContain('exfiltrated.log');
+  });
 
-    await wt.removeWorktree(asg);
+  // F8 BLOCKER-1, at its new home. A declared command that COMMITS used to be
+  // caught by the implementor round's receipt-vs-head adjudication, because the
+  // commands ran in that window. They now run here, against an already-bound
+  // implementation commit, so the "observe, never author" rule is enforced here
+  // instead — the adjudicator cannot see a commit made after it has run.
+  it('a declared command that COMMITS in the worktree is a violation (observe, never author)', async () => {
+    const result = await confined(() => async (command, cwd) => {
+      fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+      execFileSync('git', ['add', '-A'], { cwd });
+      execFileSync('git', ['commit', '--no-verify', '-m', 'committed by a verification command'], {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'verify',
+          GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+          GIT_COMMITTER_NAME: 'verify',
+          GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+        },
+      });
+      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
+    });
+
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.kind).toBe('verification_runner_violation');
+    expect(result.runnerViolations[0]!.detail).toMatch(/moved the worktree HEAD/);
+    expect(result.runnerViolations[0]!.detail).toMatch(/never author one/);
+    expect(String(result.runnerViolations[0]!.headBefore)).not.toBe(
+      String(result.runnerViolations[0]!.headAfter),
+    );
+    // The HARD-STOP signal — this is what the loop escalates to
+    // `VerificationAuthoredCommitError` instead of remediating.
+    expect(result.authoredCommit).toBeDefined();
+    expect(String(result.authoredCommit!.before)).not.toBe(String(result.authoredCommit!.after));
   });
 
   it('a worktree-cwd command reaching the SHARED common .git/hooks is caught', async () => {
-    const { service, worktrees: wt, repo: r } = await setup({
-      writes: [{ relPath: 'feature.txt', content: 'work\n' }],
-      turns: [REPORTING_TURN],
-    });
-    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     // The runner's cwd is the linked WORKTREE. `git rev-parse --git-common-dir`
     // from there resolves to the PRIMARY shared .git — so the command can plant
     // a hook that runs on the next PRIMARY commit. Prove the guard catches it.
-    const plantingViaWorktree: VerificationRunner = async (command, cwd) => {
+    const result = await confined((r) => async (command, cwd) => {
       const common = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd }).toString().trim();
       const commonAbs = path.isAbsolute(common) ? common : path.resolve(cwd, common);
       // Sanity: the worktree's common-dir IS the primary .git (shared) — compare
@@ -914,19 +1075,10 @@ describe('W3-1 — primary-checkout mutation guard', () => {
       expect(fs.realpathSync(commonAbs)).toBe(fs.realpathSync(path.join(r.dir, '.git')));
       fs.writeFileSync(path.join(commonAbs, 'hooks', 'pre-commit'), '#!/bin/sh\nowned\n', { mode: 0o755 });
       return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
-    };
-    const asg = assignmentId('asg_impl_w3_wt_hook');
+    });
 
-    const result = await runImplementor(
-      { service, worktrees: wt },
-      { runId, assignmentId: asg, implementor: CODEX_IMPLEMENTOR, baseCommit: gitSha(await r.headSha()), context: baseContext(), options: { runVerification: plantingViaWorktree } },
-    );
-
-    expect(result.runnerViolation).toBeDefined();
-    expect(result.runnerViolation!.detail).toMatch(/\.git\/hooks manifest changed/);
-    expect(result.verificationPassed).toBe(false);
-
-    await wt.removeWorktree(asg);
+    expect(result.runnerViolations).toHaveLength(1);
+    expect(result.runnerViolations[0]!.detail).toMatch(/\.git\/hooks manifest changed/);
   });
 });
 
@@ -992,7 +1144,6 @@ describe('ImplementorFlow — F7 dependency provisioning fail-closed (§2.1/§2.
         context: baseContext({
           criteria: [{ id: criterionId('C1'), description: 'x', verificationCommands: ['echo would-pass'] }],
         }),
-        options: { runVerification: spyVerify },
       },
     );
 
@@ -1005,7 +1156,7 @@ describe('ImplementorFlow — F7 dependency provisioning fail-closed (§2.1/§2.
     expect(result.committed).toBe(true); // the work IS committed — only verification halts
   });
 
-  it('a no-dependency repo provisions trivially-true and runs the self-check normally', async () => {
+  it('a no-dependency repo provisions trivially-true, so the round is host-attested', async () => {
     // Sanity: the default provisioning wiring never disturbs a no-deps repo (the
     // makeTempGitRepo base has no package.json → trivially-true, no fail-closed).
     const { service, worktrees: wt, repo: r } = await setup({
@@ -1013,11 +1164,6 @@ describe('ImplementorFlow — F7 dependency provisioning fail-closed (§2.1/§2.
       turns: [REPORTING_TURN],
     });
     const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
-    let selfCheckCalls = 0;
-    const spyVerify: VerificationRunner = async () => {
-      selfCheckCalls += 1;
-      return { exitCode: 0, stdout: '', stderr: '', launchFailed: false };
-    };
     const result = await runImplementor(
       { service, worktrees: wt },
       {
@@ -1026,12 +1172,13 @@ describe('ImplementorFlow — F7 dependency provisioning fail-closed (§2.1/§2.
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()),
         context: baseContext(),
-        options: { runVerification: spyVerify },
       },
     );
     expect(result.provisioningFailed).toBeUndefined();
-    expect(selfCheckCalls).toBeGreaterThan(0); // the self-check DID run
-    expect(result.verification.length).toBeGreaterThan(0);
+    // Provisioning is the whole of what this boundary attests now — the
+    // declared commands run once, at the verify boundary, under the receipts.
+    expect(result.verificationPassed).toBe(true);
+    expect(result.verification).toEqual([]);
   });
 });
 
@@ -1063,7 +1210,6 @@ describe('ImplementorFlow — F7 round-2 #3 node_modules commit semantics follow
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()),
         context: baseContext(),
-        options: { runVerification: PASS_VERIFY },
       },
     );
   }
@@ -1126,7 +1272,7 @@ describe('runImplementor — F7 round-3 #6 rejects an inconsistent provisionActi
         // The inconsistent override: the manager provisions (active) but the caller
         // asks to keep normal `git add -A` — which would stage the provisioned,
         // git-ignored toolchain into HEAD.
-        options: { provisionActive: false, runVerification: PASS_VERIFY },
+        options: { provisionActive: false },
       },
     )
       .then(() => undefined)
@@ -1154,7 +1300,7 @@ describe('runImplementor — F7 round-3 #6 rejects an inconsistent provisionActi
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()),
         context: baseContext(),
-        options: { provisionActive: false, runVerification: PASS_VERIFY }, // matches 'none' → accepted
+        options: { provisionActive: false }, // matches 'none' → accepted
       },
     );
     expect(result.committed).toBe(true);
@@ -1192,7 +1338,6 @@ describe('ImplementorFlow — F7 round-4 #3 a pre-staged node_modules is unstage
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()),
         context: baseContext(),
-        options: { runVerification: PASS_VERIFY },
       },
     );
 
@@ -1240,7 +1385,6 @@ describe('ImplementorFlow — F10 commit with a provisioned (git-ignored) node_m
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()),
         context: baseContext(),
-        options: { runVerification: PASS_VERIFY },
       },
     );
 
@@ -1346,7 +1490,6 @@ describe.each(DRIVER_KINDS)('ImplementorFlow — F8 (C) pre_verify_handoff check
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()),
         context: baseContext(),
-        options: { runVerification: PASS_VERIFY },
       },
     );
     expect(result.committed).toBe(true);
@@ -1384,12 +1527,20 @@ describe.each(DRIVER_KINDS)('ImplementorFlow — F8 (C) pre_verify_handoff check
     const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
     const asg = assignmentId('asg_impl_verify_commits');
 
-    // A declared verification command that creates a file AND commits it, then
-    // leaves the tree clean — exactly the shape that used to slip through.
-    const committingVerify: VerificationRunner = async (command, cwd) => {
+    // Anything that creates a commit in the receipt→adjudication window, then
+    // leaves the tree clean — exactly the shape that used to slip through. The
+    // provisioning seam sits in that window (it runs after `commitAll` and the
+    // `pre_verify_handoff` receipt, before the round is adjudicated), so it
+    // stands in for whatever moved HEAD there. The declared verification
+    // commands — the vector that originally motivated this guard — no longer
+    // run at this boundary at all; they run once at the verify boundary, where
+    // `executeEvidenceReceiptsUnderConfinement` enforces the same "observe,
+    // never author" rule.
+    const commitInWindow = async (): Promise<void> => {
+      const cwd = wt.handleFor(asg)!.worktreePath;
       fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
       execFileSync('git', ['add', '-A'], { cwd });
-      execFileSync('git', ['commit', '--no-verify', '-m', 'committed by a verification command'], {
+      execFileSync('git', ['commit', '--no-verify', '-m', 'committed inside the receipt window'], {
         cwd,
         env: {
           ...process.env,
@@ -1399,7 +1550,6 @@ describe.each(DRIVER_KINDS)('ImplementorFlow — F8 (C) pre_verify_handoff check
           GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
         },
       });
-      return { exitCode: 0, stdout: `ran: ${command}`, stderr: '', launchFailed: false };
     };
 
     const thrown: unknown = await runImplementor(
@@ -1410,7 +1560,7 @@ describe.each(DRIVER_KINDS)('ImplementorFlow — F8 (C) pre_verify_handoff check
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(await r.headSha()),
         context: baseContext({ verificationCommands: ['make-a-commit'] }),
-        options: { runVerification: committingVerify },
+        options: { provisionForVerification: commitInWindow },
       },
     ).catch((error: unknown) => error);
 
@@ -1465,7 +1615,6 @@ describe.each(DRIVER_KINDS)('ImplementorFlow — F8 (C) pre_verify_handoff check
           implementor: CODEX_IMPLEMENTOR,
           baseCommit: gitSha(await r.headSha()),
           context: baseContext(),
-          options: { runVerification: PASS_VERIFY },
         },
       ).catch((error: unknown) => error);
 
@@ -1500,7 +1649,6 @@ describe.each(DRIVER_KINDS)('ImplementorFlow — F8 (C) pre_verify_handoff check
         implementor: CODEX_IMPLEMENTOR,
         baseCommit: gitSha(base),
         context: baseContext(),
-        options: { runVerification: PASS_VERIFY },
       },
     );
     expect(result.committed).toBe(false);

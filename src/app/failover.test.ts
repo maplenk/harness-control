@@ -80,7 +80,13 @@ const CRITERIA: readonly AcceptanceCriterion[] = [
 const NOOP_DELAY = async (): Promise<void> => undefined;
 
 function cfg(overrides: Record<string, unknown>): EngineConfig {
-  return unwrap(parseEngineConfig(overrides));
+  // These failover fixtures intentionally exercise a single Claude vendor.
+  return unwrap(
+    parseEngineConfig({
+      verification: { allowSameHarness: true },
+      ...overrides,
+    }),
+  );
 }
 
 function configOptionsFor(harness: Harness): ConfigOptionDescriptor[] {

@@ -216,7 +216,14 @@ import {
   wouldExceedBudget,
   type CostProjectionState,
 } from './cost.js';
-import type { PermissionMediation, RoleRunner, RoleSession } from './role-runner.js';
+import {
+  adjudicateRoleTurn,
+  type AbortedRoleTurn,
+  type PermissionMediation,
+  type RoleRunner,
+  type RoleSession,
+  type RoleTurnOrigin,
+} from './role-runner.js';
 import { noPayloadToVerify } from '../adapters/acp/session.js';
 import {
   COST_PROJECTION,
@@ -230,6 +237,7 @@ import {
   WORKFLOW_DISPATCH_EDGES,
   isEngineFoldedSupportingEvent,
   makeEngineReducer,
+  migrateMergeReadinessBlockedState,
   uiStateOf,
   type ImplementVerifyLoopState,
   type MergeReadinessBlockedState,
@@ -1078,6 +1086,7 @@ interface SpawnContext {
   readonly cwd: string;
   readonly mediation: PermissionMediation;
   readonly dispatch?: RoleDispatch;
+  turnOrigin: RoleTurnOrigin;
   acpSessionId?: AcpSessionId;
   nativeSessionId?: NativeSessionId;
   /** W2-6: the §14 identity captured after spawn, when the handle exposes
@@ -2799,6 +2808,7 @@ export class OrchestrationService {
       generationId,
       cwd,
       mediation,
+      turnOrigin: 'fresh',
       ...(dispatch !== undefined ? { dispatch } : {}),
     };
     // Install shutdown ownership before initialize can create an OS process
@@ -2884,6 +2894,7 @@ export class OrchestrationService {
       // the gate fires on EITHER so a successor-only marker is acked too).
       const ackState = this.#loadEngineRecord(runId).state;
       if (ackState.resumeReentryPending !== undefined || ackState.successorIntent !== undefined) {
+        ctx.turnOrigin = 'resumed';
         this.ingest(
           this.#trigger(runId, 'resume_reentry.completed', {
             role: runner.role,
@@ -3218,8 +3229,14 @@ export class OrchestrationService {
 
   /** The persisted W2-2 blocked-readiness read-model, if a round recorded one. */
   getMergeReadinessBlocked(runId: RunId): MergeReadinessBlockedState | undefined {
-    return this.#db.projections.get<MergeReadinessBlockedState>(runId, MERGE_READINESS_BLOCKED_PROJECTION)
-      ?.state;
+    // Persisted JSON is untrusted input: it may have been written by any prior
+    // version of this code. Normalize at the READ boundary so every caller —
+    // the CLI recheck path included — gets a current-shape record rather than
+    // crashing on a field that postdates the record.
+    return migrateMergeReadinessBlockedState(
+      this.#db.projections.get<MergeReadinessBlockedState>(runId, MERGE_READINESS_BLOCKED_PROJECTION)
+        ?.state,
+    );
   }
 
   // ---- W2-5 implement→verify loop binding (durable resume input) -----------
@@ -3441,18 +3458,19 @@ export class OrchestrationService {
     return new ResourceExhaustedError(ctx.runId, ctx.role, cause.rssBytes, cause.budgetBytes);
   }
 
-  /** Non-RSS cancellation closes the turn and gates the matching round atomically. */
-  #closeCancelledTurn(ctx: SpawnContext): void {
+  /** Every non-RSS abnormal stop closes the turn; only implementors gate the round. */
+  #closeAbortedTurn(ctx: SpawnContext, turn: AbortedRoleTurn): void {
     this.#db.transactionImmediate(() => {
       this.ingest(
         this.#trigger(ctx.runId, 'turn.completed', {
           segmentId: ctx.segmentId,
           generationId: ctx.generationId,
-          outcome: 'cancelled',
+          outcome: turn.stopReason === 'cancelled' ? 'cancelled' : 'aborted',
         }) as DomainEvent,
       );
       const round = this.getRoleRound(ctx.runId);
       if (
+        turn.disposition === 'no_deliverable' &&
         round !== undefined &&
         round.role === ctx.role &&
         round.stage !== 'completed' &&
@@ -4418,6 +4436,7 @@ export class OrchestrationService {
       generationId,
       cwd: meta.workspacePath,
       mediation: DEFAULT_HEADLESS_MEDIATION,
+      turnOrigin: 'fresh',
     };
     this.#ensureGenerationShutdown(ctx);
     this.#beginHeartbeat(runId);
@@ -5558,6 +5577,7 @@ export class OrchestrationService {
       handle,
       workspacePath,
       cwd,
+      turnOrigin: ctx.turnOrigin,
       prompt: async (input) => {
         this.#assertWithinBudget(runId, role);
         // W2-3: the prompt_turn operation is DURABLE state — `turn.started`
@@ -5600,15 +5620,14 @@ export class OrchestrationService {
         if (exhaustion !== undefined && result.stopReason === 'cancelled') {
           throw this.#resourceExhaustedError(ctx, exhaustion);
         }
-        if (result.stopReason === 'cancelled') {
-          // A NON-RSS cancel (user/cross-process) resolved the prompt
-          // `stopReason:'cancelled'` — an honest CANCELLED turn, never a
-          // `completed` one: it counts NO cadence and lets the round complete no
-          // deliverable (the F2 gate blocks it downstream). `foldTurnCompleted`
-          // still folds the operation back to idle.
-          this.#closeCancelledTurn(ctx);
+        const turn = adjudicateRoleTurn(role, ctx.turnOrigin, result);
+        if (turn.kind === 'aborted') {
+          // No abnormal ACP stop earns cadence or a successful flow result.
+          // The shared wrapper preserves role policy: coordinator retries,
+          // implementor closes no_deliverable, verifier voids the report.
+          this.#closeAbortedTurn(ctx, turn);
           if (result.usage !== undefined) this.#foldTurnUsage(runId, role, sessionKey, result.usage);
-          return result;
+          return turn;
         }
         this.ingest(
           this.#trigger(runId, 'turn.completed', {
@@ -5621,7 +5640,7 @@ export class OrchestrationService {
         // W4-1 (§12.2): a completed turn is the cadence boundary — take a
         // checkpoint once `checkpoint.cadenceTurns` turns have elapsed.
         await this.#maybeCadenceCheckpoint(ctx);
-        return result;
+        return turn;
       },
       // F8 (C): the §12.2 `pre_verify_handoff` boundary, exposed to the FLOW
       // (see `RoleSession.checkpointVerifyHandoff`). Closed over the SAME

@@ -208,6 +208,59 @@ export interface MergeReadinessBlockedState {
   /** `blocked` until a recheck ingests T24; then `resolved`. */
   readonly stage: 'blocked' | 'resolved';
   readonly recordedAt: IsoTimestamp;
+  /**
+   * F13: this record was written BEFORE host attestation existed, and was
+   * normalized on read. It carries no receipts and no resolved harness pair —
+   * not because verification failed, but because the concepts postdate it.
+   * Set by `migrateMergeReadinessBlockedState`, never persisted by a writer.
+   */
+  readonly predatesHostAttestation?: true;
+}
+
+/**
+ * Normalize a persisted `merge_readiness_blocked` projection at the READ
+ * boundary. An event-sourced store holds records written by every prior version
+ * of this code, so a field added by F13 is simply ABSENT from every record
+ * written before it — the read path must treat the JSON as untrusted input
+ * rather than as a current-shape object.
+ *
+ * The concrete failure this closes: projections written by main carry neither
+ * `Verification.evidenceReceipts` nor `VerificationBinding.resolvedHarnesses`,
+ * and `buildMergeReadiness` called `.map` on the missing array. A run main
+ * could recheck successfully — after its destination was cleaned — instead
+ * threw and was STRANDED with no way forward.
+ *
+ * Absence is given its honest meaning, in both directions:
+ *
+ *  - **Never crash on an old shape.** A missing receipt array becomes `[]`:
+ *    "recorded before receipts existed" is legitimately empty, not an error.
+ *  - **Never fabricate a modern attestation from a record that predates it.**
+ *    An empty receipt set is not proof of execution, so it forces the same
+ *    `unproven` outcome a missing receipt produces today — `requiredTestsPassed`
+ *    cannot stand on the model-evidence-only basis main used. Likewise a
+ *    missing harness pair stays ABSENT rather than being reported as a verified
+ *    pair; the run's independence was never recorded, so nothing may claim it.
+ */
+export function migrateMergeReadinessBlockedState(
+  state: MergeReadinessBlockedState | undefined,
+): MergeReadinessBlockedState | undefined {
+  if (state === undefined) return undefined;
+  const verification = state.verification as Verification | undefined;
+  const receipts = verification?.evidenceReceipts;
+  if (Array.isArray(receipts)) return state;
+
+  return {
+    ...state,
+    predatesHostAttestation: true,
+    verification: { ...(verification as Verification), evidenceReceipts: [] },
+    // Fail closed: no host attestation exists for this record, so its gate
+    // input cannot be carried forward as a pass.
+    requiredTestsPassed: false,
+    mergeReadiness: {
+      ...state.mergeReadiness,
+      evidenceReceiptRefs: state.mergeReadiness?.evidenceReceiptRefs ?? [],
+    },
+  };
 }
 
 /**
@@ -304,6 +357,15 @@ export interface WorktreeFactsState {
    * can never reset/verify the WRONG commit — resume falls back to the current HEAD
    * (which is exactly that later round's durable commit). Absent until the first
    * implementor round completes.
+   */
+  /**
+   * F13: deliberately carries NO host-verification verdict. A provisioning
+   * failure is evidence about the attempt that failed, never about a later
+   * one, and the verify boundary re-provisions unconditionally and fails
+   * closed — so the current attestation is always derivable there. Persisting
+   * a verdict let a superseded negative outlive its attempt and force every
+   * command-bearing criterion `unproven` on a resume whose tree had just been
+   * re-proven.
    */
   readonly lastImplementationCommit?: {
     readonly round: number;

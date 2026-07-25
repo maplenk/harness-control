@@ -119,7 +119,13 @@ const PASS_VERIFY: VerificationRunner = async (command) => ({
 });
 
 function cfg(overrides: Record<string, unknown>): EngineConfig {
-  return unwrap(parseEngineConfig(overrides));
+  // These strand/re-entry fixtures intentionally exercise a single Claude vendor.
+  return unwrap(
+    parseEngineConfig({
+      verification: { allowSameHarness: true },
+      ...overrides,
+    }),
+  );
 }
 
 function configOptionsFor(harness: Harness): ConfigOptionDescriptor[] {
@@ -257,7 +263,7 @@ async function openLoopRig(
     db: handle.db,
     ids: new DeterministicIdFactory(),
     adapterFactory: factory,
-    ...(opts.config !== undefined ? { config: opts.config } : {}),
+    config: opts.config ?? cfg({}),
   });
   const baseCommit = gitSha(await repo.headSha());
   const { runId } = createRunFixture(service, {
@@ -335,7 +341,7 @@ async function openServiceRig(
     // A default fake for every role — the spawn/pin window succeeds, then the
     // custom RoleRunner (or a scripted turn) produces the flow error.
     adapterFactory: makeFactory({ implementor: [{ turns: [] }] }, created),
-    ...(opts.config !== undefined ? { config: opts.config } : {}),
+    config: opts.config ?? cfg({}),
   });
   const { runId } = createRunFixture(service, { goal: 'g', workspacePath: '/ws', coordinator: COORDINATOR });
   service.advanceWorkflowPhase(runId, 'created', 'specifying');

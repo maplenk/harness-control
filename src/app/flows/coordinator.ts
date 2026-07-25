@@ -432,7 +432,19 @@ export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome>
 
     for (let round = 1; round <= this.#maxRounds; round += 1) {
       const prompt = round === 1 ? this.#firstPrompt() : this.#retryPrompt(lastIssues);
-      const assessment = this.#assess(await this.#promptText(session, prompt));
+      const turn = await this.#promptText(session, prompt);
+      if (turn.kind === 'aborted') {
+        lastIssues = [
+          {
+            path: '',
+            message:
+              `Coordinator turn aborted with stopReason=${turn.stopReason}; ` +
+              'discard the partial response and retry.',
+          },
+        ];
+        continue;
+      }
+      const assessment = this.#assess(turn.text);
       if (assessment.kind === 'valid') {
         return this.#storeAndBuild(session, assessment.document, round);
       }
@@ -466,8 +478,21 @@ export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome>
 
     try {
       while (turns < this.#maxChatTurns) {
-        const buffer = await this.#promptText(session, nextPrompt);
+        const turn = await this.#promptText(session, nextPrompt);
         turns += 1;
+        if (turn.kind === 'aborted') {
+          lastIssues = [
+            {
+              path: '',
+              message:
+                `Coordinator turn aborted with stopReason=${turn.stopReason}; ` +
+                'discard the partial response and retry.',
+            },
+          ];
+          nextPrompt = this.#retryPrompt(lastIssues);
+          continue;
+        }
+        const buffer = turn.text;
         if (buffer.trim().length === 0) {
           lastIssues = [
             {
@@ -574,16 +599,25 @@ export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome>
     }
   }
 
-  async #promptText(session: RoleSession, prompt: string): Promise<string> {
+  async #promptText(
+    session: RoleSession,
+    prompt: string,
+  ): Promise<
+    | { readonly kind: 'completed'; readonly text: string }
+    | { readonly kind: 'aborted'; readonly stopReason: string }
+  > {
     // Accumulate this turn's agent message text; reset per prompt.
     let buffer = '';
-    await session.prompt({
+    const result = await session.prompt({
       prompt,
       onUpdate: (update: SessionUpdate) => {
         if (update.kind === 'agent_message_chunk') buffer += update.text;
       },
     });
-    return buffer;
+    if (result.kind === 'aborted') {
+      return { kind: 'aborted', stopReason: result.stopReason };
+    }
+    return { kind: 'completed', text: buffer };
   }
 
   #assess(buffer: string): SpecAssessment {

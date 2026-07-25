@@ -679,8 +679,15 @@ export interface EventPayloads {
     // `cancelled` closes a NON-RSS cancelled turn honestly (user/cross-process
     // cancel that resolved the prompt `stopReason:'cancelled'` with no RSS
     // cause): also NOT `completed` — it counts no cadence and never lets the
-    // round complete as a deliverable.
-    readonly outcome: 'completed' | 'failed' | 'resource_exhausted' | 'cancelled';
+    // round complete as a deliverable. `aborted` covers the other non-normal
+    // ACP stops (refusal/token/request caps): likewise no cadence and never a
+    // successful flow result.
+    readonly outcome:
+      | 'completed'
+      | 'failed'
+      | 'resource_exhausted'
+      | 'cancelled'
+      | 'aborted';
   };
   /**
    * W2-1 — a generation's stop was CONFIRMED (transport ladder completed,
