@@ -147,6 +147,33 @@ describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)
     expect((await r.run(['show', ':node_modules/left-pad/index.js'])).trim()).toBe('module.exports = () => {};');
   });
 
+  it('CONTROL: the pathspec form this replaced is still fatal on this git, with the same tree', async () => {
+    // Pins WHY the helper changed, and fails loudly if anyone reinstates the
+    // exclude pathspec: on git >= 2.55 the `:(exclude)node_modules` ITEM counts
+    // as explicitly naming an ignored path, so the command dies before staging
+    // anything. If a future git stops doing this, this test goes red and the
+    // decision can be revisited on evidence rather than memory.
+    const r = await repoWithIgnore('node_modules/\n');
+    plantNodeModules(r.dir, 'node_modules');
+    await r.writeFile('src/feature.ts', 'export const feature = true;\n');
+
+    const thrown: unknown = await runGit(['add', '-A', '--', '.', ':(exclude)node_modules'], r.dir).catch(
+      (e: unknown) => e,
+    );
+
+    expect(isWorktreeError(thrown)).toBe(true);
+    expect(String(thrown)).toMatch(/ignored by one of your \.gitignore files/i);
+    // Note the failure mode is not even clean: git stages what it can and THEN
+    // reports the ignored path with exit 1, so the old helper threw over a
+    // half-staged index and the commit never ran — the round's work sat staged
+    // and uncommitted.
+    expect(await stagedPaths(r.dir)).toEqual(['src/feature.ts']);
+
+    // The replacement handles the identical tree and commits cleanly.
+    await addAllExceptNodeModules(r.dir);
+    expect(await stagedPaths(r.dir)).toEqual(['src/feature.ts']);
+  });
+
   it('FAILS CLOSED when a node_modules path cannot be removed from the index', async () => {
     const r = await repoWithIgnore('node_modules/\n');
     plantNodeModules(r.dir, 'node_modules');
