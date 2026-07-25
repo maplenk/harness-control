@@ -52,9 +52,37 @@ elif [ -n "$CONFIG" ]; then
   echo "!! CONFIG is set but not a readable file: $CONFIG" >&2; exit 1
 fi
 
+# Standing criterion-authoring rules, appended to EVERY slice goal.
+#
+# These are not style advice — each one killed a paying run. They live here
+# rather than in the per-slice SLICE text because relying on the operator to
+# retype them is exactly the omission that costs a run: run_60ccbfda drafted
+# five criteria that no implementor could ever satisfy, and was cancelled.
+#
+# L12: the host gate proves a criterion only when every declared command exits
+#      the code the criterion expects (0 unless declared otherwise). `grep`
+#      exits 1 when it finds NOTHING — which is the pass condition for every
+#      absence check — so an undeclared absence criterion is unprovable.
+# L13: the coordinator never executes what it drafts, and the implementor
+#      cannot repair it, because commands are frozen under the approved hash.
+#      A command that cannot run burns every remediation round.
+CRITERION_LAWS="CRITERION-AUTHORING RULES (each of these killed a previous run; violating one wastes the whole slice): \
+(1) Every verification command must EXIT 0 when the criterion is satisfied. A criterion that asserts something is ABSENT \
+must not rely on a bare \`grep\` — grep exits 1 when it finds nothing, and a non-zero exit does not prove the criterion. \
+Write the check so success is exit 0, e.g. \`test -z \"\$(grep -REl PATTERN PATH || true)\"\`. \
+(2) NEVER write \`! grep ...\` to force a zero exit: that also exits 0 when grep FAILS with exit 2 (unreadable path, bad \
+regex), turning 'I could not determine this' into 'this is false'. \
+(3) Every command must be executable AS WRITTEN against the versions actually installed in this repo. Check flags against \
+the installed major version before you declare a command — e.g. Vite 7 takes a POSITIONAL root (\`vite build web\`) and \
+ERRORS on \`--root\`. Prefer commands you can reason about exactly; when unsure of a flag, use a simpler form. \
+(4) Every criterion must be satisfiable by EDITING FILES. Never write a criterion that asks anyone to re-run something, \
+provide evidence, or change the environment — the implementor can only edit code, and the commands themselves are frozen \
+under the approved spec hash."
+
 GOAL="Read docs/UI-IMPLEMENTATION-PLAN.md ${SECTION} at plan SHA ${PLAN_SHA}. \
 Produce a testable spec whose acceptance criteria are exactly that section's \
-acceptance bullets. Scope: only ${SLICE}; touch no files outside ${PATHS}."
+acceptance bullets. Scope: only ${SLICE}; touch no files outside ${PATHS}. \
+${CRITERION_LAWS}"
 
 echo "── dogfood START ──────────────────────────────────────────────"
 echo " section     : ${SECTION} @ ${PLAN_SHA}"
@@ -66,6 +94,17 @@ echo " store       : ${HARNESS_HOME}"
 echo " json/err    : ${JSON}  |  ${ERRLOG}"
 echo " (spawns the real coordinator; blocks until awaiting_approval)"
 echo "───────────────────────────────────────────────────────────────"
+echo
+echo "GOAL (verbatim, exactly what the coordinator is told):"
+printf '%s\n' "$GOAL" | fold -s -w 100 | sed 's/^/  | /'
+echo
+
+# A coordinator turn is a real spend. DRY_RUN=1 prints the goal and stops, so
+# the operator can read what will be asked before paying for it.
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  echo "── DRY_RUN=1 — nothing spawned, no run created ──"
+  exit 0
+fi
 
 set +e
 "${CLI[@]}" start --workspace . --coordinator "$COORDINATOR" \
