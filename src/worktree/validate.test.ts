@@ -178,6 +178,31 @@ describe('validateWorktree — §16.3 reconciliation outcome matrix', () => {
     expect(result.outcome).toBe('clean');
   });
 
+  it('F10: the WIP commit succeeds with a PROVISIONED (git-ignored) node_modules on disk', async () => {
+    // The §16.3 reconciliation path with a real F7-provisioned tree present had
+    // ZERO coverage — which is how the git 2.55 exclude-pathspec regression
+    // ("The following paths are ignored by one of your .gitignore files")
+    // reached production and killed run_756ce21b's resume.
+    const r = await makeRepo();
+    await r.writeFile('.gitignore', 'node_modules/\n');
+    await r.writeFile('src/app.ts', 'export const x = 1;\n');
+    await r.commitAll('source with an ignore rule');
+    await r.writeFile('node_modules/left-pad/index.js', 'module.exports = () => {};\n');
+    await r.writeFile('node_modules/.bin/tsc', '#!/bin/sh\n');
+    await r.writeFile('src/crash-dirt.ts', 'export const y = 2;\n');
+
+    const result = await validateWorktree({
+      worktreePath: r.dir,
+      wipCommitEnv: WIP_ENV,
+      excludeNodeModulesFromWip: true,
+    });
+
+    expect(result.outcome).toBe('wip_committed');
+    expect(result.wipCommitSha).toMatch(/^[0-9a-f]{40}$/);
+    const committed = (await r.run(['show', '--name-only', '--format=', 'HEAD'])).trim().split('\n');
+    expect(committed).toEqual(['src/crash-dirt.ts']); // the dirt preserved, the toolchain excluded
+  });
+
   it('F7 (#1): the WIP commit EXCLUDES node_modules when managed provisioning is active', async () => {
     const r = await makeRepo();
     await r.writeFile('src/app.ts', 'export const x = 1;\n');

@@ -1156,6 +1156,53 @@ describe('ImplementorFlow — F7 round-4 #3 a pre-staged node_modules is unstage
 });
 
 // ---------------------------------------------------------------------------
+// F10: the post-turn commit with a git-IGNORED node_modules on disk — the exact
+// F7-provisioned production shape. Every existing node_modules test above uses an
+// UNIGNORED/tracked tree, which is why none of them caught the git 2.55
+// exclude-pathspec regression that killed run_756ce21b's resume.
+// ---------------------------------------------------------------------------
+describe('ImplementorFlow — F10 commit with a provisioned (git-ignored) node_modules present', () => {
+  it('commits the work when an IGNORED node_modules exists in the worktree', async () => {
+    const { service, worktrees: wt, repo: r } = await setup({
+      writes: [
+        { relPath: 'feature.txt', content: 'the real work\n' },
+        // What F7 provisioning leaves in the worktree before the commit.
+        { relPath: 'node_modules/.bin/tsc', content: '#!/bin/sh\nexit 0\n' },
+        { relPath: 'node_modules/left-pad/index.js', content: 'module.exports = () => {};\n' },
+      ],
+      turns: [REPORTING_TURN],
+    });
+    // The repo git-ignores node_modules — the normal, correct target-repo shape.
+    await r.writeFile('.gitignore', 'node_modules/\n');
+    await r.commitAll('ignore node_modules');
+    const { runId } = createRunFixture(service, { goal: 'g', workspacePath: r.dir, coordinator: CLAUDE_LOW });
+
+    const result = await runImplementor(
+      { service, worktrees: wt },
+      {
+        runId,
+        assignmentId: assignmentId('asg_ignored_nm_commit'),
+        implementor: CODEX_IMPLEMENTOR,
+        baseCommit: gitSha(await r.headSha()),
+        context: baseContext(),
+        options: { runVerification: PASS_VERIFY },
+      },
+    );
+
+    expect(result.committed).toBe(true);
+    expect(result.changedFiles).toEqual(['feature.txt']);
+    const committed = (
+      await runGit(['diff', '--name-only', `${String(result.baseSha)}..HEAD`], result.worktreePath)
+    ).stdout;
+    expect(committed.split('\n').some((p) => p.includes('node_modules'))).toBe(false);
+    // The provisioned tree is still ON DISK for the verifier — excluded, not deleted.
+    expect(fs.existsSync(path.join(result.worktreePath, 'node_modules', '.bin', 'tsc'))).toBe(true);
+
+    await wt.removeWorktree(assignmentId('asg_ignored_nm_commit'));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // F7 round-2 #6: a provisioning failure must NOT mask the deliverable verdict.
 // A provisioning failure is adjudicated on the deliverable ALONE — an abnormal /
 // no-commit round stays `no_deliverable` (so `runRole` persists that durable stage
