@@ -79,6 +79,14 @@ export const NATIVE_SMOKE_TIMEOUT_MS = 60 * 1000;
  */
 const SMOKE_ENV_ALLOWLIST: readonly string[] = ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL'];
 
+/**
+ * HIGH-4 — how many `node_modules` levels the native-build scan will descend.
+ * npm hoists, so real trees are 1-2 levels deep and conflicts add a few more; 16
+ * is far beyond anything an install produces. Exceeding it is FATAL, never a
+ * silent truncation: a tree the scan did not finish examining cannot be attested.
+ */
+const MAX_NATIVE_SCAN_DEPTH = 16;
+
 /** Marker file written INSIDE a provisioned `node_modules` (after the tree is
  * built, so `npm ci` cannot wipe it) carrying the dependency fingerprint. It is
  * git-ignored along with the rest of `node_modules`. */
@@ -783,22 +791,62 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
 }
 
 /**
- * HIGH-6 — move an abandoned stage OUT of the assignment's active namespace
- * without deleting it, so a still-running producer cannot race a delete and
- * cannot have its writes mistaken for a live stage. Best-effort: if the rename
- * fails, the stage is LEFT where it is (never force-deleted) — a leftover
- * directory is strictly safer than racing an unknown writer.
+ * HIGH-6 (round 4) — MARK an abandoned stage in place; move and delete NOTHING.
+ *
+ * The round-3 shape renamed the stage aside, which does not work: a producer
+ * that timed out is still writing to the ORIGINAL absolute pathname, so renaming
+ * the parent simply lets it recreate `stage-*` underneath — and the tree it is
+ * filling ends up split across two directories, with the renamed copy then swept
+ * by an indiscriminate GC. Since the writer cannot be redirected, the only sound
+ * move is to leave the tree exactly where the writer expects it and record that
+ * this stage is off-limits.
+ *
+ * The marker carries the writing process's pid and the time, so GC can
+ * distinguish "a producer may still own this" from "old enough that nothing
+ * can" (`QUARANTINE_TTL_MS`). Stage directory names are unique per attempt
+ * (`mkdtemp`), so a recreated `stage-*` is always THIS attempt's own directory
+ * and can never collide with a future provisioning run's.
  */
+export const QUARANTINE_MARKER_FILE = '.harness-quarantined';
+/** How long a quarantined stage is presumed to have a live writer. */
+export const QUARANTINE_TTL_MS = 24 * 60 * 60 * 1000;
+
 function quarantineStage(stageDir: string, warn: ProvisionWarnSink): void {
-  const quarantined = path.join(
-    path.dirname(stageDir),
-    `quarantine-${Date.now().toString(36)}-${path.basename(stageDir)}`,
-  );
   try {
-    fs.renameSync(stageDir, quarantined);
-    warn({ kind: 'stage_quarantined', stage: path.basename(quarantined) });
+    fs.mkdirSync(stageDir, { recursive: true }); // the producer may have removed it
+    fs.writeFileSync(
+      path.join(stageDir, QUARANTINE_MARKER_FILE),
+      JSON.stringify({ quarantinedAtMs: Date.now(), ownerPid: process.pid }),
+      'utf8',
+    );
   } catch {
-    warn({ kind: 'stage_quarantined', stage: path.basename(stageDir) });
+    /* best effort — an unmarked stage is still never deleted while it is young */
+  }
+  warn({ kind: 'stage_quarantined', stage: path.basename(stageDir) });
+}
+
+/**
+ * True when a stage must be left alone by GC: it carries a quarantine marker and
+ * is younger than the TTL, so a producer abandoned on a deadline may still be
+ * writing into it. An unreadable/malformed marker is treated as LIVE (fail safe);
+ * once past the TTL the writer cannot plausibly still exist and the stage is
+ * collectable like any other.
+ */
+function isQuarantineProtected(stageDir: string, nowMs: number): boolean {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(stageDir, QUARANTINE_MARKER_FILE), 'utf8');
+  } catch {
+    return false; // no marker — an ordinary stage
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    const at =
+      parsed !== null && typeof parsed === 'object' ? (parsed as { quarantinedAtMs?: unknown }).quarantinedAtMs : undefined;
+    if (typeof at !== 'number' || !Number.isFinite(at)) return true; // malformed → fail safe
+    return nowMs - at < QUARANTINE_TTL_MS;
+  } catch {
+    return true; // unparseable → fail safe
   }
 }
 
@@ -895,8 +943,16 @@ async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; str
   try {
     await withDeadline(() => runtime.cloneDir(primaryNodeModules, dst), args.timeoutMs, 'clone node_modules');
   } catch (error) {
+    // HIGH-6 (round 4): on a DEADLINE, delete NOTHING. `withDeadline` stops
+    // waiting; it does not stop the producer, which is still writing to this
+    // exact pathname — removing the tree here just lets it recreate the
+    // directory behind us, and no later rename can redirect a writer that holds
+    // the original path. The stage is quarantined IN PLACE by the caller
+    // instead. A non-deadline clone failure is a settled producer, so cleaning
+    // up its partial output is safe.
+    if (error instanceof WorktreeError && error.provisioningCause === 'provisioning_timeout') throw error;
     fs.rmSync(dst, { recursive: true, force: true });
-    if (error instanceof WorktreeError && error.kind === 'provisioning_failed') throw error; // the deadline's own refusal
+    if (error instanceof WorktreeError && error.kind === 'provisioning_failed') throw error;
     warn({ kind: 'clone_failed', detail: messageOf(error) });
     throw failClosed(
       `copy-on-write clone of ${primaryNodeModules} into the provisioning stage failed: ${messageOf(error)}. ` +
@@ -1136,9 +1192,17 @@ function gcAbandonedStages(
     }
   }
 
+  const nowMs = Date.now();
   for (const name of entries) {
+    const stageDir = path.join(assignmentStageRoot, name);
+    // HIGH-6: never sweep a QUARANTINED stage while a producer abandoned on a
+    // deadline may still be writing into it. Deleting it would race that writer
+    // — the very hazard quarantining exists to avoid — and the round-3 shape
+    // made it worse by GC'ing the renamed copy indiscriminately. Past the TTL
+    // no writer can plausibly remain, so it collects like anything else.
+    if (isQuarantineProtected(stageDir, nowMs)) continue;
     try {
-      fs.rmSync(path.join(assignmentStageRoot, name), { recursive: true, force: true });
+      fs.rmSync(stageDir, { recursive: true, force: true });
       warn({ kind: 'stage_gc_removed', stage: name });
     } catch {
       /* best effort */
@@ -1293,7 +1357,20 @@ function nativeBuildPackages(treePath: string): string[] {
    * wrong artifact.
    */
   const walk = (root: string, specifierPrefix: string, depth: number): void => {
-    if (depth > 8) return; // pathological nesting; the hoisted copies are covered
+    // HIGH-4 (round 4): the depth guard FAILS CLOSED. Returning silently meant a
+    // native package nested deeper than the limit was never smoked, yet the tree
+    // still received a v2 (smoke-attested) marker — an UNPROVEN tree stamped
+    // proven, and sticky from then on. Refusing is the only honest option: a tree
+    // we did not finish examining is a tree we cannot attest.
+    if (depth > MAX_NATIVE_SCAN_DEPTH) {
+      throw failClosed(
+        `the staged node_modules nests deeper than ${MAX_NATIVE_SCAN_DEPTH} levels at ${root} — the native-build ` +
+          'scan could not examine the whole tree, so no toolchain attestation can be made for it. Refusing rather ' +
+          'than marking an unexamined tree proven. Flatten/reinstall the primary tree, or raise the scan depth.',
+        `native scan depth limit ${MAX_NATIVE_SCAN_DEPTH} exceeded at ${root}`,
+        'native_toolchain_unproven',
+      );
+    }
     let entries: Dirent[];
     try {
       entries = fs.readdirSync(root, { withFileTypes: true });

@@ -28,6 +28,7 @@ import {
   provisionWorktreeDeps,
   PROVISION_MARKER_FILE,
   PROVISION_STAGE_SUBDIR,
+  QUARANTINE_MARKER_FILE,
   scanSymlinkContainment,
   stageHoldsBackup,
   swapIntoPlace,
@@ -1784,6 +1785,31 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     expect(error.message).toContain('implicit-gyp');
   });
 
+  it('nesting DEEPER than the scan limit FAILS CLOSED (never a silent truncation)', async () => {
+    // Round-3 returned silently past the depth cap, so a native package below it
+    // was never smoked — yet the tree still got a v2 (smoke-attested) marker. An
+    // unexamined tree cannot be attested, so exceeding the cap must refuse.
+    const repo = track(await makeDepsRepo());
+    const nm = await writePrimaryNodeModules(repo.dir);
+    let deep = path.join(nm, 'left-pad');
+    for (let level = 0; level <= 17; level += 1) {
+      deep = path.join(deep, 'node_modules', `lvl${level}`);
+    }
+    fs.mkdirSync(deep, { recursive: true });
+    fs.writeFileSync(path.join(deep, 'package.json'), '{"name":"deep","version":"1.0.0"}\n');
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_scan_depth');
+    const handle = await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+    expect(error.provisioningCause).toBe('native_toolchain_unproven');
+    expect(error.message).toMatch(/nests deeper than \d+ levels/i);
+    expect(error.message).toContain('node_modules');
+    // ...and nothing was marked, so the unexamined tree cannot become sticky.
+    expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
+  });
+
   it('a NESTED (non-hoisted) native package is proven too, by its nested specifier', async () => {
     const repo = track(await makeDepsRepo());
     const nm = await writePrimaryNodeModules(repo.dir);
@@ -1915,16 +1941,23 @@ describe('F9 AC-6 — a stalled provisioning command fails closed with the locks
     expect(error.provisioningCause).toBe('provisioning_timeout');
   });
 
-  it('HIGH-6: a timed-out stage is QUARANTINED, not deleted out from under the live producer', async () => {
+  it('HIGH-6: a timed-out stage is marked IN PLACE, survives GC, and the late producer write lands in it', async () => {
+    // Round 3 renamed the stage aside. That does not work: the producer writes by
+    // the ORIGINAL pathname, so renaming the parent just lets it recreate
+    // `stage-*` while the renamed copy gets swept by an indiscriminate GC — the
+    // tree ends up split and half-deleted under a live writer. Nothing is moved
+    // or deleted now; the stage is MARKED and GC skips it.
     const repo = track(await makeDepsRepo());
     await writePrimaryNodeModules(repo.dir);
     let releaseProducer: (() => void) | undefined;
+    let producerDst: string | undefined;
     const hung: ProvisionRuntime = {
       cloneSupported: true,
       platformKey: 'test-platform',
       // Still writing into the stage long after the deadline fires.
       cloneDir: (_src, dst) =>
         new Promise<void>((resolve) => {
+          producerDst = dst;
           releaseProducer = (): void => {
             fs.mkdirSync(dst, { recursive: true });
             fs.writeFileSync(path.join(dst, 'late-write.txt'), 'written after the deadline\n');
@@ -1942,16 +1975,38 @@ describe('F9 AC-6 — a stalled provisioning command fails closed with the locks
     expect(error.provisioningCause).toBe('provisioning_timeout');
     expect(warnings.some((w) => w.kind === 'stage_quarantined')).toBe(true);
 
-    // The stage survives under a `quarantine-*` name — nothing was deleted while a
-    // writer might still hold it, and it is out of the ACTIVE stage namespace.
+    // The stage is still at its ORIGINAL path — not renamed, not deleted — and
+    // carries the quarantine marker.
     const stageRoot = path.join(manager.baseDir, PROVISION_STAGE_SUBDIR, String(asg));
-    const entries = fs.readdirSync(stageRoot);
-    expect(entries.some((name) => name.startsWith('quarantine-'))).toBe(true);
-    expect(entries.some((name) => name.startsWith('stage-'))).toBe(false);
+    const quarantinedStage = fs.readdirSync(stageRoot).find((name) => name.startsWith('stage-'));
+    expect(quarantinedStage).toBeDefined();
+    expect(existsSync(path.join(stageRoot, quarantinedStage!, QUARANTINE_MARKER_FILE))).toBe(true);
+    expect(fs.readdirSync(stageRoot).some((name) => name.startsWith('quarantine-'))).toBe(false);
 
-    // The producer finishes AFTER the refusal; its late write lands in the
-    // quarantined directory and can never be mistaken for a live stage.
+    // The producer finishes AFTER the refusal. Its write lands in the SAME
+    // directory the deadline abandoned — the one we marked — not in a resurrected
+    // copy beside it.
     releaseProducer?.();
+    expect(producerDst).toBeDefined();
+    expect(path.dirname(producerDst!)).toBe(path.join(stageRoot, quarantinedStage!));
+    expect(readFileSync(path.join(producerDst!, 'late-write.txt'), 'utf8')).toBe('written after the deadline\n');
+
+    // A SUBSEQUENT provisioning attempt is unaffected: it gets its own unique
+    // stage, succeeds, and its GC pass leaves the quarantined stage alone.
+    const healthy = fakeRuntime();
+    const manager2 = await openManager(repo, { runtime: healthy.runtime });
+    const asg2 = assignmentId('asg_f9_quarantine'); // SAME assignment → same namespace
+    await manager2.reattach({
+      assignmentId: asg2,
+      worktreePath: path.join(manager.baseDir, `assignment-${String(asg)}`),
+      branch: `harness/${String(asg)}`,
+      baseSha: gitSha(await repo.headSha()),
+    });
+    const outcome = await manager2.provisionForVerification(asg2);
+    expect(outcome.strategy).toBe('clone');
+    // The quarantined stage and the producer's bytes are STILL there.
+    expect(existsSync(path.join(stageRoot, quarantinedStage!, QUARANTINE_MARKER_FILE))).toBe(true);
+    expect(existsSync(path.join(producerDst!, 'late-write.txt'))).toBe(true);
   });
 });
 
