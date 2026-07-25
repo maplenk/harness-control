@@ -154,17 +154,24 @@ export class VerificationAuthoredCommitError extends Error {
     readonly round: number,
     readonly boundCommit: GitSha,
     readonly authoredCommit: GitSha,
-    /** An evidence-write failure detected in the same execution. Carried as
-     * `cause` so outranking it for the DECISION never hides it from the
-     * operator as the reported cause. */
+    /** TRUE when the evidence-write path ALSO failed during the same execution.
+     * A BOOLEAN, never a check on the error value: `throw undefined` and
+     * `Promise.reject(undefined)` are legal, so testing the value would drop the
+     * only indication that evidence execution failed at all. The authored commit
+     * outranks it for the DECISION; the operator must still be told. */
+    readonly evidenceExecutionFailed: boolean = false,
     executionError?: unknown,
   ) {
     super(
       `a declared verification command authored a commit in assignment ${String(assignmentId)} ` +
         `round ${round}: the worktree moved from the bound implementation commit ${String(boundCommit)} ` +
         `to ${String(authoredCommit)}. Verification commands must observe the bound commit, never ` +
-        'author one; the round is refused rather than remediated so nothing can descend from it.',
-      ...(executionError !== undefined ? [{ cause: executionError }] : []),
+        'author one; the round is refused rather than remediated so nothing can descend from it.' +
+        (evidenceExecutionFailed
+          ? ' The evidence-write path ALSO failed during this execution — the authored commit ' +
+            'outranks it for the refusal, but that failure is real and is carried as the cause.'
+          : ''),
+      ...(evidenceExecutionFailed ? [{ cause: executionError }] : []),
     );
   }
 }
@@ -1062,6 +1069,7 @@ export async function runImplementVerifyLoop(
           round,
           receiptExecution.authoredCommit.before,
           receiptExecution.authoredCommit.after,
+          receiptExecution.executionFailed,
           receiptExecution.executionError,
         );
       }

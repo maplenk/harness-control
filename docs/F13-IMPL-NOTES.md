@@ -564,6 +564,55 @@ The real file was restored from the copy and its symbols re-grepped afterwards
 `executeEvidenceReceiptsUnderConfinement`), with the full suite re-run green —
 that exact move silently wiped a real fix twice earlier in this project.
 
+## Round 5 — codex round 4 on `4d8d464`: the last branch
+
+Items 1 and 3 confirmed, and the round-4 deviation was ruled ACCEPTABLE as
+implemented — main's coordinator already requires at least one criterion and one
+command per criterion, so no coordinator-valid main run can reach the disputed
+no-commands case, and consulting the spec would add cross-projection coupling
+solely for records that predate or bypass that invariant while weakening the
+fail-closed rule. Kept as-is.
+
+One blocker: **round 4's own fix, applied everywhere except its own branch.**
+`VerificationAuthoredCommitError` still tested `executionError !== undefined` and
+received only the value, so an evidence-write failure that rejected with
+`undefined` — exactly the case round 4 closed elsewhere — lost every indication
+that evidence execution had failed, specifically when it coincided with an
+authored commit. The authored commit correctly outranks it for the DECISION; the
+operator must still be told.
+
+The constructor now takes `evidenceExecutionFailed: boolean`, the call site
+passes `receiptExecution.executionFailed`, and both the `cause` attachment and a
+sentence in the message key off the boolean. The flag is also exposed as a
+readonly property, so a programmatic consumer can observe it without parsing
+prose.
+
+### The grep, because this is the third time a fix landed at every site but one
+
+Every non-test read of `executionError`, and what each branches on:
+
+| site | branches on | verdict |
+| --- | --- | --- |
+| `verifier.ts:375` | `executionFailed` | correct |
+| `orchestrate.ts:167` | *the value* | **the bug** |
+| `orchestrate.ts:1065` | passed the value, never the flag | **the bug's feeder** |
+| `orchestrate.ts:1073` | guarded by `if (receiptExecution.executionFailed)` | correct |
+
+Exactly one logical site was wrong, and it is fixed. No other consumer branches
+on the value.
+
+### Fails-on-parent
+
+The regression drives the conjunction specifically — an authored commit AND
+`Promise.reject(undefined)` — and asserts both the hard stop and that the
+evidence-execution failure is still reported. Proven by restoring the pre-fix
+value-branching from a copy: `AssertionError: expected undefined to be true`.
+The real file was restored from that copy and its symbols re-grepped
+(`VerificationAuthoredCommitError`, `VerificationHeadUnreadableError`,
+`evidenceExecutionFailed`, `executionFailed`, `headReadFailed`,
+`runnerViolations`, `recordImplementationCommit`), with zero simulation residue
+and the full suite re-run green.
+
 ## Green bar after the merge
 
 ```text
@@ -571,9 +620,9 @@ $ npm run typecheck
 exit 0
 
 $ npx vitest run
-Tests  2000 passed, 0 failed
+Tests  2001 passed, 0 failed
   1991 at 07d4af0 → 1994 (+3, round-2 blockers) → 1997 (+3, the conjunction)
-       → 2000 (+3, totality edges + legacy projection)
+       → 2000 (+3, totality edges + legacy projection) → 2001 (+1, the last branch)
 ```
 
 Main alone was 1945; F13 alone was 1743 on its older base. The +46 over main is

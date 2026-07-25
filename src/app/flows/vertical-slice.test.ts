@@ -1174,6 +1174,90 @@ describe('F8 authorship — a verification command that COMMITS hard-stops the r
   // into remediation — where round 2's commit descends from the
   // verification-authored one. The hard stop must not be reachable only when
   // the command is "merely" an author.
+  // The undefined-rejection hole, on the ONE branch that still tested the error
+  // VALUE rather than the flag. `Promise.reject(undefined)` is legal, so an
+  // evidence-write failure coinciding with an authored commit lost every
+  // indication that evidence execution had failed at all: the authored commit
+  // correctly outranks it for the DECISION, but the operator must still be told.
+  it('reports the evidence-execution failure even when it rejects with UNDEFINED alongside an authored commit', async () => {
+    const bothPass = verifierTurn([
+      { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+      { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+    ]);
+    const slice = await openSlice({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: [
+        {
+          writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+          turns: [implementorTurn('Implemented --verbose.')],
+        },
+        {
+          writes: [{ relPath: 'src/cli/round2.ts', content: 'export const round2 = true;\n' }],
+          turns: [implementorTurn('Round 2 must not run.')],
+        },
+      ],
+      verifier: [{ turns: [bothPass] }, { turns: [bothPass] }],
+    });
+
+    const { runId, outcome } = await coordinateAndApprove(slice);
+    const asg = assignmentId('asg_slice_authored_undefined_reject');
+
+    let didAuthor = false;
+    const committingVerify: VerificationRunner = async (command, cwd) => {
+      if (!didAuthor) {
+        fs.writeFileSync(path.join(cwd, 'made-by-verification.ts'), 'export const x = 1;\n');
+        execFileSync('git', ['add', '-A'], { cwd });
+        execFileSync('git', ['commit', '--no-verify', '-m', 'authored before the CAS rejected'], {
+          cwd,
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'verify',
+            GIT_AUTHOR_EMAIL: 'verify@harness.invalid',
+            GIT_COMMITTER_NAME: 'verify',
+            GIT_COMMITTER_EMAIL: 'verify@harness.invalid',
+          },
+        });
+        didAuthor = true;
+      }
+      return { exitCode: 0, stdout: `ran ${command}`, stderr: '', launchFailed: false };
+    };
+
+    const thrown: unknown = await runImplementVerifyLoop(
+      { service: slice.service, worktrees: slice.worktrees, ids: slice.ids, clock: dbHandle!.db.clock },
+      {
+        runId,
+        assignmentId: asg,
+        implementor: IMPLEMENTOR,
+        verifier: VERIFIER,
+        specHash: outcome.specVersion.contentHash,
+        specDocument: outcome.canonicalSpec,
+        goal: GOAL,
+        taskScope: 'Implement the --verbose flag.',
+        criteria: outcome.specVersion.criteria,
+        baseCommit: slice.baseCommit,
+        // Rejects with UNDEFINED — the exact value that reads as "did not throw"
+        // to any check written against the error instead of the flag.
+        evidence: {
+          record: (): Promise<never> => Promise.reject(undefined),
+        },
+        runVerificationCommands: committingVerify,
+        maxRounds: 2,
+      },
+    ).then(() => undefined).catch((caught: unknown) => caught);
+
+    // The authored commit still outranks it: HARD STOP, one implementor only.
+    expect(thrown).toBeInstanceOf(VerificationAuthoredCommitError);
+    expect(slice.created.filter((c) => c.role === 'implementor')).toHaveLength(1);
+    // ...and the evidence-execution failure is STILL reported, even though the
+    // rejected value is `undefined`.
+    const error = thrown as VerificationAuthoredCommitError;
+    expect(error.evidenceExecutionFailed).toBe(true);
+    expect(error.message).toMatch(/evidence-write path ALSO failed/);
+    expect('cause' in error).toBe(true);
+
+    await slice.worktrees.removeWorktree(asg);
+  });
+
   it('hard-stops even when the command ALSO escapes into the primary checkout', async () => {
     const allPass = verifierTurn([
       { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
