@@ -229,27 +229,51 @@ async function stagedNodeModulesPaths(worktreePath: string): Promise<string[]> {
   const { stdout } = await runGit(['diff', '--cached', '--name-only', '-z'], worktreePath);
   const candidates = stdout.split('\0').filter((p) => p.length > 0 && NODE_MODULES_PATH_RE.test(p));
   if (candidates.length === 0) return [];
-  // REGRESSION 4 (round 10): only a git-IGNORED node_modules is the engine's.
+  // REGRESSION 4 (round 10): only the ENGINE's node_modules is excluded.
   //
-  // The guard exists to stop the PROVISIONED tree entering a commit, and a
-  // provisioned tree is BY DEFINITION git-ignored (provisioning fails closed
-  // otherwise). Excluding every node_modules-shaped path at any depth swept up
-  // TRACKED, vendored trees too — intentional user content that main commits
-  // without complaint — silently unstaging them and then refusing the round for
-  // post-verification dirt. A tracked node_modules stays committable.
-  const engineOwned: string[] = [];
+  // The guard exists to stop the PROVISIONED tree entering a commit. Excluding
+  // every node_modules-shaped path at any depth swept up TRACKED, vendored trees
+  // too — intentional user content that main commits without complaint —
+  // silently unstaging them and then refusing the round for post-verification
+  // dirt. A vendored node_modules stays committable.
+  //
+  // ROUND 13 (ITEM 3): ownership is a property of the ROOT, decided ONCE. The
+  // unstage necessarily acts on the outer root (one pathspec per file would blow
+  // ARG_MAX on a 100k-entry tree), so classifying per FILE let a single ignored,
+  // not-yet-committed file inside a vendored tree condemn the whole root — its
+  // tracked siblings' staged modifications went with it. Grouping first also ends
+  // the per-file subprocess storm: at most two probes per ROOT, whatever the tree's
+  // size.
+  const byRoot = new Map<string, string[]>();
   for (const candidate of candidates) {
-    if (await isEngineOwnedNodeModules(worktreePath, candidate)) engineOwned.push(candidate);
+    const root = outerNodeModulesRoot(candidate);
+    if (root === undefined) continue; // unreachable for NODE_MODULES_PATH_RE matches; defensive
+    const grouped = byRoot.get(root);
+    if (grouped === undefined) byRoot.set(root, [candidate]);
+    else grouped.push(candidate);
+  }
+  const engineOwned: string[] = [];
+  for (const [root, staged] of byRoot) {
+    if (await isEngineOwnedNodeModulesRoot(worktreePath, root, staged)) engineOwned.push(...staged);
   }
   return engineOwned;
+}
+
+/** The OUTERMOST `node_modules` directory a repo-relative path sits under
+ * (`node_modules`, `web/node_modules`), or `undefined` if it is not under one. */
+function outerNodeModulesRoot(relpath: string): string | undefined {
+  const segments = relpath.split('/');
+  const index = segments.indexOf('node_modules');
+  if (index < 0) return undefined;
+  return segments.slice(0, index + 1).join('/');
 }
 
 /** The marker the provisioner writes INSIDE a tree it built (see `provision.ts`). */
 const PROVISION_MARKER_BASENAME = '.harness-provisioned';
 
 /**
- * REGRESSION 4 (round 10) — is this staged node_modules path the ENGINE's tree
- * rather than the user's?
+ * REGRESSION 4 (round 10) — is this staged node_modules ROOT the ENGINE's tree
+ * rather than the user's? Asked ONCE per root (ITEM 3), never per file.
  *
  * ROUND 13 (ITEM 1) — the ROOT tree is exempt from the question entirely.
  *
@@ -273,28 +297,45 @@ const PROVISION_MARKER_BASENAME = '.harness-provisioned';
  *  - the tree carries the provisioner's own MARKER file, which proves engine
  *    ownership even in a repo with no ignore rule at all.
  *
- * And one veto that outranks both: a path already IN HEAD is committed user
- * content — a vendored dependency tree main commits without complaint — and must
- * stay committable. Excluding every node_modules-shaped path at any depth was the
+ * And one veto that outranks both: ANY content of the root already IN HEAD makes
+ * the WHOLE root committed user content — a vendored dependency tree main commits
+ * without complaint — which must stay committable. ITEM 3: the veto is evaluated
+ * over the root, not over the individual file, because the unstage acts on the
+ * root; deciding per file let one ignored newcomer unstage its tracked siblings.
+ * Excluding every node_modules-shaped path at any depth was the original
  * regression: it silently unstaged those and then failed the round on the
  * resulting "post-verification dirt".
  */
-async function isEngineOwnedNodeModules(worktreePath: string, candidate: string): Promise<boolean> {
-  const segments = candidate.split('/');
-  const index = segments.indexOf('node_modules');
-  if (index < 0) return false;
+async function isEngineOwnedNodeModulesRoot(
+  worktreePath: string,
+  root: string,
+  staged: readonly string[],
+): Promise<boolean> {
   // ITEM 1: the ROOT tree — main's unconditional exclusion, asked no questions.
-  if (index === 0) return true;
-  if (await isPathInHead(worktreePath, candidate)) return false; // committed user content
-  if (await isPathIgnoredByRule(worktreePath, candidate)) return true;
-  const treeRoot = segments.slice(0, index + 1).join('/');
-  return existsSync(path.join(worktreePath, treeRoot, PROVISION_MARKER_BASENAME));
+  if (!root.includes('/')) return true;
+  if (await rootHasHeadContent(worktreePath, root)) return false; // committed user content
+  // The ignore probe runs on a staged FILE under the root, not on the root path
+  // itself: `git check-ignore --no-index` answers "not ignored" for a DIRECTORY
+  // that is absent from disk (a trailing-slash rule needs to know it IS one),
+  // while a file path under it answers correctly whether or not it exists.
+  // Verified against git 2.55. One probe either way.
+  const probe = staged[0];
+  if (probe !== undefined && (await isPathIgnoredByRule(worktreePath, probe))) return true;
+  return existsSync(path.join(worktreePath, root, PROVISION_MARKER_BASENAME));
 }
 
-/** True iff `relpath` is present in the committed HEAD tree. */
-async function isPathInHead(worktreePath: string, relpath: string): Promise<boolean> {
+/**
+ * True iff the committed HEAD tree holds ANY content under `root`.
+ *
+ * `:(literal)` (MED-8's reason, and supported by `ls-tree` unlike `check-ignore`):
+ * a repo path may legitimately begin with a colon, and git would otherwise parse a
+ * leading `:(...)` as PATHSPEC MAGIC — the probe would then match nothing and
+ * report a tracked tree as untracked. An unreadable HEAD (unborn branch) exits
+ * non-zero, which is correctly "nothing is tracked yet".
+ */
+async function rootHasHeadContent(worktreePath: string, root: string): Promise<boolean> {
   const { exitCode, stdout } = await runGitStatus(
-    ['ls-tree', '--name-only', 'HEAD', '--', relpath],
+    ['ls-tree', '-r', '--name-only', 'HEAD', '--', `:(literal)${root}`],
     worktreePath,
   );
   return exitCode === 0 && stdout.trim().length > 0;
@@ -315,10 +356,11 @@ async function isPathInHead(worktreePath: string, relpath: string): Promise<bool
 function nodeModulesPathspecs(paths: readonly string[]): string[] {
   const roots = new Set<string>();
   for (const p of paths) {
-    const segments = p.split('/');
-    const index = segments.indexOf('node_modules');
-    if (index < 0) continue; // unreachable for NODE_MODULES_PATH_RE matches; defensive
-    roots.add(`:(literal)${segments.slice(0, index + 1).join('/')}`);
+    // The SAME root derivation the ownership classification groups by, so what is
+    // reset is exactly what was classified.
+    const root = outerNodeModulesRoot(p);
+    if (root === undefined) continue; // unreachable for NODE_MODULES_PATH_RE matches; defensive
+    roots.add(`:(literal)${root}`);
   }
   return [...roots].sort();
 }

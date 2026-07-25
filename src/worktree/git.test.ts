@@ -17,7 +17,10 @@
  * keeps an ignored tree out) and then PROVES the index is free of `node_modules`
  * at ANY depth, failing closed if it cannot make it so.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { addAll, addAllExceptNodeModules, assertIndexFreeOfNodeModules, runGit, unstageNodeModules } from './git.js';
@@ -51,6 +54,35 @@ function plantNodeModules(root: string, relDir: string): void {
 async function stagedPaths(worktreePath: string): Promise<string[]> {
   const { stdout } = await runGit(['diff', '--cached', '--name-only'], worktreePath);
   return stdout.split('\n').filter((line) => line.length > 0);
+}
+
+/**
+ * Runs `body` with a `git` SHIM first on PATH that records each invocation's
+ * subcommand and then execs the real binary, and returns those subcommands in
+ * order. `git.ts` spawns `execFile('git', …)` with `process.env` at call time,
+ * so this counts the ACTUAL subprocesses the helper spends — the only honest way
+ * to assert a probe budget from outside the module.
+ */
+async function withGitProbeLog(body: () => Promise<void>): Promise<string[]> {
+  const realGit = execFileSync('/usr/bin/which', ['git'], { encoding: 'utf8' }).trim();
+  const shimDir = await mkdtemp(path.join(tmpdir(), 'harness-git-shim-'));
+  const logPath = path.join(shimDir, 'calls.log');
+  const shim = path.join(shimDir, 'git');
+  writeFileSync(shim, `#!/bin/sh\nprintf '%s\\n' "$1" >> ${JSON.stringify(logPath)}\nexec ${JSON.stringify(realGit)} "$@"\n`, 'utf8');
+  chmodSync(shim, 0o755);
+  writeFileSync(logPath, '', 'utf8');
+
+  const previousPath = process.env['PATH'];
+  process.env['PATH'] = `${shimDir}:${previousPath ?? ''}`;
+  try {
+    await body();
+  } finally {
+    if (previousPath === undefined) delete process.env['PATH'];
+    else process.env['PATH'] = previousPath;
+  }
+  const calls = readFileSync(logPath, 'utf8').split('\n').filter((line) => line.length > 0);
+  await rm(shimDir, { recursive: true, force: true });
+  return calls;
 }
 
 describe('addAllExceptNodeModules — F10 (git 2.55 ignored-pathspec regression)', () => {
@@ -358,6 +390,76 @@ describe('ROUND 13 ITEM 1 — the ROOT node_modules is excluded unconditionally 
     await addAll(r.dir);
 
     expect(await stagedPaths(r.dir)).toContain('node_modules/left-pad/index.js');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND 13 ITEM 3 — a nested root is classified ONCE, not once per staged file.
+//
+// The unstage acts on the outer `node_modules` ROOT (it must: one pathspec per
+// file would blow ARG_MAX on a 100k-entry tree), but ownership was decided PER
+// FILE. So a single ignored, not-yet-committed file inside a legitimately
+// vendored tree classified the whole root as the engine's and reset it —
+// silently unstaging its TRACKED siblings' modifications, which main commits
+// without complaint, and leaving them behind as post-verification dirt.
+// Classifying the root once, with any HEAD content vetoing exclusion for the
+// entire root, fixes that and the per-file subprocess storm together.
+// ---------------------------------------------------------------------------
+describe('ROUND 13 ITEM 3 — the outer node_modules root is classified once, HEAD content vetoing the whole root', () => {
+  it('an ignored NEW file does not unstage its TRACKED siblings (main commits both)', async () => {
+    const r = await repoWithIgnore('node_modules/\n');
+    // A vendored tree the repo TRACKS despite the ignore rule — committed before
+    // the rule existed, or force-added. Main stages and commits its modifications:
+    // ignore rules do not apply to tracked files, and main's exclusion was
+    // root-only so it never touched this tree at all.
+    plantNodeModules(r.dir, 'vendor/web/node_modules');
+    await r.run(['add', '-f', '--', 'vendor/web/node_modules']);
+    await r.commitAll('vendor the web dependencies');
+
+    // The round edits a TRACKED file in that tree (staged by `add -A`, because
+    // tracked files are never ignored) and adds a NEW one, which the ignore rule
+    // covers — so it reaches the index only by a force-add (round-4 #3's shape).
+    writeFileSync(path.join(r.dir, 'vendor/web/node_modules/left-pad/index.js'), 'module.exports = 2;\n', 'utf8');
+    writeFileSync(path.join(r.dir, 'vendor/web/node_modules/left-pad/extra.js'), 'module.exports = 3;\n', 'utf8');
+    await r.run(['add', '-f', '--', 'vendor/web/node_modules/left-pad/extra.js']);
+    await r.writeFile('src/feature.ts', 'export const feature = true;\n');
+
+    await addAllExceptNodeModules(r.dir);
+
+    const staged = await stagedPaths(r.dir);
+    expect(staged).toContain('src/feature.ts');
+    // The tracked modification SURVIVES: one ignored newcomer does not make the
+    // whole vendored root the engine's.
+    expect(staged).toContain('vendor/web/node_modules/left-pad/index.js');
+    expect(staged).toContain('vendor/web/node_modules/left-pad/extra.js');
+
+    await r.run(['commit', '-m', 'the round']);
+    // And nothing is left behind as "post-verification dirt".
+    expect((await r.statusPorcelain()).trim()).toBe('');
+  });
+
+  it('probes git ONCE per root, not twice per staged file', async () => {
+    const r = await repoWithIgnore(''); // unignored nested tree: the worst case,
+    // where BOTH probes (in-HEAD, then ignore-rule) run before the answer is "no".
+    const tree = 'vendor/web/node_modules';
+    mkdirSync(path.join(r.dir, tree, 'big'), { recursive: true });
+    for (let i = 0; i < 40; i += 1) {
+      writeFileSync(path.join(r.dir, tree, 'big', `m${String(i)}.js`), `module.exports = ${String(i)};\n`, 'utf8');
+    }
+
+    const log = await withGitProbeLog(async () => {
+      await addAllExceptNodeModules(r.dir);
+    });
+
+    // Two classification passes run (the unstage, then the independent invariant
+    // re-check), each spending at most one `ls-tree` + one `check-ignore` on this
+    // single root. Per-FILE classification spent 2 probes x 40 files x 2 passes =
+    // 160 subprocesses for the same answer.
+    const probes = log.filter((sub) => sub === 'ls-tree' || sub === 'check-ignore');
+    expect(probes.length).toBeLessThanOrEqual(8);
+    // …and the answer is unchanged: an unignored, unmarked NESTED tree is user
+    // content and stays staged.
+    expect(await stagedPaths(r.dir)).toContain(`${tree}/big/m0.js`);
   });
 });
 
