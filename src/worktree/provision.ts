@@ -2038,11 +2038,30 @@ function nativeArtifacts(pkgDir: string): {
         stoppedBecause ??= capReason;
         return;
       }
+      // A nested tree belongs to OTHER packages, which the scan visits in their
+      // own right, so passing over one is not a gap in THIS package's scan —
+      // whether it is a real directory or a link to one.
+      if (entry.name === 'node_modules') continue;
+      const full = path.join(dir, entry.name);
+      // ROUND 18 — `readdirSync` reports Dirents with lstat semantics, so a
+      // SYMLINK is neither `isFile()` nor `isDirectory()` and used to fall
+      // through this loop silently while the scan still called itself COMPLETE.
+      // A package whose artifact — or the directory holding it — is a link then
+      // presented as "zero artifacts, nothing skipped" and was refused as never
+      // built. We deliberately do NOT follow the link: that reopens the
+      // containment question the symlink-escape guard exists to close, and we do
+      // not need it, because an incomplete scan already means indeterminate.
+      // Skipping is not looking, so record it.
+      if (entry.isSymbolicLink()) {
+        stoppedBecause ??=
+          `${full} is a symlink, and the scan does not follow links (one may point outside the worktree), ` +
+          'so whatever it points at was never examined';
+        continue;
+      }
       if (entry.isDirectory()) {
-        if (entry.name === 'node_modules') continue;
-        walk(path.join(dir, entry.name), depth + 1);
+        walk(full, depth + 1);
       } else if (entry.isFile() && entry.name.endsWith('.node')) {
-        artifacts.push(path.join(dir, entry.name));
+        artifacts.push(full);
       }
     }
   };

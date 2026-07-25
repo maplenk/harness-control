@@ -2352,6 +2352,39 @@ describe('ROUND 17 — a bounded search that found nothing is not a finding', ()
   });
 });
 
+describe('ROUND 18 — a symlink the scan SKIPS is a scan that stopped looking', () => {
+  it('a package whose only compiled artifact is a SYMLINK is indeterminate, not "never built"', async () => {
+    const repo = track(await makeDepsRepo({ deps: { 'left-pad': '1.0.0' }, devDeps: { 'linked-native': '1.0.0' } }));
+    const nm = await writePrimaryNodeModules(repo.dir, { packages: ['left-pad'] });
+    // A real, loadable addon living in a sibling directory…
+    writeInstalledPackage(nm, 'addon-store');
+    fs.copyFileSync(realNativeAddon(), path.join(nm, 'addon-store', 'bind.node'));
+    // …reached by the native package through a RELATIVE, in-tree link that is the
+    // whole of its visible build output. Hoisted and workspace layouts produce
+    // exactly this; main clones the link verbatim and the package loads.
+    writeInstalledPackage(nm, 'linked-native', { native: true, built: false });
+    const releaseDir = path.join(nm, 'linked-native', 'build', 'Release');
+    fs.mkdirSync(releaseDir, { recursive: true });
+    await symlink(path.join('..', '..', '..', 'addon-store', 'bind.node'), path.join(releaseDir, 'bind.node'));
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_r18_symlinked_artifact');
+    await createAtHead(repo, manager, asg);
+
+    // The scan declines to FOLLOW the link (containment), which is fine — but it
+    // may not then report "no artifact" over a scan calling itself complete.
+    expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+    const reported = warnings
+      .filter((w) => w.kind === 'proof_indeterminate')
+      .filter((w) => /linked-native/.test((w as { subject: string }).subject))
+      .map((w) => (w as { reason: string }).reason);
+    expect(reported.length).toBe(1);
+    // It must name the skipped link, not just say the scan was short.
+    expect(reported[0]).toMatch(/symlink/i);
+    expect(reported[0]).toMatch(/bind\.node/);
+  });
+});
+
 describe('F9 AC-5 — an unbuilt native dependency is caught BEFORE the tree is marked', () => {
   it('a script-bearing package that cannot be loaded → native_toolchain_unproven, no marker (never sticky)', async () => {
     const repo = track(
