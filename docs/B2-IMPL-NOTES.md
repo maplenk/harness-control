@@ -6,7 +6,7 @@ which is NOT the tip of `main` at the time of writing (`main` is at `5669d22`, F
 numbers below are measured against `a77f3da`.
 Spec: `docs/AUTONOMOUS-BASE-PLAN.md` §1 + B2. Invariant reversal recorded in `PLAN.md` §7.1.
 
-> **READ §9 FIRST**, then §8, §7, §6. **§9 is the round-5 record and the current state of the design.**
+> **READ §10 FIRST**, then §9, §8, §7, §6. **§10 is the round-6 record and the current state of the design.**
 > Earlier: Sections 1–5 describe round 1 and are superseded in places.
 > **§8** is the round-4 record (durable-log boundary + persisted-projection migration) and is the
 > current state of the design.
@@ -759,3 +759,84 @@ by `@ts-expect-error` directives in `approval-boundary.test.ts`, which fail `npm
 - **I did not try to backfill `lastDraftRef` during incremental recovery.** That would mean the reducer
   reading events before its cursor — the DB access a reducer must not do. Refusing and telling the
   operator to rebuild from sequence 1 is the honest option.
+
+---
+
+## 10. ROUND 6 — one reordering closes both blockers
+
+Codex re-reviewed `47c4416`. **(a) CONFIRMED**: the brand genuinely binds — its own compiler probe
+produced exactly two errors on the union batch and widened event, both erasure helpers threw for
+erased approvals, and the branded type survives through `#atomicEngineWrite`,
+`appendTriggerWithEffects` and `appendBatch`. **(c) CONFIRMED**: bare advances replace-or-clear the
+reference and the completion lookup stops at the latest advance. My round-5 test change was ruled
+**correct**. Two blockers remained, and one change closed both.
+
+### The two blockers
+
+**1 — the marker was checked in the wrong place.** `historyComplete` was tested only inside the
+`ref === undefined` branch, so a pre-marker projection that legitimately has no marker but RETAINS a
+stale reference (from a bare advance already behind its cursor) was still trusted. Codex probed that
+state and an `approvedBy:'auto'` approval matching the stale reference reached `approved`.
+
+**2 — the repair I advertised does not exist.** `recover()` is cursor-based and incremental; there is
+no CLI verb and no repository operation that forces a rebuild from sequence 1. My round-5 error text
+told the operator to "rebuild this run's engine projection from sequence 1", which they cannot do. So
+a parent-persisted HUMAN run sitting at `awaiting_approval` had neither the marker nor the reference,
+now refused approval, and had no way forward. The fresh default-human path was unchanged, but the
+**parent-to-branch UPGRADE path was not** — merging could have stranded runs that exist in the live
+store today.
+
+### The fix: gate the marker on `auto` alone, checked FIRST
+
+`assertApprovalProvenance` now runs in this order:
+
+1. **engine signature requires a judgeable state** — `approvedBy:'auto'` with no `historyComplete`
+   refuses, unconditionally, BEFORE the reference is consulted;
+2. **engine signature requires drafted provenance** — `auto` with no reference refuses;
+3. **the binding must match the reference** — for both signers, when a reference exists.
+
+Blocker 1 dies because the marker is checked first, so a stale-but-present reference can no longer
+carry an engine signature. Blocker 2 dissolves because human approval never depends on the marker, so
+nothing already in the store is stranded and no rebuild machinery is needed. The error text no longer
+advertises a rebuild that does not exist; it says what is actually available (a human may approve
+explicitly; otherwise cancel and re-start).
+
+### Sanity-check I was asked to do rather than take on trust
+
+**Can a projection lacking `historyComplete` belong to a run pinned `auto`?**
+
+For the live store: **no**, and the chain is checkable.
+- Lacking the marker ⟹ written by a build without it ⟹ round 4 or earlier, or `main`.
+- `approval` as a config key exists ONLY on this branch (introduced in `a9d0603`).
+- `loadRunConfig` re-parses a persisted config through the schema (verified at `service.ts`), so a
+  config written without the key resolves to `approval: 'human'` by default.
+- Therefore every run in the live store is human-pinned, and the marker gate cannot reach it.
+
+**One exception codex's phrasing did not cover, which I am flagging rather than working around:** a
+run created by an INTERMEDIATE commit of THIS branch (rounds 1–4, where `auto` existed but the marker
+did not) would have an auto-pinned config and a marker-less projection. Such a run fails CLOSED here
+— it is refused, not falsely approved — and it cannot exist outside a developer's checkout of an
+unmerged branch. It does not make the rebuild path necessary. If `auto` had ever shipped, it would.
+
+### A second test expectation corrected — and why
+
+My round-5 test "a projection resumed PAST the completion advance refuses instead of falling
+permissive" used an `approvedBy:'human'` payload. Round 6 deliberately makes that case permissive
+again, so the test now uses `'auto'` and is renamed to say so. This is the second time in two rounds
+I have changed a test rather than the code, so the reasoning is stated explicitly: gating HUMAN
+approval on the marker is precisely what blocker 2 forbids, because it strands every run already in
+the store. The engine signature is the thing that may never rest on unjudgeable provenance. The human
+half of that same state is now covered by an explicit upgrade-path test.
+
+### Round-6 fails-on-parent proof (parent `47c4416`)
+
+| What | Parent failure (verbatim) |
+| --- | --- |
+| no marker + STALE PRESENT reference + `auto` approval matching it | `promise resolved "{ status: 'applied', …(3) }" instead of rejecting` |
+| PARENT-SHAPED human run (no marker, no reference) | refused with `Corrupt event log … Rebuild this run's engine projection from sequence 1 to judge it.` — the stranding, demonstrated, complete with the instruction that cannot be followed |
+
+Passing on the parent, correctly: the same state accepting a HUMAN approval (round 5 already allowed
+it when no reference was present), and a marker-carrying run auto-approving normally.
+
+**Green bar after round 6:** `npm run typecheck` exit 0; `npx vitest run` → **108 files / 2050 tests,
+0 failed** (round 5: 108 / 2042).

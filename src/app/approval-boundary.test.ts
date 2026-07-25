@@ -176,11 +176,11 @@ function approvalEvents(db: TestDatabaseHandle['db'], runId: RunId): readonly { 
  * determined attacker would have to write, since `appendableEvent()` REFUSES an
  * approval at runtime. Everything after that point still has to hold.
  *
- * Original round-3 note: which appends transitions and never saw round 2's per-route checks.
- * `as DomainEvent` is exactly how a real bypass would be written (and how the
- * ~70 existing `ingest` call sites are written); the PRECISELY typed form is a
- * compile error, which `ingest-type-guard.test-d.ts` cannot express in vitest,
- * so it is asserted by the `@ts-expect-error` below.
+ * Public `ingest` appends transitions and never saw round 2's per-route checks,
+ * which is how the original bypass worked. `as DomainEvent` is exactly how a
+ * real bypass would be written (and how the ~70 existing `ingest` call sites are
+ * written); the PRECISELY typed form is a compile error, which vitest cannot
+ * express, so it is asserted by `@ts-expect-error` under `npm run typecheck`.
  */
 function handBuiltApproval(
   runId: RunId,
@@ -836,7 +836,7 @@ describe.each(DRIVER_KINDS)('B2 round 4 — stale persisted attribution is migra
 //     widened `DomainEvent` both slipped through unbranded.
 // ===========================================================================
 describe.each(DRIVER_KINDS)('B2 round 5 — provenance is UNDETERMINABLE, not absent [%s]', (kind) => {
-  it('CODEX REPRO: a projection resumed PAST the completion advance refuses instead of falling permissive', async () => {
+  it('CODEX REPRO: a projection resumed PAST the completion advance refuses an ENGINE signature', async () => {
     const { service, db } = await setup(kind, HUMAN_CONFIG());
     const runId = await runWithCompletedDraft(service, draftFor(1));
 
@@ -847,16 +847,22 @@ describe.each(DRIVER_KINDS)('B2 round 5 — provenance is UNDETERMINABLE, not ab
     const { lastDraftRef: _noRef, historyComplete: _noMarker, ...legacyState } = record!.state;
     db.projections.save(runId, ENGINE_STATE_PROJECTION, legacyState, record!.eventCursor);
 
-    // The attack codex described is a DIRECT append plus a recovery — the
-    // service's own check reads the log and would catch an `approve()` call, so
-    // the fold is the layer under test here. A mismatching HUMAN approval used
-    // to be treated as the documented "no completion ref" case and folded
-    // straight into approved.
+    // The attack is a DIRECT append plus a recovery — the service's own check
+    // reads the log and would catch an `approve()` call, so the fold is the
+    // layer under test.
+    //
+    // B2 round 6 NOTE: this originally used an `approvedBy:'human'` payload,
+    // and round 6 deliberately made that case permissive again — gating human
+    // approval on the marker would strand every run already in the live store,
+    // since `recover()` is incremental and nothing rebuilds from sequence 1.
+    // The ENGINE signature is what may never rest on unjudgeable provenance, so
+    // that is what this asserts. The human half of the same state is covered by
+    // the round-6 upgrade-path test below.
     db.events.append(
       forcedIntoLog(
         handBuiltApproval(
           runId,
-          { specVersionId: 'spec_anything', specHash: 'hash_anything', approvedBy: 'human' },
+          { specVersionId: 'spec_anything', specHash: 'hash_anything', approvedBy: 'auto' },
           'undeterminable_1',
         ),
       ),
@@ -969,5 +975,106 @@ describe.each(DRIVER_KINDS)('B2 round 5 — the append brand actually binds [%s]
     }) as DomainEvent;
     expect(() => appendableEvent(fact)).not.toThrow();
     expect(appendableEvents([fact, fact])).toHaveLength(2);
+  });
+});
+
+// ===========================================================================
+// B2 ROUND 6 — the marker gates the ENGINE only, checked FIRST
+//
+// Round 5 checked `historyComplete` only inside the `ref === undefined` branch,
+// so a projection with NO marker but a STALE reference still behind its cursor
+// was trusted, and an `approvedBy:'auto'` approval matching that stale
+// reference reached `approved`. Round 6 hoists the check and gates it on `auto`
+// alone — which also keeps the parent-to-branch UPGRADE path open, because
+// `recover()` is incremental and nothing rebuilds a projection from sequence 1.
+// ===========================================================================
+describe.each(DRIVER_KINDS)('B2 round 6 — a stale reference cannot carry an engine signature [%s]', (kind) => {
+  /** A projection as a pre-marker build left it: reference present, marker absent. */
+  function stripMarkerKeepingRef(db: TestDatabaseHandle['db'], runId: RunId): void {
+    const record = db.projections.get<Record<string, unknown>>(runId, ENGINE_STATE_PROJECTION);
+    expect(record).toBeDefined();
+    expect(record!.state['lastDraftRef']).toBeDefined(); // the STALE reference survives
+    const { historyComplete: _dropped, ...withoutMarker } = record!.state;
+    db.projections.save(runId, ENGINE_STATE_PROJECTION, withoutMarker, record!.eventCursor);
+  }
+
+  it("CODEX REPRO: no marker + a STALE PRESENT reference + an 'auto' approval MATCHING it → refused", async () => {
+    const { service, db } = await setup(kind, AUTO_CONFIG());
+    // Round 1 completes and is auto-signed, leaving a reference in the state.
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    expect(service.status(runId).phase).toBe('approved');
+
+    // Rewind to awaiting_approval with the reference intact and the marker
+    // stripped — exactly the pre-round-5 shape codex probed.
+    const record = db.projections.get<Record<string, unknown>>(runId, ENGINE_STATE_PROJECTION);
+    db.projections.save(
+      runId,
+      ENGINE_STATE_PROJECTION,
+      { ...record!.state, phase: 'awaiting_approval' },
+      record!.eventCursor,
+    );
+    stripMarkerKeepingRef(db, runId);
+
+    // The approval MATCHES the reference, so round 5's binding comparison was
+    // satisfied and the marker check never ran. It must be refused now.
+    await expect(
+      service.approve(runId, {
+        specVersionId: toSpecVersionId('spec_1'),
+        specHash: toSpecHash('hash_1'),
+        mode: 'auto',
+      }),
+    ).rejects.toMatchObject({ reason: 'provenance_undeterminable' });
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+    // Only round 1's own approval is in the log — this attempt appended nothing.
+    expect(approvalEvents(db, runId)).toHaveLength(1);
+  });
+
+  it('the SAME state still accepts a HUMAN approval — the upgrade path is not stranded', async () => {
+    const { service, db } = await setup(kind, AUTO_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    const record = db.projections.get<Record<string, unknown>>(runId, ENGINE_STATE_PROJECTION);
+    db.projections.save(
+      runId,
+      ENGINE_STATE_PROJECTION,
+      { ...record!.state, phase: 'awaiting_approval' },
+      record!.eventCursor,
+    );
+    stripMarkerKeepingRef(db, runId);
+
+    const applied = await service.approve(runId, {
+      specVersionId: toSpecVersionId('spec_1'),
+      specHash: toSpecHash('hash_1'),
+    });
+    expect(applied.status).toBe('applied');
+    expect(service.status(runId).specApprovedBy).toBe('human');
+  });
+
+  it('BLOCKER 2: a PARENT-SHAPED human run (no marker, no reference) is still approvable', async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = runAtGateWithoutDraft(service);
+    // Strip the marker to model a projection persisted by an older build — the
+    // shape every run in the live store has today.
+    const record = db.projections.get<Record<string, unknown>>(runId, ENGINE_STATE_PROJECTION);
+    const { historyComplete: _dropped, ...legacy } = record!.state;
+    db.projections.save(runId, ENGINE_STATE_PROJECTION, legacy, record!.eventCursor);
+    expect(db.projections.get<Record<string, unknown>>(runId, ENGINE_STATE_PROJECTION)!.state['historyComplete'])
+      .toBeUndefined();
+
+    // There is no rebuild-from-sequence-1 operation, so refusing here would
+    // strand the run permanently. It must approve.
+    const applied = await service.approve(runId, {
+      specVersionId: toSpecVersionId('spec_legacy'),
+      specHash: toSpecHash('hash_legacy'),
+    });
+    expect(applied.status).toBe('applied');
+    expect(service.status(runId).phase).toBe('approved');
+    expect(service.status(runId).specApprovedBy).toBe('human');
+  });
+
+  it('a marker-carrying run still auto-approves normally — the gate is surgical', async () => {
+    const { service } = await setup(kind, AUTO_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    expect(service.status(runId).phase).toBe('approved');
+    expect(service.status(runId).specApprovedBy).toBe('auto');
   });
 });

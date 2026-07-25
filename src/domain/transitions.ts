@@ -633,9 +633,24 @@ export interface EngineState {
    *
    * `initialEngineState` sets this, so any state folded from sequence 1 by this
    * build carries it and every later fold preserves it. A projection persisted
-   * by an older build does NOT, which is exactly the "cannot judge" case — and
-   * an undeterminable provenance now REFUSES instead of falling into the
-   * permissive branch.
+   * by an older build does NOT, which is exactly the "cannot judge" case.
+   *
+   * B2 round 6 — the marker gates the ENGINE signature ONLY, and that is a
+   * deliberate, load-bearing asymmetry rather than a softening:
+   *  - it closes the hole, because it is checked BEFORE the reference branch,
+   *    so a stale-but-present reference can no longer carry an `auto` approval;
+   *  - it keeps the UPGRADE path open, because `recover()` is incremental and
+   *    there is NO operation that rebuilds a projection from sequence 1. Gating
+   *    human approval on the marker would strand every run already in the live
+   *    store at `awaiting_approval` with no way forward.
+   *
+   * That is only sound because no run lacking the marker can be pinned `auto`:
+   * `approval` did not exist before this branch, and `loadRunConfig` re-parses
+   * a persisted config through the schema, so a config written without the key
+   * resolves to `'human'`. The one exception is a run created by an
+   * INTERMEDIATE commit of this branch (rounds 1–4, where `auto` existed but
+   * this marker did not) — that state fails CLOSED here, and cannot exist
+   * outside a developer's checkout of this unmerged branch.
    */
   readonly historyComplete?: true;
   /** Bound on T1. */
@@ -931,20 +946,33 @@ function assertApprovalProvenance(state: EngineState, event: DomainEvent): void 
   if (event.type !== 'spec.approved') return;
   const payload = (event as EventOfType<'spec.approved'>).payload;
   const ref = state.lastDraftRef;
+  // B2 round 6 — ORDER MATTERS, and this is the order:
+  //   1. an ENGINE signature requires a judgeable state (this check),
+  //   2. then it requires drafted provenance to exist,
+  //   3. then the binding must match that provenance.
+  //
+  // Round 5 checked the marker only INSIDE the `ref === undefined` branch, so a
+  // projection with no marker but a STALE reference still behind its cursor was
+  // trusted — codex probed exactly that and an `approvedBy:'auto'` approval
+  // matching the stale reference reached `approved`. Hoisting the check makes a
+  // present-but-untrustworthy reference unable to carry an engine signature.
+  //
+  // It is gated on `auto` ALONE, and that is what keeps the upgrade path open:
+  // a HUMAN signature never depends on the marker, so a run persisted by an
+  // older build — which necessarily has no marker — is still approvable. See
+  // the note on `historyComplete` for why no such run can be pinned `auto`.
+  if (payload.approvedBy === 'auto' && state.historyComplete !== true) {
+    throw new SpecApprovalProvenanceError(
+      event.runId,
+      'provenance_undeterminable',
+      `spec.approved claims approvedBy='auto' but this projection was not built from the run's complete ` +
+        `history (no history-complete marker), so its drafted provenance cannot be judged — a reference ` +
+        `it happens to carry may be stale, and one it lacks may simply never have been folded. Absent ` +
+        `provenance and UNKNOWN provenance are not the same thing, and the engine signs on neither. ` +
+        `A human may still approve this run explicitly; otherwise cancel and re-start it.`,
+    );
+  }
   if (ref === undefined) {
-    // B2 round 5: absent means one of TWO things, and only one of them is
-    // permissive. Refuse the one we cannot tell apart from tampering.
-    if (state.historyComplete !== true) {
-      throw new SpecApprovalProvenanceError(
-        event.runId,
-        'provenance_undeterminable',
-        `spec.approved cannot be judged: this projection was not built from the run's complete history ` +
-          `(it carries no history-complete marker, so it predates provenance tracking and resumed past ` +
-          `any completed coordinator round without folding it). Absent provenance and UNKNOWN provenance ` +
-          `are not the same thing, and an approval is never accepted on the strength of the second. ` +
-          `Rebuild this run's engine projection from sequence 1 to judge it.`,
-      );
-    }
     if (payload.approvedBy === 'auto') {
       throw new SpecApprovalProvenanceError(
         event.runId,
