@@ -29,6 +29,8 @@ import {
   PROVISION_MARKER_FILE,
   PROVISION_STAGE_SUBDIR,
   QUARANTINE_MARKER_FILE,
+  QUARANTINE_TTL_MS,
+  gcProvisionStages,
   scanSymlinkContainment,
   stageHoldsBackup,
   swapIntoPlace,
@@ -1810,6 +1812,92 @@ describe('F9 HIGH-4 — the native filter is independent of the scripts object',
     expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
   });
 
+  it('an UNREADABLE package manifest fails the scan closed (never silently omitted)', async () => {
+    // Round 4 swallowed read/enumeration failures during the native scan, so a
+    // package it could not examine was simply omitted while the tree STILL got a
+    // v2 (smoke-attested) marker — the same silent-truncation shape the depth cap
+    // now refuses. A manifest is the reachable case: the symlink containment scan
+    // (which runs first) reads DIRECTORIES, so an unreadable directory refuses
+    // there, but it never opens a package.json.
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    let staged: string | undefined;
+    const fake = fakeRuntime({
+      cloneImpl: async (src, dst) => {
+        await cp(src, dst, { recursive: true, verbatimSymlinks: true });
+        staged = path.join(dst, 'left-pad', 'package.json');
+        fs.chmodSync(staged, 0o000);
+      },
+    });
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_manifest_unreadable');
+    const handle = await createAtHead(repo, manager, asg);
+
+    try {
+      const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+      expect(error.provisioningCause).toBe('native_toolchain_unproven');
+      expect(error.message).toContain('left-pad');
+      expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
+    } finally {
+      if (staged !== undefined && existsSync(staged)) fs.chmodSync(staged, 0o644);
+    }
+  });
+
+  it('a MALFORMED package manifest fails the scan closed', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const fake = fakeRuntime({
+      cloneImpl: async (src, dst) => {
+        await cp(src, dst, { recursive: true, verbatimSymlinks: true });
+        fs.writeFileSync(path.join(dst, 'left-pad', 'package.json'), '{ not json');
+      },
+    });
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_manifest_malformed');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+    expect(error.provisioningCause).toBe('native_toolchain_unproven');
+    expect(error.message).toContain('left-pad');
+  });
+
+  it('an unreadable scope DIRECTORY is refused before the tree can be marked', async () => {
+    // Round 4 swallowed a scope-enumeration error with `continue`, so native
+    // packages hidden under it were omitted and the tree STILL got a v2 marker —
+    // the same silent-truncation shape the depth cap now refuses. Enumeration and
+    // depth must have the same posture.
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    // The scope dir becomes unreadable in the STAGED tree (the clone), which is
+    // where the scan runs — the primary stays healthy so its own tree proof and
+    // the clone itself both succeed, isolating the scan as the thing under test.
+    let stagedScope: string | undefined;
+    const fake = fakeRuntime({
+      cloneImpl: async (src, dst) => {
+        await cp(src, dst, { recursive: true, verbatimSymlinks: true });
+        stagedScope = path.join(dst, '@scope');
+        fs.mkdirSync(path.join(stagedScope, 'pkg'), { recursive: true });
+        fs.chmodSync(stagedScope, 0o000);
+      },
+    });
+    const manager = await openManager(repo, { runtime: fake.runtime });
+    const asg = assignmentId('asg_scope_unreadable');
+    const handle = await createAtHead(repo, manager, asg);
+
+    try {
+      // The symlink containment scan (B6) reaches this first and refuses; the
+      // native scan's own enumeration guard is defence-in-depth for the race
+      // where a directory becomes unreadable BETWEEN the two walks. Either way
+      // the tree is never marked.
+      const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+      expect(error.kind).toBe('provisioning_failed');
+      expect(error.message).toContain('@scope');
+      expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false);
+    } finally {
+      if (stagedScope !== undefined && existsSync(stagedScope)) fs.chmodSync(stagedScope, 0o755);
+    }
+  });
+
   it('a NESTED (non-hoisted) native package is proven too, by its nested specifier', async () => {
     const repo = track(await makeDepsRepo());
     const nm = await writePrimaryNodeModules(repo.dir);
@@ -1922,6 +2010,116 @@ describe('F9 AC-6 — a stalled provisioning command fails closed with the locks
     // The critical section really was left: a fresh operation acquires at once.
     const validated = await manager.validate(asg);
     expect(validated.outcome).toBe('clean');
+  });
+
+  it('HIGH-6 #4: a stage whose quarantine MARKER cannot be written is NOT reported quarantined', async () => {
+    const repo = track(await makeDepsRepo());
+    await writePrimaryNodeModules(repo.dir);
+    const hung: ProvisionRuntime = {
+      cloneSupported: true,
+      platformKey: 'test-platform',
+      // Make the stage un-markable: replace it with a FILE, so both mkdir and the
+      // marker write fail. (A real cause would be a full disk or a permission
+      // change under the stage root.)
+      cloneDir: (_src, dst) =>
+        new Promise<void>(() => {
+          fs.rmSync(path.dirname(dst), { recursive: true, force: true });
+          fs.writeFileSync(path.dirname(dst), 'not a directory\n');
+        }),
+      install: async () => undefined,
+    };
+    const warnings: ProvisionWarnEvent[] = [];
+    const manager = await openManager(repo, { runtime: hung, timeoutMs: 60, warn: (e) => warnings.push(e) });
+    const asg = assignmentId('asg_f9_mark_fail');
+    await createAtHead(repo, manager, asg);
+
+    const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+    expect(error.provisioningCause).toBe('provisioning_timeout');
+    // It must NOT claim a quarantine it did not achieve.
+    expect(warnings.some((w) => w.kind === 'stage_quarantined')).toBe(false);
+    expect(warnings.some((w) => w.kind === 'stage_quarantine_failed')).toBe(true);
+  });
+
+  it('HIGH-6 #5: a marker that cannot be READ means LIVE, never "ordinary" (GC must not delete it)', async () => {
+    const repo = track(await makeDepsRepo());
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_f9_marker_unreadable');
+    await createAtHead(repo, manager, asg);
+    const stageRoot = path.join(manager.baseDir, PROVISION_STAGE_SUBDIR, String(asg));
+    const stage = path.join(stageRoot, 'stage-unreadable');
+    fs.mkdirSync(stage, { recursive: true });
+    const marker = path.join(stage, QUARANTINE_MARKER_FILE);
+    fs.writeFileSync(marker, '{}');
+    fs.chmodSync(marker, 0o000);
+
+    try {
+      // A GC sweep must leave it alone: the marker EXISTS but cannot be read, so
+      // its liveness is unknown — which is the definition of "do not touch".
+      gcProvisionStages(manager.baseDir, String(asg));
+      expect(existsSync(stage)).toBe(true);
+    } finally {
+      fs.chmodSync(marker, 0o644);
+    }
+  });
+
+  it('HIGH-6 #6: a post-TTL stage is deleted only once its OWNER is proven gone', async () => {
+    const repo = track(await makeDepsRepo());
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_f9_ttl_owner');
+    await createAtHead(repo, manager, asg);
+    const stageRoot = path.join(manager.baseDir, PROVISION_STAGE_SUBDIR, String(asg));
+    const ancient = Date.now() - QUARANTINE_TTL_MS - 60_000;
+
+    const liveStage = path.join(stageRoot, 'stage-live-owner');
+    fs.mkdirSync(liveStage, { recursive: true });
+    fs.writeFileSync(
+      path.join(liveStage, QUARANTINE_MARKER_FILE),
+      JSON.stringify({ quarantinedAtMs: ancient, ownerPid: 4242, ownerStartedAt: 'START-A' }),
+    );
+    const deadStage = path.join(stageRoot, 'stage-dead-owner');
+    fs.mkdirSync(deadStage, { recursive: true });
+    fs.writeFileSync(
+      path.join(deadStage, QUARANTINE_MARKER_FILE),
+      JSON.stringify({ quarantinedAtMs: ancient, ownerPid: 4343, ownerStartedAt: 'START-B' }),
+    );
+
+    // Owner 4242 is still the SAME live process; 4343 is gone.
+    const ownerProbe = {
+      self: () => ({ pid: process.pid, startedAt: 'SELF' }),
+      isOwnerAlive: (owner: { readonly pid: number; readonly startedAt?: string }): boolean =>
+        owner.pid === 4242 && owner.startedAt === 'START-A',
+    };
+
+    gcProvisionStages(manager.baseDir, String(asg), undefined, undefined, ownerProbe);
+
+    // A live owner EXTENDS rather than expires — deleting it would recreate the
+    // original race, just a day later.
+    expect(existsSync(liveStage)).toBe(true);
+    // A proven-gone owner releases the stage, so retention stays bounded.
+    expect(existsSync(deadStage)).toBe(false);
+  });
+
+  it('HIGH-6 / MED-6: a MALFORMED marker is bounded, not protected forever', async () => {
+    const repo = track(await makeDepsRepo());
+    const manager = await openManager(repo);
+    const asg = assignmentId('asg_f9_malformed_marker');
+    await createAtHead(repo, manager, asg);
+    const stageRoot = path.join(manager.baseDir, PROVISION_STAGE_SUBDIR, String(asg));
+    const stage = path.join(stageRoot, 'stage-malformed');
+    fs.mkdirSync(stage, { recursive: true });
+    fs.writeFileSync(path.join(stage, QUARANTINE_MARKER_FILE), 'not json at all');
+    // Age the directory past the TTL — the fallback clock when the marker carries
+    // no usable timestamp.
+    const ancient = new Date(Date.now() - QUARANTINE_TTL_MS - 60_000);
+    fs.utimesSync(stage, ancient, ancient);
+
+    const neverAlive = {
+      self: () => ({ pid: process.pid }),
+      isOwnerAlive: (): boolean => false,
+    };
+    gcProvisionStages(manager.baseDir, String(asg), undefined, undefined, neverAlive);
+
+    expect(existsSync(stage)).toBe(false);
   });
 
   it('a hung provisioning GIT probe times out the same way', async () => {

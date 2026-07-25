@@ -47,6 +47,8 @@ import { readdir, readFile, readlink } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
+import { createPsClient } from '../supervisor/ps.js';
+import { SystemClock } from '../lib/clock.js';
 import { sha256Hex } from '../artifacts/hash.js';
 import { WorktreeError, type ProvisioningCause } from './errors.js';
 
@@ -148,6 +150,9 @@ export type ProvisionWarnEvent =
   /** HIGH-6: a stage abandoned on a DEADLINE was renamed aside rather than
    * deleted, because the producer may still be writing into it. */
   | { readonly kind: 'stage_quarantined'; readonly stage: string }
+  /** ROUND 5 (#4): the stage could NOT be marked, so it is not protected — said
+   * plainly rather than reported as a quarantine that did not happen. */
+  | { readonly kind: 'stage_quarantine_failed'; readonly stage: string; readonly detail: string }
   /** F9: the runtime native smoke loaded these packages from the staged tree. */
   | { readonly kind: 'native_smoke_passed'; readonly packages: readonly string[] };
 
@@ -211,6 +216,8 @@ export interface ProvisionParams {
   /** F9 (P5): deadline for every external command / injected seam call on the
    * provisioning path. Defaults to `PROVISION_COMMAND_TIMEOUT_MS`; shrunk in tests. */
   readonly commandTimeoutMs?: number;
+  /** ROUND 5 (#6): §14 owner-liveness probe for quarantine GC; injectable in tests. */
+  readonly ownerProbe?: QuarantineOwnerProbe;
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +554,8 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
   const { worktreePath, primaryRepoRoot: repoRoot, baseDir, strategy, runtime } = params;
   const warn: ProvisionWarnSink = params.warn ?? (() => undefined);
   const timeoutMs = params.commandTimeoutMs ?? PROVISION_COMMAND_TIMEOUT_MS;
+  // ROUND 5 (#6): the §14 owner-liveness probe quarantine GC consults.
+  const ownerProbe = params.ownerProbe ?? defaultOwnerProbe();
   // F9 (P5): every git probe below runs under the deadline.
   const git = boundedGit(params.git, timeoutMs);
   const nodeModules = path.join(worktreePath, 'node_modules');
@@ -561,7 +570,7 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
   // worktree's node_modules is MISSING but a stage holds an `old-*` backup (a crash
   // after move-aside, before move-in), the backup is RESTORED before deletion — it
   // is the only surviving copy of the prior valid tree.
-  gcAbandonedStages(assignmentStageRoot, worktreePath, warn);
+  gcAbandonedStages(assignmentStageRoot, worktreePath, warn, ownerProbe);
 
   // Explicit opt-out: `none` disables managed provisioning (the operator owns
   // node_modules). Proven-skip so the fail-closed gate never halts a deliberately
@@ -783,9 +792,18 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
     // same-filesystem move that takes the path out of the assignment's active
     // namespace — and leave it for a later GC sweep once the writer is gone.
     if (timedOut) {
-      quarantineStage(stageDir, warn);
+      quarantineStage(stageDir, warn, ownerProbe);
     } else if (!stageHoldsBackup(stageDir)) {
-      fs.rmSync(stageDir, { recursive: true, force: true });
+      try {
+        fs.rmSync(stageDir, { recursive: true, force: true });
+      } catch {
+        // ROUND 5: a CLEANUP failure must never MASK the outcome. `rmSync` on a
+        // tree containing an unreadable directory throws, and thrown from this
+        // `finally` it REPLACED the real fail-closed refusal with a bare EACCES —
+        // turning a precise, cause-coded refusal into an untyped error. A stage
+        // we could not delete is a leftover temp directory, which the next call's
+        // GC preflight sweeps; the refusal is what the caller must see.
+      }
     }
   }
 }
@@ -808,45 +826,146 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
  * and can never collide with a future provisioning run's.
  */
 export const QUARANTINE_MARKER_FILE = '.harness-quarantined';
-/** How long a quarantined stage is presumed to have a live writer. */
+/** How long a quarantined stage is presumed to have a live writer, when the
+ * owner's liveness cannot be positively disproven. */
 export const QUARANTINE_TTL_MS = 24 * 60 * 60 * 1000;
 
-function quarantineStage(stageDir: string, warn: ProvisionWarnSink): void {
+/** The recorded §14 identity of the process that abandoned a stage. */
+export interface QuarantineOwner {
+  readonly pid: number;
+  /** Opaque `ps lstart` token — compared for exact equality only. */
+  readonly startedAt?: string;
+}
+
+/**
+ * ROUND 5 (#6) — the §14 liveness/identity probe quarantine GC consults. A
+ * post-TTL delete must PROVE the owner is gone, because a producer with no
+ * bound (a hung `npm`, an NFS stall) can outlive any timeout: deleting its
+ * stage on a timestamp alone recreates the original race a day later.
+ * Injectable so tests can script a live/dead owner without racing real pids.
+ */
+export interface QuarantineOwnerProbe {
+  /** This process's own identity, to stamp into a marker it writes. */
+  self(): QuarantineOwner;
+  /** Is `owner` still the EXACT live process it claims to be? `false` for a gone
+   * pid OR a recycled one (start-time mismatch) — either way the stage is free. */
+  isOwnerAlive(owner: QuarantineOwner): boolean;
+}
+
+let cachedOwnerProbe: QuarantineOwnerProbe | undefined;
+function defaultOwnerProbe(): QuarantineOwnerProbe {
+  if (cachedOwnerProbe !== undefined) return cachedOwnerProbe;
+  // Only sampleIdentity/isAlive are used here; the clock stamps tree samples we
+  // never take.
+  const ps = createPsClient(new SystemClock());
+  cachedOwnerProbe = {
+    self() {
+      const startedAt = ps.sampleIdentity(process.pid)?.startedAt;
+      return { pid: process.pid, ...(startedAt !== undefined ? { startedAt } : {}) };
+    },
+    isOwnerAlive(owner) {
+      if (!ps.isAlive(owner.pid)) return false;
+      if (owner.startedAt === undefined) return true; // bare liveness, best effort
+      return ps.sampleIdentity(owner.pid)?.startedAt === owner.startedAt;
+    },
+  };
+  return cachedOwnerProbe;
+}
+
+/**
+ * ROUND 5 (#4) — mark a stage quarantined, and report HONESTLY whether it
+ * worked. The round-4 shape wrote the marker best-effort yet emitted
+ * `stage_quarantined` unconditionally, so a failed write left an UNMARKED live
+ * stage that GC would then treat as ordinary and delete — the exact race
+ * quarantining exists to prevent, now invisible because we had claimed success.
+ */
+function quarantineStage(stageDir: string, warn: ProvisionWarnSink, probe: QuarantineOwnerProbe): void {
+  const owner = probe.self();
   try {
     fs.mkdirSync(stageDir, { recursive: true }); // the producer may have removed it
     fs.writeFileSync(
       path.join(stageDir, QUARANTINE_MARKER_FILE),
-      JSON.stringify({ quarantinedAtMs: Date.now(), ownerPid: process.pid }),
+      JSON.stringify({
+        quarantinedAtMs: Date.now(),
+        ownerPid: owner.pid,
+        ...(owner.startedAt !== undefined ? { ownerStartedAt: owner.startedAt } : {}),
+      }),
       'utf8',
     );
-  } catch {
-    /* best effort — an unmarked stage is still never deleted while it is young */
+  } catch (error) {
+    warn({ kind: 'stage_quarantine_failed', stage: path.basename(stageDir), detail: messageOf(error) });
+    return;
   }
   warn({ kind: 'stage_quarantined', stage: path.basename(stageDir) });
 }
 
 /**
- * True when a stage must be left alone by GC: it carries a quarantine marker and
- * is younger than the TTL, so a producer abandoned on a deadline may still be
- * writing into it. An unreadable/malformed marker is treated as LIVE (fail safe);
- * once past the TTL the writer cannot plausibly still exist and the stage is
- * collectable like any other.
+ * True when a stage must be left alone by GC.
+ *
+ * ROUND 5 (#5/#6) — two corrections. A marker that EXISTS but cannot be READ is
+ * LIVE, not "ordinary": round 4 classified every read failure as no-marker, so
+ * the very next sweep deleted it — the exact opposite of the documented rule.
+ * Only a genuine absence (ENOENT/ENOTDIR) means "an ordinary stage".
+ *
+ * And a post-TTL stage is released only once its OWNER is proven gone. The TTL
+ * alone is not a liveness proof: an unbounded producer still holds the path a
+ * day later. A live owner EXTENDS the quarantine rather than expiring it.
+ * MED-6: retention stays BOUNDED because the moment the owner dies (or its pid
+ * is recycled) the next sweep collects the stage, and a marker with no usable
+ * timestamp falls back to the directory's own mtime rather than being protected
+ * forever.
  */
-function isQuarantineProtected(stageDir: string, nowMs: number): boolean {
+function isQuarantineProtected(stageDir: string, nowMs: number, probe: QuarantineOwnerProbe): boolean {
   let raw: string;
   try {
     raw = fs.readFileSync(path.join(stageDir, QUARANTINE_MARKER_FILE), 'utf8');
-  } catch {
-    return false; // no marker — an ordinary stage
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false; // no marker — ordinary stage
+    return true; // present but unreadable — liveness unknown, so do not touch
   }
+
+  let owner: QuarantineOwner | undefined;
+  let quarantinedAtMs: number | undefined;
   try {
     const parsed: unknown = JSON.parse(raw);
-    const at =
-      parsed !== null && typeof parsed === 'object' ? (parsed as { quarantinedAtMs?: unknown }).quarantinedAtMs : undefined;
-    if (typeof at !== 'number' || !Number.isFinite(at)) return true; // malformed → fail safe
-    return nowMs - at < QUARANTINE_TTL_MS;
+    if (parsed !== null && typeof parsed === 'object') {
+      const record = parsed as { quarantinedAtMs?: unknown; ownerPid?: unknown; ownerStartedAt?: unknown };
+      if (typeof record.quarantinedAtMs === 'number' && Number.isFinite(record.quarantinedAtMs)) {
+        quarantinedAtMs = record.quarantinedAtMs;
+      }
+      if (typeof record.ownerPid === 'number' && Number.isInteger(record.ownerPid)) {
+        owner = {
+          pid: record.ownerPid,
+          ...(typeof record.ownerStartedAt === 'string' ? { startedAt: record.ownerStartedAt } : {}),
+        };
+      }
+    }
   } catch {
-    return true; // unparseable → fail safe
+    /* malformed — fall through to the mtime clock below (bounded, not forever) */
+  }
+
+  // A still-live owner extends the quarantine for as long as it lives.
+  if (owner !== undefined) {
+    try {
+      if (probe.isOwnerAlive(owner)) return true;
+    } catch {
+      return true; // a probe we cannot run is not a proof of death
+    }
+  }
+
+  // Owner gone (or never recorded): hold only until the TTL elapses. A marker
+  // with no usable timestamp uses the stage's own mtime, so a malformed marker
+  // is bounded rather than protected forever (MED-6).
+  const since = quarantinedAtMs ?? mtimeMsOf(stageDir) ?? nowMs;
+  return nowMs - since < QUARANTINE_TTL_MS;
+}
+
+function mtimeMsOf(target: string): number | undefined {
+  try {
+    return fs.statSync(target).mtimeMs;
+  } catch {
+    return undefined;
   }
 }
 
@@ -1109,12 +1228,14 @@ export function gcProvisionStages(
   assignmentId: string,
   worktreePath?: string,
   warn?: ProvisionWarnSink,
+  ownerProbe?: QuarantineOwnerProbe,
 ): void {
   gcAbandonedStages(
     // #5: the per-assignment namespace dir — an EXACT match, never a prefix scan.
     path.join(baseDir, PROVISION_STAGE_SUBDIR, sanitizeSlug(assignmentId)),
     worktreePath,
     warn ?? (() => undefined),
+    ownerProbe ?? defaultOwnerProbe(),
   );
 }
 
@@ -1122,6 +1243,7 @@ function gcAbandonedStages(
   assignmentStageRoot: string,
   worktreePath: string | undefined,
   warn: ProvisionWarnSink,
+  ownerProbe: QuarantineOwnerProbe,
 ): void {
   // #5: `assignmentStageRoot` is THIS assignment's own namespace dir — every child is
   // one of its stage dirs, so no slug prefix filter is needed (which is what caused
@@ -1200,7 +1322,7 @@ function gcAbandonedStages(
     // — the very hazard quarantining exists to avoid — and the round-3 shape
     // made it worse by GC'ing the renamed copy indiscriminately. Past the TTL
     // no writer can plausibly remain, so it collects like anything else.
-    if (isQuarantineProtected(stageDir, nowMs)) continue;
+    if (isQuarantineProtected(stageDir, nowMs, ownerProbe)) continue;
     try {
       fs.rmSync(stageDir, { recursive: true, force: true });
       warn({ kind: 'stage_gc_removed', stage: name });
@@ -1327,16 +1449,35 @@ function nativeBuildPackages(treePath: string): string[] {
     let manifestRaw: string;
     try {
       manifestRaw = fs.readFileSync(path.join(dir, 'package.json'), 'utf8');
-    } catch {
-      return; // no manifest here (a cache dir, `.bin`, a stray file)
+    } catch (error) {
+      // ROUND 5 (#3 audit): only a GENUINE absence is a skip — a cache dir, a
+      // stray file, `.bin`. Any OTHER read error (EACCES, EIO) is a package we
+      // could not examine, and an unexamined package cannot be attested.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return;
+      throw failClosed(
+        `the native-build scan could not read ${path.join(dir, 'package.json')}: ${messageOf(error)}. ` +
+          'A package we could not examine cannot be attested; refusing rather than marking the tree proven.',
+        `unreadable manifest for ${specifier}`,
+        'native_toolchain_unproven',
+      );
     }
     let parsed: Record<string, unknown>;
     try {
       const value: unknown = JSON.parse(manifestRaw);
-      if (value === null || typeof value !== 'object' || Array.isArray(value)) return;
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('not a JSON object');
+      }
       parsed = value as Record<string, unknown>;
-    } catch {
-      return;
+    } catch (error) {
+      // A malformed manifest inside a tree we are attesting is a corrupt tree —
+      // the same fail-closed posture `parsePackageJson` (B3) already takes.
+      throw failClosed(
+        `the native-build scan could not parse ${path.join(dir, 'package.json')}: ${messageOf(error)}. ` +
+          'A package whose manifest is corrupt cannot be attested.',
+        `malformed manifest for ${specifier}`,
+        'native_toolchain_unproven',
+      );
     }
     const scripts = parsed['scripts'];
     if (scripts === null || typeof scripts !== 'object') return;
@@ -1392,8 +1533,18 @@ function nativeBuildPackages(treePath: string): string[] {
         let scoped: Dirent[];
         try {
           scoped = fs.readdirSync(path.join(root, entry.name), { withFileTypes: true });
-        } catch {
-          continue;
+        } catch (error) {
+          // ROUND 5 (#3): FAIL CLOSED, exactly as the depth cap does. Swallowing
+          // this with `continue` omitted every native package under the scope
+          // while the tree still received a v2 (smoke-attested) marker — an
+          // unexamined subtree stamped proven. Enumeration and depth must have
+          // the same posture: a scan that could not complete attests nothing.
+          throw failClosed(
+            `the native-build scan could not enumerate ${path.join(root, entry.name)}: ${messageOf(error)}. ` +
+              'A subtree we could not examine cannot be attested; refusing rather than marking the tree proven.',
+            `unreadable scope directory ${entry.name}`,
+            'native_toolchain_unproven',
+          );
         }
         for (const child of scoped) {
           if (child.isDirectory()) {
