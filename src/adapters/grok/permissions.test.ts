@@ -116,9 +116,14 @@ describe('buildGrokMediation — the payload veto is universal', () => {
       allowedShellCommands: ['npm run typecheck'],
     });
     expect(config.mode).toBe('headless');
-    const policy = (config as { policy?: { allow: readonly string[]; workspaceWriteRoot?: string } }).policy;
+    const policy = (config as {
+      policy?: { allow: readonly string[]; workspaceWriteBoundary?: { roots: readonly string[] } };
+    }).policy;
     expect(policy?.allow).toEqual(['keep me', 'Execute `npm run typecheck`']);
-    expect(policy?.workspaceWriteRoot).toBe('/repo/worktree');
+    // B4: the write root became a validated `WriteBoundary`. With no declared
+    // scope it holds exactly the one root the bare string used to hold, so this
+    // asserts the identical binding through the new shape.
+    expect(policy?.workspaceWriteBoundary?.roots).toEqual(['/repo/worktree']);
   });
 
   // -------------------------------------------------------------------------

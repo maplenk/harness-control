@@ -166,6 +166,7 @@ import {
   type ResumeNowPlan,
   type ResumePlan,
 } from '../scheduler/limit-schedule.js';
+import type { WriteBoundary } from '../worktree/write-scope.js';
 import { buildCheckpointContent, deriveIncompleteOperation } from '../checkpoint/content.js';
 import { writeCheckpoint } from '../checkpoint/writer.js';
 import { CadenceTracker } from '../checkpoint/cadence.js';
@@ -743,6 +744,12 @@ export interface RoleAdapterOptions {
   readonly resolved: ResolvedRoleModel;
   /** Exact approved evidence commands needed by this role, if any. */
   readonly allowedShellCommands?: readonly string[];
+  /**
+   * B4 — the assignment's WRITE boundary, forwarded to the provider's permission
+   * mediation. Absent means "the whole `cwd`", which is what every adapter bound
+   * before B4; supplying it can only NARROW. See `worktree/write-scope.ts`.
+   */
+  readonly writeBoundary?: WriteBoundary;
 }
 
 export interface RoleAdapterHandle {
@@ -844,6 +851,9 @@ export function defaultRoleAdapterFactory(): RoleAdapterFactory {
                 ...base,
                 role: options.role,
                 model: options.resolved.model,
+                ...(options.writeBoundary !== undefined
+                  ? { writeBoundary: options.writeBoundary }
+                  : {}),
                 ...(options.allowedShellCommands !== undefined
                   ? { allowedShellCommands: options.allowedShellCommands }
                   : {}),
@@ -3104,6 +3114,10 @@ export class OrchestrationService {
         ...(runner.allowedShellCommands !== undefined
           ? { allowedShellCommands: runner.allowedShellCommands }
           : {}),
+        // B4: the boundary travels with the RUNNER, because the runner is the
+        // object that holds the worktree handle, and the handle is where the
+        // boundary is a REQUIRED field. Nothing here can invent one.
+        ...(runner.writeBoundary !== undefined ? { writeBoundary: runner.writeBoundary } : {}),
       });
     } catch (error) {
       // W4-8: resource setup failed AFTER admission was granted (e.g. the

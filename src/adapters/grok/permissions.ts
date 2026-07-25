@@ -26,6 +26,7 @@
  *    root) happens on the way in and cannot skip it.
  */
 import type { RoleName } from '../../domain/state.js';
+import { writeBoundary, type WriteBoundary } from '../../worktree/write-scope.js';
 import { noPayloadToVerify, type PermissionMediationConfig, type VerifyOperationPayload } from '../acp/session.js';
 import { grokShellPayloadMatchesTitle, grokShellPermissionTitle, isGrokReadOnlyShellPermissionTitle } from './command.js';
 
@@ -41,8 +42,26 @@ export interface GrokMediationInput {
   /** The caller's requested mediation, if any. */
   readonly permissions?: PermissionMediationConfig;
   readonly role?: RoleName;
-  /** Worktree root for the implementor's structured-write rule. */
+  /**
+   * The EXECUTION root: where the session runs and what the read-only shell
+   * classifier judges absolute path arguments against. Reads legitimately span
+   * the whole tree even when writes do not.
+   */
   readonly cwd: string;
+  /**
+   * B4 — the implementor's WRITE boundary, separate from `cwd` because
+   * narrowing READS to a scope would deny the agent the exploration its own
+   * prompt tells it to do, while leaving WRITES at `cwd` is exactly the
+   * whole-root permission shared-tree parallelism cannot have.
+   *
+   * Optional, and the omission is safe in one direction only: this function
+   * falls back to the single root `cwd`, which is byte-for-byte the pre-B4
+   * `workspaceWriteRoot: cwd` binding. Supplying a boundary can only NARROW.
+   * The invariant this module exists to protect — every Grok session that can
+   * approve anything has a VALIDATED write boundary, never a raw string — holds
+   * either way, because the fallback goes through `writeBoundary()` too.
+   */
+  readonly writeBoundary?: WriteBoundary;
   /** Exact verification commands to allowlist as `Execute` titles. */
   readonly allowedShellCommands?: readonly string[];
 }
@@ -85,7 +104,12 @@ export function buildGrokMediation(input: GrokMediationInput): VetoedMediation {
             // function reference.
             allowReadOnlyOperation: (operation: string): boolean =>
               isGrokReadOnlyShellPermissionTitle(operation, input.cwd),
-            workspaceWriteRoot: input.cwd,
+            // B4: the WRITE rule is bound to the assignment's scope, which may
+            // be narrower than `cwd`. The read-only classifier above stays on
+            // `cwd` deliberately — an implementor must be able to READ the tree
+            // it is changing a corner of.
+            workspaceWriteBoundary:
+              input.writeBoundary ?? writeBoundary({ mode: 'worktree', executionRoot: input.cwd }),
           },
         }
       : base;

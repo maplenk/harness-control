@@ -190,6 +190,42 @@ export function porcelainPaths(status: string): string[] {
 }
 
 /**
+ * EXACT touched paths from `git status --porcelain -z`.
+ *
+ * `porcelainPaths` above parses the HUMAN format, where git QUOTES any path
+ * containing a space, a quote, a non-ASCII byte or a control character — fine
+ * for a blocker list a person reads, useless for a path a containment check
+ * must resolve. `-z` emits raw bytes with NUL terminators and no quoting at
+ * all, which is the only form in which "is this path inside that root" can be
+ * asked truthfully.
+ *
+ * BOTH sides of a rename/copy are reported. A rename writes the destination AND
+ * removes the source, so a write-scope check that saw only the destination would
+ * approve an assignment deleting a file it does not own.
+ */
+export async function statusPorcelainPathsExact(dir: string): Promise<readonly string[]> {
+  const { stdout } = await runGit(['status', '--porcelain', '-z'], dir);
+  const fields = stdout.split('\0');
+  const paths: string[] = [];
+  for (let i = 0; i < fields.length; i += 1) {
+    const record = fields[i];
+    if (record === undefined || record.length === 0) continue;
+    // `XY <path>` — two status columns, one space, then the path verbatim.
+    const status = record.slice(0, 2);
+    paths.push(record.slice(3));
+    // Rename/copy: the ORIGINAL path is the next NUL-terminated field.
+    if (status.startsWith('R') || status.startsWith('C')) {
+      const source = fields[i + 1];
+      if (source !== undefined && source.length > 0) {
+        paths.push(source);
+        i += 1;
+      }
+    }
+  }
+  return paths;
+}
+
+/**
  * The checked-out branch name of `dir` (§16 integration hint). Returns
  * `undefined` on a detached HEAD or when `dir` is not a resolvable repo:
  * `symbolic-ref --quiet` exits non-zero (no branch) rather than printing an
@@ -230,6 +266,61 @@ export async function worktreeAdd(
   baseSha: string,
 ): Promise<void> {
   await runGit(['worktree', 'add', '-b', branch, worktreePath, baseSha], repoRoot);
+}
+
+/**
+ * B3 (in-place mode): create `branch` at `sha` and check it OUT in `dir`.
+ *
+ * `git checkout -b`, not `git switch -c`: `switch` arrived in git 2.23 and is
+ * still marked experimental in its own documentation, while `checkout -b` is the
+ * form the rest of this module's plumbing era assumes. `--` is not needed (there
+ * is no pathspec), and the explicit start point makes the new branch bound to the
+ * run's PINNED base rather than to whatever HEAD happens to be.
+ */
+export async function createAndCheckoutBranch(dir: string, branch: string, sha: string): Promise<void> {
+  await runGit(['checkout', '-b', branch, sha], dir);
+}
+
+/** B3: check out an existing ref (used to restore the user's original HEAD). */
+export async function checkoutRef(dir: string, ref: string): Promise<void> {
+  await runGit(['checkout', ref], dir);
+}
+
+/**
+ * B3: does `branch` already exist in this repository?
+ *
+ * `show-ref --verify --quiet refs/heads/<branch>` — `--verify` means the ref is
+ * matched EXACTLY rather than by suffix, so a branch named `x` is never reported
+ * because `feature/x` exists.
+ */
+export async function branchExists(dir: string, branch: string): Promise<boolean> {
+  try {
+    await runGit(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * B3: what HEAD points at, as something `git checkout` can restore.
+ *
+ * The BRANCH NAME when HEAD is attached (restoring the branch is what the user
+ * expects — their branch keeps moving with them), the resolved SHA when it is
+ * detached (restoring a name that does not exist would be a lie). Returns
+ * `undefined` only when neither can be read, which the caller must treat as "the
+ * original HEAD is unknown", never as "there was nothing to restore".
+ */
+export async function headRestorePoint(
+  dir: string,
+): Promise<{ readonly kind: 'branch' | 'detached'; readonly ref: string } | undefined> {
+  const branch = await currentBranch(dir);
+  if (branch !== undefined) return { kind: 'branch', ref: branch };
+  try {
+    return { kind: 'detached', ref: await resolveSha(dir, 'HEAD') };
+  } catch {
+    return undefined;
+  }
 }
 
 export async function worktreeRemove(repoRoot: string, worktreePath: string, force: boolean): Promise<void> {

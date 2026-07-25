@@ -28,6 +28,7 @@ import type {
 } from '../adapters/spi.js';
 import type { AcpStopReason } from '../domain/entities.js';
 import type { AppliedConfigOption, ResolvedRoleModel } from './model-resolution.js';
+import type { WriteBoundary } from '../worktree/write-scope.js';
 
 // ---------------------------------------------------------------------------
 // Permission mediation (§10.2, T20) — the run-level configured mediator
@@ -192,6 +193,18 @@ interface RoleRunnerBase<TResult> {
    * may ignore the hint and keep their own permission mediation.
    */
   readonly allowedShellCommands?: readonly string[];
+  /**
+   * B4 — WHERE this role's session may write, forwarded to the provider's
+   * permission mediation by `runRole`.
+   *
+   * It lives on the RUNNER because the runner is the object that holds the
+   * worktree handle, and `WorktreeHandle.writeBoundary` is a REQUIRED field —
+   * so a real flow cannot produce a runner without having a validated boundary
+   * in hand. Optional here for the same asymmetry documented on the adapter
+   * option: omission means "the whole cwd", which is exactly what every session
+   * bound before B4, and supplying it can only narrow.
+   */
+  readonly writeBoundary?: WriteBoundary;
   run(session: RoleSession): Promise<TResult>;
 }
 

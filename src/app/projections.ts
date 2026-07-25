@@ -33,6 +33,8 @@ import type {
   SpecVersionId,
 } from '../domain/ids.js';
 import type { ValidationOutcome } from '../worktree/validate.js';
+import type { InPlaceCheckpoint } from '../worktree/in-place.js';
+import { resolveExecutionMode, type ExecutionMode } from '../domain/execution-mode.js';
 // Type-only (erased at runtime — no import cycle): the §16 binding shape the
 // blocked-readiness read-model persists belongs to the verifier flow.
 import type { VerificationBinding } from './flows/verifier.js';
@@ -376,6 +378,45 @@ export interface WorktreeFactsState {
     readonly round: number;
     readonly commit: GitSha;
   };
+  /**
+   * B3 — the execution mode this workspace was created under, as PERSISTED
+   * BYTES. Typed `unknown` on purpose: every record written before B3 has no
+   * mode field, and typing it `ExecutionMode` would be a compile-time claim
+   * about JSON on disk. `resolveExecutionMode` is the only permitted reader; it
+   * maps absence and any unrecognised value to `worktree`, which is both the
+   * status quo and the mode every such record was actually written under.
+   */
+  readonly executionMode?: unknown;
+  /** B4 — the declared write scope (repo-relative). Absent = the whole root. */
+  readonly writeScope?: readonly string[];
+  /**
+   * B3 — the in-place START CHECKPOINT: the revert target and the receipt for
+   * the assignment. Present only for `in_place` workspaces, written at creation
+   * BEFORE the branch switch, so a crashed in-place run always has a recorded
+   * revert target and a recorded pre-run HEAD to restore.
+   */
+  readonly inPlaceCheckpoint?: InPlaceCheckpoint;
+}
+
+/**
+ * The READ boundary for persisted worktree facts.
+ *
+ * An event-sourced store holds records written by every prior version of this
+ * code, so B3's fields are simply ABSENT from every record written before it —
+ * and absence must be given its honest meaning rather than crashing a resume or
+ * being read as "some mode". `resolveExecutionMode` supplies that meaning
+ * (`worktree`), and an `in_place` record with NO checkpoint is downgraded rather
+ * than trusted: an in-place workspace whose revert target was not durably
+ * recorded cannot be resumed as in-place, and pretending otherwise would arm a
+ * `reset --hard` against a target nobody wrote down.
+ */
+export function resolvePersistedExecutionMode(
+  facts: WorktreeFactsState | undefined,
+): ExecutionMode {
+  if (facts === undefined) return 'worktree';
+  const mode = resolveExecutionMode(facts.executionMode);
+  if (mode === 'in_place' && facts.inPlaceCheckpoint === undefined) return 'worktree';
+  return mode;
 }
 
 /**

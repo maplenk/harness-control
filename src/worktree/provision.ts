@@ -187,7 +187,7 @@ type ManifestValue = string | null;
 export type ProvisionStrategy = 'auto' | 'clone' | 'install' | 'none';
 
 /** How a `provisionForVerification` call actually satisfied the worktree. */
-export type ProvisionStrategyTaken = 'clone' | 'install' | 'short_circuit' | 'none';
+export type ProvisionStrategyTaken = 'clone' | 'install' | 'short_circuit' | 'none' | 'in_place';
 
 export interface ProvisionOutcome {
   /** Always `true` on a resolved call — a proven real tree, or a trivially-true
