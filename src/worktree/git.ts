@@ -74,6 +74,35 @@ export async function runGit(
   }
 }
 
+/**
+ * ROUND 14 — `runGitStatus`'s shape for a command that reads its work from STDIN
+ * (`check-ignore --stdin`, the only caller). Kept beside it deliberately: same
+ * env hardening, same "a non-zero exit is an ANSWER, not a throw" contract, same
+ * buffer cap. Uses the callback form of `execFile` because `promisify` discards
+ * the ChildProcess, and the child's stdin is the whole point.
+ *
+ * A child that exits before reading its input makes the write fail with EPIPE;
+ * that is an ordinary outcome here (the exit code carries the answer), so the
+ * stdin error is absorbed rather than left to surface as an unhandled stream
+ * error and take the orchestrator down.
+ */
+function runGitStatusStdin(args: readonly string[], cwd: string, stdin: string): Promise<GitCommandStatus> {
+  return new Promise<GitCommandStatus>((resolve) => {
+    const child = execFile(
+      GIT_BIN,
+      [...args],
+      { cwd, maxBuffer: MAX_BUFFER_BYTES, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } },
+      (error, stdout, stderr) => {
+        const shaped = error as (ExecFileErrorShape & { code?: unknown }) | null;
+        const exitCode = shaped === null ? 0 : typeof shaped.code === 'number' ? shaped.code : -1;
+        resolve({ stdout: toText(stdout), stderr: toText(stderr), exitCode });
+      },
+    );
+    child.stdin?.on('error', () => undefined);
+    child.stdin?.end(stdin);
+  });
+}
+
 export async function isInsideWorkTree(dir: string): Promise<boolean> {
   try {
     const { stdout } = await runGit(['rev-parse', '--is-inside-work-tree'], dir);
@@ -252,9 +281,16 @@ async function stagedNodeModulesPaths(worktreePath: string): Promise<string[]> {
     if (grouped === undefined) byRoot.set(root, [candidate]);
     else grouped.push(candidate);
   }
+  // ROUND 14 (REGRESSION 1): ownership of a nested root is read from ALL its
+  // staged paths, so the ignore status of EVERY path is needed — resolved in ONE
+  // subprocess (`--stdin`) rather than one per file. The ROOT tree needs no ignore
+  // data at all (it is unconditional), so the common production shape — a
+  // provisioned root tree — still spends nothing here.
+  const nested = candidates.filter((p) => outerNodeModulesRoot(p)?.includes('/') === true);
+  const ignored = nested.length > 0 ? await pathsIgnoredByRule(worktreePath, nested) : new Set<string>();
   const engineOwned: string[] = [];
   for (const [root, staged] of byRoot) {
-    if (await isEngineOwnedNodeModulesRoot(worktreePath, root, staged)) engineOwned.push(...staged);
+    if (await isEngineOwnedNodeModulesRoot(worktreePath, root, staged, ignored)) engineOwned.push(...staged);
   }
   return engineOwned;
 }
@@ -310,18 +346,63 @@ async function isEngineOwnedNodeModulesRoot(
   worktreePath: string,
   root: string,
   staged: readonly string[],
+  ignored: ReadonlySet<string>,
 ): Promise<boolean> {
   // ITEM 1: the ROOT tree — main's unconditional exclusion, asked no questions.
   if (!root.includes('/')) return true;
   if (await rootHasHeadContent(worktreePath, root)) return false; // committed user content
-  // The ignore probe runs on a staged FILE under the root, not on the root path
-  // itself: `git check-ignore --no-index` answers "not ignored" for a DIRECTORY
-  // that is absent from disk (a trailing-slash rule needs to know it IS one),
-  // while a file path under it answers correctly whether or not it exists.
-  // Verified against git 2.55. One probe either way.
-  const probe = staged[0];
-  if (probe !== undefined && (await isPathIgnoredByRule(worktreePath, probe))) return true;
-  return existsSync(path.join(worktreePath, root, PROVISION_MARKER_BASENAME));
+  // The MARKER is whole-TREE evidence: the provisioner wrote it into a tree it
+  // built, so per-path ignore status cannot outrank it.
+  if (existsSync(path.join(worktreePath, root, PROVISION_MARKER_BASENAME))) return true;
+  // ROUND 14 (REGRESSION 1): otherwise EVERY staged path under the root must be
+  // ignored. Reading ownership off `staged[0]` was "classified once" implemented
+  // as "classified from an arbitrary member" — git sorts these, so the deciding
+  // path is not even one the round chose. A narrow, entirely legitimate rule
+  // (`**/node_modules/.bin/` over a vendored tree) then condemned the whole root
+  // and unstaged the files main commits. A MIXED root is not ours: a tree the
+  // engine provisioned is ignored in its entirety, so "some of it is ignored" is
+  // evidence of a user tree with a rule about part of it, not of our tree.
+  return staged.every((p) => ignored.has(p));
+}
+
+/**
+ * ROUND 14 — which of `paths` a git IGNORE RULE covers, in ONE subprocess.
+ *
+ * `check-ignore -z -v -n --stdin` emits exactly four NUL-separated fields per
+ * INPUT path (`source`, `linenum`, `pattern`, `pathname`) in input order, with
+ * the pathname echoed verbatim and an empty `pattern` for a path no rule matches
+ * — so the whole staged set is classified without one probe per file. `--no-index`
+ * keeps this about RULES only, so force-adding cannot launder a tree past the
+ * guard. Exit 0 (some matched) and 1 (none matched) are both answers; anything
+ * else is a real failure and throws, exactly as the single-path form does.
+ *
+ * (`check-ignore` does not accept `:(literal)` — verified on git 2.55, it exits
+ * 128 — so paths go in as-is, which is the same spelling the pre-round-14 code
+ * used and the same one the reset's `:(literal)` pathspecs are derived from.)
+ */
+async function pathsIgnoredByRule(worktreePath: string, paths: readonly string[]): Promise<Set<string>> {
+  const { exitCode, stdout, stderr } = await runGitStatusStdin(
+    ['check-ignore', '--no-index', '-z', '-v', '-n', '--stdin'],
+    worktreePath,
+    `${paths.join('\0')}\0`,
+  );
+  if (exitCode !== 0 && exitCode !== 1) {
+    throw new WorktreeError(
+      'git_command_failed',
+      `git check-ignore --no-index --stdin over ${paths.length} path(s) (cwd=${worktreePath}) failed ` +
+        `(exit ${exitCode}): ${stderr.trim()}`,
+    );
+  }
+  const fields = stdout.split('\0');
+  const ignored = new Set<string>();
+  // Four fields per record; a trailing empty element from the final NUL is ignored
+  // by the length check.
+  for (let i = 0; i + 3 < fields.length; i += 4) {
+    const pattern = fields[i + 2];
+    const pathname = fields[i + 3];
+    if (pathname !== undefined && pattern !== undefined && pattern.length > 0) ignored.add(pathname);
+  }
+  return ignored;
 }
 
 /**

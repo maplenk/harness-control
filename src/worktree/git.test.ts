@@ -438,6 +438,60 @@ describe('ROUND 13 ITEM 3 — the outer node_modules root is classified once, HE
     expect((await r.statusPorcelain()).trim()).toBe('');
   });
 
+  // ROUND 14 REGRESSION 1 — "classified once" was implemented as "classified from
+  // the FIRST staged path", which is a different thing. A narrow ignore rule that
+  // happens to cover the first path (git sorts them, so it is not even a path the
+  // round chose) condemned the whole root, and the vendored files main commits
+  // went with it. Ownership of a ROOT means the WHOLE root is ours.
+  it('a NARROW ignore rule matching only the first staged path does not condemn the root', async () => {
+    // `**/node_modules/.bin/` is a real rule people write about a vendored tree:
+    // commit the packages, ignore the generated bin shims. `.bin/tsc` also SORTS
+    // first ('.' < any letter), and `staged[0]` is what ownership was read from —
+    // so a rule about one generated subdirectory decided the whole tree.
+    const r = await repoWithIgnore('vendor/web/node_modules/.bin/\n');
+    plantNodeModules(r.dir, 'vendor/web/node_modules');
+    await r.writeFile('vendor/web/app.ts', 'export const web = 1;\n');
+    // The ignored one reaches the index only by a force-add (an agent's `git add -f`).
+    await r.run(['add', '-f', '--', 'vendor/web/node_modules/.bin/tsc']);
+
+    await addAllExceptNodeModules(r.dir);
+
+    const staged = await stagedPaths(r.dir);
+    // Mixed root: the vendored files main commits are still staged…
+    expect(staged).toContain('vendor/web/node_modules/left-pad/index.js');
+    expect(staged).toContain('vendor/web/app.ts');
+    // …and so is the ignored newcomer, because a root is either wholly ours or
+    // not ours at all — and HEAD content aside, this one is demonstrably not.
+    expect(staged).toContain('vendor/web/node_modules/.bin/tsc');
+    await r.run(['commit', '-m', 'vendored dependencies']);
+    expect((await r.statusPorcelain()).trim()).toBe('');
+  });
+
+  it('a WHOLLY ignored nested root is still excluded (the engine tree case is unweakened)', async () => {
+    const r = await repoWithIgnore('node_modules/\n');
+    plantNodeModules(r.dir, 'web/node_modules');
+    await r.writeFile('web/app.ts', 'export const web = 1;\n');
+    await r.run(['add', '-f', '--', 'web/node_modules']); // every staged path is ignored
+
+    await addAllExceptNodeModules(r.dir);
+
+    const staged = await stagedPaths(r.dir);
+    expect(staged).toEqual(['web/app.ts']);
+  });
+
+  it('a nested root carrying the provisioner MARKER is excluded whatever the per-file rules say', async () => {
+    const r = await repoWithIgnore(''); // no ignore rule at all
+    plantNodeModules(r.dir, 'web/node_modules');
+    // The marker is whole-TREE evidence of engine ownership; per-path ignore
+    // status cannot override it.
+    writeFileSync(path.join(r.dir, 'web/node_modules', '.harness-provisioned'), '{}\n', 'utf8');
+    await r.writeFile('web/app.ts', 'export const web = 1;\n');
+
+    await addAllExceptNodeModules(r.dir);
+
+    expect(await stagedPaths(r.dir)).toEqual(['web/app.ts']);
+  });
+
   it('probes git ONCE per root, not twice per staged file', async () => {
     const r = await repoWithIgnore(''); // unignored nested tree: the worst case,
     // where BOTH probes (in-HEAD, then ignore-rule) run before the answer is "no".
