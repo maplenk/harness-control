@@ -121,7 +121,22 @@ async function makeDepsRepo(opts: {
       2,
     )}\n`,
   );
-  await repo.writeFile('package-lock.json', opts.lock ?? DEFAULT_LOCK);
+  // ROUND 8: the fixture lockfile RESOLVES every declared package, as a real npm
+  // lockfile does. `writeInstalledPackage` installs 1.0.0, so these agree; a test
+  // that wants a version MISMATCH builds its own repo.
+  const resolved: Record<string, { version: string }> = {};
+  for (const name of Object.keys({ ...(opts.deps ?? { 'left-pad': '1.0.0' }), ...(opts.devDeps ?? {}) })) {
+    resolved[`node_modules/${name}`] = { version: '1.0.0' };
+  }
+  await repo.writeFile(
+    'package-lock.json',
+    opts.lock ??
+      `${JSON.stringify(
+        { name: 'x', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'x' }, ...resolved } },
+        null,
+        2,
+      )}\n`,
+  );
   if (opts.npmrc !== undefined) await repo.writeFile('.npmrc', opts.npmrc);
   await repo.commitAll('deps');
   return repo;
@@ -468,7 +483,28 @@ describe('F7 AC-3 — clone-vs-install selection by dependency fingerprint', () 
   });
 
   it.each([
-    ['package-lock.json only', async (root: string) => writeFile(path.join(root, 'package-lock.json'), `${DEFAULT_LOCK}\n// bumped`)],
+    // ROUND 8: a VALID lockfile whose bytes differ — the fingerprint must change,
+    // but the lock must still resolve the declared package (an unparseable one is
+    // now a refusal in its own right, which is a different test).
+    [
+      'package-lock.json only',
+      async (root: string) =>
+        writeFile(
+          path.join(root, 'package-lock.json'),
+          `${JSON.stringify(
+            {
+              name: 'x',
+              version: '1.0.0',
+              lockfileVersion: 3,
+              requires: true,
+              bumped: true,
+              packages: { '': { name: 'x' }, 'node_modules/left-pad': { version: '1.0.0' } },
+            },
+            null,
+            2,
+          )}\n`,
+        ),
+    ],
     ['package.json only', async (root: string) => writeFile(path.join(root, 'package.json'), `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '2.0.0' } }, null, 2)}\n`)],
     ['.npmrc', async (root: string) => writeFile(path.join(root, '.npmrc'), 'registry=https://example.test/\n')],
   ])(
@@ -1694,6 +1730,70 @@ describe('F9 AC-2 — a stale primary tree is never cloned (primary_tree_stale)'
     expect(error.provisioningCause).toBe('primary_tree_stale');
     expect(error.message).toContain('left-pad');
     expect(fake.calls.clone).toBe(0); // refused BEFORE cloning
+  });
+
+  // ROUND 8 (Blocker 2) — the version proof was CONDITIONAL: an absent lock entry
+  // skipped the comparison, and an unreadable/unsupported lockfile produced an
+  // empty map, so Yarn, pnpm, no lockfile, a malformed package-lock.json, or an
+  // unrecognised entry all degraded silently to presence-only — cloning a stale
+  // tree and stamping it v2. That is the F9 defect reintroduced through F9's own
+  // precondition. Absence of proof is not proof.
+  describe('unusable lock data is a REFUSAL, never a downgrade to presence-only', () => {
+    /** A repo declaring `left-pad` whose lockfile is exactly `lock` (absent when undefined). */
+    async function repoWithLock(lock: string | undefined): Promise<TempGitRepo> {
+      const repo = track(await makeTempGitRepo('harness-f9-lock-'));
+      await repo.writeFile('.gitignore', 'node_modules/\n');
+      await repo.writeFile(
+        'package.json',
+        `${JSON.stringify({ name: 'x', version: '1.0.0', dependencies: { 'left-pad': '1.0.0' } }, null, 2)}\n`,
+      );
+      if (lock !== undefined) await repo.writeFile('package-lock.json', lock);
+      await repo.commitAll('deps');
+      return repo;
+    }
+
+    it.each([
+      ['NO lockfile at all (Yarn/pnpm repos land here)', undefined, /no package-lock\.json/i],
+      ['a MALFORMED lockfile', '{ not json at all', /could not be parsed/i],
+      ['a lockfile that is not an object', '"a string"', /not a JSON object/i],
+      [
+        'a lockfile with no entry for a DECLARED package',
+        `${JSON.stringify({ name: 'x', lockfileVersion: 3, packages: { '': { name: 'x' } } }, null, 2)}\n`,
+        /resolves no version for it/i,
+      ],
+    ])('refuses on %s', async (_label, lock, expected) => {
+      const repo = await repoWithLock(lock);
+      await writePrimaryNodeModules(repo.dir); // a PRESENT, healthy-looking tree
+      const fake = fakeRuntime();
+      const manager = await openManager(repo, { runtime: fake.runtime });
+      const asg = assignmentId(`asg_f9_lock_${String(_label).replace(/[^a-z]/gi, '').slice(0, 12)}`);
+      const handle = await createAtHead(repo, manager, asg);
+
+      const error = await expectProvisioningFailure(manager.provisionForVerification(asg));
+
+      expect(error.provisioningCause).toBe('primary_tree_stale');
+      expect(error.message).toMatch(expected);
+      expect(fake.calls.clone).toBe(0); // the stale tree is never cloned...
+      expect(existsSync(path.join(handle.worktreePath, 'node_modules', PROVISION_MARKER_FILE))).toBe(false); // ...nor marked
+    });
+
+    it('a v1 lockfile (top-level `dependencies`) IS recognised and proven', async () => {
+      const repo = await repoWithLock(
+        `${JSON.stringify(
+          { name: 'x', version: '1.0.0', lockfileVersion: 1, dependencies: { 'left-pad': { version: '1.0.0' } } },
+          null,
+          2,
+        )}\n`,
+      );
+      await writePrimaryNodeModules(repo.dir);
+      const fake = fakeRuntime();
+      const manager = await openManager(repo, { runtime: fake.runtime });
+      const asg = assignmentId('asg_f9_lock_v1');
+      await createAtHead(repo, manager, asg);
+
+      expect((await manager.provisionForVerification(asg)).strategy).toBe('clone');
+      expect(fake.calls.clone).toBe(1);
+    });
   });
 
   it('matching versions still clone (the happy path is unchanged)', async () => {

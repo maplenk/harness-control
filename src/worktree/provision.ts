@@ -1057,7 +1057,18 @@ async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; str
   const declared = declaredRootPackages(args.wtManifests);
   // ROUND 7 (Finding 2): at VERSION granularity — a name check alone let a
   // dependency bumped without reinstalling pass on its OLD directory.
-  const defects = proveePrimaryTree(primaryNodeModules, declared, lockedRootVersions(args.wtManifests));
+  const locked = lockedRootVersions(args.wtManifests);
+  if (!locked.ok) {
+    throw failClosed(
+      `the primary checkout's node_modules at ${primaryNodeModules} cannot be proven against the committed ` +
+        `dependency manifests: ${locked.reason}. Refusing rather than cloning a tree whose dependency VERSIONS ` +
+        'nothing can confirm — presence alone is not proof (a package bumped without reinstalling keeps its old ' +
+        'directory). Commit an npm package-lock.json alongside package.json and run `npm install` in the primary.',
+      `unusable lock data: ${locked.reason}`,
+      'primary_tree_stale',
+    );
+  }
+  const defects = proveePrimaryTree(primaryNodeModules, declared, locked.versions);
   if (defects.length > 0) {
     const named = defects
       .slice(0, 8)
@@ -1471,7 +1482,13 @@ function proveePrimaryTree(
       continue;
     }
     const expected = lockedVersions.get(name);
-    if (expected === undefined) continue; // the lockfile pins no version for it
+    if (expected === undefined) {
+      // ROUND 8 (Blocker 2): no resolved version for a DECLARED package means the
+      // lockfile cannot prove this package at all. Skipping the comparison is the
+      // same silent downgrade the empty-map fallback was.
+      defects.push({ name, detail: 'the lockfile resolves no version for it (unrecognised or absent entry)' });
+      continue;
+    }
     let installed: string | undefined;
     try {
       const raw: unknown = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
@@ -1495,31 +1512,48 @@ function proveePrimaryTree(
 
 /**
  * The version the LOCKFILE resolved for each root-declared package, read from
- * the fingerprinted `package-lock.json` (npm lockfileVersion 2/3 `packages`
- * entries keyed `node_modules/<name>`, falling back to v1 `dependencies`).
+ * the fingerprinted `package-lock.json`.
  *
- * A lockfile that cannot be parsed yields an EMPTY map rather than throwing: the
- * fingerprint already proved the primary's lockfile is byte-identical to the
- * committed one, so a parse failure here degrades the check to presence-only
- * rather than failing a run for a lockfile the repo itself is happy with.
+ * ROUND 8 (Blocker 2) — returns a REASON instead of an empty map when the data
+ * is unusable. Degrading to presence-only was the F9 defect reintroduced through
+ * its own precondition: a missing, malformed, or non-npm lockfile (Yarn, pnpm)
+ * silently skipped every version comparison, cloned a stale tree, stamped it v2,
+ * and short-circuited onto it for the rest of the run. Absence of proof is not
+ * proof; the caller REFUSES.
+ *
+ * Recognised: npm lockfileVersion 2/3 `packages` entries keyed
+ * `node_modules/<name>` (top-level only — a nested `a/node_modules/b` is not the
+ * root copy), and the v1 `dependencies` map.
  */
-function lockedRootVersions(manifests: ManifestSet): Map<string, string> {
-  const versions = new Map<string, string>();
+type LockVersions =
+  | { readonly ok: true; readonly versions: ReadonlyMap<string, string> }
+  | { readonly ok: false; readonly reason: string };
+
+function lockedRootVersions(manifests: ManifestSet): LockVersions {
   const raw = manifests.entries.get('package-lock.json');
-  if (typeof raw !== 'string') return versions;
+  if (raw === null || raw === undefined) {
+    return {
+      ok: false,
+      reason:
+        'the committed manifests contain no package-lock.json, so no resolved dependency versions exist to prove ' +
+        'the primary tree against (a Yarn/pnpm lockfile is not read by this engine)',
+    };
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
-    return versions;
+  } catch (error) {
+    return { ok: false, reason: `package-lock.json could not be parsed: ${messageOf(error)}` };
   }
-  if (parsed === null || typeof parsed !== 'object') return versions;
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, reason: 'package-lock.json is not a JSON object' };
+  }
   const record = parsed as { packages?: unknown; dependencies?: unknown };
+  const versions = new Map<string, string>();
   const packages = record.packages;
   if (packages !== null && typeof packages === 'object' && !Array.isArray(packages)) {
     for (const [key, value] of Object.entries(packages as Record<string, unknown>)) {
       if (!key.startsWith('node_modules/')) continue;
-      // Only TOP-LEVEL entries: a nested `a/node_modules/b` is not the root copy.
       const name = key.slice('node_modules/'.length);
       if (name.includes('node_modules/')) continue;
       if (value !== null && typeof value === 'object') {
@@ -1537,7 +1571,7 @@ function lockedRootVersions(manifests: ManifestSet): Map<string, string> {
       }
     }
   }
-  return versions;
+  return { ok: true, versions };
 }
 
 /**
