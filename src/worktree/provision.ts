@@ -880,7 +880,17 @@ function defaultOwnerProbe(): QuarantineOwnerProbe {
  * quarantining exists to prevent, now invisible because we had claimed success.
  */
 function quarantineStage(stageDir: string, warn: ProvisionWarnSink, probe: QuarantineOwnerProbe): void {
-  const owner = probe.self();
+  // ROUND 6 (Finding 3): this runs from the timeout `finally`, so ANYTHING it
+  // throws would REPLACE the in-flight cause-coded refusal with an unrelated
+  // error. `probe.self()` shells out to `ps` and can fail. A missing owner
+  // identity only weakens the marker (GC falls back to the TTL clock); losing
+  // the refusal would be far worse.
+  let owner: QuarantineOwner;
+  try {
+    owner = probe.self();
+  } catch {
+    owner = { pid: process.pid };
+  }
   try {
     fs.mkdirSync(stageDir, { recursive: true }); // the producer may have removed it
     fs.writeFileSync(
@@ -1070,7 +1080,16 @@ async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; str
     // instead. A non-deadline clone failure is a settled producer, so cleaning
     // up its partial output is safe.
     if (error instanceof WorktreeError && error.provisioningCause === 'provisioning_timeout') throw error;
-    fs.rmSync(dst, { recursive: true, force: true });
+    // ROUND 6 (Finding 3): guarded for the same reason as the stage `finally` —
+    // `rmSync` over a partial tree containing an unreadable entry throws, and
+    // thrown from this catch it would REPLACE the clone's own cause-coded
+    // refusal with a bare FS error. A stage we could not clean is a leftover
+    // temp directory the next GC preflight sweeps; the refusal is what matters.
+    try {
+      fs.rmSync(dst, { recursive: true, force: true });
+    } catch {
+      /* cleanup must never mask the primary failure */
+    }
     if (error instanceof WorktreeError && error.kind === 'provisioning_failed') throw error;
     warn({ kind: 'clone_failed', detail: messageOf(error) });
     throw failClosed(
@@ -1194,7 +1213,18 @@ export function swapIntoPlace(
     }
     throw moveInError;
   }
-  if (hadPrior) fs.rmSync(backup, { recursive: true, force: true });
+  // ROUND 6 (Finding 3, same family): the swap has SUCCEEDED — the new tree is in
+  // place. Freeing the moved-aside copy is pure cleanup, so letting it throw
+  // would turn a completed provisioning into a spurious "could not swap into
+  // place" failure. A surviving backup is harmless: the caller's `finally`
+  // preserves the stage and a later GC sweep collects it.
+  if (hadPrior) {
+    try {
+      fs.rmSync(backup, { recursive: true, force: true });
+    } catch {
+      /* the swap already succeeded; cleanup never fails it */
+    }
+  }
 }
 
 /**

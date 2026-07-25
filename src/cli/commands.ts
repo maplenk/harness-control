@@ -75,7 +75,7 @@ import {
   type EvidenceRecorder,
   type FixRequest,
 } from '../app/flows/verifier.js';
-import type { VerificationRunner } from '../app/flows/implementor.js';
+import type { ProvisioningFailure, VerificationRunner } from '../app/flows/implementor.js';
 import { collectIncidentProbeState, latestIncidentEvent } from '../scheduler/limit-schedule.js';
 import { redactText } from '../redaction/index.js';
 import { parseRoleProfile } from './profile.js';
@@ -1100,17 +1100,7 @@ function loopResultOutput(
     },
     ...(mr !== undefined ? { mergeReadiness: mergeReadinessView(mr) } : {}),
     ...(result.provisioningFailure !== undefined
-      ? {
-          provisioningFailure: {
-            repoRoot: result.provisioningFailure.repoRoot,
-            worktreePath: result.provisioningFailure.worktreePath,
-            detail: result.provisioningFailure.detail,
-            ...(result.provisioningFailure.round !== undefined ? { round: result.provisioningFailure.round } : {}),
-            ...(result.provisioningFailure.implementationCommit !== undefined
-              ? { implementationCommit: String(result.provisioningFailure.implementationCommit) }
-              : {}),
-          },
-        }
+      ? { provisioningFailure: provisioningFailureView(result.provisioningFailure) }
       : {}),
   };
   const lines = [
@@ -1213,6 +1203,28 @@ function provisioningNextHint(cause: ProvisioningCause | undefined): string {
     default:
       return "ensure the primary checkout's node_modules is installed and node_modules is git-ignored, then re-run.";
   }
+}
+
+/**
+ * The STABLE JSON projection of a provisioning failure. Sibling of
+ * `mergeReadinessView`, extracted so the payload is asserted directly.
+ *
+ * ROUND 6 (Finding 4): `cause` is part of it. The closed cause vocabulary exists
+ * for MACHINE consumption — omitting it here forced JSON consumers (the future
+ * UI included) to parse the human prose in `detail` to recover what the text
+ * renderer already had.
+ */
+export function provisioningFailureView(pf: ProvisioningFailure): Record<string, unknown> {
+  return {
+    repoRoot: pf.repoRoot,
+    worktreePath: pf.worktreePath,
+    ...(pf.cause !== undefined ? { cause: pf.cause } : {}),
+    detail: pf.detail,
+    ...(pf.round !== undefined ? { round: pf.round } : {}),
+    ...(pf.implementationCommit !== undefined
+      ? { implementationCommit: String(pf.implementationCommit) }
+      : {}),
+  };
 }
 
 function mergeReadinessView(mr: MergeReadiness): Record<string, unknown> {
