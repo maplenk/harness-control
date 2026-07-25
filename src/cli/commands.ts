@@ -81,7 +81,7 @@ import { redactText } from '../redaction/index.js';
 import { parseRoleProfile } from './profile.js';
 import { isErr, ok, type Result } from '../lib/result.js';
 import { DEFAULT_ENGINE_CONFIG } from '../config/loader.js';
-import type { GitWorktreeManager } from '../worktree/index.js';
+import type { GitWorktreeManager, ProvisioningCause } from '../worktree/index.js';
 import type { RunCommand } from './args.js';
 
 export interface CommandOutput {
@@ -1144,8 +1144,9 @@ function loopResultOutput(
       `    repo:     ${pf.repoRoot}`,
       `    worktree: ${pf.worktreePath}`,
       ...(pf.implementationCommit !== undefined ? [`    commit:   ${String(pf.implementationCommit)}`] : []),
+      ...(pf.cause !== undefined ? [`    cause:    ${pf.cause}`] : []),
       `    detail:   ${pf.detail}`,
-      `  next: ensure the primary checkout's node_modules is installed and node_modules is git-ignored, then re-run.`,
+      `  next: ${provisioningNextHint(pf.cause)}`,
     );
   }
   const exitCode =
@@ -1155,6 +1156,63 @@ function loopResultOutput(
         ? EXIT_INTEGRATION_BLOCKED
         : 1;
   return finish(kind, body, lines.join('\n'), exitCode);
+}
+
+/**
+ * F9 — the operator's NEXT STEP, chosen by the refusal's cause code. The pre-F9
+ * text was a single generic line ("ensure the primary checkout's node_modules is
+ * installed and node_modules is git-ignored"), which is actively misleading for
+ * the two commonest causes: it tells someone whose IMPLEMENTOR added a dependency
+ * to reinstall the primary (which cannot help), and says nothing at all about a
+ * present-but-unbuilt native toolchain. Unknown/absent causes (the pre-F9
+ * refusals, which keep their prose detail) fall back to the generic hint.
+ */
+function provisioningNextHint(cause: ProvisioningCause | undefined): string {
+  switch (cause) {
+    case 'deps_changed_in_worktree':
+      return (
+        'the round committed a dependency-manifest change. Dependency changes land via the engine track, not inside ' +
+        'runs: revert the manifest edit in the round, or land it on the primary checkout, run `npm install` there, ' +
+        'and start a fresh run.'
+      );
+    case 'primary_manifests_diverged':
+      return 'commit/sync the primary checkout\'s manifest edits, run `npm install` there, then re-run.';
+    case 'manifest_divergence_unclassified':
+      return (
+        'the manifests diverged but the primary\'s HEAD could not be read to attribute it — check the primary ' +
+        'checkout is a healthy git repo, then apply whichever applies: revert an in-round manifest change, or ' +
+        'commit/sync + `npm install` in the primary.'
+      );
+    case 'primary_tree_stale':
+      return 'run `npm install` in the primary checkout (its node_modules does not match its own manifests), then re-run.';
+    case 'native_toolchain_unproven':
+      return (
+        'a dependency with a native build step is present but was never built. Run `npm install` (NOT ' +
+        '`--ignore-scripts`) in the primary checkout so its lifecycle scripts compile the bindings, verify with ' +
+        '`node -e "require(\'<package>\')"`, then re-run.'
+      );
+    case 'unsafe_clone_symlinks':
+      return (
+        "the primary checkout's node_modules contains absolute or escaping symlinks; remove and reinstall it " +
+        '(`rm -rf node_modules && npm install`), then re-run.'
+      );
+    case 'install_provisioning_removed':
+      return "set worktree.provision to 'clone' (or 'auto'), or 'none' to provision node_modules yourself.";
+    case 'clone_unsupported':
+      return (
+        'this host cannot copy-on-write clone (no APFS `cp -c`), and there is no install lane. Set ' +
+        "worktree.provision='none' and provision each worktree's node_modules yourself."
+      );
+    case 'clone_failed':
+      return (
+        'the clone itself failed — check free space and that the worktree base dir is on the SAME filesystem as ' +
+        'the primary checkout, then re-run.'
+      );
+    case 'provisioning_timeout':
+      return 'a provisioning command exceeded its deadline; check for a stalled npm/git process, then re-run.';
+    default:
+      return "ensure the primary checkout's node_modules is installed and node_modules is git-ignored, then re-run.";
+  }
 }
 
 function mergeReadinessView(mr: MergeReadiness): Record<string, unknown> {

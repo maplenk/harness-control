@@ -48,9 +48,36 @@ import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
 import { sha256Hex } from '../artifacts/hash.js';
-import { WorktreeError } from './errors.js';
+import { WorktreeError, type ProvisioningCause } from './errors.js';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * F9 (P5) — the deadline every provisioning-path external command and injected
+ * seam call runs under (10 min, matching the verification runner's per-command
+ * cap). An unbounded `npm ci`/`cp`/git probe holds the repo git mutex AND the
+ * cross-process advisory lease forever, wedging the whole run and every peer
+ * process. On expiry provisioning fails closed with `provisioning_timeout` and
+ * the throw unwinds the manager's critical section, releasing both.
+ */
+export const PROVISION_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * F9 — per-package cap for the runtime native smoke. Much tighter than the
+ * command deadline: a `node -e "require(pkg)"` that has not returned in a minute
+ * is not "slow", it is hung.
+ */
+export const NATIVE_SMOKE_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * F9 — the minimal environment the native smoke's `node` runs under. Mirrors the
+ * verification runner's W3-1 posture (§17.1): the orchestrator's environment,
+ * including every provider credential, is NEVER inherited wholesale by a
+ * provisioning-time subprocess. Kept as a local list rather than importing the
+ * transport's `CHILD_ENV_ALLOWLIST` because `src/worktree` must not depend on
+ * `src/adapters`; the two are deliberately identical in spirit.
+ */
+const SMOKE_ENV_ALLOWLIST: readonly string[] = ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL'];
 
 /** Marker file written INSIDE a provisioned `node_modules` (after the tree is
  * built, so `npm ci` cannot wipe it) carrying the dependency fingerprint. It is
@@ -95,18 +122,23 @@ export interface ProvisionOutcome {
 /** Structured provisioning warnings (non-fatal path notes) for the manager's
  * `provisionWarn` sink. */
 export type ProvisionWarnEvent =
-  | { readonly kind: 'clone_source_fingerprint_mismatch'; readonly worktreePath: string }
+  /** F9 (iv): the field carries the PRIMARY checkout root (the clone SOURCE),
+   * which the pre-F9 name `worktreePath` misdescribed. Now emitted only as a
+   * note alongside the fail-closed refusal, never as a fall-through to install. */
+  | { readonly kind: 'clone_source_fingerprint_mismatch'; readonly primaryRepoRoot: string }
   | { readonly kind: 'clone_unsupported'; readonly reason: string }
   | { readonly kind: 'clone_failed'; readonly detail: string }
+  /** F9: no `fallback` field — an unsafe clone is now a refusal, not a lane switch. */
   | {
       readonly kind: 'clone_symlinks_unsafe';
       readonly count: number;
       readonly sample: readonly string[];
-      readonly fallback: 'install';
     }
   | { readonly kind: 'cache_purged'; readonly cache: string }
   | { readonly kind: 'stage_gc_removed'; readonly stage: string }
-  | { readonly kind: 'stage_backup_restored'; readonly stage: string };
+  | { readonly kind: 'stage_backup_restored'; readonly stage: string }
+  /** F9: the runtime native smoke loaded these packages from the staged tree. */
+  | { readonly kind: 'native_smoke_passed'; readonly packages: readonly string[] };
 
 export type ProvisionWarnSink = (event: ProvisionWarnEvent) => void;
 
@@ -126,9 +158,18 @@ export interface ProvisionRuntime {
   /** COW-clone `srcDir` → `dstDir` (which must NOT already exist). Throws on
    * failure. Default: `cp -c -R`. */
   cloneDir(srcDir: string, dstDir: string): Promise<void>;
-  /** Offline install in `cwd` (seeded with the committed manifests), producing
-   * `cwd/node_modules`. Throws on failure. Default:
-   * `npm ci --prefer-offline --no-audit --fund=false --ignore-scripts`. */
+  /**
+   * Offline install in `cwd` (seeded with the committed manifests), producing
+   * `cwd/node_modules`.
+   *
+   * F9: THIS SEAM HAS NO PRODUCTION CALLER. The install lane is gone — `npm ci
+   * --ignore-scripts` cannot build a script-installed native dependency, so a
+   * tree it produces can never be PROVEN (P1), and stamping it "proven" made the
+   * breakage sticky (P2). `provision:'install'` is refused at config parse and at
+   * this module's entry; `'auto'`/`'clone'` are clone-or-fail-closed. The member
+   * is retained for the transition (the manager's runtime option, the F7 test
+   * fakes) and still bounded by the provisioning deadline wherever it is called.
+   */
   install(cwd: string): Promise<void>;
 }
 
@@ -156,6 +197,9 @@ export interface ProvisionParams {
    * `fs.renameSync`); production leaves it undefined so `swapIntoPlace` uses the real
    * rename. Lets a test drive the #2 double-fault through the PRODUCTION catch/finally. */
   readonly rename?: (from: string, to: string) => void;
+  /** F9 (P5): deadline for every external command / injected seam call on the
+   * provisioning path. Defaults to `PROVISION_COMMAND_TIMEOUT_MS`; shrunk in tests. */
+  readonly commandTimeoutMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,19 +213,81 @@ export function defaultProvisionRuntime(): ProvisionRuntime {
     async cloneDir(srcDir, dstDir) {
       // `-c` = clonefile(2) (APFS copy-on-write, instant, zero extra space until
       // divergence); `-R` recursive, preserving symlinks. `dstDir` must not exist
-      // (cp then creates it as a clone of srcDir).
-      await execFileAsync('cp', ['-c', '-R', srcDir, dstDir]);
+      // (cp then creates it as a clone of srcDir). F9 (P5): `timeout` makes
+      // execFile KILL a wedged `cp` rather than merely stop waiting on it.
+      await execFileAsync('cp', ['-c', '-R', srcDir, dstDir], { timeout: PROVISION_COMMAND_TIMEOUT_MS });
     },
     async install(cwd) {
       // `--ignore-scripts` is the MVP install-script mitigation (spec §2.2/§5): a
       // manifest the implementor edited cannot run arbitrary lifecycle scripts on
-      // the host during provisioning.
+      // the host during provisioning. F9: this lane has no production caller (see
+      // `ProvisionRuntime.install`); the env is pinned to the smoke allowlist
+      // anyway (codex focus (ii)) so it can never leak orchestrator credentials to
+      // an npm lifecycle if it is ever called again, and it is bounded like `cp`.
+      const env: Record<string, string> = { npm_config_ignore_scripts: 'true' };
+      for (const key of SMOKE_ENV_ALLOWLIST) {
+        const value = process.env[key];
+        if (value !== undefined) env[key] = value;
+      }
       await execFileAsync(
         'npm',
         ['ci', '--prefer-offline', '--no-audit', '--fund=false', '--ignore-scripts'],
-        { cwd, env: { ...process.env, npm_config_ignore_scripts: 'true' }, maxBuffer: 64 * 1024 * 1024 },
+        { cwd, env, maxBuffer: 64 * 1024 * 1024, timeout: PROVISION_COMMAND_TIMEOUT_MS },
       );
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// F9 (P5) — bounded seam calls
+// ---------------------------------------------------------------------------
+/**
+ * Race an injected seam call (a runtime op, a git probe) against a deadline and
+ * FAIL CLOSED on expiry. The default runtime's own `execFile` calls carry a
+ * `timeout` too — that KILLS the child; this bounds the PROMISE, so a hung
+ * injected seam (or one whose kill did not take) can never hold the caller's
+ * mutex + advisory lease open indefinitely. Both are needed: neither subsumes
+ * the other.
+ */
+async function withDeadline<T>(
+  operation: () => Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              failClosed(
+                `provisioning step '${label}' timed out after ${timeoutMs}ms; refusing (the git mutex and advisory lease are released).`,
+                `timeout: ${label} (${timeoutMs}ms)`,
+                'provisioning_timeout',
+              ),
+            ),
+          timeoutMs,
+        );
+        // Never keep the process alive for a deadline that no longer matters.
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** The `ProvisionGit` seam with every call bounded (F9 P5). */
+function boundedGit(git: ProvisionGit, timeoutMs: number): ProvisionGit {
+  return {
+    isPathIgnored: (worktreePath, pathspec) =>
+      withDeadline(() => git.isPathIgnored(worktreePath, pathspec), timeoutMs, `git check-ignore ${pathspec}`),
+    isPathTracked: (worktreePath, pathspec) =>
+      withDeadline(() => git.isPathTracked(worktreePath, pathspec), timeoutMs, `git ls-files ${pathspec}`),
+    readFileAtHead: (worktreePath, relpath) =>
+      withDeadline(() => git.readFileAtHead(worktreePath, relpath), timeoutMs, `git show HEAD:${relpath}`),
   };
 }
 
@@ -427,8 +533,11 @@ async function assertNodeModulesSafe(a: {
  * `WorktreeError{kind:'provisioning_failed'}` (the caller fails closed).
  */
 export async function provisionWorktreeDeps(params: ProvisionParams): Promise<ProvisionOutcome> {
-  const { worktreePath, primaryRepoRoot: repoRoot, baseDir, strategy, runtime, git } = params;
+  const { worktreePath, primaryRepoRoot: repoRoot, baseDir, strategy, runtime } = params;
   const warn: ProvisionWarnSink = params.warn ?? (() => undefined);
+  const timeoutMs = params.commandTimeoutMs ?? PROVISION_COMMAND_TIMEOUT_MS;
+  // F9 (P5): every git probe below runs under the deadline.
+  const git = boundedGit(params.git, timeoutMs);
   const nodeModules = path.join(worktreePath, 'node_modules');
   // #5: every assignment gets its OWN stage NAMESPACE dir `<.provision>/<slug>/`, so
   // GC is an EXACT per-assignment match (enumerate exactly that dir) — never a bare
@@ -448,6 +557,22 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
   // unmanaged run.
   if (strategy === 'none') {
     return proven('none', '', repoRoot, worktreePath, "provisioning disabled (worktree.provision='none')");
+  }
+
+  // F9 (P4/§4): the install lane is GONE. `npm ci --ignore-scripts` cannot build a
+  // script-installed native dependency, so a tree it produces can never be proven
+  // — and stamping it proven made the breakage STICKY for the rest of the run. The
+  // config schema refuses `'install'` at parse; this is the programmatic belt for
+  // a manager constructed directly. Accepted config must ACT or be REFUSED.
+  if (strategy === 'install') {
+    throw failClosed(
+      `worktree.provision='install' is no longer supported (repo ${repoRoot}): script-less installs cannot prove ` +
+        'native toolchains (a `--ignore-scripts` install leaves better-sqlite3 with no compiled binding while still ' +
+        "populating node_modules/.bin). Land dependency changes in the primary checkout, run `npm install` there, and use " +
+        "worktree.provision='clone' (or 'auto').",
+      'install provisioning removed',
+      'install_provisioning_removed',
+    );
   }
 
   // Dependency fingerprint from the COMMITTED HEAD manifests (bound to what the
@@ -546,37 +671,37 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
       worktreeFingerprint: fingerprint,
       wtManifests,
       warn,
+      git,
+      timeoutMs,
     });
 
-    // Symlink containment scan against the EVENTUAL worktree boundary (H7). An
-    // unsafe link from a CLONE → discard and install fresh (unless clone was
-    // forced); an unsafe link that survives install → fail closed. A scan that
-    // cannot fully complete THROWS (B6) → fail closed.
-    const scanFor = (treeRoot: string): SymlinkContainmentScan => ({
-      stageTreeRoot: treeRoot,
+    // Symlink containment scan against the EVENTUAL worktree boundary (H7). A scan
+    // that cannot fully complete THROWS (B6) → fail closed. F9 (§4): an unsafe link
+    // is now a REFUSAL under EVERY strategy — the retry-as-install that `auto` used
+    // to perform is gone with the install lane, so `auto` and `clone` behave
+    // identically here (clone-or-fail-closed) and the config no longer lies about it.
+    const scan: SymlinkContainmentScan = {
+      stageTreeRoot: built.treePath,
       eventualTreeRoot: nodeModules,
       containmentRoot: worktreePath,
-    });
-    let bad = await scanSymlinkContainment(scanFor(built.treePath));
-    if (bad.length > 0 && built.strategyTaken === 'clone' && strategy !== 'clone') {
-      warn({ kind: 'clone_symlinks_unsafe', count: bad.length, sample: bad.slice(0, 5), fallback: 'install' });
-      fs.rmSync(built.treePath, { recursive: true, force: true });
-      built.treePath = await buildViaInstall({ stageDir, runtime, wtManifests });
-      built.strategyTaken = 'install';
-      bad = await scanSymlinkContainment(scanFor(built.treePath));
-    }
+    };
+    const bad = await scanSymlinkContainment(scan);
     if (bad.length > 0) {
+      warn({ kind: 'clone_symlinks_unsafe', count: bad.length, sample: bad.slice(0, 5) });
       throw failClosed(
-        `provisioned node_modules for ${worktreePath} contains ${bad.length} unsafe symlink(s) ` +
-          `(absolute or worktree-escaping): ${bad.slice(0, 5).join(', ')}`,
+        `provisioned node_modules for ${worktreePath} (repo ${repoRoot}) contains ${bad.length} unsafe symlink(s) ` +
+          `(absolute or worktree-escaping): ${bad.slice(0, 5).join(', ')}. Refusing — a write through such a link ` +
+          'escapes the worktree. Repair the primary checkout\'s node_modules (reinstall it) and re-run.',
         `fingerprint=${fingerprint}; strategy=${built.strategyTaken}`,
+        'unsafe_clone_symlinks',
       );
     }
 
     purgeTransientCaches(built.treePath, warn);
-    // B2: never accept/mark a tree without a real `.bin/` — a populated-but-broken
-    // tree (only `.package-lock.json`, or `.bin` vanished) would let the verifier
-    // resolve a GLOBAL tsc/vitest and falsely green the run.
+    // B2: never accept/mark a tree without a real `.bin/`. NOTE (F9 P1): this is a
+    // NECESSARY condition, never a sufficient one — `.bin` is populated at unpack
+    // time from `bin` fields and says nothing about lifecycle scripts having run.
+    // The real toolchain proof is the runtime smoke below.
     if (!hasBinDir(built.treePath)) {
       throw failClosed(
         `provisioned node_modules for ${worktreePath} has no node_modules/.bin directory (strategy=${built.strategyTaken}) — ` +
@@ -584,8 +709,11 @@ export async function provisionWorktreeDeps(params: ProvisionParams): Promise<Pr
         `fingerprint=${fingerprint}; strategy=${built.strategyTaken}; missing .bin`,
       );
     }
-    // Marker LAST (after the tree is fully built): npm ci wipes node_modules before
-    // installing, so a marker written earlier would be lost.
+    // F9 (P1/P2): PROVE the toolchain by LOADING it, BEFORE the marker exists — so
+    // a tree that cannot be proven can never become the sticky short-circuit for
+    // every later round of the run.
+    await runNativeSmoke(built.treePath, warn, timeoutMs);
+    // Marker LAST (after the tree is fully built AND proven).
     fs.writeFileSync(path.join(built.treePath, PROVISION_MARKER_FILE), fingerprint, 'utf8');
 
     try {
@@ -620,78 +748,176 @@ interface BuildArgs {
   readonly worktreeFingerprint: string;
   readonly wtManifests: ManifestSet;
   readonly warn: ProvisionWarnSink;
+  /** Already deadline-bounded (`boundedGit`). Used to classify a manifest divergence. */
+  readonly git: ProvisionGit;
+  readonly timeoutMs: number;
 }
 
-/** Produce a staged `node_modules` via clone (fingerprint-matched primary, APFS)
- * or install (everything else). Never clones an unproven source. */
-async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; strategyTaken: 'clone' | 'install' }> {
-  const { strategy, runtime, primaryRepoRoot, worktreeFingerprint, warn } = args;
+/**
+ * Produce a staged `node_modules` by CLONING a primary tree that has been proven
+ * to match the committed manifests — or FAIL CLOSED.
+ *
+ * F9: there is no second lane. Everything that used to "fall back to install"
+ * (fingerprint mismatch, an unreadable primary manifest, a non-APFS host, a
+ * hollow primary tree, a runtime clone failure) is now a cause-coded refusal,
+ * because the install lane could not produce a PROVABLE tree and silently
+ * stamping its output "proven" is how a broken toolchain became sticky for a
+ * whole run. `auto` and `clone` are both clone-or-fail-closed; they differ only
+ * in that neither retries anything any more.
+ */
+async function buildStagedTree(args: BuildArgs): Promise<{ treePath: string; strategyTaken: 'clone' }> {
+  const { runtime, primaryRepoRoot, worktreeFingerprint, warn } = args;
   const primaryNodeModules = path.join(primaryRepoRoot, 'node_modules');
-  // A real directory (never a symlinked root) with a real `.bin/` — B2: a
-  // hollow/empty or toolchain-less primary node_modules is never cloned (it would
-  // clone a broken tree and reintroduce the exit-127 false-negative); install. #3:
-  // a real FS error reading the non-authoritative clone source is "not cloneable →
-  // install", never a fail-closed halt (isolated in `isPrimaryCloneable`).
-  const primaryIsCloneable = isPrimaryCloneable(primaryNodeModules);
-  const wantsClone = strategy === 'auto' || strategy === 'clone';
 
-  let cloneEligible = false;
-  if (wantsClone && runtime.cloneSupported && primaryIsCloneable) {
-    // Clone ONLY when the primary's INSTALLED (working-tree) manifests fingerprint
-    // matches the worktree's committed one — otherwise the primary tree is the
-    // wrong dependency set (an unproven source, never cloned). A failure reading
-    // the primary's own manifests is NOT fatal (the primary is only the clone
-    // SOURCE, not the authority) — fall back to install.
-    try {
-      const primaryManifests = await collectManifests(diskSource(primaryRepoRoot), runtime.platformKey);
-      cloneEligible = computeDependencyFingerprint(primaryManifests, runtime.platformKey) === worktreeFingerprint;
-    } catch (error) {
-      warn({ kind: 'clone_failed', detail: `primary manifest read failed: ${messageOf(error)}` });
-      cloneEligible = false;
-    }
-    if (!cloneEligible) warn({ kind: 'clone_source_fingerprint_mismatch', worktreePath: primaryRepoRoot });
-  } else if (wantsClone && !runtime.cloneSupported) {
+  if (!runtime.cloneSupported) {
     warn({ kind: 'clone_unsupported', reason: 'APFS copy-on-write (cp -c) is not available on this platform' });
+    throw failClosed(
+      `worktree dependency provisioning requires a copy-on-write clone of ${primaryNodeModules}, which this host ` +
+        'does not support (no APFS `cp -c`). The install lane was removed because a script-less install cannot ' +
+        "prove native toolchains; set worktree.provision='none' and provision node_modules yourself on this host.",
+      'clone unsupported on this platform',
+      'clone_unsupported',
+    );
+  }
+  // A real directory (never a symlinked root) with a real `.bin/`. B2: a hollow or
+  // toolchain-less primary is never cloned — that is how the exit-127 false
+  // negative got in. There is nothing to fall back to now, so it refuses.
+  if (!isPrimaryCloneable(primaryNodeModules)) {
+    throw failClosed(
+      `the primary checkout's node_modules at ${primaryNodeModules} is missing, hollow, a symlink, or has no .bin/ — ` +
+        'there is no proven tree to clone. Run `npm install` in the primary checkout and re-run.',
+      'primary node_modules is not a cloneable tree',
+      'primary_tree_stale',
+    );
   }
 
-  if (cloneEligible) {
-    const dst = path.join(args.stageDir, 'node_modules');
-    try {
-      await runtime.cloneDir(primaryNodeModules, dst);
-      return { treePath: dst, strategyTaken: 'clone' };
-    } catch (error) {
-      // A runtime clone failure (e.g. a cross-volume base dir, non-APFS at runtime)
-      // falls back to install — never fails the run on the clone optimization.
-      warn({ kind: 'clone_failed', detail: messageOf(error) });
-      fs.rmSync(dst, { recursive: true, force: true });
-    }
+  // Clone ONLY when the primary's INSTALLED (working-tree) manifests fingerprint
+  // matches the worktree's COMMITTED one. A failure reading the primary's own
+  // manifests used to be non-fatal ("the primary is only the SOURCE") and fell
+  // through to install; with no install lane, an unreadable clone source is a
+  // refusal — never a guess.
+  let primaryManifests: ManifestSet;
+  try {
+    primaryManifests = await collectManifests(diskSource(primaryRepoRoot), runtime.platformKey);
+  } catch (error) {
+    warn({ kind: 'clone_failed', detail: `primary manifest read failed: ${messageOf(error)}` });
+    throw failClosed(
+      `could not read the primary checkout's dependency manifests at ${primaryRepoRoot}: ${messageOf(error)}. ` +
+        'Refusing to clone a source whose dependency set cannot be established.',
+      messageOf(error),
+      'manifest_divergence_unclassified',
+    );
   }
-  return { treePath: await buildViaInstall(args), strategyTaken: 'install' };
+  if (computeDependencyFingerprint(primaryManifests, runtime.platformKey) !== worktreeFingerprint) {
+    warn({ kind: 'clone_source_fingerprint_mismatch', primaryRepoRoot });
+    throw await manifestDivergenceFailure(args, primaryManifests);
+  }
+
+  // F9 (P3) — fingerprints agreeing proves only that the two MANIFESTS match. Prove
+  // the primary TREE actually contains what they declare before cloning it.
+  const declared = declaredRootPackages(args.wtManifests);
+  const missing = proveePrimaryTree(primaryNodeModules, declared);
+  if (missing.length > 0) {
+    throw failClosed(
+      `the primary checkout's node_modules at ${primaryNodeModules} is STALE: ${missing.length} manifest-declared ` +
+        `package(s) have no directory there (${missing.slice(0, 8).join(', ')}${missing.length > 8 ? ', …' : ''}). ` +
+        'Its manifests match the committed ones, but it was never installed against them — cloning it would hand ' +
+        'verification a tree missing those dependencies (`command not found`, exit 127). Run `npm install` in the ' +
+        'primary checkout and re-run.',
+      `primary tree missing ${missing.length} declared package(s)`,
+      'primary_tree_stale',
+    );
+  }
+
+  const dst = path.join(args.stageDir, 'node_modules');
+  try {
+    await withDeadline(() => runtime.cloneDir(primaryNodeModules, dst), args.timeoutMs, 'clone node_modules');
+  } catch (error) {
+    fs.rmSync(dst, { recursive: true, force: true });
+    if (error instanceof WorktreeError && error.kind === 'provisioning_failed') throw error; // the deadline's own refusal
+    warn({ kind: 'clone_failed', detail: messageOf(error) });
+    throw failClosed(
+      `copy-on-write clone of ${primaryNodeModules} into the provisioning stage failed: ${messageOf(error)}. ` +
+        'Refusing — there is no install fallback (a script-less install cannot prove native toolchains).',
+      messageOf(error),
+      'clone_failed',
+    );
+  }
+  return { treePath: dst, strategyTaken: 'clone' };
 }
 
-/** Seed a checkout-free stage with the committed manifests and run `npm ci`
- * there, producing `<stage>/install/node_modules`. Throws `provisioning_failed`
- * on install failure. */
-async function buildViaInstall(args: { stageDir: string; runtime: ProvisionRuntime; wtManifests: ManifestSet }): Promise<string> {
-  const cwd = path.join(args.stageDir, 'install');
-  fs.rmSync(cwd, { recursive: true, force: true });
-  fs.mkdirSync(cwd, { recursive: true });
-  for (const [rel, content] of args.wtManifests.entries) {
-    if (content === null) continue;
-    const dst = path.join(cwd, rel);
-    fs.mkdirSync(path.dirname(dst), { recursive: true });
-    fs.writeFileSync(dst, content, 'utf8');
-  }
+/**
+ * F9 (§1) — turn a fingerprint mismatch into a message that names WHICH manifest
+ * diverged and WHOSE fault it is, because the two cases have opposite remedies
+ * and the old generic hint ("ensure the primary's node_modules is installed")
+ * sent the commonest one (a dep-adding implementor commit) in circles.
+ *
+ * Classification needs a third reference, since the two sets in hand — the
+ * worktree at HEAD and the primary ON DISK — cannot by themselves say which side
+ * moved. The primary's own HEAD is that reference:
+ *   - worktree-HEAD manifests differ from primary-HEAD manifests
+ *       → the implementor's COMMIT changed dependencies (`deps_changed_in_worktree`);
+ *   - they agree, so the divergence is primary on-disk vs primary HEAD
+ *       → uncommitted/unsynced edits in the primary (`primary_manifests_diverged`).
+ * If the primary's HEAD cannot be read, neither remedy can be asserted, so the
+ * refusal says so and names both (`manifest_divergence_unclassified`) rather than
+ * guessing — fail closed, honestly.
+ */
+async function manifestDivergenceFailure(
+  args: BuildArgs,
+  primaryManifests: ManifestSet,
+): Promise<WorktreeError> {
+  const { wtManifests, primaryRepoRoot, runtime } = args;
+  const diverged = divergedManifestNames(wtManifests, primaryManifests);
+  const named =
+    diverged.length > 0
+      ? `diverged manifests: ${diverged.join(', ')}`
+      : `the manifests are byte-identical, so the platform key differs (${runtime.platformKey}) — the primary's tree was installed under a different Node/OS/arch`;
+
+  let primaryHead: ManifestSet | undefined;
   try {
-    await args.runtime.install(cwd);
-  } catch (error) {
-    throw failClosed(`dependency install (npm ci) failed in ${cwd}: ${messageOf(error)}`, messageOf(error));
+    primaryHead = await collectManifests(headSource(args.git, primaryRepoRoot), runtime.platformKey);
+  } catch {
+    primaryHead = undefined;
   }
-  const treePath = path.join(cwd, 'node_modules');
-  if (lstatSafe(treePath)?.isDirectory() !== true) {
-    throw failClosed(`dependency install produced no node_modules directory in ${cwd}`, 'npm ci left no node_modules');
+  if (primaryHead === undefined) {
+    return failClosed(
+      `worktree dependency provisioning refused (repo ${primaryRepoRoot}): the committed manifests do not match the ` +
+        `primary checkout's installed ones — ${named}. The primary's own HEAD could not be read, so the cause cannot ` +
+        'be attributed: either the implementor committed a dependency change (land dependency changes via the engine ' +
+        'track, not inside runs) or the primary has uncommitted manifest edits (commit/sync and run `npm install`).',
+      named,
+      'manifest_divergence_unclassified',
+    );
   }
-  return treePath;
+  const worktreeMoved = divergedManifestNames(wtManifests, primaryHead).length > 0;
+  return worktreeMoved
+    ? failClosed(
+        `worktree dependency provisioning refused (repo ${primaryRepoRoot}): the implementor's commit CHANGED the ` +
+          `dependency manifests — ${named}. Dependency changes are landed via the engine track, not inside runs: ` +
+          'no provable tree exists for the new manifests (a script-less install cannot build native dependencies). ' +
+          'Revert the manifest change in the round, or land it in the primary checkout, `npm install` there, and re-run.',
+        named,
+        'deps_changed_in_worktree',
+      )
+    : failClosed(
+        `worktree dependency provisioning refused (repo ${primaryRepoRoot}): the PRIMARY checkout has uncommitted or ` +
+          `unsynced dependency manifest edits — ${named}. Its committed manifests match the worktree's, so the drift ` +
+          'is on disk in the primary. Commit/sync the manifests, run `npm install` in the primary checkout, and re-run.',
+        named,
+        'primary_manifests_diverged',
+      );
+}
+
+/** Which fingerprinted manifest files differ between two sets (present-vs-absent
+ * counts as a difference — `null` is the absent sentinel). */
+function divergedManifestNames(a: ManifestSet, b: ManifestSet): string[] {
+  const names = new Set<string>([...a.entries.keys(), ...b.entries.keys()]);
+  const diverged: string[] = [];
+  for (const name of [...names].sort()) {
+    if (a.entries.get(name) !== b.entries.get(name)) diverged.push(name);
+  }
+  return diverged;
 }
 
 /**
@@ -889,8 +1115,186 @@ function proven(
   return { provisioned: true, strategy, fingerprint, repoRoot, worktreePath, detail };
 }
 
-function failClosed(message: string, detail: string): WorktreeError {
-  return new WorktreeError('provisioning_failed', message, { detail });
+/** F9: every refusal may carry a machine-readable `cause` the CLI turns into a
+ * SPECIFIC remedy. Pre-F9 refusals pass none and keep the generic hint. */
+function failClosed(message: string, detail: string, cause?: ProvisioningCause): WorktreeError {
+  return new WorktreeError('provisioning_failed', message, {
+    detail,
+    ...(cause !== undefined ? { provisioningCause: cause } : {}),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// F9 — proving the tree
+// ---------------------------------------------------------------------------
+/** The root-level `dependencies` + `devDependencies` NAMES a manifest declares. */
+function declaredRootPackages(manifests: ManifestSet): string[] {
+  const raw = manifests.entries.get('package.json');
+  if (typeof raw !== 'string') return [];
+  const parsed = parsePackageJson(raw, 'package.json');
+  const names = new Set<string>();
+  for (const field of ['dependencies', 'devDependencies'] as const) {
+    const value = parsed[field];
+    if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      for (const name of Object.keys(value as object)) names.add(name);
+    }
+  }
+  return [...names].sort();
+}
+
+/**
+ * F9 (P3) — PROVE the primary tree before cloning it. Fingerprints only prove
+ * that the primary's MANIFESTS say what the worktree's committed manifests say;
+ * they say nothing about whether anyone ever ran `npm install` against them. The
+ * false clone is exactly that gap: merge a dep-adding commit, start a run before
+ * installing in the primary, and a stale tree missing the new dependency is
+ * cloned and stamped proven — `vite: not found`, exit 127, the very failure class
+ * F7 exists to kill, arriving through the clone lane instead.
+ *
+ * Minimum sufficient proof: every root-declared dependency + devDependency name
+ * resolves to a DIRECTORY under the primary's `node_modules` (scoped names
+ * resolve under their scope dir, which is just the path). Transitive dependencies
+ * are not enumerated — the root set is what the fingerprint is computed over and
+ * what verification commands actually reach for.
+ */
+function proveePrimaryTree(primaryNodeModules: string, declared: readonly string[]): string[] {
+  const missing: string[] = [];
+  for (const name of declared) {
+    // A package name is a posix path fragment ('@scope/pkg'); join it as such.
+    const dir = path.join(primaryNodeModules, ...name.split('/'));
+    if (lstatSafe(dir)?.isDirectory() !== true) missing.push(name);
+  }
+  return missing;
+}
+
+/**
+ * F9 (P1) — the packages in an INSTALLED tree whose correctness depends on a
+ * lifecycle BUILD step: they declare an install/preinstall/postinstall script AND
+ * look like a native addon (a `binding.gyp`, or a script invoking node-gyp /
+ * prebuild / node-pre-gyp / cmake-js). `better-sqlite3` is the canonical member.
+ *
+ * Deliberately narrower than "every script-bearing package": plenty of packages
+ * run a postinstall that has nothing to do with loadability (`esbuild` fetches a
+ * platform binary, CLI packages run setup scripts, some are not `require`-able at
+ * all), and `require`ing those would fail the smoke for reasons that are not
+ * breakage. The native-addon set is exactly the set whose `require()` genuinely
+ * dlopens a built artifact — a real proof, with no false positives.
+ *
+ * Enumerates the tree's TOP LEVEL (npm hoists, so that is the installed set),
+ * including one level under `@scope/`. Unreadable/malformed package manifests are
+ * skipped, not fatal: they are not evidence of a missing BUILD.
+ */
+function nativeBuildPackages(treePath: string): string[] {
+  const found: string[] = [];
+  const consider = (name: string): void => {
+    const dir = path.join(treePath, ...name.split('/'));
+    let manifestRaw: string;
+    try {
+      manifestRaw = fs.readFileSync(path.join(dir, 'package.json'), 'utf8');
+    } catch {
+      return; // no manifest here (a cache dir, `.bin`, a stray file)
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      const value: unknown = JSON.parse(manifestRaw);
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return;
+      parsed = value as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const scripts = parsed['scripts'];
+    if (scripts === null || typeof scripts !== 'object') return;
+    const hooks = ['install', 'preinstall', 'postinstall']
+      .map((hook) => (scripts as Record<string, unknown>)[hook])
+      .filter((value): value is string => typeof value === 'string');
+    if (hooks.length === 0) return;
+    const nativeScript = hooks.some((script) => /node-gyp|node-pre-gyp|prebuild|cmake-js/i.test(script));
+    if (nativeScript || fs.existsSync(path.join(dir, 'binding.gyp'))) found.push(name);
+  };
+
+  let entries: Dirent[];
+  try {
+    entries = fs.readdirSync(treePath, { withFileTypes: true });
+  } catch (error) {
+    throw failClosed(
+      `could not enumerate the staged node_modules at ${treePath} to derive its native-build packages: ${messageOf(error)}`,
+      'staged tree unreadable',
+      'native_toolchain_unproven',
+    );
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === '.bin') continue;
+    if (entry.name.startsWith('@')) {
+      let scoped: Dirent[];
+      try {
+        scoped = fs.readdirSync(path.join(treePath, entry.name), { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const child of scoped) if (child.isDirectory()) consider(`${entry.name}/${child.name}`);
+    } else {
+      consider(entry.name);
+    }
+  }
+  return found.sort();
+}
+
+/**
+ * F9 (P1/P2) — the RUNTIME toolchain proof, run on the STAGED tree BEFORE the
+ * marker is written, on BOTH lanes.
+ *
+ * `hasBinDir` never could have worked: `node_modules/.bin/` is populated from
+ * package `bin` fields at UNPACK time, wholly independent of lifecycle scripts,
+ * so a `--ignore-scripts` install yields a fully-populated `.bin` and zero built
+ * `.node` artifacts — which is precisely how a better-sqlite3 with no binding was
+ * stamped "proven" and then, because the marker matched, reused by every
+ * subsequent round until the run burned to terminal.
+ *
+ * The replacement actually loads each native-build package with
+ * `node -e "require('<pkg>')"` from the staged tree's parent (so bare-specifier
+ * resolution walks into the staged `node_modules`), under a minimal env and a
+ * per-package deadline. A load failure is `native_toolchain_unproven` naming the
+ * package. The CLONE lane runs it too: the clone is CHEAP, not SAFE — its
+ * correctness is inherited from whenever the primary was last really installed.
+ */
+async function runNativeSmoke(
+  treePath: string,
+  warn: ProvisionWarnSink,
+  timeoutMs: number,
+): Promise<void> {
+  const packages = nativeBuildPackages(treePath);
+  if (packages.length === 0) return;
+  // Bare specifiers resolve from `<cwd>/node_modules`, and the staged tree IS
+  // `<parent>/node_modules` on both lanes (clone: `<stage>/node_modules`;
+  // install: `<stage>/install/node_modules`).
+  const cwd = path.dirname(treePath);
+  const env: Record<string, string> = {};
+  for (const key of SMOKE_ENV_ALLOWLIST) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  for (const name of packages) {
+    try {
+      await execFileAsync(process.execPath, ['-e', `require(${JSON.stringify(name)})`], {
+        cwd,
+        env,
+        timeout: Math.min(timeoutMs, NATIVE_SMOKE_TIMEOUT_MS),
+        maxBuffer: 4 * 1024 * 1024,
+      });
+    } catch (error) {
+      const stderr = typeof (error as { stderr?: unknown }).stderr === 'string'
+        ? ((error as { stderr: string }).stderr).trim().split('\n').slice(0, 6).join(' | ')
+        : messageOf(error);
+      throw failClosed(
+        `provisioned node_modules for ${treePath} could not LOAD '${name}', which declares a native build step — ` +
+          'the package is present but was never built (a script-less install cannot build it). Refusing to verify ' +
+          `against an unproven toolchain: ${stderr}`,
+        `native smoke failed for ${name}`,
+        'native_toolchain_unproven',
+      );
+    }
+  }
+  warn({ kind: 'native_smoke_passed', packages });
 }
 
 /**

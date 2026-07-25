@@ -121,6 +121,7 @@ import {
   statusPorcelain,
   WorktreeError,
   type GitWorktreeManager,
+  type ProvisioningCause,
   type WorktreeHandle,
 } from '../../worktree/index.js';
 import { isSecretKeyName, redactText } from '../../redaction/index.js';
@@ -558,6 +559,11 @@ export interface ProvisioningFailure {
   readonly worktreePath: string;
   /** Redacted, operator-actionable summary (ignore-rule / clone-vs-install / install failure). */
   readonly detail: string;
+  /** F9: the machine-readable refusal cause, when provisioning supplied one. The
+   * CLI turns it into a SPECIFIC next step — the pre-F9 generic hint sent the two
+   * commonest cases (a dep-adding implementor commit, a stale primary tree) in
+   * circles. Absent for the pre-F9 refusals, which keep their prose detail. */
+  readonly cause?: ProvisioningCause;
   /** F7 (M9): the loop round that failed (the loop driver fills this in). */
   readonly round?: number;
   /** F7 (M9): the actual committed HEAD at the point of failure (host-read; the
@@ -1026,6 +1032,11 @@ export class ImplementorFlow {
           kind: 'provisioning_failed',
           repoRoot: handle.repoRoot,
           worktreePath: cwd,
+          // F9: the cause is a CLOSED vocabulary constant, never free text — it
+          // needs no redaction and never carries a path or secret.
+          ...(error instanceof WorktreeError && error.provisioningCause !== undefined
+            ? { cause: error.provisioningCause }
+            : {}),
           detail: redactText(
             error instanceof WorktreeError
               ? (error.detail ?? error.message)

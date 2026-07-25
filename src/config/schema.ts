@@ -351,22 +351,42 @@ const budgetSchema = z
 const BUDGET_DEFAULT = budgetSchema.parse({});
 
 // ---------------------------------------------------------------------------
-// F7 (spec §3): worktree dependency provisioning. The engine provisions a REAL,
-// git-ignored `node_modules` into each child worktree at the post-commit /
-// pre-verification boundary so host self-check + verifier commands
-// (`npm run typecheck`, `npx vitest`) don't exit 127. `auto` (default) clones the
-// primary checkout's tree when the committed dependency fingerprint matches and
-// APFS copy-on-write is available, else `npm ci`; `clone`/`install` force a lane
-// (both fall back to install on a non-clonable host); `none` disables managed
-// provisioning (the operator owns node_modules). The value flows into
-// `WorktreeManagerOptions.provision` via cli/index.ts.
+// F7 (spec §3) / F9 (spec §4): worktree dependency provisioning. The engine
+// provisions a REAL, git-ignored `node_modules` into each child worktree at the
+// post-commit / pre-verification boundary so host self-check + verifier commands
+// (`npm run typecheck`, `npx vitest`) don't exit 127.
+//
+// F9 made the vocabulary HONEST — accepted config must ACT or be REFUSED (W4-1):
+//   `auto`   = clone the primary's proven tree, or FAIL CLOSED;
+//   `clone`  = identical, with no retry of any kind (pre-F9 it silently fell
+//              through to install on ineligibility, so it never "forced" a lane);
+//   `install`= REMOVED. `npm ci --ignore-scripts` cannot build a script-installed
+//              native dependency, so the lane could never produce a PROVABLE tree
+//              — and stamping its output "proven" made the breakage sticky for
+//              the rest of the run. Refused HERE, at parse, with a migration
+//              message rather than accepted-but-inert;
+//   `none`   = unchanged (managed provisioning off; the operator owns node_modules).
+// The value flows into `WorktreeManagerOptions.provision` via cli/index.ts.
 // ---------------------------------------------------------------------------
-export const PROVISION_STRATEGIES = ['auto', 'clone', 'install', 'none'] as const satisfies readonly ProvisionStrategy[];
+export const PROVISION_STRATEGIES = ['auto', 'clone', 'none'] as const satisfies readonly ProvisionStrategy[];
 export const DEFAULT_PROVISION_STRATEGY: ProvisionStrategy = 'auto';
+
+/** F9: the operator-facing migration text for the removed install lane. */
+export const INSTALL_PROVISIONING_REMOVED_MESSAGE =
+  "worktree.provision='install' was removed: script-less installs cannot prove native toolchains (a " +
+  '`npm ci --ignore-scripts` leaves better-sqlite3 with no compiled binding while still populating ' +
+  "node_modules/.bin, so the tree looks provisioned and is not). Land dependency changes in the primary " +
+  "checkout, run `npm install` there, and use 'clone' (or 'auto'); use 'none' to own node_modules yourself.";
 
 const worktreeSchema = z
   .object({
-    provision: z.enum(PROVISION_STRATEGIES).default(DEFAULT_PROVISION_STRATEGY),
+    // `'install'` is accepted by the enum ONLY so the refusal can carry the
+    // migration message; a plain enum miss would report the generic
+    // "invalid enum value" and leave the operator guessing what replaced it.
+    provision: z
+      .enum(['auto', 'clone', 'install', 'none'] as const)
+      .default(DEFAULT_PROVISION_STRATEGY)
+      .refine((value) => value !== 'install', { message: INSTALL_PROVISIONING_REMOVED_MESSAGE }),
   })
   .strict()
   .readonly();

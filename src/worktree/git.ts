@@ -47,12 +47,17 @@ export async function runGit(
   args: readonly string[],
   cwd: string,
   extraEnv: Readonly<Record<string, string>> = {},
+  /** F9 (P5): wall-clock cap; on expiry execFile KILLS the child and this
+   * rejects `git_command_failed`. Omitted = unbounded (the historical default —
+   * every caller that holds the git mutex should pass one). */
+  timeoutMs?: number,
 ): Promise<GitResult> {
   try {
     const { stdout, stderr } = await execFileAsync(GIT_BIN, [...args], {
       cwd,
       maxBuffer: MAX_BUFFER_BYTES,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...extraEnv },
+      ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
     });
     return { stdout: toText(stdout), stderr: toText(stderr) };
   } catch (error) {
@@ -374,12 +379,15 @@ export async function runGitStatus(
   args: readonly string[],
   cwd: string,
   extraEnv: Readonly<Record<string, string>> = {},
+  /** F9 (P5): wall-clock cap; a killed child surfaces as a non-zero exit code. */
+  timeoutMs?: number,
 ): Promise<GitCommandStatus> {
   try {
     const { stdout, stderr } = await execFileAsync(GIT_BIN, [...args], {
       cwd,
       maxBuffer: MAX_BUFFER_BYTES,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...extraEnv },
+      ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
     });
     return { stdout: toText(stdout), stderr: toText(stderr), exitCode: 0 };
   } catch (error) {
@@ -395,8 +403,8 @@ export async function runGitStatus(
  * (exit 128 / spawn failure → throw), so the F7 preflight never mistakes a
  * broken repo for "safe to provision".
  */
-export async function isPathIgnored(worktreePath: string, pathspec: string): Promise<boolean> {
-  const { exitCode, stderr } = await runGitStatus(['check-ignore', '-q', '--', pathspec], worktreePath);
+export async function isPathIgnored(worktreePath: string, pathspec: string, timeoutMs?: number): Promise<boolean> {
+  const { exitCode, stderr } = await runGitStatus(['check-ignore', '-q', '--', pathspec], worktreePath, {}, timeoutMs);
   if (exitCode === 0) return true;
   if (exitCode === 1) return false;
   throw new WorktreeError(
@@ -411,8 +419,13 @@ export async function isPathIgnored(worktreePath: string, pathspec: string): Pro
  * known file" (not tracked); ANY OTHER exit (128 real error / -1 spawn failure) →
  * throw — F7 must never mistake an operational git failure for "not tracked".
  */
-export async function isPathTracked(worktreePath: string, pathspec: string): Promise<boolean> {
-  const { exitCode, stderr } = await runGitStatus(['ls-files', '--error-unmatch', '--', pathspec], worktreePath);
+export async function isPathTracked(worktreePath: string, pathspec: string, timeoutMs?: number): Promise<boolean> {
+  const { exitCode, stderr } = await runGitStatus(
+    ['ls-files', '--error-unmatch', '--', pathspec],
+    worktreePath,
+    {},
+    timeoutMs,
+  );
   if (exitCode === 0) return true;
   if (exitCode === 1) return false;
   throw new WorktreeError(
@@ -463,8 +476,12 @@ export async function isAncestor(worktreePath: string, ancestor: string, descend
  * The follow-up `git show` reads the proven-present blob's bytes. `relpath` is
  * repo-root-relative, posix-separated.
  */
-export async function readFileAtHead(worktreePath: string, relpath: string): Promise<string | undefined> {
-  const probe = await runGitStatus(['ls-tree', '--name-only', 'HEAD', '--', relpath], worktreePath);
+export async function readFileAtHead(
+  worktreePath: string,
+  relpath: string,
+  timeoutMs?: number,
+): Promise<string | undefined> {
+  const probe = await runGitStatus(['ls-tree', '--name-only', 'HEAD', '--', relpath], worktreePath, {}, timeoutMs);
   if (probe.exitCode !== 0) {
     throw new WorktreeError(
       'git_command_failed',
@@ -472,7 +489,7 @@ export async function readFileAtHead(worktreePath: string, relpath: string): Pro
     );
   }
   if (probe.stdout.trim().length === 0) return undefined; // genuinely absent at HEAD (locale-independent)
-  const { exitCode, stdout, stderr } = await runGitStatus(['show', `HEAD:${relpath}`], worktreePath);
+  const { exitCode, stdout, stderr } = await runGitStatus(['show', `HEAD:${relpath}`], worktreePath, {}, timeoutMs);
   if (exitCode === 0) return stdout;
   throw new WorktreeError(
     'git_command_failed',
