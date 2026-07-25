@@ -75,6 +75,7 @@ import {
   type EventOfType,
   type EventPayloads,
   type LimitClassification,
+  type NotServiceOwned,
   type SpecDraftRef,
 } from '../domain/events.js';
 import {
@@ -282,6 +283,27 @@ export class WorkflowDispatchIngestError extends Error {
   }
 }
 
+/**
+ * B2 round 3 (codex F1/F2 re-open) — `spec.approved` was handed to the PUBLIC
+ * `ingest`, which appends transitions without any approval binding. Approval is
+ * a service VERB: `approve` (explicit) and the auto-approval folded into
+ * `completeCoordinationRound`. This refusal is the outer layer; the guard that
+ * actually cannot be routed around lives on the transition itself.
+ */
+export class SpecApprovalIngestError extends Error {
+  override readonly name: string = 'SpecApprovalIngestError';
+  readonly runId: RunId;
+  constructor(runId: RunId) {
+    super(
+      `ingest: 'spec.approved' cannot be ingested directly for run ${runId} — approval is a service ` +
+        `verb. Call approve(runId, {specVersionId, specHash, mode?}), or let ` +
+        `completeCoordinationRound sign it under a run pinned to approval='auto'. Both bind the exact ` +
+        `drafted SpecVersion; a hand-built T1 binds whatever it was handed.`,
+    );
+    this.runId = runId;
+  }
+}
+
 /** Why the SERVICE refused a T1 approval (B2 round 2, codex F1/F2). */
 export type SpecApprovalRefusalReason =
   /** `mode:'auto'` on a run NOT pinned to `approval:'auto'`. */
@@ -292,6 +314,8 @@ export type SpecApprovalRefusalReason =
   | 'spec_draft_stale'
   /** The caller named a version/hash that is not the completed draft's. */
   | 'approved_binding_mismatch'
+  /** `mode:'auto'` on a run with NO durable coordinator-completion record. */
+  | 'auto_approve_without_completion'
   /** The T1 that must accompany a durable coordinator completion did not apply. */
   | 'auto_approve_rejected';
 
@@ -1598,13 +1622,33 @@ export class OrchestrationService {
    * `advanceWorkflowPhase` is its only legal producer). No source bypasses
    * this method.
    */
-  ingest(event: DomainEvent): IngestResult {
+  ingest<E extends DomainEvent>(event: NotServiceOwned<E>): IngestResult {
+    // `NotServiceOwned` already made a precisely-typed service-owned event a
+    // COMPILE error; widen back here to serve JavaScript and `as DomainEvent`
+    // callers, who meet the runtime refusal instead.
+    const raw = event as DomainEvent;
     // W2-0: `workflow.dispatch.advanced` has exactly one legal producer —
     // `advanceWorkflowPhase` (which validates edge + phase + suspension
     // before appending). Public ingest refuses it with a typed error.
-    if (event.type === 'workflow.dispatch.advanced') {
-      throw new WorkflowDispatchIngestError(event.runId);
+    if (raw.type === 'workflow.dispatch.advanced') {
+      throw new WorkflowDispatchIngestError(raw.runId);
     }
+    // B2 round 3: same rule for T1. Approval is a service verb — see
+    // `SpecApprovalIngestError`. NOTE this refusal is defense in depth, not the
+    // gate: `#ingestTransition` asserts the binding for every T1 it applies, so
+    // deleting this line would still not let anything reach `approved`
+    // unvalidated.
+    if (raw.type === 'spec.approved') {
+      throw new SpecApprovalIngestError(raw.runId);
+    }
+    return this.#ingest(raw);
+  }
+
+  /**
+   * The un-narrowed append path, for the service's OWN producers (each of which
+   * validates its event before calling). Public callers go through `ingest`.
+   */
+  #ingest(event: DomainEvent): IngestResult {
     const row = transitionForEvent(event.type);
     if (row === undefined) {
       // W2-1/W2-3: the engine-folded supporting events (child.spawn.initiated
@@ -1643,6 +1687,13 @@ export class OrchestrationService {
    * effects fold one `alert.raised` EACH as an extra supporting event IN THE
    * SAME transaction — so an alert can never exist without its cause and the
    * rejected path (a stale-generation crash, a double-pause) appends NO alert.
+   *
+   * B2 round 3 — THE APPROVAL GATE LIVES HERE, on the STATE, not on the routes
+   * into it. Round 2 asserted the binding in `approve()` and
+   * `completeCoordinationRound()`; codex then reached `approved` through public
+   * `ingest`, which those checks never saw. Every §6.3 transition append in the
+   * engine funnels through this method, so asserting here is the one check that
+   * cannot be routed around: a caller may only avoid it by not appending T1 at all.
    */
   #ingestTransition(event: DomainEvent, alertCtx?: AlertRaisedContext): IngestResult {
     // F1 (§5x, Approach A): read + validate + append atomically. The read is
@@ -1651,6 +1702,13 @@ export class OrchestrationService {
     // ingest — an incompatible trigger is rejected against FRESH state, never
     // appended folding a stale snapshot (the old lost-update/illegal-append).
     const { written, meta: outcome } = this.#atomicEngineWrite<TransitionOutcome>(event.runId, (currentState) => {
+      // B2 round 3: inside the write lock, before the transition is applied, so
+      // the binding is validated against the SAME committed state the fold sees
+      // and a throw rolls the whole append back.
+      if (event.type === 'spec.approved') {
+        const approval = (event as EventOfType<'spec.approved'>).payload;
+        this.#assertApprovalBinding(event.runId, approval, approval.approvedBy);
+      }
       const outcome = applyTransition(currentState, event);
       if (outcome.status === 'rejected') {
         return { trigger: outcome.rejectionEvent as DomainEvent, meta: outcome };
@@ -1868,39 +1926,46 @@ export class OrchestrationService {
     await this.assertOrPinLegacyCleanWorkspace(runId);
     const mode = input.mode ?? 'human';
     // The trigger (and its id allocation) is built OUTSIDE the write lock; the
-    // VALIDATION and the append are inside one transaction (codex F2: the old
-    // code validated in the CLI, then appended in a separate transaction, so a
-    // concurrent revision could replace the draft in between).
-    const trigger = this.#trigger(
-      runId,
-      'spec.approved',
-      { specVersionId: input.specVersionId, specHash: input.specHash, approvedBy: mode },
-      opts,
-    ) as DomainEvent;
-    return this.#db.transactionImmediate(() => {
-      this.#assertApprovalBinding(runId, input, mode);
-      return this.ingest(trigger);
-    });
+    // binding assertion and the append happen together INSIDE
+    // `#ingestTransition`'s transaction (codex F2: the old code validated in
+    // the CLI, then appended in a separate transaction, so a concurrent
+    // revision could replace the draft in between). There is deliberately NO
+    // assertion call here: round 2 put one on each route and codex walked in
+    // through a route that had none. The check belongs to the transition.
+    return this.#ingestTransition(
+      this.#trigger(
+        runId,
+        'spec.approved',
+        { specVersionId: input.specVersionId, specHash: input.specHash, approvedBy: mode },
+        opts,
+      ) as DomainEvent,
+    );
   }
 
   /**
-   * B2 round 2 (codex F1/F2) — THE approval gate, at the authoritative
-   * boundary. Called inside the approving transaction by BOTH approval routes
-   * (`approve` and the auto-approval folded into `completeCoordinationRound`),
-   * so no caller — CLI, test, or future in-process component — can reach
-   * `approved` without passing it.
+   * B2 round 3 (codex F1/F2) — THE approval gate. Called from ONE place:
+   * `#ingestTransition`, for every `spec.approved` it applies, inside the write
+   * lock. Not from `approve()`, not from `completeCoordinationRound()` — those
+   * are ROUTES, and round 2's per-route checks were bypassed by a hand-built T1
+   * handed to public `ingest`. Whatever produces a T1, it lands here.
    *
-   * Two independent checks:
+   * Three checks:
    *  1. SIGNER. `mode:'auto'` is legal only on a run whose PINNED config
    *     (W1-F5) says `approval:'auto'`. A `human` run refuses it outright, so
    *     `approvedBy:'auto'` in the log can never be a lie about a run that
    *     never opted into autonomy.
-   *  2. BINDING. When the durable completion ref proves a drafting round
-   *     completed, the current draft projection AND the caller's
-   *     version+hash must both equal it — hash, version AND revision (codex
-   *     F2: hash-only detection let a superseded revision carrying the same
-   *     content hash through). A run that never completed a drafting round has
-   *     no ref to check against and keeps the pre-B2 explicit-hash path.
+   *  2. NO COMPLETION REF. Absence of a reference is not permission. The
+   *     ENGINE may never sign something it cannot prove was drafted, so
+   *     `mode:'auto'` REFUSES here (round 2 returned early — the fail-open
+   *     codex named). A HUMAN approval is still allowed: that is the
+   *     documented pre-B2 explicit-`--spec-hash` path for runs that never
+   *     completed a drafting round (pure-unit and legacy histories), and a
+   *     person typing a hash is an accountable act in a way an engine
+   *     fabricating one is not. The asymmetry is deliberate.
+   *  3. BINDING. When the durable completion ref DOES exist, the current draft
+   *     projection AND the caller's version+hash must both equal it — hash,
+   *     version AND revision (codex F2: hash-only detection let a superseded
+   *     revision carrying the same content hash through).
    */
   #assertApprovalBinding(
     runId: RunId,
@@ -1918,7 +1983,19 @@ export class OrchestrationService {
       );
     }
     const completion = this.getCoordinatorCompletion(runId);
-    if (completion === undefined) return; // never drafted (pure-unit/legacy run)
+    if (completion === undefined) {
+      if (mode === 'auto') {
+        throw new SpecApprovalRefusedError(
+          runId,
+          'auto_approve_without_completion',
+          `refusing approve: run ${runId} has NO durable coordinator-completion record, so there is no ` +
+            `drafted SpecVersion for the engine to sign. Auto-approval binds a spec a coordinator round ` +
+            `actually produced — it never signs an unbacked hash. (A human may still approve such a run ` +
+            `explicitly with --spec-hash; the engine may not.)`,
+        );
+      }
+      return; // human approval of a run that never drafted — the pre-B2 path
+    }
 
     const draft = this.getSpecDraft(runId);
     if (draft === undefined) {
@@ -2808,15 +2885,12 @@ export class OrchestrationService {
         },
       });
       if (autoApproval === undefined) return advanced;
-      // The same gate `approve` runs — this path is not privileged just
-      // because it is internal (the draft it validates is the one written
-      // three lines up, so it passes; the point is that there is ONE gate).
-      this.#assertApprovalBinding(
-        runId,
-        { specVersionId: draft.specVersionId, specHash: draft.specHash },
-        'auto',
-      );
-      const approved = this.ingest(autoApproval);
+      // Straight to the guarded transition path — no assertion call here. The
+      // gate is ON the transition (`#ingestTransition`), so this route is not
+      // privileged for being internal, and cannot drift out of sync with the
+      // other one. The draft it validates against is the one written three
+      // lines up, in this same transaction.
+      const approved = this.#ingestTransition(autoApproval);
       if (approved.status !== 'applied') {
         // Roll the WHOLE completion back rather than commit a draft whose
         // pinned auto-approval did not take: half-applied is exactly the
@@ -3378,6 +3452,39 @@ export class OrchestrationService {
     });
   }
 
+  /**
+   * B2 round 3 (codex F5) — THE single resolution point for the approval
+   * SIGNER, and the only one permitted to exist.
+   *
+   * Precedence, and the reasoning:
+   *  1. `EngineState.specApprovedBy` — folded from the T1 payload by this
+   *     build. Authoritative and free.
+   *  2. Otherwise, if a hash is bound, READ THE DURABLE EVENT. A projection
+   *     written by a pre-B2 build (or damaged since) has the hash but no
+   *     signer, and the `spec.approved` row still says exactly who signed. So
+   *     there is nothing to assume: the log is consulted, not defaulted. Only
+   *     runs in this state pay the scan.
+   *  3. Otherwise UNKNOWN — the field is ABSENT, never `'human'`. An unbacked
+   *     guess here is the false attestation codex reproduced; downstream
+   *     consumers require the value and REFUSE when it is missing, which is
+   *     the honest outcome for a projection whose approval cannot be
+   *     substantiated.
+   */
+  #resolveApprovalSigner(
+    runId: RunId,
+    state: EngineState,
+  ): { specApprovedBy?: SpecApprovalMode } {
+    if (state.specApprovedBy !== undefined) return { specApprovedBy: state.specApprovedBy };
+    if (state.approvedSpecHash === undefined) return {};
+    const events = this.#db.events.listByRun(runId);
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const event = events[i]!;
+      if (event.type !== 'spec.approved') continue;
+      return { specApprovedBy: (event as EventOfType<'spec.approved'>).payload.approvedBy };
+    }
+    return {}; // a bound hash with no approval event: UNKNOWN, never assumed
+  }
+
   /** The persisted coordinator spec draft for a run, if `start` drafted one. */
   getSpecDraft(runId: RunId): SpecDraftState | undefined {
     return this.#db.projections.get<SpecDraftState>(runId, SPEC_DRAFT_PROJECTION)?.state;
@@ -3464,15 +3571,14 @@ export class OrchestrationService {
         : {}),
       counters: state.counters,
       ...(state.approvedSpecHash !== undefined ? { approvedSpecHash: state.approvedSpecHash } : {}),
-      // B2 round 2 (codex F5): THE ONE legacy-compat point for the signer.
-      // Every T1 folded by a B2+ build carries `specApprovedBy`; a run approved
-      // by a PRE-B2 build has the hash bound but no signer, and human was then
-      // the only possible signer. Resolving it here — once, at the read
-      // boundary, tied to `approvedSpecHash` actually being bound — means every
-      // downstream consumer takes a REQUIRED, event-derived value and no other
-      // layer gets to default a missing signer to 'human'.
-      ...(state.approvedSpecHash !== undefined
-        ? { specApprovedBy: state.specApprovedBy ?? 'human' }
+      // B2 round 3 (codex F5): the signer is DERIVED FROM THE DURABLE EVENT.
+      // Round 2 mapped any missing projection signer to 'human', so codex
+      // produced a run whose log said `approvedBy:'auto'` while `status()`
+      // reported `'human'` — a false attestation in the one field that exists
+      // to tell a human whether another human reviewed the spec, which the
+      // now-required downstream fields then propagated.
+      ...(state.specApprovedBy !== undefined || state.approvedSpecHash !== undefined
+        ? this.#resolveApprovalSigner(runId, state)
         : {}),
       cost,
       budget: {

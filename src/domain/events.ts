@@ -871,6 +871,39 @@ export type EventOfType<T extends DomainEventType> = EventBase<T, EventPayloads[
 /** The `Event` entity of PLAN §6.1. */
 export type DomainEvent = { [K in DomainEventType]: EventOfType<K> }[DomainEventType];
 
+/**
+ * Events the application service OWNS: each has exactly ONE legal producer,
+ * which validates before appending, so the PUBLIC `ingest` surface refuses
+ * them.
+ *
+ *  - `workflow.dispatch.advanced` (W2-0) — `advanceWorkflowPhase` validates the
+ *    edge + phase + suspension axis first.
+ *  - `spec.approved` (B2 round 3) — approval is a service VERB (`approve`, and
+ *    the auto-approval folded into `completeCoordinationRound`), never an
+ *    ingestible transition. Codex reproduced the entire approval gate being
+ *    bypassed by handing a hand-built T1 to public `ingest`: a human-pinned,
+ *    draft-less run reached `approved` with a fabricated hash and a durable
+ *    `approvedBy:'auto'`.
+ *
+ * Refusing them here is only the OUTER layer. The load-bearing guard is on the
+ * transition itself (`#ingestTransition` asserts the approval binding for every
+ * T1 it applies, whatever produced it), because guarding the routes is a list
+ * you must keep complete forever and guarding the state is one you cannot forget.
+ */
+export type ServiceOwnedEventType = 'workflow.dispatch.advanced' | 'spec.approved';
+
+/**
+ * Compile-time half of that refusal. A caller holding a PRECISELY typed
+ * service-owned event (`EventOfType<'spec.approved'>`) cannot pass it to
+ * `ingest` at all — the parameter resolves to `never`. A caller that has
+ * deliberately widened to `DomainEvent` (`as DomainEvent`, or JavaScript) still
+ * compiles and meets the runtime refusal instead; past that it meets the
+ * transition-level assertion, which nothing can route around.
+ */
+export type NotServiceOwned<E extends DomainEvent> = E['type'] extends ServiceOwnedEventType
+  ? never
+  : E;
+
 // ---------------------------------------------------------------------------
 // Construction helpers
 // ---------------------------------------------------------------------------

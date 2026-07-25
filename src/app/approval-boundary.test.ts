@@ -41,8 +41,16 @@ import type { DriverKind } from '../persistence/index.js';
 import { parseEngineConfig } from '../config/loader.js';
 import type { EngineConfig } from '../config/schema.js';
 import { unwrap } from '../lib/result.js';
-import { OrchestrationService, SpecApprovalRefusedError, type RoleAdapterFactory } from './service.js';
-import { SPEC_DRAFT_PROJECTION, type SpecDraftState } from './projections.js';
+import {
+  OrchestrationService,
+  SpecApprovalIngestError,
+  SpecApprovalRefusedError,
+  type RoleAdapterFactory,
+} from './service.js';
+import { ENGINE_STATE_PROJECTION, SPEC_DRAFT_PROJECTION, type SpecDraftState } from './projections.js';
+import { draftEvent, type DomainEvent, type EventOfType } from '../domain/events.js';
+import { idempotencyKey } from '../domain/ids.js';
+import type { Clock } from '../lib/clock.js';
 
 const CLAUDE_LOW = { harness: 'claude', model: 'opus', effort: 'low' } as const;
 
@@ -137,6 +145,32 @@ async function runWithCompletedDraft(
 
 function approvalEvents(db: TestDatabaseHandle['db'], runId: RunId): readonly { payload: unknown }[] {
   return db.events.listByRun(runId).filter((e) => e.type === 'spec.approved');
+}
+
+/**
+ * B2 round 3: codex's bypass — a hand-built T1 handed straight to public
+ * `ingest`, which appends transitions and never saw round 2's per-route checks.
+ * `as DomainEvent` is exactly how a real bypass would be written (and how the
+ * ~70 existing `ingest` call sites are written); the PRECISELY typed form is a
+ * compile error, which `ingest-type-guard.test-d.ts` cannot express in vitest,
+ * so it is asserted by the `@ts-expect-error` below.
+ */
+function handBuiltApproval(
+  runId: RunId,
+  input: { readonly specVersionId: string; readonly specHash: string; readonly approvedBy: 'human' | 'auto' },
+  key: string,
+): DomainEvent {
+  return draftEvent({
+    type: 'spec.approved',
+    runId,
+    payload: {
+      specVersionId: toSpecVersionId(input.specVersionId),
+      specHash: toSpecHash(input.specHash),
+      approvedBy: input.approvedBy,
+    },
+    idempotencyKey: idempotencyKey(key),
+    occurredAt: '2026-07-25T00:00:00.000Z' as ReturnType<Clock['nowIso']>,
+  }) as DomainEvent;
 }
 
 const DRIVER_KINDS = await availableDriverKinds();
@@ -331,5 +365,199 @@ describe.each(DRIVER_KINDS)('B2 F3 — auto-approval is part of the durable comp
     expect(String(service.status(runId).approvedSpecHash)).toBe('hash_1');
     expect(service.getSpecDraft(runId)?.specVersionId).toBe('spec_1');
     expect(approvalEvents(db, runId)).toHaveLength(1);
+  });
+});
+
+// ===========================================================================
+// B2 ROUND 3 — the bypass codex found: public `ingest()`
+//
+// Round 2 asserted the binding in `approve()` and `completeCoordinationRound()`.
+// Codex walked past both by handing a hand-built T1 to public `ingest`, which
+// appends transitions and never saw those checks. Round 3's answer is to guard
+// the STATE: `#ingestTransition` asserts for EVERY `spec.approved` it applies,
+// whatever produced it. These tests drive the attack itself.
+// ===========================================================================
+describe.each(DRIVER_KINDS)('B2 round 3 — T1 is unreachable unvalidated [%s]', (kind) => {
+  it('CODEX REPRO: a hand-built T1 through public ingest() cannot auto-approve a human-pinned, draft-less run', async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = runAtGateWithoutDraft(service);
+
+    expect(() =>
+      service.ingest(
+        handBuiltApproval(
+          runId,
+          { specVersionId: 'spec_fabricated', specHash: 'totally-made-up-hash', approvedBy: 'auto' },
+          'bypass_1',
+        ),
+      ),
+    ).toThrow(SpecApprovalIngestError);
+
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+    expect(service.status(runId).approvedSpecHash).toBeUndefined();
+    expect(service.status(runId).specApprovedBy).toBeUndefined();
+    expect(approvalEvents(db, runId)).toHaveLength(0);
+  });
+
+  it('CODEX REPRO: a hand-built T1 through ingest() cannot approve a STALE revision sharing the completion hash', async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = await runWithCompletedDraft(service, {
+      ...draftFor(2),
+      specHash: toSpecHash('hash_shared'),
+    });
+    db.projections.save(runId, SPEC_DRAFT_PROJECTION, {
+      ...draftFor(1),
+      specHash: toSpecHash('hash_shared'),
+    });
+
+    expect(() =>
+      service.ingest(
+        handBuiltApproval(
+          runId,
+          { specVersionId: 'spec_1', specHash: 'hash_shared', approvedBy: 'human' },
+          'bypass_2',
+        ),
+      ),
+    ).toThrow(SpecApprovalIngestError);
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+    expect(approvalEvents(db, runId)).toHaveLength(0);
+  });
+
+  it('the gate is on the TRANSITION, not on the door: approve() carries no check of its own and still refuses', async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+
+    // `approve()` no longer asserts anything itself — round 3 deleted its
+    // route-level check and sends the trigger straight to the transition path,
+    // never through public `ingest`. So a refusal here can ONLY come from the
+    // assertion on the transition. That is what makes the bypass structural:
+    // the two producers and the public door all converge on one check.
+    await expect(
+      service.approve(runId, {
+        specVersionId: toSpecVersionId('spec_1'),
+        specHash: toSpecHash('hash_2'), // right run, wrong spec
+      }),
+    ).rejects.toBeInstanceOf(SpecApprovalRefusedError);
+    expect(approvalEvents(db, runId)).toHaveLength(0);
+
+    // …and the public door is shut for the same event type.
+    expect(() =>
+      service.ingest(
+        handBuiltApproval(runId, { specVersionId: 'spec_1', specHash: 'hash_1', approvedBy: 'human' }, 'bypass_3'),
+      ),
+    ).toThrow(SpecApprovalIngestError);
+    expect(approvalEvents(db, runId)).toHaveLength(0);
+  });
+
+  // NOTE ON ENFORCEMENT: this assertion is carried by `npm run typecheck`, not
+  // by vitest — vitest does not typecheck, so at RUNTIME this test is trivially
+  // true. Its teeth are the `@ts-expect-error` directive: tsc reports TS2578
+  // "Unused '@ts-expect-error' directive" if the call below ever becomes legal,
+  // so a regression in the compile-time guard FAILS the typecheck gate.
+  it('a PRECISELY typed spec.approved event is a COMPILE error at ingest() (enforced by tsc, not vitest)', () => {
+    const event = undefined as unknown as EventOfType<'spec.approved'>;
+    const svc = undefined as unknown as OrchestrationService;
+    // @ts-expect-error -- B2 round 3: `NotServiceOwned` resolves the parameter
+    // to `never` for a precisely-typed service-owned event.
+    const refused = (): unknown => svc.ingest(event);
+    expect(typeof refused).toBe('function');
+  });
+
+  it('every other event type still ingests normally through the public surface', async () => {
+    const { service } = await setup(kind, HUMAN_CONFIG());
+    const runId = runAtGateWithoutDraft(service);
+    // A plain supporting event — the guard must be surgical, not a blanket ban.
+    const result = service.ingest(
+      draftEvent({
+        type: 'notify.requested',
+        runId,
+        payload: { topic: 'merge_ready', message: 'round-3 guard is surgical' },
+        idempotencyKey: idempotencyKey('surgical_1'),
+        occurredAt: '2026-07-25T00:00:00.000Z' as ReturnType<Clock['nowIso']>,
+      }) as DomainEvent,
+    );
+    expect(result.status).toBe('recorded');
+  });
+});
+
+// ===========================================================================
+// B2 ROUND 3 — F5: the signer is derived from the durable EVENT
+// ===========================================================================
+describe.each(DRIVER_KINDS)('B2 round 3 — the approval signer never lies [%s]', (kind) => {
+  it('CODEX REPRO: a durable approvedBy:\'auto\' event is NEVER reported as \'human\' when the projection loses the signer', async () => {
+    const { service, db } = await setup(kind, AUTO_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    expect(service.status(runId).specApprovedBy).toBe('auto');
+
+    // Damage the projection exactly as an older build would have left it:
+    // hash bound, signer absent. Round 2 answered 'human' here.
+    const record = db.projections.get<Record<string, unknown>>(runId, ENGINE_STATE_PROJECTION);
+    expect(record).toBeDefined();
+    const { specApprovedBy: _dropped, ...withoutSigner } = record!.state;
+    db.projections.save(runId, ENGINE_STATE_PROJECTION, withoutSigner, record!.eventCursor);
+
+    // The LOG still says who signed, so that is what is reported.
+    expect(service.status(runId).specApprovedBy).toBe('auto');
+    const signedBy = (
+      db.events.listByRun(runId).find((e) => e.type === 'spec.approved')?.payload as {
+        approvedBy: string;
+      }
+    ).approvedBy;
+    expect(service.status(runId).specApprovedBy).toBe(signedBy);
+  });
+
+  it('a bound hash with NO approval event is UNKNOWN — absent, never \'human\'', async () => {
+    const { service, db } = await setup(kind, HUMAN_CONFIG());
+    const runId = await runWithCompletedDraft(service, draftFor(1));
+    await service.approve(runId, {
+      specVersionId: toSpecVersionId('spec_1'),
+      specHash: toSpecHash('hash_1'),
+    });
+    expect(service.status(runId).specApprovedBy).toBe('human');
+
+    // Strip BOTH the folded signer and the event that could substantiate it.
+    const record = db.projections.get<Record<string, unknown>>(runId, ENGINE_STATE_PROJECTION);
+    const { specApprovedBy: _dropped, ...withoutSigner } = record!.state;
+    db.projections.save(runId, ENGINE_STATE_PROJECTION, withoutSigner, record!.eventCursor);
+    db.driver.prepare('DELETE FROM events WHERE run_id = ? AND type = ?').run([String(runId), 'spec.approved']);
+
+    // Unsubstantiated approval: report nothing rather than assert a human.
+    expect(service.status(runId).specApprovedBy).toBeUndefined();
+    expect(service.status(runId).approvedSpecHash).toBeDefined();
+  });
+
+  it('an unapproved run reports no signer at all', async () => {
+    const { service } = await setup(kind, HUMAN_CONFIG());
+    const runId = runAtGateWithoutDraft(service);
+    expect(service.status(runId).specApprovedBy).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// B2 ROUND 3 — the fail-open codex named: no completion ref is not permission
+// ===========================================================================
+describe.each(DRIVER_KINDS)('B2 round 3 — absence of a completion ref refuses the ENGINE [%s]', (kind) => {
+  it("mode:'auto' on a run with NO durable completion record is REFUSED", async () => {
+    const { service, db } = await setup(kind, AUTO_CONFIG());
+    const runId = runAtGateWithoutDraft(service); // no drafting round ever completed
+    await expect(
+      service.approve(runId, {
+        specVersionId: toSpecVersionId('spec_x'),
+        specHash: toSpecHash('hash_x'),
+        mode: 'auto',
+      }),
+    ).rejects.toMatchObject({ reason: 'auto_approve_without_completion' });
+    expect(service.status(runId).phase).toBe('awaiting_approval');
+    expect(approvalEvents(db, runId)).toHaveLength(0);
+  });
+
+  it('a HUMAN approval of the same run is still allowed (the documented pre-B2 explicit-hash path)', async () => {
+    const { service } = await setup(kind, AUTO_CONFIG());
+    const runId = runAtGateWithoutDraft(service);
+    const applied = await service.approve(runId, {
+      specVersionId: toSpecVersionId('spec_x'),
+      specHash: toSpecHash('hash_x'),
+    });
+    expect(applied.status).toBe('applied');
+    expect(service.status(runId).specApprovedBy).toBe('human');
   });
 });

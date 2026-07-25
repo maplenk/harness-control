@@ -6,11 +6,13 @@ which is NOT the tip of `main` at the time of writing (`main` is at `5669d22`, F
 numbers below are measured against `a77f3da`.
 Spec: `docs/AUTONOMOUS-BASE-PLAN.md` §1 + B2. Invariant reversal recorded in `PLAN.md` §7.1.
 
-> **ROUND 2 (post-codex review of `c45eccf`).** Codex returned NEEDS-FIX with five findings and
-> REPRODUCED every one. Sections 1–5 below describe round 1; **§6 is the round-2 record and
-> supersedes them wherever they disagree** — in particular the approval gate moved from the CLI to
-> the service, auto-approval moved into the coordinator-completion transaction, the signer became
-> required end to end, and the §7 testability gate acquired a structural companion. Read §6 first.
+> **READ §7 FIRST, THEN §6.** Sections 1–5 describe round 1 and are superseded in places.
+> **§6** is the round-2 record (codex review of `c45eccf`: five findings, all reproduced). **§7** is
+> the round-3 record (re-review of `52362b7`: F3/F4 confirmed fixed, F1/F2/F5 NOT-fixed because
+> round 2 guarded the routes into the approval state instead of the state itself). Where they
+> disagree, the later section wins — in particular the approval gate now lives on the T1 TRANSITION,
+> not on `approve()`/`completeCoordinationRound()`, and the signer is read from the durable event
+> rather than defaulted.
 
 ---
 
@@ -430,3 +432,110 @@ exercised). Newly relevant:
 - **§5's guard analysis is now partly superseded.** Its "criteria that are concrete but trivial"
   bullet described the hole F4 fixes structurally; the residual (a vacuous criterion citing a real
   command) is restated above. Its F13/B1 ordering warning still stands unchanged.
+
+---
+
+## 7. ROUND 3 — "guard the state, not the routes"
+
+Codex re-reviewed `52362b7`. **F3 and F4 CONFIRMED** (atomic completion + rollback correct; deleting
+the unreachable recovery test correct; auto requires a non-empty allowlist, exact matching, persisted
+per run; both residuals ruled not merge-blocking). **F1, F2 and F5 NOT-FIXED**, all three for one
+reason:
+
+> Round 2 guarded the ROUTES (`approve()`, `completeCoordinationRound()`). Public `ingest()` also
+> appends transitions, and it saw none of those checks.
+
+Codex reproduced the original attack straight through it: a human-pinned, draft-less run reaching
+`approved` with a fabricated hash and a durable `approvedBy:'auto'`; and approval of a stale revision
+sharing the completion's hash. It named the pattern — the same one that took four rounds on the grok
+payload veto — and forbade a third call-site check.
+
+### The fix: one check, on the transition
+
+`#assertApprovalBinding` is now called from **exactly one place**: inside `#ingestTransition`
+(`src/app/service.ts:1685`), in the write-locked callback, for every `spec.approved` it applies —
+whatever produced it. Round 2's per-route calls in `approve()` and `completeCoordinationRound()` were
+**deleted**, not supplemented. Every §6.3 transition append in the engine funnels through that one
+method (3 call sites, all internal), so the only way to avoid the assertion is to not append a T1.
+
+Three layers, outermost to innermost:
+
+| Layer | Mechanism | Defeated by |
+| --- | --- | --- |
+| Compile | `ingest<E extends DomainEvent>(event: NotServiceOwned<E>)` — a precisely typed `EventOfType<'spec.approved'>` resolves the parameter to `never` (`src/domain/events.ts`) | widening to `DomainEvent` first |
+| Runtime | public `ingest` throws `SpecApprovalIngestError`, mirroring the established `WorkflowDispatchIngestError` precedent | calling an internal producer |
+| **State** | **`#ingestTransition` asserts the binding for every T1 it applies** | **nothing — this is the append path** |
+
+The conditional-type trick was chosen because it costs zero churn: the ~70 existing
+`ingest(… as DomainEvent)` call sites keep compiling (widening is deliberate there), while a caller
+holding the precise type cannot compile at all. `Exclude<DomainEvent, …>` on the parameter would have
+broken all 70 and bought nothing the runtime layer does not already cover.
+
+**Enforcement note, stated because it is easy to overclaim:** the compile-time layer is enforced by
+`npm run typecheck`, NOT by vitest — vitest does not typecheck. Its teeth are the `@ts-expect-error`
+in `approval-boundary.test.ts`: tsc reports TS2578 "Unused '@ts-expect-error' directive" the moment
+that call becomes legal, so a regression fails the typecheck gate. Verified empirically that tsc does
+flag unused directives.
+
+### The fail-open (service.ts:1920)
+
+Round 2 returned early when there was no completion ref. Codex: *absence of a reference is not
+permission, it is the case that must refuse hardest.* Now:
+- `mode:'auto'` with no completion ref → **REFUSED** (`auto_approve_without_completion`). The engine
+  never signs a hash it cannot prove a coordinator round produced.
+- `mode:'human'` with no completion ref → still allowed. This is the documented pre-B2
+  explicit-`--spec-hash` path for pure-unit and legacy histories, and a person typing a hash is an
+  accountable act in a way an engine fabricating one is not. **The asymmetry is deliberate and
+  commented as such** — flagging it plainly rather than claiming the fail-open is fully closed.
+
+### F5 — the signer is read from the durable event, never defaulted
+
+Round 2 mapped ANY missing projection signer to `'human'`, so codex produced a run whose log said
+`approvedBy:'auto'` while `status()` reported `'human'` — and the now-required downstream fields
+propagated it. That is worse than a missing value: it is a false attestation in the single field that
+exists to tell a human whether another human reviewed the spec.
+
+`#resolveApprovalSigner` (`src/app/service.ts`) is the one resolution point:
+1. `EngineState.specApprovedBy` when folded by this build (free, authoritative);
+2. else, if a hash is bound, **read the `spec.approved` event from the log** — a pre-B2 projection
+   has no signer but the event still says who signed, so nothing is assumed. Only runs in this state
+   pay the scan;
+3. else **UNKNOWN — the field is absent, never `'human'`.** Downstream requires it and the CLI
+   refuses (`approval_signer_missing`), which is the honest outcome for an approval that cannot be
+   substantiated.
+
+### Round-3 fails-on-parent proof (parent `52362b7`)
+
+Same isolated-tree method; the tests drive codex's bypass through `ingest()` directly, not the CLI.
+
+| What | Parent failure (verbatim) |
+| --- | --- |
+| F1 bypass via `ingest()` | `expected [Function] to throw an error` — the hand-built T1 was ACCEPTED |
+| F2 bypass via `ingest()` (stale revision, shared hash) | `expected [Function] to throw an error` |
+| F5 signer lie | `expected 'human' to be 'auto'` — the durable `approvedBy:'auto'` event reported as human |
+| F5 unsubstantiated | `expected 'human' to be undefined` |
+| Fail-open | `promise resolved "{ status: 'applied', …(3) }" instead of rejecting` |
+
+Passing on the parent, correctly: the compile-time test (a runtime no-op — see the enforcement note),
+"every other event type still ingests" (the guard must be surgical), "an unapproved run reports no
+signer", and "a HUMAN approval with no completion ref is still allowed" — all unchanged behaviour.
+
+**Green bar after round 3:** `npm run typecheck` exit 0; `npx vitest run` → **108 files / 2012 tests,
+0 failed** (round 2: 108 / 1992).
+
+### Also corrected (codex, non-blocking)
+
+`README.md:115`, `PLAN.md:192` and `src/cli/commands.ts:963` still said human approval was the
+only/always production path. True before B2, false after. All three now name both paths and keep
+`--test-approve` distinct from each.
+
+### Round-3 judgement calls
+
+- **Deleted the route-level checks rather than keeping them as belt-and-braces.** Two checks that can
+  drift is the failure mode being fixed; one check that everything reaches is the point. `approve()`
+  now carries none, and a test asserts it still refuses — which is only possible if the transition is
+  doing the work.
+- **Conditional-type parameter over `Exclude`.** Zero churn, and it targets exactly the caller who
+  knows what they are passing. A caller who has already erased the type is caught one layer down.
+- **The human/engine asymmetry on a missing completion ref** (above) — the one place I did not
+  "refuse hardest", with the reasoning stated rather than buried.

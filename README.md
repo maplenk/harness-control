@@ -112,9 +112,11 @@ harness-orchestrator start --workspace /path/to/repo \
 # 2b. Optional revision round before approving:
 harness-orchestrator spec revise RUN_ID --feedback "Tighten AC-2; no new deps"
 
-# 3. Explicit human approval — the ONLY production approval path. The hash
-#    binds the exact SpecVersion; omit --spec-hash to bind the drafted spec's
-#    hash, or pass it to have it validated against the draft.
+# 3. Explicit human approval — the DEFAULT production approval path (the other
+#    is the engine signing on a run configured approval:"auto", which already
+#    happened during `start`). The hash binds the exact SpecVersion; omit
+#    --spec-hash to bind the drafted spec's hash, or pass it to have it
+#    validated against the draft.
 harness-orchestrator approve RUN_ID --spec-version SPEC_ID --spec-hash HASH
 
 # 4. Drive implement → verify → (bounded remediation) → merge-readiness.

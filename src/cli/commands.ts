@@ -960,9 +960,10 @@ async function handleApprove(
   if (cmd.testApprove) {
     if (env.HARNESS_TEST_MODE !== '1') {
       const text =
-        'refusing --test-approve: HARNESS_TEST_MODE=1 is not set. Explicit human approval is the ' +
-        'only production approval path (PLAN §4.1/§18); --test-approve exists solely for automated ' +
-        'acceptance runs.';
+        'refusing --test-approve: HARNESS_TEST_MODE=1 is not set. The production approval paths are ' +
+        "explicit human approval (the default) and, on a run pinned approval:'auto', the engine " +
+        'signing the REAL drafted hash (PLAN §4.1/§7.1/§18). --test-approve is neither: it exists ' +
+        'solely for automated acceptance runs, and it alone may bind a synthetic hash.';
       return finish('approve', { runId: cmd.runId, refused: 'test_approve_guard', detail: text }, text, 2);
     }
     // Bind the REAL draft hash when a draft exists (W1-F3); the synthetic
