@@ -16,6 +16,8 @@
  * - `projections.ts`: EngineState reducer + UI vocabulary projection.
  * - `process-registry-store.ts`: W2-6 durable §14 identity store (SQLite
  *   projection layer) backing the supervisor's startup orphan reaping.
+ * - `commands/`: application-neutral command surface (§3A.1) — intents,
+ *   CommandContext envelope, typed results, and the shared executor.
  */
 export * from './service.js';
 export * from './alerts.js';
@@ -26,3 +28,4 @@ export * from './cost.js';
 export * from './projections.js';
 export * from './process-registry-store.js';
 export * from './desired-model-store.js';
+export * from './commands/index.js';
