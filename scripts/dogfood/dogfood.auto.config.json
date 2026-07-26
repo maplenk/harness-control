@@ -1,0 +1,15 @@
+{
+  "approval": "auto",
+  "memory": {
+    "perRole": {
+      "implementor": { "budgetMb": 2048 }
+    }
+  },
+  "verification": {
+    "allowedCommands": [
+      "npm run typecheck",
+      "npm run build",
+      "npx vitest run"
+    ]
+  }
+}

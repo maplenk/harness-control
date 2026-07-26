@@ -2328,6 +2328,20 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
     ...(st.resumeReentryPending !== undefined ? { resumeReentryPending: st.resumeReentryPending } : {}),
     counters: st.counters,
     ...(st.approvedSpecHash !== undefined ? { approvedSpecHash: st.approvedSpecHash } : {}),
+    // B2: WHO signed the T1 that bound `approvedSpecHash` — `'human'` (an
+    // operator ran `approve`) or `'auto'` (the engine signed under a run pinned
+    // to `approval:'auto'`). Reported here because `status` is the only surface
+    // an UNATTENDED runner can branch on: without it a script wanting to skip a
+    // redundant `approve` would have to infer the signer from the config it
+    // passed, which is exactly the inference the pinned mode exists to remove.
+    //
+    // ABSENT means UNKNOWN, never 'human'. `specApprovedBy` is NOT present
+    // exactly when `approvedSpecHash` is: a pre-B2 approval binds a hash the
+    // log cannot attribute, and `run`/`recheck` REFUSE on that. Emitting a
+    // default here would manufacture the false attestation those refusals
+    // exist to prevent — so the key is simply omitted, same as every other
+    // consumer treats it.
+    ...(st.specApprovedBy !== undefined ? { specApprovedBy: st.specApprovedBy } : {}),
     ...(st.goal !== undefined ? { goal: st.goal } : {}),
     ...(st.workspacePath !== undefined ? { workspacePath: st.workspacePath } : {}),
     planningChatEnabled:
