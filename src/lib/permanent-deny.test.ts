@@ -313,7 +313,14 @@ describe('unparseable payloads never reach the permissive default', () => {
     expectUnprovable('ls { x }');
     expectUnprovable("ls 'unterminated"); // unbalanced quote
     expectUnprovable('ls x'); // control byte
-    expectUnprovable('ls # comment');
+    // `ls # comment` USED to be listed here. It was never an example of the
+    // rule this test states -- the tokenizer can read it perfectly well; it is
+    // `ls` followed by a POSIX comment, which executes nothing. The scanner
+    // simply rejected `#` outright, so any command carrying an explanatory
+    // comment was unclassifiable and therefore DENIED, and that ended real
+    // implementor rounds with no deliverable. The rule is unchanged and every
+    // genuinely unreadable form above still denies; only this example moved.
+    // Both directions now live in the comment test below.
     expectUnprovable(`ls ${'a'.repeat(9000)}`); // over the byte bound
     // …and the SAFE null redirections still pass, because they name no file.
     expectAdmissible('git status 2>&1');
@@ -397,5 +404,42 @@ describe('the posture is a value with one producer', () => {
     // per-criterion commands travel that path, and spec §5 removes the
     // implementor's list separately. Pinned so the next reader sees a decision.
     expect(permanentDenyGatesExactAllowlist).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POSIX comments — readable, not unparseable.
+//
+// A `#` that STARTS A WORD outside quotes begins a comment: everything after it
+// executes nothing. The scanner used to reject `#` outright, which made a
+// command like `# check state` or `ls -la  # look around` unclassifiable and
+// therefore denied. Agents write comments constantly, and this cost implementor
+// rounds on run_6c3ff460 before it was traced.
+//
+// The word-start condition mirrors the shell exactly: in `ls a#b` the `#` is an
+// ordinary filename byte. And a trailing comment must never LAUNDER whatever
+// precedes it — the segment before the `#` is still classified.
+// ---------------------------------------------------------------------------
+describe('POSIX comments are read, not refused', () => {
+  it('admits a command carrying an explanatory comment', () => {
+    expectAdmissible('ls -la   # look around');
+    expectAdmissible('git status --short && git log -3 --oneline  # check state');
+  });
+
+  it('admits a comment-only command, which executes nothing at all', () => {
+    expectAdmissible('# read-only inspection of worktree git state');
+  });
+
+  it('treats a `#` that does NOT start a word as an ordinary byte', () => {
+    expectAdmissible('ls a#b');
+    expectAdmissible("echo 'a#b'");
+  });
+
+  it('REFUSES what precedes the comment — a trailing comment launders nothing', () => {
+    expectDenied('rm -rf src   # cleanup', 'destructive_delete');
+    expectDenied('sudo rm x # oops', 'privilege_escalation');
+    expectDenied("bash -c 'x' # hi", 'opaque_evaluator');
+    // Still unreadable, so still refused — via `unprovable`, as it was before.
+    expectUnprovable('ls > out.txt # write');
   });
 });

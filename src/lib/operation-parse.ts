@@ -144,6 +144,7 @@ export function splitShellSegments(command: string): readonly string[] | undefin
   const segments: string[] = [];
   let quote: "'" | '"' | undefined;
   let start = 0;
+  let commentConsumedTail = false;
   const push = (end: number): boolean => {
     const segment = command.slice(start, end).trim();
     if (segment.length === 0) return false;
@@ -180,7 +181,26 @@ export function splitShellSegments(command: string): readonly string[] | undefin
       quote = char;
       continue;
     }
-    if (char === '<' || char === '#' || char === '(' || char === ')' || char === '{' || char === '}') {
+    // A `#` that STARTS A WORD outside quotes begins a POSIX comment: everything
+    // to end-of-line is not a command and cannot execute. Skipping it is strictly
+    // safer than the blanket rejection it replaces, which made any command
+    // carrying an explanatory comment unclassifiable — and therefore denied,
+    // ending the implementor's round with no deliverable. That is a normal thing
+    // for an agent to write, and it cost several rounds before being traced.
+    //
+    // The word-start condition is load-bearing and mirrors the shell exactly: in
+    // `ls a#b` the `#` is an ordinary filename byte, not a comment, because it
+    // does not begin a word. A quoted `#` is already handled above.
+    if (char === '#' && (index === 0 || /\s/.test(command[index - 1] ?? ''))) {
+      // The comment runs to end-of-line. There are no newlines here (they are
+      // refused above), so a comment consumes the rest of the input — but the
+      // segment accumulated BEFORE it is still a real command and must be kept.
+      if (start < index && !push(index)) return undefined;
+      start = command.length;
+      commentConsumedTail = true;
+      break;
+    }
+    if (char === '<' || char === '(' || char === ')' || char === '{' || char === '}') {
       return undefined;
     }
     if (char === '&') {
@@ -215,7 +235,13 @@ export function splitShellSegments(command: string): readonly string[] | undefin
       start = index + 1;
     }
   }
-  if (quote !== undefined || !push(command.length)) return undefined;
+  // An unterminated quote is still unreadable. The trailing push is REQUIRED to
+  // yield a segment except when a comment consumed the tail — `ls -la # look`
+  // has nothing after the `#`, and a comment-only command has nothing at all.
+  // A command that is entirely a comment executes nothing, so an empty segment
+  // list is the honest parse of it, not a failure to parse.
+  if (quote !== undefined) return undefined;
+  if (!push(command.length) && !commentConsumedTail) return undefined;
   return segments;
 }
 
