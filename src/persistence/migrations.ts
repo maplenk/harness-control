@@ -53,6 +53,14 @@ export interface AppliedMigration {
  *    folds a window into one `process_sample_aggregates` row (the
  *    `ProcessSample` projection from `../domain/entities.ts`) and PRUNES the
  *    raw rows it just folded, bounding raw storage (§12.1, §19 test 31).
+ *  - `operations`: durable command operation records (§3A.2). Lifecycle
+ *    accepted → claimed → running → terminal, with UNIQUE(actor,
+ *    idempotency_key) so a retried command is idempotent rather than
+ *    duplicated. `run_id` is nullable until a `start` binds a run. Owner /
+ *    lease / heartbeat columns support reclaim of claimed|running rows
+ *    whose lease lapsed. The versioned command payload (`command_version` +
+ *    `command_json` + `command_hash`) is the re-drive input for a start that
+ *    never bound a run.
  */
 const MIGRATION_1_INIT = `
 CREATE TABLE IF NOT EXISTS runs (
@@ -135,11 +143,44 @@ CREATE TABLE IF NOT EXISTS process_sample_aggregates (
 );
 `;
 
+const MIGRATION_2_OPERATIONS = `
+CREATE TABLE IF NOT EXISTS operations (
+  operation_id TEXT PRIMARY KEY,
+  actor TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  command_version INTEGER NOT NULL,
+  command_json TEXT NOT NULL,
+  command_hash TEXT NOT NULL,
+  state TEXT NOT NULL,
+  run_id TEXT REFERENCES runs(run_id) ON DELETE CASCADE,
+  owner_pid INTEGER,
+  owner_started_at TEXT,
+  lease_expires_at TEXT,
+  heartbeat_at TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  result_json TEXT,
+  error_json TEXT,
+  accepted_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  terminal_at TEXT,
+  UNIQUE (actor, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_operations_state ON operations (state);
+CREATE INDEX IF NOT EXISTS idx_operations_run ON operations (run_id);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   {
     id: 1,
     name: 'init',
     up: (driver) => driver.exec(MIGRATION_1_INIT),
+  },
+  {
+    id: 2,
+    name: 'operations',
+    up: (driver) => driver.exec(MIGRATION_2_OPERATIONS),
   },
 ];
 
