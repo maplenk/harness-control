@@ -654,6 +654,11 @@ function exitCodeFromStatus(status: ApplicationResult['status']): number {
 /**
  * CLI-side ApplicationCommandPort: maps neutral intents back through the
  * legacy dispatch body, answering respondToPermission with unsupported_command.
+ *
+ * Before any seam option (including `--test-approve`) is applied, `execute`
+ * inspects the *actual* `CommandContext.origin` and rejects every non-`cli`
+ * origin with `cli_only_capability`. A forged or legitimately granted seam
+ * therefore cannot enable CLI-only options over HTTP.
  */
 export function cliApplicationPort(input: {
   readonly service: OrchestrationService;
@@ -664,7 +669,21 @@ export function cliApplicationPort(input: {
 }): ApplicationCommandPort {
   const { service, db, env, deps, seam } = input;
   return {
-    async execute(command, _context): Promise<ApplicationResult> {
+    async execute(command, context): Promise<ApplicationResult> {
+      // Runtime gate: refuse non-cli origins before reading seam.options.
+      if (context.origin !== 'cli') {
+        return {
+          status: 'rejected',
+          command: command.kind,
+          error: {
+            code: 'cli_only_capability',
+            message:
+              'CLI-only capability (e.g. --test-approve) requires origin "cli"; ' +
+              `received origin "${context.origin}"`,
+            details: { origin: context.origin },
+          },
+        };
+      }
       if (command.kind === 'respondToPermission') {
         return {
           status: 'rejected',

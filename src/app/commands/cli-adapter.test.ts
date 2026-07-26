@@ -4,6 +4,7 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { DeterministicIdFactory } from '../../lib/id-factory.js';
+import { isOk } from '../../lib/result.js';
 import {
   acpSessionId,
   processGenerationId,
@@ -24,6 +25,7 @@ import {
   type CommandOutput,
 } from '../../cli/commands.js';
 import type { RunCommand } from '../../cli/args.js';
+import { grantCliOnlySeam } from './cli-seam.js';
 import type { ApplicationCommand, ApplicationResult, CommandContext } from './types.js';
 import type { ApplicationCommandPort } from './executor.js';
 
@@ -346,12 +348,22 @@ describe('applicationResultFromCommandOutput / renderApplicationResult', () => {
 
   it('answers respondToPermission with unsupported_command via the CLI port', async () => {
     const { service, db } = await setup();
+    const seamResult = grantCliOnlySeam(
+      {
+        actor: 'cli:t',
+        origin: 'cli',
+        idempotencyKey: 'idem_1' as CommandContext['idempotencyKey'],
+      },
+      { json: true },
+    );
+    expect(isOk(seamResult)).toBe(true);
+    if (!isOk(seamResult)) return;
     const port = cliApplicationPort({
       service,
       db,
       env: {},
       deps: {},
-      seam: { origin: 'cli', options: { json: true } },
+      seam: seamResult.value,
     });
     const result = await port.execute(
       {

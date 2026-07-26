@@ -4,6 +4,11 @@
  *
  * The synthetic-hash approve path and the wait-policy flags live here, gated
  * by a `CliCommandContext` whose origin is literally `'cli'`.
+ *
+ * `CliOnlySeam` is an opaque branded capability: only `grantCliOnlySeam` can
+ * mint one (module-private unique-symbol brand). A plain object literal is
+ * not assignable without an explicit cast, and the CLI port still re-checks
+ * the live `CommandContext.origin` before using seam options.
  */
 import { err, ok, type Result } from '../../lib/result.js';
 import type { ApplicationError, CommandContext } from './types.js';
@@ -22,15 +27,27 @@ export interface CliInvocationOptions {
   readonly wait?: boolean;
 }
 
-/** A granted CLI-only capability (origin locked to `'cli'`). */
-export interface CliOnlySeam {
+/**
+ * Module-private brand — not re-exported as a value, not constructible
+ * outside this module without an explicit greppable cast.
+ */
+declare const CLI_ONLY_SEAM_BRAND: unique symbol;
+
+/**
+ * Opaque CLI-only capability. Constructible solely via `grantCliOnlySeam`.
+ * Callers holding a structural `{ origin: 'cli', options }` are rejected at
+ * the type level; the brand is mintable only at the grant site below.
+ */
+export type CliOnlySeam = {
+  readonly [CLI_ONLY_SEAM_BRAND]: true;
   readonly origin: 'cli';
   readonly options: CliInvocationOptions;
-}
+};
 
 /**
  * Grant the CLI-only options bag. The parameter type rejects a non-cli origin
  * at compile time; the runtime check is a backstop against a forged cast.
+ * This is the sole construction site for the `CliOnlySeam` brand.
  */
 export function grantCliOnlySeam(
   context: CliCommandContext,
@@ -47,5 +64,10 @@ export function grantCliOnlySeam(
       details: { origin },
     });
   }
-  return ok({ origin: 'cli', options });
+  // Sole mint of the opaque brand (explicit cast is greppable; nothing else
+  // in-tree constructs a CliOnlySeam).
+  return ok({
+    origin: 'cli',
+    options,
+  } as CliOnlySeam);
 }
