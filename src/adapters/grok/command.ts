@@ -3,7 +3,12 @@ import { execFileSync } from 'node:child_process';
 import { accessSync, constants, statSync } from 'node:fs';
 import * as path from 'node:path';
 import type { RoleName } from '../../domain/state.js';
-import { resolvesInsideRoot } from '../../lib/path-containment.js';
+import {
+  commandFromPermissionTitle,
+  parseShellCommandArgv,
+  pathFromStructuredFileTitle,
+} from '../../lib/operation-parse.js';
+import { escapesWorktree, isSafeGitRead } from '../../lib/permanent-deny.js';
 import { err, ok, type Result } from '../../lib/result.js';
 import { AdapterError, isAdapterError } from '../spi.js';
 import {
@@ -73,35 +78,6 @@ export function grokShellPermissionTitle(command: string): string {
   return `Execute \`${command}\``;
 }
 
-const MAX_READ_ONLY_SHELL_BYTES = 8_192;
-const MAX_READ_ONLY_SHELL_SEGMENTS = 24;
-/**
- * Redirections that cannot name a file to write.
- *
- * `>/dev/null` and friends discard; `2>&1` and `1>&2` DUPLICATE a file
- * descriptor onto another and touch the filesystem not at all — strictly safer
- * than the `/dev/null` forms already admitted here, which at least name a path.
- *
- * The `&`-forms were missing, and `2>&1` is in essentially every exploratory
- * command an agent writes. Measured on dogfood run `run_c4648778`:
- * `git show --stat <tag> 2>/dev/null` was ADMITTED while the same command with
- * `2>&1` was REFUSED, and because a compound is admitted only when every segment
- * is, one `2>&1` denied the whole request. That ended the implementor turn with
- * nothing written — three times, across the round and two resumes.
- *
- * Deliberately NOT admitted: `2>&3` or any other descriptor number. Only 1 and 2
- * are known to be the pipes the host itself created; a higher descriptor could
- * have been opened onto a file by the caller, and duplicating onto it would
- * write. Refusing those costs an agent a rewrite it can trivially do.
- */
-const SAFE_NULL_REDIRECTIONS = new Set([
-  '>/dev/null',
-  '1>/dev/null',
-  '2>/dev/null',
-  '&>/dev/null',
-  '2>&1',
-  '1>&2',
-]);
 const SAFE_SIMPLE_READ_COMMANDS = new Set([
   'cat',
   'grep',
@@ -116,7 +92,7 @@ const SAFE_SIMPLE_READ_COMMANDS = new Set([
   // `… || echo "no dir yet"`). None can mutate state: `echo`/`printf` only
   // print, `test`/`[`/`true`/`false` only evaluate, and `dirname`/`basename`
   // only parse path strings. Writes-via-redirection are already blocked by
-  // `stripSafeRedirections`, and out-of-worktree paths by `hasEscapingPathArgument`.
+  // `stripSafeRedirections`, and out-of-worktree paths by `escapesWorktree`.
   'echo',
   'printf',
   'test',
@@ -125,405 +101,13 @@ const SAFE_SIMPLE_READ_COMMANDS = new Set([
   'dirname',
   'basename',
 ]);
-/**
- * Git subcommands with NO writing form at all.
- *
- * This list was previously six entries, extended one at a time as each new
- * denial killed a paying implementor round — `git tag -l`, then `git ls-tree`.
- * That is guarding the routes instead of the state (house rule 1): every
- * individual addition was correct, and the next unlisted-but-harmless read
- * would have cost another round.
- *
- * So it is now enumerated from what git IS, not from what an agent happened to
- * try. Membership rule: the subcommand must have no argument form that mutates
- * the repository, the index, the working tree, or the network. Anything whose
- * READ and WRITE forms are distinguished only by argument shape is deliberately
- * absent — guessing read-from-write by inspecting positionals is exactly the
- * inference that turns a write into an "apparently safe" read.
- *
- * Deliberately EXCLUDED, with reasons, so nobody adds them casually:
- *   config      `--get` reads, `config k v` WRITES
- *   symbolic-ref  reads with one arg, WRITES with two
- *   hash-object   `-w` writes an object
- *   stash/worktree/remote/notes/bisect  read via a `list`/`show` SUBcommand,
- *                 write via others; the shape differs from the `-l` flag gate
- *                 used for `tag`/`branch` and needs its own handling
- *   ls-remote, fetch, clone, pull   network
- *   fsck, gc, repack, prune         maintenance; may rewrite object storage
- */
-const SAFE_GIT_READ_SUBCOMMANDS = new Set([
-  // history / content inspection
-  'diff',
-  'diff-files',
-  'diff-index',
-  'diff-tree',
-  'log',
-  'show',
-  'status',
-  'shortlog',
-  'whatchanged',
-  'blame',
-  'annotate',
-  'cherry',
-  'grep',
-  // object / ref plumbing
-  'cat-file',
-  'ls-files',
-  'ls-tree',
-  'for-each-ref',
-  'show-ref',
-  'rev-list',
-  'rev-parse',
-  'name-rev',
-  'describe',
-  'merge-base',
-  'count-objects',
-  'var',
-  'patch-id',
-  // attribute / ignore queries
-  'check-ignore',
-  'check-attr',
-  'check-mailmap',
-]);
-
-interface ShellToken {
-  readonly value: string;
-  /** The token contained AT LEAST ONE quoted span. Never sufficient on its own —
-   * see `unquotedRedirect` (BLOCKER-1). */
-  readonly quoted: boolean;
-  /**
-   * BLOCKER-1: the token contains a `>` or `<` that appeared OUTSIDE quotes,
-   * i.e. a real shell redirection OPERATOR. Tracked per CHARACTER because a
-   * token can mix quoted and unquoted spans with no whitespace between them
-   * (`echo '$HOME'>owned.txt` is ONE token), and a single whole-token `quoted`
-   * flag let such a token inherit blanket-quoted status — which
-   * `stripSafeRedirections` read as "no redirection here", classifying a real
-   * WRITE as read-only.
-   *
-   * This mirrors the shell's own rule exactly: token recognition happens BEFORE
-   * quote removal, so an operator is one that appears outside quotes. A `>` the
-   * user quoted is an ordinary argument byte and stays admissible.
-   */
-  readonly unquotedRedirect: boolean;
-}
-
-function splitShellSegments(command: string): readonly string[] | undefined {
-  if (Buffer.byteLength(command, 'utf8') > MAX_READ_ONLY_SHELL_BYTES) return undefined;
-  const segments: string[] = [];
-  let quote: "'" | '"' | undefined;
-  let start = 0;
-  const push = (end: number): boolean => {
-    const segment = command.slice(start, end).trim();
-    if (segment.length === 0) return false;
-    segments.push(segment);
-    return segments.length <= MAX_READ_ONLY_SHELL_SEGMENTS;
-  };
-
-  for (let index = 0; index < command.length; index += 1) {
-    const char = command[index];
-    if (char === undefined) return undefined;
-    // Control bytes are unacceptable in EVERY context — quoting cannot make a
-    // NUL or an embedded newline a legitimate literal.
-    if (char === '\0' || char === '\n' || char === '\r') return undefined;
-    // F11: quote state FIRST. A POSIX SINGLE-quoted span is expansion-free — the
-    // shell performs no parameter/command substitution and no escape processing
-    // inside it — so `$`, `\` and a backtick there are ordinary argument bytes,
-    // and so are `;`/`|`/`&`/`(`/`<`. Treating the span as an opaque literal is
-    // therefore exactly as safe as the old blanket rejection, and it is what
-    // makes a quoted regex (`rg -n 'a\.b|c$'`) classifiable at all. The scan
-    // still ends the span only at the closing quote, so nothing inside it can
-    // introduce a second, unclassified command.
-    if (quote === "'") {
-      if (char === "'") quote = undefined;
-      continue;
-    }
-    // OUTSIDE single quotes — including INSIDE double quotes, where the shell
-    // DOES expand — the conservative rejection is unchanged.
-    if (char === '`' || char === '$' || char === '\\') return undefined;
-    if (quote === '"') {
-      if (char === '"') quote = undefined;
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      quote = char;
-      continue;
-    }
-    if (char === '<' || char === '#' || char === '(' || char === ')' || char === '{' || char === '}') {
-      return undefined;
-    }
-    if (char === '&') {
-      // An `&` adjacent to a `>` belongs to a REDIRECTION, not to the control
-      // grammar: `2>&1` / `1>&2` duplicate a descriptor, `&>` targets both
-      // streams. Let those through as ordinary token bytes so the redirection
-      // allowlist in `stripSafeRedirections` decides them — it admits only the
-      // exact discard/duplicate forms, so `&>out.txt` is still refused there.
-      //
-      // Without this the bare-`&` rejection below fired FIRST and made every
-      // command containing `2>&1` unclassifiable. That is not theoretical: it
-      // denied three consecutive implementor turns on run_c4648778, each of
-      // which ended with nothing written, while the same commands written with
-      // `2>/dev/null` were admitted.
-      if (command[index - 1] === '>' || command[index + 1] === '>') continue;
-      // A LONE `&` still backgrounds a process, which is outside anything this
-      // classifier can reason about. Only `&&` may split a segment.
-      if (command[index + 1] !== '&' || !push(index)) return undefined;
-      index += 1;
-      start = index + 1;
-      continue;
-    }
-    if (char === '|') {
-      const width = command[index + 1] === '|' ? 2 : 1;
-      if (!push(index)) return undefined;
-      index += width - 1;
-      start = index + 1;
-      continue;
-    }
-    if (char === ';') {
-      if (!push(index)) return undefined;
-      start = index + 1;
-    }
-  }
-  if (quote !== undefined || !push(command.length)) return undefined;
-  return segments;
-}
-
-function tokenizeShellSegment(segment: string): readonly ShellToken[] | undefined {
-  const tokens: ShellToken[] = [];
-  let quote: "'" | '"' | undefined;
-  let value = '';
-  let quoted = false;
-  // BLOCKER-1: per-CHARACTER provenance. Set only by a `>`/`<` seen while NOT
-  // inside quotes, so a token that mixes spans (`'$HOME'>owned.txt`) can never
-  // launder its operator through the whole-token `quoted` flag.
-  let unquotedRedirect = false;
-  const push = (): void => {
-    if (value.length === 0 && !quoted) return;
-    tokens.push({ value, quoted, unquotedRedirect });
-    value = '';
-    quoted = false;
-    unquotedRedirect = false;
-  };
-
-  for (const char of segment) {
-    // Same ordering as `splitShellSegments` (F11), for the same reason: control
-    // bytes are always fatal, a SINGLE-quoted span is an opaque literal, and
-    // everywhere else (including inside double quotes) expansion characters are
-    // still refused. The literal bytes land in the token VALUE, so the
-    // downstream checks — `stripSafeRedirections` (which only treats an
-    // UNQUOTED `>`/`<` as a redirection) and `hasEscapingPathArgument` (which
-    // inspects the resolved value, so `cat '/etc/passwd'` is still caught) —
-    // see exactly what the shell will pass to the program.
-    if (char === '\0' || char === '\n' || char === '\r') return undefined;
-    if (quote === "'") {
-      if (char === "'") quote = undefined;
-      else value += char;
-      quoted = true;
-      continue;
-    }
-    if (char === '`' || char === '$' || char === '\\') return undefined;
-    if (quote === '"') {
-      if (char === '"') quote = undefined;
-      else value += char;
-      quoted = true;
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      quote = char;
-      quoted = true;
-      continue;
-    }
-    if (/\s/u.test(char)) {
-      push();
-      continue;
-    }
-    // Unquoted (we are past every in-quote branch above): a redirection
-    // character here is a real OPERATOR, whatever else the token contains.
-    if (char === '>' || char === '<') unquotedRedirect = true;
-    value += char;
-  }
-  if (quote !== undefined) return undefined;
-  push();
-  return tokens.length > 0 ? tokens : undefined;
-}
-
-/**
- * Drop the STANDALONE safe null redirections and refuse every other redirection.
- *
- * BLOCKER-1: the decision is driven by `token.unquotedRedirect` — per-character
- * provenance — not by the whole-token `quoted` flag. A token is dropped as a
- * safe null redirection only when it is STRUCTURALLY standalone: entirely
- * unquoted AND exactly one of the allowlisted forms. `echo x'2>/dev/nul'l` is a
- * mixed token that merely resembles one, and is refused. A `>`/`<` that appeared
- * INSIDE quotes never sets the flag, so `rg -n '>' src` keeps passing it through
- * as the ordinary argument the shell will pass to the program.
- */
-function stripSafeRedirections(tokens: readonly ShellToken[]): readonly string[] | undefined {
-  const argv: string[] = [];
-  for (const token of tokens) {
-    // Q26: only a token that CARRIES a redirection operator is a candidate for
-    // being dropped. A hypothetical redirection-free allowlist entry must reach
-    // `argv` as the ordinary argument it is, never be silently stripped.
-    if (token.unquotedRedirect) {
-      if (!token.quoted && SAFE_NULL_REDIRECTIONS.has(token.value)) continue;
-      return undefined;
-    }
-    argv.push(token.value);
-  }
-  return argv.length > 0 ? argv : undefined;
-}
-
-/**
- * F14 — an argument ESCAPES when it can name something outside the agent's own
- * worktree. The predicate used to answer that with `arg.startsWith('/')`, i.e.
- * every absolute path escapes. It does not: the implementor prompt hands the
- * agent its worktree BY ABSOLUTE PATH ("You may create, modify, or delete files
- * ONLY inside your assigned worktree: <abs>"), so the engine named a path and
- * then denied every command that used it. A denied permission ends the turn
- * before the work is committed, so the run dies `no_deliverable` — four dogfood
- * runs were lost to it, the last (run_60ccbfda) on nothing but
- * `ls -la <worktree> && ls -la web …`.
- *
- * The rule now: an absolute argument is admissible IFF it RESOLVES inside
- * `worktreeRoot` — realpath containment via the nearest existing ancestor
- * (`resolvesInsideRoot`, shared with the ACP structured-write rule). Everything
- * else is refused byte-for-byte as before:
- *
- *  - the `..` forms are still refused, and now apply to ABSOLUTE paths too
- *    (`<root>/web/../x`, `<root>/link/..`) rather than being skipped by the
- *    blanket `/` rejection they used to hide behind. Refusing more here can only
- *    cost a denial the agent can trivially rewrite; admitting a `..` we did not
- *    have to admit is how a symlink escape gets in.
- *  - `~/` (the shell would expand it to a home outside the worktree) and `=/`
- *    (an option value naming an absolute path) stay refused unconditionally.
- *
- * FAIL CLOSED: no root, a relative or unresolvable root, a path with no existing
- * ancestor, any filesystem error — all refusals. `worktreeRoot` is a REQUIRED
- * parameter (`string | undefined`) precisely so a call site must state which one
- * it has: a caller that cannot supply a root must say so, and gets today's
- * behaviour (no absolute path admissible) rather than silently getting it.
- */
-function hasEscapingPathArgument(
-  argv: readonly string[],
-  worktreeRoot: string | undefined,
-): boolean {
-  return argv.slice(1).some((arg) => {
-    if (
-      arg === '..' ||
-      arg.startsWith('../') ||
-      arg.includes('/../') ||
-      arg.endsWith('/..') ||
-      arg.startsWith('~/') ||
-      arg.includes('=/')
-    ) {
-      return true;
-    }
-    if (!arg.startsWith('/')) return false;
-    return worktreeRoot === undefined || !resolvesInsideRoot(worktreeRoot, arg);
-  });
-}
-
-/**
- * Subcommands that READ in list mode but WRITE in their bare form: `git tag -l`
- * lists tags, `git tag NAME` CREATES one; `git branch --list` lists, `git branch
- * NAME` creates. They are admitted only with an explicit list flag, because with
- * `-l`/`--list` every positional is a glob PATTERN and no form of the command
- * can create a ref.
- *
- * Found live: an implementor's first turn ran
- * `git show --stat <tag> …; git rev-parse <tag> …; git tag -l 'dogfood/*' …`.
- * Every other segment classified read-only; `git tag` was not on the list, and
- * because a compound command is admitted only when EVERY segment is, the whole
- * request was denied. The implementor treated the denial as fatal and stopped
- * with no deliverable — twice, on the round and on its resume.
- */
-const GIT_LIST_MODE_SUBCOMMANDS = new Set(['tag', 'branch']);
-const GIT_LIST_FLAGS = new Set(['-l', '--list']);
-/**
- * Present-tense refusal, not a fallback: a list flag alone is NOT sufficient,
- * because `git branch -l -d NAME` still deletes. Requiring `-l` and refusing
- * every mutating flag are two different conditions and both must hold.
- */
-const GIT_LIST_MODE_MUTATING_FLAGS = new Set([
-  '-d', '-D', '--delete',
-  '-m', '-M', '--move',
-  '-C', '--copy',
-  '-f', '--force',
-  '-a', '-s', '-u', '--annotate', '--sign', '--local-user',
-  '--edit', '--create-reflog', '--set-upstream', '--set-upstream-to', '--unset-upstream',
-]);
-
-function isSafeGitRead(argv: readonly string[]): boolean {
-  const subcommand = argv[1];
-  if (subcommand === undefined) return false;
-  if (!SAFE_GIT_READ_SUBCOMMANDS.has(subcommand)) {
-    // Not a plain read. It may still be a list-mode read — but ONLY with an
-    // explicit list flag. Absent one, refuse: `git tag v1` creates a tag, and
-    // guessing from the shape of the positionals is exactly the inference that
-    // turns a write into an "apparently safe" read.
-    if (!GIT_LIST_MODE_SUBCOMMANDS.has(subcommand)) return false;
-    const args = argv.slice(2);
-    if (!args.some((arg) => GIT_LIST_FLAGS.has(arg))) return false;
-    if (args.some((arg) => GIT_LIST_MODE_MUTATING_FLAGS.has(arg) || arg.startsWith('--set-upstream-to='))) {
-      return false;
-    }
-  }
-  return !argv.slice(2).some((arg) =>
-    arg === '-c' ||
-    arg === '--ext-diff' ||
-    arg === '--textconv' ||
-    arg === '--output' ||
-    arg.startsWith('--output=') ||
-    arg === '--exec-path' ||
-    arg.startsWith('--exec-path=') ||
-    arg === '--config-env' ||
-    arg.startsWith('--config-env=') ||
-    arg === '--git-dir' ||
-    arg.startsWith('--git-dir=') ||
-    arg === '--work-tree' ||
-    arg.startsWith('--work-tree=') ||
-    arg === '--namespace' ||
-    arg.startsWith('--namespace=') ||
-    arg === '--help' ||
-    arg === '-h'
-  );
-}
-
 function isSafeReadOnlyArgv(argv: readonly string[], worktreeRoot: string | undefined): boolean {
-  if (hasEscapingPathArgument(argv, worktreeRoot)) return false;
+  if (escapesWorktree(argv, worktreeRoot)) return false;
   if (argv[0] === 'git') return isSafeGitRead(argv);
   if (argv[0] === 'rg' && argv.slice(1).some((arg) => arg === '--pre' || arg.startsWith('--pre='))) {
     return false;
   }
   return argv[0] !== undefined && SAFE_SIMPLE_READ_COMMANDS.has(argv[0]);
-}
-
-const PERMISSION_TITLE_PREFIX = 'Execute `';
-const PERMISSION_TITLE_SUFFIX = '`';
-
-/**
- * MED-9 — recover the command from an `Execute \`…\`` title STRUCTURALLY, by
- * stripping the fixed prefix and suffix, rather than with a capture that forbade
- * backticks in the interior (`/^Execute \`([^\`\r\n]+)\`$/`).
- *
- * That capture made a literal backtick unclassifiable ANYWHERE, including inside
- * single quotes where the shell treats it as an ordinary byte — so `ls 'x\`y'`
- * could never be approved no matter how obviously read-only it is. Judging
- * interior bytes is the quote-aware scanners' job, not the wrapper's: they still
- * reject an unquoted backtick (command substitution) and every control byte.
- *
- * The prefix/suffix are exact and the interior must be non-empty, so the title
- * shape is as strictly bounded as before.
- */
-function commandFromPermissionTitle(operation: string): string | undefined {
-  const trimmed = operation.trim();
-  if (!trimmed.startsWith(PERMISSION_TITLE_PREFIX) || !trimmed.endsWith(PERMISSION_TITLE_SUFFIX)) {
-    return undefined;
-  }
-  const command = trimmed.slice(PERMISSION_TITLE_PREFIX.length, trimmed.length - PERMISSION_TITLE_SUFFIX.length);
-  // CR/LF never belong in a single-line title; the scanners reject them anyway,
-  // but keeping the check here preserves the old wrapper's guarantee exactly.
-  if (command.length === 0 || command.includes('\r') || command.includes('\n')) return undefined;
-  return command;
 }
 
 /**
@@ -546,14 +130,9 @@ export function isGrokReadOnlyShellPermissionTitle(
 ): boolean {
   const command = commandFromPermissionTitle(operation);
   if (command === undefined) return false;
-  const segments = splitShellSegments(command);
+  const segments = parseShellCommandArgv(command);
   if (segments === undefined) return false;
-  return segments.every((segment) => {
-    const tokens = tokenizeShellSegment(segment);
-    if (tokens === undefined) return false;
-    const argv = stripSafeRedirections(tokens);
-    return argv !== undefined && isSafeReadOnlyArgv(argv, worktreeRoot);
-  });
+  return segments.every((argv) => isSafeReadOnlyArgv(argv, worktreeRoot));
 }
 
 /**
@@ -666,7 +245,7 @@ function classifyGrokOperation(operation: string | undefined, rawInput: unknown)
   // (`{command: 42}`) is not an absent one — we failed to read something that
   // was there — so it can only be `unknown`.
   if (command.kind !== 'absent') return { kind: 'unknown' };
-  const titledPath = STRUCTURED_FILE_TITLE_RE.exec(operation.trim())?.[1];
+  const titledPath = pathFromStructuredFileTitle(operation);
   if (titledPath === undefined) return { kind: 'unknown' };
 
   // ...and BIND the path the title asserts. Without this the veto never compared
@@ -686,10 +265,6 @@ function classifyGrokOperation(operation: string | undefined, rawInput: unknown)
       return { kind: 'unknown' };
   }
 }
-
-/** Mirrors `isWorkspaceWriteOperation`'s title shape (see `acp/session.ts`),
- * capturing the asserted path so the payload can be bound to it. */
-const STRUCTURED_FILE_TITLE_RE = /^(?:Write|Edit) `([^`\r\n]+)`$/;
 
 export interface ResolvedGrokCommand {
   readonly command: string;

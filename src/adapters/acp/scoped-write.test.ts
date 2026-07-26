@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { admitsWorkspaceWrite, decidePermission, noPayloadToVerify } from './session.js';
 import { buildGrokMediation } from '../grok/permissions.js';
 import { writeBoundary } from '../../worktree/write-scope.js';
+import { denyByDefaultPosture } from '../../lib/permanent-deny.js';
 
 const tempDirs: string[] = [];
 afterEach(() => {
@@ -37,7 +38,7 @@ function policyFor(root: string, declaredScope?: readonly string[]) {
     mode: 'headless',
     role: 'implementor',
     verifyOperationPayload: noPayloadToVerify,
-    policy: {
+    policy: { implementorPosture: denyByDefaultPosture,
       allow: [],
       workspaceWriteBoundary: writeBoundary({
         mode: 'in_place',
@@ -118,7 +119,7 @@ describe('buildGrokMediation — the only producer', () => {
         verifyOperationPayload: noPayloadToVerify,
         mode: 'headless',
         role: 'implementor',
-        policy: { allow: [] },
+        policy: { implementorPosture: denyByDefaultPosture, allow: [] },
       },
       role: 'implementor',
       cwd: root,
@@ -143,7 +144,7 @@ describe('buildGrokMediation — the only producer', () => {
         verifyOperationPayload: noPayloadToVerify,
         mode: 'headless',
         role: 'implementor',
-        policy: { allow: [] },
+        policy: { implementorPosture: denyByDefaultPosture, allow: [] },
       },
       role: 'implementor',
       cwd: root,
@@ -167,7 +168,7 @@ describe('buildGrokMediation — the only producer', () => {
         verifyOperationPayload: noPayloadToVerify,
         mode: 'headless',
         role: 'implementor',
-        policy: { allow: [] },
+        policy: { implementorPosture: denyByDefaultPosture, allow: [] },
       },
       role: 'implementor',
       cwd: root,

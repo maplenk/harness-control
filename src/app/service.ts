@@ -233,6 +233,7 @@ import {
   type RoleTurnOrigin,
 } from './role-runner.js';
 import { noPayloadToVerify } from '../adapters/acp/session.js';
+import { denyByDefaultPosture } from '../lib/permanent-deny.js';
 import {
   COST_PROJECTION,
   ENGINE_STATE_PROJECTION,
@@ -6345,7 +6346,24 @@ export function toPermissionConfig(
     mode: 'headless',
     role,
     verifyOperationPayload: noPayloadToVerify,
-    ...(mediation.allow !== undefined ? { policy: { allow: mediation.allow } } : {}),
+    ...(mediation.allow !== undefined
+      ? {
+          policy: {
+            allow: mediation.allow,
+            // §2.4: provider-AGNOSTIC mapping, so it states the pre-§2.4
+            // posture. This function has no worktree root (it does not know
+            // where the session will run) and no knowledge of the operation
+            // TITLE SHAPE the harness will emit, and the permissive posture
+            // needs both. Provider factories layer their own posture over this,
+            // exactly as they do for `verifyOperationPayload`:
+            // `buildGrokMediation` replaces it with
+            // `permissiveImplementorPosture(cwd)`. Codex, Claude-ACP and
+            // OpenCode implementors therefore keep today's deny-by-default —
+            // an unchanged, visible, reviewable state rather than a silent one.
+            implementorPosture: denyByDefaultPosture,
+          },
+        }
+      : {}),
   };
 }
 
