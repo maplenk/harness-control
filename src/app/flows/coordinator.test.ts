@@ -669,3 +669,82 @@ describe('CoordinatorRunner — spec revise (T2)', () => {
     expect(h.prompts[1]).toContain('revision 1');
   });
 });
+
+// ===========================================================================
+// B2 × F15 — under `auto`, a criterion may only expect exit 0.
+//
+// `verification.allowedCommands` pins the command TEXT. F15's
+// `expectedExitCode` is chosen by the COORDINATOR and there is nowhere to pin
+// it. Under `approval: 'auto'` nobody reads the spec before its hash freezes,
+// so `{command: 'npx vitest run', expectedExitCode: 1}` was a criterion
+// satisfied BY THE SUITE FAILING — measured as ACCEPTED before this gate. It is
+// the codex-F4 repro (`true` + "exit code is 0") with the polarity inverted:
+// the command is no longer invented, the PASS CONDITION is.
+//
+// Scoped to `auto` deliberately (house rule 3). Under `human` a reviewer reads
+// the declared code, so nothing that works today is refused — pinned below.
+// ===========================================================================
+describe('validateCoordinatorSpec — B2 × F15 exit-code gate', () => {
+  const ALLOW = ['npx vitest run'] as const;
+
+  function specCiting(commands: readonly unknown[]): Record<string, unknown> {
+    return {
+      ...validSpec(),
+      acceptanceCriteria: [
+        {
+          id: 'AC-1',
+          description: 'the suite passes',
+          verificationCommands: commands,
+          expectedEvidence: 'exit code is 0',
+        },
+      ],
+    };
+  }
+
+  it('REFUSES a non-zero expected exit under auto-approval — the criterion would pass when the command FAILS', () => {
+    const result = validateCoordinatorSpec(
+      specCiting([{ command: 'npx vitest run', expectedExitCode: 1 }]),
+      { allowedVerificationCommands: [...ALLOW], requireZeroExitUnderAutoApproval: true },
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error[0]?.message).toMatch(/auto-approved/);
+    expect(result.error[0]?.path).toBe('acceptanceCriteria.0.verificationCommands.0');
+  });
+
+  it('ADMITS a bare string under auto-approval — exit 0 is the only provable pass', () => {
+    expect(
+      validateCoordinatorSpec(specCiting(['npx vitest run']), {
+        allowedVerificationCommands: [...ALLOW],
+        requireZeroExitUnderAutoApproval: true,
+      }).ok,
+    ).toBe(true);
+  });
+
+  it('ADMITS the object form declaring 0 under auto-approval — it normalizes to the bare string', () => {
+    expect(
+      validateCoordinatorSpec(specCiting([{ command: 'npx vitest run', expectedExitCode: 0 }]), {
+        allowedVerificationCommands: [...ALLOW],
+        requireZeroExitUnderAutoApproval: true,
+      }).ok,
+    ).toBe(true);
+  });
+
+  it('leaves HUMAN approval unchanged: a non-zero expected exit is still accepted', () => {
+    expect(
+      validateCoordinatorSpec(specCiting([{ command: 'npx vitest run', expectedExitCode: 1 }]), {
+        allowedVerificationCommands: [...ALLOW],
+      }).ok,
+    ).toBe(true);
+  });
+
+  it('still refuses an UNDECLARED command under auto — the allowlist gate is not replaced by this one', () => {
+    const result = validateCoordinatorSpec(specCiting(['true']), {
+      allowedVerificationCommands: [...ALLOW],
+      requireZeroExitUnderAutoApproval: true,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error[0]?.message).toMatch(/does not declare/);
+  });
+});

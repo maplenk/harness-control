@@ -262,6 +262,13 @@ export function buildCliFlows(db: Database, config: EngineConfig = DEFAULT_ENGIN
         // run's persisted config on every later command), so the coordinator is
         // held to the set THIS run declared — it cannot invent `true`.
         allowedVerificationCommands: config.verification.allowedCommands,
+        // B2 × F15: the allowlist pins command TEXT; F15's `expectedExitCode` is
+        // the COORDINATOR's to choose. Under `auto` nobody reads the spec before
+        // it is frozen, so a criterion could declare
+        // `{command: 'npx vitest run', expectedExitCode: 1}` — satisfied by the
+        // suite FAILING. Measured as accepted. Under `human` the reviewer sees
+        // the code, so this stays permissive there.
+        requireZeroExitUnderAutoApproval: config.approval === 'auto',
         ...(revise !== undefined ? { revise } : {}),
         ...(enableChat === true ? { planningChat } : {}),
       });

@@ -668,6 +668,12 @@ describe('F15 — every reader of a declared command crosses the normalizing cho
       'app/flows/coordinator.ts',
       [
         "verificationCommands: z", // the §7 schema (normalizes on parse)
+        // B2 × F15 exit-code gate: reads the DECLARATION to refuse a non-zero
+        // expected exit under auto-approval, where nothing can pin the code and
+        // no human reads the spec before its hash freezes.
+        "for (const [j, command] of criterion.verificationCommands.entries()) {",
+        // a diagnostic PATH template, not a reader of the value
+        "path: `acceptanceCriteria.${i}.verificationCommands.${j}`,",
         // B2 F4 gate, classified when B2 merged: reads the DECLARATION and
         // compares `verificationCommandText(...)` against the run allowlist, so a
         // declared `expectedExitCode` neither defeats the pin nor breaks it.

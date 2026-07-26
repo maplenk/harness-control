@@ -51,6 +51,7 @@ import type { AcceptanceCriterion, Artifact, SpecVersion } from '../../domain/en
 import {
   describeVerificationCommand,
   normalizeVerificationCommand,
+  verificationCommandExpectedExitCode,
   normalizeVerificationCommands,
   reservedExitCodeReason,
   verificationCommandText,
@@ -278,6 +279,26 @@ export interface SpecValidationIssue {
 export interface SpecValidationOptions {
   /** Exact commands (`verification.allowedCommands`) a criterion may cite. */
   readonly allowedVerificationCommands?: readonly string[];
+  /**
+   * B2 × F15 — set when the run is pinned `approval: 'auto'`.
+   *
+   * `allowedCommands` pins command TEXT. F15's `expectedExitCode` is chosen by
+   * the COORDINATOR and there is nowhere to pin it, so under `auto` — where no
+   * human reads the spec before the hash freezes it — a criterion could declare
+   * `{command: 'npx vitest run', expectedExitCode: 1}` and be satisfied BY THE
+   * SUITE FAILING. That was measured as accepted, and it is the codex-F4 repro
+   * (`true` + "exit code is 0") reborn with the polarity inverted.
+   *
+   * So under `auto` a cited command must expect exit 0. An absence check is
+   * still expressible — as the text form `test -z "$(grep … || true)"`, which
+   * exits 0 on success and IS pinnable by the allowlist.
+   *
+   * Deliberately scoped to `auto` (house rule 3): under `human` a non-zero
+   * declared code is accepted today and a reviewer sees it, so nothing that
+   * works now is refused. The fuller fix — letting the config pin
+   * `{command, expectedExitCode}` PAIRS — is a follow-up, not this.
+   */
+  readonly requireZeroExitUnderAutoApproval?: boolean;
 }
 
 /**
@@ -468,6 +489,27 @@ export function assessSpecSemantics(
     // about what proves the criterion, not part of the command's identity —
     // pinning `grep -R x web/` must not be defeatable, nor made unusable, by
     // the criterion also saying that finding nothing (exit 1) is the pass.
+    // B2 × F15: under `auto` the declared exit code has no human reader and no
+    // config pin, so only exit 0 may be declared. See
+    // `SpecValidationOptions.requireZeroExitUnderAutoApproval`.
+    if (options.requireZeroExitUnderAutoApproval === true) {
+      for (const [j, command] of criterion.verificationCommands.entries()) {
+        const expected = verificationCommandExpectedExitCode(command);
+        if (expected !== 0) {
+          issues.push({
+            path: `acceptanceCriteria.${i}.verificationCommands.${j}`,
+            message:
+              `criterion ${criterion.id} declares expectedExitCode ${expected} on ` +
+              `${describeVerificationCommand(command)}, but this run is auto-approved. The run pins which ` +
+              `commands may be cited; it cannot pin what counts as passing, so a non-zero expected exit under ` +
+              `auto-approval would let a criterion be satisfied by the command FAILING — with no human reading ` +
+              `the spec before its hash is frozen. Express the check so success is exit 0 instead: an absence ` +
+              `test is \`test -z "$(grep -REl PATTERN PATH || true)"\`, which exits 0 when the pattern is absent.`,
+          });
+        }
+      }
+    }
+
     if (allowedSet.size > 0) {
       for (const [j, command] of criterion.verificationCommands.entries()) {
         if (!allowedSet.has(verificationCommandText(command))) {
@@ -635,6 +677,9 @@ export interface CoordinatorRunnerDeps {
    * host validator — telling it the rule is a courtesy, the check is the gate.
    */
   readonly allowedVerificationCommands?: readonly string[];
+  /** B2 × F15: set when the run is pinned `approval: 'auto'`. See
+   * `SpecValidationOptions.requireZeroExitUnderAutoApproval`. */
+  readonly requireZeroExitUnderAutoApproval?: boolean;
   /** Bounded validation re-prompt rounds (default 3). */
   readonly maxRounds?: number;
   /** Opt-in room transport. Absence preserves the original one-agent flow. */
@@ -978,7 +1023,12 @@ export class CoordinatorRunner implements ReadOnlyRoleRunner<CoordinatorOutcome>
     const allowed = this.#deps.allowedVerificationCommands;
     const result = validateCoordinatorSpec(
       parsed,
-      allowed !== undefined ? { allowedVerificationCommands: allowed } : {},
+      {
+        ...(allowed !== undefined ? { allowedVerificationCommands: allowed } : {}),
+        ...(this.#deps.requireZeroExitUnderAutoApproval === true
+          ? { requireZeroExitUnderAutoApproval: true }
+          : {}),
+      },
     );
     return result.ok
       ? { kind: 'valid', document: result.value }
