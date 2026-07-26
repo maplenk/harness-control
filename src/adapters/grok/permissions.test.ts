@@ -20,6 +20,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { RoleName } from '../../domain/state.js';
 import { decidePermission, noPayloadToVerify, type PermissionMediationConfig } from '../acp/session.js';
 import { buildGrokMediation } from './permissions.js';
+import { denyByDefaultPosture } from '../../lib/permanent-deny.js';
 
 const tempDirs: string[] = [];
 afterEach(() => {
@@ -37,7 +38,7 @@ const MEDIATIONS: ReadonlyArray<{ readonly label: string; readonly permissions?:
   { label: 'headless, no policy', permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless' } },
   {
     label: 'headless with an exact allowlist',
-    permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: ['Execute `npm run typecheck`'] } },
+    permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { implementorPosture: denyByDefaultPosture, allow: ['Execute `npm run typecheck`'] } },
   },
   { label: 'interactive, no handler', permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'interactive' } },
   {
@@ -110,7 +111,7 @@ describe('buildGrokMediation — the payload veto is universal', () => {
 
   it('shapes the implementor headless policy exactly as before (allowlist + classifier + write root)', () => {
     const config = buildGrokMediation({
-      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: ['keep me'] } },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { implementorPosture: denyByDefaultPosture, allow: ['keep me'] } },
       role: 'implementor',
       cwd: '/repo/worktree',
       allowedShellCommands: ['npm run typecheck'],
@@ -139,7 +140,7 @@ describe('buildGrokMediation — the payload veto is universal', () => {
     const cwd = path.join(base, 'harness-orchestration.worktrees', 'assignment-asg_run_f14');
     mkdirSync(path.join(cwd, 'web'), { recursive: true });
     const config = buildGrokMediation({
-      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: [] } },
+      permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { implementorPosture: denyByDefaultPosture, allow: [] } },
       role: 'implementor',
       cwd,
     });
@@ -165,7 +166,7 @@ describe('buildGrokMediation — the payload veto is universal', () => {
     const supplied: PermissionMediationConfig = {
       verifyOperationPayload: noPayloadToVerify, mode: 'headless',
       role: 'verifier',
-      policy: { allow: ['Execute `npm test`'] },
+      policy: { implementorPosture: denyByDefaultPosture, allow: ['Execute `npm test`'] },
     };
     const config = buildGrokMediation({ permissions: supplied, role: 'verifier', cwd: '/repo/worktree' });
     expect((config as { policy?: { allow: readonly string[] } }).policy?.allow).toEqual(['Execute `npm test`']);

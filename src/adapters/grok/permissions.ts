@@ -26,6 +26,7 @@
  *    root) happens on the way in and cannot skip it.
  */
 import type { RoleName } from '../../domain/state.js';
+import { permissiveImplementorPosture } from '../../lib/permanent-deny.js';
 import { writeBoundary, type WriteBoundary } from '../../worktree/write-scope.js';
 import { noPayloadToVerify, type PermissionMediationConfig, type VerifyOperationPayload } from '../acp/session.js';
 import { grokShellPayloadMatchesTitle, grokShellPermissionTitle, isGrokReadOnlyShellPermissionTitle } from './command.js';
@@ -71,8 +72,14 @@ export interface GrokMediationInput {
  *
  * The veto is attached last and unconditionally, so no branch below can return a
  * config without it. When the caller supplied no mediation at all we still
- * produce one (`headless`, empty policy = default-deny) rather than returning
- * `undefined`, so there is no "no config, no veto" path either.
+ * produce one rather than returning `undefined`, so there is no "no config, no
+ * veto" path either.
+ *
+ * §2.4: this is also the ONE place that turns the permissive implementor default
+ * on. The posture rides in the same shaped policy as the read-only classifier
+ * and the write boundary, so a Grok implementor either gets all three or gets
+ * none — there is no partially-configured session. Every other role, and every
+ * caller-supplied interactive config, keeps today's deny-by-default.
  */
 export function buildGrokMediation(input: GrokMediationInput): VetoedMediation {
   // The placeholder veto here is REPLACED unconditionally by the real one on
@@ -110,6 +117,20 @@ export function buildGrokMediation(input: GrokMediationInput): VetoedMediation {
             // it is changing a corner of.
             workspaceWriteBoundary:
               input.writeBoundary ?? writeBoundary({ mode: 'worktree', executionRoot: input.cwd }),
+            // §2.4: the permissive default, bound to the SAME execution root the
+            // read-only classifier judges absolute path arguments against. This
+            // is the only production site that turns it on, and it is the site
+            // whose denials were measured: `run_c4648778` lost four consecutive
+            // implementor turns to `git tag -l`, `2>&1` and `git ls-tree`, each
+            // separately patched into the read-only classifier afterwards.
+            //
+            // The posture is bound to `cwd`, not to `writeBoundary`, for the
+            // same reason the read-only classifier is: the §2.4 containment rule
+            // asks "is this outside the agent's worktree", which is a READ
+            // boundary question. Narrowing WRITES stays the write boundary's
+            // job, and the workspace-write rule above still adjudicates every
+            // structured write against it.
+            implementorPosture: permissiveImplementorPosture(input.cwd),
           },
         }
       : base;

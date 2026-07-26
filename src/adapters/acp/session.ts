@@ -21,8 +21,12 @@
  *   (the authoritative prompt-promise signal), never a crash.
  * - Permission mediation engine (§10.2, T20): interactive callback surface
  *   (config handler or SPI `resolvePermission`) + headless policy allowlist
- *   with EXACT-operation match; default DENY, unknown-operation DENY, and
+ *   with EXACT-operation match; unknown-operation DENY, and
  *   Coordinator/Verifier WRITE requests always denied — in every mode.
+ *   The terminal default is per-ROLE (spec §2.4): deny for every role, EXCEPT an
+ *   implementor whose policy carries a `permissiveImplementorPosture`, for which
+ *   it is *allow by default; ask only for the unprovable; deny the destructive*,
+ *   gated by the single §3.1 deny module (`lib/permanent-deny.ts`).
  *
  * REAL wire shapes (P2 live gate, docs/reviews/p2-live-gate.md — pinned by
  * the offline fakes so TX-class regressions fail offline):
@@ -54,6 +58,11 @@ import type { RoleName } from '../../domain/state.js';
 import { SystemClock, type Clock } from '../../lib/clock.js';
 import type { IsoTimestamp } from '../../lib/clock.js';
 import { resolvesInsideRoot } from '../../lib/path-containment.js';
+import {
+  classifyImplementorOperation,
+  type ImplementorAdmissionPosture,
+  type PermanentDenyRuleId,
+} from '../../lib/permanent-deny.js';
 import type { WriteBoundary } from '../../worktree/write-scope.js';
 import { referenceClassifyError } from '../fake/in-process.js';
 import {
@@ -104,6 +113,34 @@ import {
  */
 export interface HeadlessPermissionPolicy {
   readonly allow: readonly string[];
+  /**
+   * REQUIRED (spec §2.4) — which admission posture an IMPLEMENTOR session runs
+   * under. `denyByDefaultPosture` is the pre-§2.4 allowlist; a posture built by
+   * `permissiveImplementorPosture(root)` inverts the default to *allow by
+   * default; ask only for the unprovable; deny the destructive*.
+   *
+   * Non-optional on purpose, and this is the whole house-rule-1 point. The
+   * dangerous state is not "someone forgot the field"; it is "someone turned the
+   * permissive default on somewhere the permanent-deny list is not applied". Two
+   * things make that unconstructible:
+   *
+   *  - the deny classifier is NOT injectable. `decidePermission` imports
+   *    `classifyImplementorOperation` directly from `lib/permanent-deny.ts`, so
+   *    there is no seam at which a construction site could supply the posture
+   *    and omit the gate;
+   *  - the permissive posture is a VALUE with only one producer, which validates
+   *    the containment root, so a permissive posture without a usable worktree
+   *    root cannot exist either.
+   *
+   * What being REQUIRED buys on top of that is the other direction: a new
+   * provider adapter cannot silently inherit deny-by-default. Four implementor
+   * turns on `run_c4648778` died to a silent deny-by-default; a compile error is
+   * what makes the next one a decision.
+   *
+   * Ignored for non-implementor roles — coordinator and verifier keep their
+   * read-only posture, and their write veto runs first and is untouched.
+   */
+  readonly implementorPosture: ImplementorAdmissionPosture;
   /**
    * Optional fail-closed classifier for provider operation titles that can be
    * proven read-only after parsing. The harness supplies this only for Grok's
@@ -183,7 +220,9 @@ export type PermissionMediationConfig =
       readonly role?: RoleName;
       /** REQUIRED (round 7) — see the interactive variant. */
       readonly verifyOperationPayload: VerifyOperationPayload;
-      /** Omitted policy = empty allowlist = default DENY everything. */
+      /** Omitted policy = empty allowlist AND no implementor posture = default
+       * DENY everything (§2.4's permissive branch is unreachable without a
+       * policy to carry the posture). */
       readonly policy?: HeadlessPermissionPolicy;
     };
 
@@ -197,11 +236,24 @@ export type PermissionDecisionReason =
   | 'denied_role_write'
   /** HIGH-5: the operation would otherwise have been approved, but the payload
    * the provider will actually EXECUTE could not be bound to its title. */
-  | 'denied_raw_input_mismatch';
+  | 'denied_raw_input_mismatch'
+  /** §2.4 — admitted by the permissive implementor default: the operation was
+   * POSITIVELY read and is on none of the permanent-deny rules. */
+  | 'allowlisted_permissive_implementor'
+  /** §2.4 — a permanent-deny rule FIRED. Never grantable, in any tier. */
+  | 'denied_permanent_rule'
+  /** §2.4 — the operation could not be read, so it is not provably safe. House
+   * rule 2: this is NOT the same as `denied_permanent_rule`, and it is the set
+   * that operator review (`permission_wait`) is destined to receive. */
+  | 'denied_unprovable_operation';
 
 export interface PermissionDecision {
   readonly action: 'allow' | 'deny' | 'interactive';
   readonly reason: PermissionDecisionReason;
+  /** Which §2.4 rule refused, when `reason === 'denied_permanent_rule'`. */
+  readonly deniedByRule?: PermanentDenyRuleId;
+  /** Operator-facing explanation for the two §2.4 denials. */
+  readonly detail?: string;
 }
 
 /**
@@ -263,8 +315,45 @@ export function admitsWorkspaceWrite(
 
 /**
  * Decision core (unit-testable): §10.2 — interactive → surface;
- * headless → allowlist EXACT match else deny; unknown → deny;
- * coordinator/verifier write requests ALWAYS denied (every mode).
+ * headless → allowlist EXACT match, then the read-only classifier, then the
+ * workspace-write rule, then (spec §2.4, implementor only) the PERMISSIVE
+ * default; unknown → deny; coordinator/verifier write requests ALWAYS denied
+ * (every mode).
+ *
+ * ## §2.4 — the inverted default, and exactly where the gate sits
+ *
+ * The approved posture is *allow by default; ask only for the unprovable; deny
+ * the destructive*. This function used to do the opposite: it ended
+ * `return { action: 'deny', reason: 'denied_default' }`, so every operation that
+ * was not an exact allowlist hit, a proven read, or a workspace write — every
+ * harmless exploratory read included — was refused, and a refusal ends the
+ * implementor turn (`no_deliverable`, manual resume).
+ *
+ * The ORDER below is the load-bearing part:
+ *
+ *  1. the coordinator/verifier write veto stays FIRST and untouched;
+ *  2. the payload veto stays second, before any mediation branch;
+ *  3. the permanent-deny verdict is computed once, and a `denied` verdict
+ *     short-circuits BEFORE the read-only classifier and the workspace-write
+ *     rule — so no agent-discretionary path can admit something §2.4 forbids;
+ *  4. the permissive ALLOW comes last, after those two, so every operation that
+ *     is admitted today keeps its existing reason code and its existing
+ *     decision. This change only widens (house rule 3).
+ *
+ * The exact-operation allowlist (step 5 in the body) is deliberately NOT gated —
+ * see `permanentDenyGatesExactAllowlist` in `lib/permanent-deny.ts` for why, and
+ * note that the verifier's per-criterion commands travel that path.
+ *
+ * ## Post-wait lockdown (§4.2) — how it must be added
+ *
+ * §4.2 requires that once a permission wait is recorded, this function returns
+ * `deny` for EVERY subsequent request in that generation. That machinery does
+ * not exist yet (`permission_wait` appears nowhere in the tree). When it lands,
+ * its check belongs with the role-write veto at the TOP of this function, before
+ * the payload veto — not near the tail. The permissive branch is the last thing
+ * evaluated and returns only on an `admissible` verdict, so an early lockdown
+ * return cannot be reached past it; putting the lockdown late is the only way to
+ * reopen what §4.2 closes.
  */
 export function decidePermission(
   config: PermissionMediationConfig,
@@ -301,9 +390,39 @@ export function decidePermission(
   if (operation === undefined || operation.trim() === '') {
     return { action: 'deny', reason: 'denied_unknown_operation' };
   }
+  // The EXACT-operation allowlist. Host DECLARATIONS (the run's verification
+  // commands), not agent-chosen operations, and therefore not gated by the §2.4
+  // list — the verifier's per-criterion commands travel this path and gating it
+  // would newly refuse what the status quo accepts. Spec §5 removes the
+  // implementor's list separately, by setting `allowedShellCommands = []`.
   if ((config.policy?.allow ?? []).includes(operation)) {
     return { action: 'allow', reason: 'allowlisted' };
   }
+
+  // §2.4 — computed ONCE, for the implementor under a permissive posture, and
+  // consulted in two places: as a hard gate immediately below, and as the
+  // permissive ALLOW at the very end. A throw here is a denial, never a pass.
+  let verdict: ReturnType<typeof classifyImplementorOperation> | undefined;
+  if (role === 'implementor' && config.policy?.implementorPosture.kind === 'permissive') {
+    try {
+      verdict = classifyImplementorOperation(operation, rawInput, config.policy.implementorPosture);
+    } catch {
+      verdict = { kind: 'unprovable', detail: 'the permanent-deny classifier threw' };
+    }
+  }
+  // The GATE. Before the read-only classifier and before the workspace-write
+  // rule, so neither can admit an operation on the §2.4 never-allowed list —
+  // `Write <worktree>/.git/hooks/pre-commit` is the concrete one the
+  // workspace-write rule used to admit.
+  if (verdict?.kind === 'denied') {
+    return {
+      action: 'deny',
+      reason: 'denied_permanent_rule',
+      deniedByRule: verdict.rule,
+      detail: verdict.detail,
+    };
+  }
+
   try {
     if (config.policy?.allowReadOnlyOperation?.(operation) === true) {
       return { action: 'allow', reason: 'allowlisted_read_only_operation' };
@@ -317,6 +436,22 @@ export function decidePermission(
     admitsWorkspaceWrite(operation, config.policy.workspaceWriteBoundary)
   ) {
     return { action: 'allow', reason: 'allowlisted_workspace_write' };
+  }
+
+  // §2.4 — the inverted default. Reached only for an implementor whose policy
+  // carries a permissive posture, and only for an operation POSITIVELY read and
+  // found on none of the permanent-deny rules.
+  if (verdict?.kind === 'admissible') {
+    return { action: 'allow', reason: 'allowlisted_permissive_implementor' };
+  }
+  // House rule 2: "I could not determine X" is never "X is false". An operation
+  // whose payload could not be parsed is NOT provably safe, so it denies here
+  // instead of falling through into the permissive default above. It is
+  // reported under its own reason because it is the set §2.4 routes to operator
+  // review (`permission_wait`) — unlike `denied_permanent_rule`, which is never
+  // grantable.
+  if (verdict?.kind === 'unprovable') {
+    return { action: 'deny', reason: 'denied_unprovable_operation', detail: verdict.detail };
   }
   return { action: 'deny', reason: 'denied_default' };
 }
