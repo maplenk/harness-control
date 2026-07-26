@@ -1,10 +1,18 @@
 /**
- * CLI command execution (PLAN §18) — turns a parsed `RunCommand` into calls on
- * the one `OrchestrationService`, producing a stable `--json` payload, a human
- * text rendering, and a process exit code. This is the layer the acceptance
- * tests drive against a FAKE-backed engine (test DB + fake adapter factory, no
- * real spawns): the CLI holds no state of its own, so asserting these outputs
- * asserts the wiring end-to-end.
+ * CLI command execution (PLAN §18) — a thin adapter over the application-neutral
+ * command executor (plan §3A.1 / Phase A0).
+ *
+ * Flow: parsed `RunCommand` → `ApplicationCommand` + `CommandContext{origin:'cli'}`
+ * → shared `executeApplicationCommand` → render `ApplicationResult` back to the
+ * stable CLI contract `{ json, text, exitCode }`. Presentation/test fields
+ * (`json`/`testApprove`/`noWait`/`wait`) stay on the CLI-only seam; they are
+ * never part of `ApplicationCommand`, so `--test-approve` is structurally
+ * unreachable from an `origin:'http'` caller.
+ *
+ * The legacy domain dispatch body lives in `executeCliDomainCommand` (moved
+ * verbatim from the former `executeCommand`) and is reached only through the
+ * CLI-constructed port — handleX functions are unchanged. Status and set_budget
+ * remain CLI-local (not in the §3A.1 intent list).
  *
  * Invariants honored here:
  *  - every state change goes through the service (`createRun`, the CLI wrappers
@@ -35,6 +43,7 @@ import {
   assignmentId,
   criterionId,
   gitSha,
+  newIdempotencyKey,
   specHash as toSpecHash,
   type GitSha,
   type RunId,
@@ -46,7 +55,7 @@ import type { AcceptanceCriterion, MergeReadiness, SpecVersion } from '../domain
 import { normalizeVerificationCommands } from '../domain/verification-command.js';
 import type { RoleName } from '../domain/state.js';
 import type { Clock } from '../lib/clock.js';
-import type { IdFactory } from '../lib/id-factory.js';
+import { RandomIdFactory, type IdFactory } from '../lib/id-factory.js';
 import {
   DurableDesiredModelStore,
   IndependenceViolationError,
@@ -67,6 +76,19 @@ import {
   type RunMeta,
   type SpecDraftState,
 } from '../app/index.js';
+import {
+  executeApplicationCommand,
+  grantCliOnlySeam,
+  type ApplicationCommand,
+  type ApplicationCommandPort,
+  type ApplicationError,
+  type ApplicationResult,
+  type CliCommandContext,
+  type CliInvocationOptions,
+  type CliOnlySeam,
+  type CommandContext,
+  type CommandPayload,
+} from '../app/commands/index.js';
 import {
   runImplementVerifyLoop,
   type ImplementVerifyLoopResult,
@@ -185,17 +207,64 @@ export interface CommandDeps {
   readonly flows?: CliFlowDeps;
   /** W2-5 schedule-loop timer; defaults to real `setTimeout` sleeping. */
   readonly waiter?: WaitScheduler;
+  /**
+   * Optional application-command port injection seam (§3A.1). Production leaves
+   * this unset and uses `cliApplicationPort`; tests inject a spy to prove the
+   * CLI delegates to the shared executor.
+   */
+  readonly applicationPort?: ApplicationCommandPort;
 }
 
 /**
- * Execute one run-oriented command against the engine. ASYNC: `start` and `run`
- * drive the P3 role flows through the `OrchestrationService` (coordinator draft;
- * implement→verify→remediation→merge-readiness), streaming real adapters when a
- * `flows` runtime is injected. Known engine errors (`RunNotFoundError`,
- * `WorkflowAdvanceError`, `BudgetExceededError`, worktree/loop errors) are
- * mapped to a clean exit-1 output rather than thrown.
+ * Execute one run-oriented command against the engine. ASYNC adapter over the
+ * application-neutral executor (§3A.1): routes the CLI verb, translates to
+ * ApplicationCommand + CommandContext{origin:'cli'}, dispatches through
+ * `executeApplicationCommand`, and renders the typed result back to the stable
+ * `{json, text, exitCode}` contract. Status / set_budget stay CLI-local.
  */
 export async function executeCommand(
+  service: OrchestrationService,
+  db: Database,
+  command: RunCommand,
+  env: NodeJS.ProcessEnv,
+  deps: CommandDeps = {},
+): Promise<CommandOutput> {
+  const routing = routeCliCommand(command, env, deps);
+  if (routing.route === 'cli_local') {
+    return executeCliDomainCommand(service, db, routing.command, env, deps);
+  }
+
+  const seamResult = grantCliOnlySeam(routing.context as CliCommandContext, routing.options);
+  if (isErr(seamResult)) {
+    return renderApplicationResult({
+      status: 'rejected',
+      command: routing.command.kind,
+      error: seamResult.error,
+    });
+  }
+
+  const port =
+    deps.applicationPort ??
+    cliApplicationPort({
+      service,
+      db,
+      env,
+      deps,
+      seam: seamResult.value,
+    });
+  const result = await executeApplicationCommand(port, {
+    command: routing.command,
+    context: routing.context,
+  });
+  return renderApplicationResult(result);
+}
+
+/**
+ * Legacy domain dispatch body (former `executeCommand`), preserved verbatim.
+ * Reached only via the CLI-constructed application port (or the CLI-local
+ * status / set_budget path). Do not modify handleX functions for parity.
+ */
+async function executeCliDomainCommand(
   service: OrchestrationService,
   db: Database,
   command: RunCommand,
@@ -269,6 +338,350 @@ export async function executeCommand(
     }
     return errorOutput(command.kind, runId, error);
   }
+}
+
+// ---------------------------------------------------------------------------
+// §3A.1 CLI adapter — RunCommand ↔ ApplicationCommand + render helpers
+// ---------------------------------------------------------------------------
+
+/** Strip presentation / test / wait-policy flags off a RunCommand into the CLI bag. */
+export function cliInvocationOptions(command: RunCommand): CliInvocationOptions {
+  const options: CliInvocationOptions = {
+    json: command.json,
+    ...('testApprove' in command && command.testApprove === true ? { testApprove: true as const } : {}),
+    ...('noWait' in command && command.noWait === true ? { noWait: true as const } : {}),
+    ...('wait' in command && command.wait === true ? { wait: true as const } : {}),
+  };
+  return options;
+}
+
+/** Build a CLI-origin CommandContext for one invocation. */
+export function cliCommandContext(
+  _command: RunCommand,
+  env: NodeJS.ProcessEnv,
+  deps: CommandDeps,
+): CommandContext {
+  const user = env['USER'] ?? env['LOGNAME'] ?? 'unknown';
+  return {
+    actor: `cli:${user}`,
+    origin: 'cli',
+    idempotencyKey: newIdempotencyKey(deps.ids ?? new RandomIdFactory()),
+  };
+}
+
+export type CliCommandRouting =
+  | {
+      readonly route: 'application';
+      readonly command: ApplicationCommand;
+      readonly context: CommandContext;
+      readonly options: CliInvocationOptions;
+    }
+  | {
+      readonly route: 'cli_local';
+      readonly command: Extract<RunCommand, { kind: 'status' | 'set_budget' }>;
+    };
+
+/**
+ * Total routing over RunCommand: status / set_budget stay CLI-local; every
+ * other verb becomes an ApplicationCommand with presentation fields stripped.
+ */
+export function routeCliCommand(
+  command: RunCommand,
+  env: NodeJS.ProcessEnv,
+  deps: CommandDeps = {},
+): CliCommandRouting {
+  if (command.kind === 'status' || command.kind === 'set_budget') {
+    return { route: 'cli_local', command };
+  }
+  const options = cliInvocationOptions(command);
+  const context = cliCommandContext(command, env, deps);
+  return {
+    route: 'application',
+    command: toApplicationCommand(command),
+    context,
+    options,
+  };
+}
+
+function toApplicationCommand(
+  command: Exclude<RunCommand, { kind: 'status' | 'set_budget' }>,
+): ApplicationCommand {
+  switch (command.kind) {
+    case 'start':
+      return {
+        kind: 'start',
+        workspace: command.workspace,
+        goal: command.goal,
+        coordinator: command.coordinator,
+        ...(command.configPath !== undefined ? { configPath: command.configPath } : {}),
+        ...(command.enableChat === true ? { enableChat: true as const } : {}),
+      };
+    case 'spec_revise':
+      return {
+        kind: 'reviseSpec',
+        runId: command.runId,
+        feedback: command.feedback,
+      };
+    case 'approve':
+      return {
+        kind: 'approve',
+        runId: command.runId,
+        specVersionId: command.specVersionId,
+        ...(command.specHash !== undefined ? { specHash: command.specHash } : {}),
+      };
+    case 'run':
+      return {
+        kind: 'run',
+        runId: command.runId,
+        ...(command.implementor !== undefined ? { implementor: command.implementor } : {}),
+        ...(command.verifier !== undefined ? { verifier: command.verifier } : {}),
+        ...(command.inPlace !== undefined ? { inPlace: command.inPlace } : {}),
+      };
+    case 'recheck':
+      return { kind: 'recheck', runId: command.runId };
+    case 'resume':
+      return { kind: 'resume', runId: command.runId };
+    case 'pause':
+      return { kind: 'pause', runId: command.runId };
+    case 'breaker_reset':
+      return { kind: 'breakerReset', runId: command.runId };
+    case 'switch_model':
+      return {
+        kind: 'switchModel',
+        runId: command.runId,
+        role: command.role,
+        target: command.target,
+      };
+    case 'cancel':
+      return { kind: 'cancel', runId: command.runId };
+  }
+}
+
+/**
+ * Exact inverse of the application routing: rebuild a RunCommand from the
+ * domain intent plus the CLI options bag (conditional spreads; no explicit
+ * `undefined` under exactOptionalPropertyTypes).
+ */
+export function toRunCommand(
+  command: ApplicationCommand,
+  options: CliInvocationOptions,
+): RunCommand {
+  switch (command.kind) {
+    case 'start':
+      return {
+        kind: 'start',
+        json: options.json,
+        workspace: command.workspace,
+        goal: command.goal,
+        coordinator: command.coordinator,
+        ...(command.configPath !== undefined ? { configPath: command.configPath } : {}),
+        ...(command.enableChat === true ? { enableChat: true as const } : {}),
+        ...(options.noWait === true ? { noWait: true as const } : {}),
+      };
+    case 'reviseSpec':
+      return {
+        kind: 'spec_revise',
+        json: options.json,
+        runId: command.runId,
+        feedback: command.feedback,
+        ...(options.noWait === true ? { noWait: true as const } : {}),
+      };
+    case 'approve':
+      return {
+        kind: 'approve',
+        json: options.json,
+        runId: command.runId,
+        specVersionId: command.specVersionId,
+        ...(command.specHash !== undefined ? { specHash: command.specHash } : {}),
+        testApprove: options.testApprove === true,
+      };
+    case 'run':
+      return {
+        kind: 'run',
+        json: options.json,
+        runId: command.runId,
+        ...(command.implementor !== undefined ? { implementor: command.implementor } : {}),
+        ...(command.verifier !== undefined ? { verifier: command.verifier } : {}),
+        ...(command.inPlace !== undefined ? { inPlace: command.inPlace } : {}),
+        ...(options.noWait === true ? { noWait: true as const } : {}),
+      };
+    case 'recheck':
+      return { kind: 'recheck', json: options.json, runId: command.runId };
+    case 'resume':
+      return {
+        kind: 'resume',
+        json: options.json,
+        runId: command.runId,
+        ...(options.wait === true ? { wait: true as const } : {}),
+      };
+    case 'pause':
+      return { kind: 'pause', json: options.json, runId: command.runId };
+    case 'cancel':
+      return { kind: 'cancel', json: options.json, runId: command.runId };
+    case 'breakerReset':
+      return { kind: 'breaker_reset', json: options.json, runId: command.runId };
+    case 'switchModel':
+      return {
+        kind: 'switch_model',
+        json: options.json,
+        runId: command.runId,
+        role: command.role,
+        target: command.target,
+      };
+    case 'respondToPermission':
+      // No CLI verb today — callers that need a RunCommand for this intent
+      // should not reach here; the port rejects it with unsupported_command.
+      throw new Error('respondToPermission has no CLI verb');
+  }
+}
+
+/**
+ * Map a legacy CommandOutput into a typed ApplicationResult (CLI → neutral).
+ * Exit code drives status; `data`/`details` are `output.json` minus `command`/`ok`.
+ */
+export function applicationResultFromCommandOutput(
+  commandLabel: string,
+  output: CommandOutput,
+): ApplicationResult {
+  const command = String(output.json['command'] ?? commandLabel);
+  const data = stripCommandEnvelope(output.json);
+  const status = statusFromExitCode(output.exitCode, output.json);
+  if (status === 'accepted') {
+    const payload: CommandPayload = { data, summary: output.text };
+    return { status: 'accepted', command, payload };
+  }
+  const errorObj =
+    output.json['error'] !== null && typeof output.json['error'] === 'object'
+      ? (output.json['error'] as Record<string, unknown>)
+      : undefined;
+  const code = String(
+    output.json['refused'] ??
+      errorObj?.['code'] ??
+      errorObj?.['name'] ??
+      output.json['reason'] ??
+      status,
+  );
+  const error: ApplicationError = {
+    code,
+    message: output.text,
+    details: data,
+  };
+  return { status, command, error };
+}
+
+function statusFromExitCode(
+  exitCode: number,
+  json: Record<string, unknown>,
+): ApplicationResult['status'] {
+  if (exitCode === 0) return 'accepted';
+  if (exitCode === 3) return 'limit_paused';
+  if (exitCode === 4) return 'blocked';
+  if (exitCode === 1) {
+    const errorObj =
+      json['error'] !== null && typeof json['error'] === 'object'
+        ? (json['error'] as Record<string, unknown>)
+        : undefined;
+    if (errorObj?.['name'] === 'RunNotFoundError') return 'not_found';
+    if (json['outcome'] === 'rejected') return 'rejected';
+    return 'failed';
+  }
+  if (exitCode === 2) {
+    const refused = json['refused'];
+    if (refused === 'approved_hash_mismatch' || refused === 'approved_version_mismatch') {
+      return 'conflict';
+    }
+    return 'invalid';
+  }
+  return 'failed';
+}
+
+function stripCommandEnvelope(json: Record<string, unknown>): Record<string, unknown> {
+  const data: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(json)) {
+    if (key === 'command' || key === 'ok') continue;
+    data[key] = value;
+  }
+  return data;
+}
+
+/**
+ * Render a typed ApplicationResult back to the CLI contract. Total mapping:
+ * accepted→0, rejected/failed/not_found→1, invalid/conflict→2, limit_paused→3,
+ * blocked→4.
+ */
+export function renderApplicationResult(result: ApplicationResult): CommandOutput {
+  const exitCode = exitCodeFromStatus(result.status);
+  if (result.status === 'accepted') {
+    return {
+      json: {
+        command: result.command,
+        ok: exitCode === 0,
+        ...result.payload.data,
+      },
+      text: result.payload.summary,
+      exitCode,
+    };
+  }
+  return {
+    json: {
+      command: result.command,
+      ok: exitCode === 0,
+      ...result.error.details,
+    },
+    text: result.error.message,
+    exitCode,
+  };
+}
+
+function exitCodeFromStatus(status: ApplicationResult['status']): number {
+  switch (status) {
+    case 'accepted':
+      return 0;
+    case 'rejected':
+    case 'failed':
+    case 'not_found':
+      return 1;
+    case 'invalid':
+    case 'conflict':
+      return 2;
+    case 'limit_paused':
+      return EXIT_LIMIT_PAUSED;
+    case 'blocked':
+      return EXIT_INTEGRATION_BLOCKED;
+  }
+}
+
+/**
+ * CLI-side ApplicationCommandPort: maps neutral intents back through the
+ * legacy dispatch body, answering respondToPermission with unsupported_command.
+ */
+export function cliApplicationPort(input: {
+  readonly service: OrchestrationService;
+  readonly db: Database;
+  readonly env: NodeJS.ProcessEnv;
+  readonly deps: CommandDeps;
+  readonly seam: CliOnlySeam;
+}): ApplicationCommandPort {
+  const { service, db, env, deps, seam } = input;
+  return {
+    async execute(command, _context): Promise<ApplicationResult> {
+      if (command.kind === 'respondToPermission') {
+        return {
+          status: 'rejected',
+          command: 'respondToPermission',
+          error: {
+            code: 'unsupported_command',
+            message:
+              'respondToPermission has no CLI verb in this slice; durable permission lifecycle is §3A.3 / Phase B2',
+            details: {},
+          },
+        };
+      }
+      const runCommand = toRunCommand(command, seam.options);
+      const output = await executeCliDomainCommand(service, db, runCommand, env, deps);
+      return applicationResultFromCommandOutput(command.kind, output);
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
