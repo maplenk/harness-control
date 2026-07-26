@@ -9,7 +9,7 @@
     "allowedCommands": [
       "npm run typecheck",
       "npm run build",
-      "npx vitest run"
+      "npx vitest run --configLoader runner"
     ]
   }
 }
