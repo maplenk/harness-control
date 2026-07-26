@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 #
 # Dogfood START stage (§6A) — the coordinator drafts a testable spec from a
-# PINNED plan section, then STOPS at the human-approval gate. This spawns the
-# real coordinator adapter (a blocking turn) and exits at `awaiting_approval`;
-# it never approves or implements anything.
+# PINNED plan section, then STOPS at the approval gate. This spawns the real
+# coordinator adapter (a blocking turn) and exits; it never approves or
+# implements anything ITSELF.
+#
+# Where it stops depends on the run's PINNED approval mode (B2), which comes
+# from the config passed to `start` and is immutable for the run's life:
+#   approval:'human' (the default, scripts/dogfood/dogfood.config.json)
+#       → the run parks at `awaiting_approval`; a person runs `harness approve`.
+#   approval:'auto'  (scripts/dogfood/dogfood.auto.config.json)
+#       → the ENGINE signs the drafted hash inside the same transaction that
+#         persists the draft, and this exits with the run already at `approved`.
+# This script does not choose; it REPORTS what the engine did, read back from
+# the engine's own `start --json` output.
 #
 # Parameters (env-overridable):
 #   SECTION      required  plan section to spec, e.g. "§3A.1"
@@ -11,10 +21,12 @@
 #   PATHS        required  comma-list of files the implementor may touch
 #   PLAN_SHA     optional  plan commit to pin (default: current HEAD)
 #   COORDINATOR  optional  packed harness:model:effort (default claude:opus:xhigh)
+#   CONFIG       optional  engine config file (default dogfood.config.json; "" = engine defaults)
+#   MANIFEST_OUT optional  ALSO write the manifest here (for scripted chaining)
 #   HARNESS_HOME optional  run store (default ~/.harness)
 #
-# Output: prints the run id, spec version, spec hash + the exact approve/run
-# commands, and writes a per-run manifest under $HARNESS_HOME/logs.
+# Output: prints the run id, spec version, spec hash + the exact next command,
+# and writes a per-run manifest under $HARNESS_HOME/logs.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -40,7 +52,7 @@ CONFIG="${CONFIG-$ROOT/scripts/dogfood/dogfood.config.json}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 JSON="$LOGDIR/slice-$STAMP-start.json"
 ERRLOG="$LOGDIR/slice-$STAMP-start.err.log"
-MANIFEST="$LOGDIR/slice-$STAMP.manifest.json"
+MANIFEST="${MANIFEST_OUT:-$LOGDIR/slice-$STAMP.manifest.json}"
 
 # --config forwarding: forward the config file if set + present; record its hash.
 CONFIG_ARGS=()
@@ -128,11 +140,18 @@ const [json, manifestPath, section, planSha, coordinator, goal, config, configSh
 const o = JSON.parse(fs.readFileSync(json, 'utf8'));
 const b = o.json ?? o;                    // --json prints the command body
 const spec = b.spec ?? {};
+// B2: WHO signed, read back from the ENGINE's own output — never inferred from
+// "we passed the auto config, so it must be auto". `start --json` emits an
+// `approval` object only when the engine actually bound the drafted hash
+// itself; its absence means the run is still at the human gate.
+const approval = b.approval;
 const manifest = {
   section, planSha, coordinator, goal,
   ...(config ? { config, configSha } : {}),
   baseSha: require('child_process').execSync('git rev-parse HEAD').toString().trim(),
   runId: b.runId, phase: b.phase,
+  approvalMode: approval ? approval.mode : 'human',
+  autoApproved: Boolean(approval && approval.mode === 'auto' && b.phase === 'approved'),
   specVersionId: spec.specVersionId, specHash: spec.specHash, revision: spec.revision,
   proposedImplementor: spec.proposedImplementor, proposedVerifier: spec.proposedVerifier,
   criteria: spec.criteria ?? [],
@@ -149,9 +168,21 @@ line('  criteria: ' + (manifest.criteria.map((c) => c.id).join(', ') || '(none p
 line('  proposed implementor: ' + (manifest.proposedImplementor ?? '—'));
 line('  proposed verifier   : ' + (manifest.proposedVerifier ?? '—'));
 line('  manifest: ' + manifestPath);
+line('  approval: ' + manifest.approvalMode + (manifest.autoApproved ? ' — ENGINE-SIGNED, no human reviewed this spec' : ''));
 line('');
-line('next — review the spec, then approve the EXACT hash and run:');
-line('  scripts/dogfood/run-slice.sh ' + manifest.runId + ' ' + manifest.specVersionId + ' ' + manifest.specHash);
+// The `next` line follows the ENGINE's state. An auto-approved run has already
+// passed T1; still telling the operator to "approve the EXACT hash" would send
+// them into a command T1's own precondition rejects.
+if (manifest.autoApproved) {
+  line('next — the spec is ALREADY approved (approvedBy:auto). Read the criteria above, then:');
+  line('  scripts/dogfood/run-slice.sh ' + manifest.runId + ' ' + manifest.specVersionId + ' ' + manifest.specHash);
+  line('  (run-slice.sh skips `approve` on its own — it reads the run\'s phase + bound hash.)');
+} else {
+  line('next — review the spec, then approve the EXACT hash and run:');
+  line('  scripts/dogfood/run-slice.sh ' + manifest.runId + ' ' + manifest.specVersionId + ' ' + manifest.specHash);
+}
 NODE
 
-echo "── coordinator done; run is awaiting_approval ──"
+PHASE_OUT="$(node -e 'const o=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));
+  process.stdout.write(String((o.json??o).phase??"?"));' "$JSON")"
+echo "── coordinator done; run is ${PHASE_OUT} ──"

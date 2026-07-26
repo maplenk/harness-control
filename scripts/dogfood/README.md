@@ -38,6 +38,52 @@ scripts/dogfood/watch.sh RUN_ID             # the only side-effect-FREE option
 scripts/dogfood/run-slice.sh RUN_ID SPEC_VERSION SPEC_HASH
 ```
 
+## Unattended: no human approval step (B2 `approval: 'auto'`)
+
+Steps 1 and 3 collapse into one command when the run is created under a config
+pinned to `approval: 'auto'`:
+
+```sh
+SECTION="§3A.1" SLICE="…" PATHS="…" scripts/dogfood/auto-slice.sh
+```
+
+`auto-slice.sh` = `start-slice.sh` (with `CONFIG=scripts/dogfood/dogfood.auto.config.json`)
+→ `run-slice.sh`, and **nothing in the chain approves anything**. Under
+`approval:'auto'` the ENGINE binds the drafted spec hash inside the same
+transaction that persists the draft (`completeCoordinationRound`), so `start`
+returns with the run already at `approved`; the scripts only read that back and
+proceed. Everything after approval — implement → verify → bounded remediation →
+merge-readiness — is unchanged, because nothing after T1 ever involved a human.
+
+The mode is pinned into the run's config at `createRun` and is **immutable for
+that run's life**: a later process holding the opposite config can neither grant
+nor revoke it. The scripts therefore branch on the run's own reported state, not
+on which config file was passed. `run-slice.sh` skips `approve` only when
+`status --json` reports the run `approved` **and** bound to the exact hash it was
+handed; it refuses on a different hash, on a signer the event log cannot
+substantiate, and on any other phase.
+
+**Preconditions and price of `auto`:**
+
+- `verification.allowedCommands` must be **non-empty** — the engine refuses
+  `approval:'auto'` without it at config parse. With no human reading the spec,
+  the coordinator must not also choose what counts as proof.
+- Matching is **exact string equality against the command text**. Every command
+  any criterion may cite has to be in the config **before** `start`, including
+  slice-specific absence checks (`test -z "$(grep -REl "PATTERN" PATH || true)"`).
+  Editing that list *is* the approval you are no longer giving — and it is the
+  only remaining human eye on whether a declared command is executable as
+  written (L13/F16 is not built).
+- `dogfood.auto.config.json` ships a baseline of whole-repo commands
+  (`npm run typecheck`, `npm run build`, `npx vitest run`). Extend it per slice;
+  do not widen it to make a run pass.
+- **Residual, not fixed:** the allowlist pins the command TEXT, while F15's
+  `expectedExitCode` is chosen by the coordinator. A criterion may cite an
+  allowed command and declare a NON-ZERO exit as its proof — e.g.
+  `{"command":"npx vitest run","expectedExitCode":1}` is a criterion satisfied by
+  the suite failing. Read the drafted criteria before the merge gate.
+- The **merge gate stays human**. `auto` removes the approval step, not the merge.
+
 ## ⚠ `status` is NOT read-only — monitoring mutates the run
 
 Counterintuitive and worth knowing before you "just check on it": **every CLI
