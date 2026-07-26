@@ -1022,3 +1022,126 @@ describe('§17.1: typed provider failures reach the CLI redacted (raw-throw bypa
     expect(renderFatalError('AKIAIOSFODNN7EXAMPLE leaked')).toBe('[REDACTED:aws_access_key] leaked');
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// B3 — `run --in-place`: the flag that did not exist, end to end through the CLI.
+// ---------------------------------------------------------------------------
+describe('CLI — `run --in-place` reaches the engine and is visible in `status`', () => {
+  const IMPL_SCRIPTS: readonly AdapterScript[] = [
+    {
+      writes: [{ relPath: 'src/cli/verbose.ts', content: 'export const verbose = true;\n' }],
+      turns: [implementorTurn('Implemented --verbose.')],
+    },
+  ];
+  const VERIFY_SCRIPTS: readonly AdapterScript[] = [
+    {
+      turns: [
+        verifierTurn([
+          { id: 'AC-1', verdict: 'passed', evidence: 'ran check-ac1: exit 0' },
+          { id: 'AC-2', verdict: 'passed', evidence: 'ran check-ac2: exit 0' },
+        ]),
+      ],
+    },
+  ];
+
+  /** start -> approve -> run, returning the run output and the run id. */
+  async function startApproveRun(
+    wired: Wired,
+    runFlags: Record<string, unknown>,
+  ): Promise<{ runId: RunId; run: Awaited<ReturnType<typeof executeCommand>> }> {
+    const { service, db, deps } = wired;
+    const start = await executeCommand(
+      service,
+      db,
+      { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
+      {},
+      deps,
+    );
+    const runId = start.json['runId'] as RunId;
+    const spec = start.json['spec'] as { specVersionId: string; specHash: string };
+    const approve = await executeCommand(
+      service,
+      db,
+      {
+        kind: 'approve',
+        json: true,
+        runId,
+        specVersionId: toSpecVersionId(spec.specVersionId),
+        specHash: toSpecHash(spec.specHash),
+        testApprove: true,
+      },
+      { HARNESS_TEST_MODE: '1' },
+    );
+    expect(approve.exitCode).toBe(0);
+    const run = await executeCommand(
+      service,
+      db,
+      { kind: 'run', json: true, runId, implementor: IMPLEMENTOR, verifier: VERIFIER, ...runFlags },
+      {},
+      deps,
+    );
+    return { runId, run };
+  }
+
+  it('drives the run IN THE CHECKOUT and reports the mode in run + status', async () => {
+    const wired = await setup({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: IMPL_SCRIPTS,
+      verifier: VERIFY_SCRIPTS,
+    });
+    const branchBefore = (await repo!.run(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+    const { runId, run } = await startApproveRun(wired, { inPlace: true });
+
+    expect(run.json['error']).toBeUndefined();
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ outcome: 'merge_ready', executionMode: 'in_place' });
+    // The decisive fact: in-place mode works in the CHECKOUT, not in a worktree
+    // under `<repo>.worktrees/`. `executionMode` alone is a label; this is the
+    // observation that the flag actually reached the workspace lifecycle. The
+    // engine canonicalizes the root through `git rev-parse --show-toplevel`
+    // (`/private/var/...` on darwin), so the fixture's mkdtemp path is compared
+    // through the same canonicalization rather than byte-for-byte.
+    expect(run.json['worktreePath']).toBe(
+      (await repo!.run(['rev-parse', '--show-toplevel'])).trim(),
+    );
+    expect(run.text).toContain('execution mode: in_place');
+
+    // `status` reports it too — an operator must be able to tell, WITHOUT
+    // remembering which flag they typed, whether a run is writing in their tree.
+    const status = await executeCommand(wired.service, wired.db, { kind: 'status', json: true, runId }, {});
+    expect(status.json['executionMode']).toBe('in_place');
+    expect(status.text).toContain('execution mode: in_place');
+    // B3 exit: a TERMINAL in-place run puts the operator back on their branch.
+    expect((await repo!.run(['rev-parse', '--abbrev-ref', 'HEAD'])).trim()).toBe(branchBefore);
+  }, 60_000);
+
+  it('WITHOUT the flag the run is a worktree run, exactly as before', async () => {
+    const wired = await setup({
+      coordinator: [{ turns: [coordinatorTurn(validSpec())] }],
+      implementor: IMPL_SCRIPTS,
+      verifier: VERIFY_SCRIPTS,
+    });
+    const { runId, run } = await startApproveRun(wired, {});
+    expect(run.json).toMatchObject({ outcome: 'merge_ready', executionMode: 'worktree' });
+    expect(run.json['worktreePath']).not.toBe(
+      (await repo!.run(['rev-parse', '--show-toplevel'])).trim(),
+    );
+    const status = await executeCommand(wired.service, wired.db, { kind: 'status', json: true, runId }, {});
+    expect(status.json['executionMode']).toBe('worktree');
+  }, 60_000);
+
+  it('a run that never reached `run` reports `worktree` — absence is the status quo, not "unknown"', async () => {
+    const wired = await setup({ coordinator: [{ turns: [coordinatorTurn(validSpec())] }] });
+    const start = await executeCommand(
+      wired.service,
+      wired.db,
+      { kind: 'start', json: true, workspace: repo!.dir, goal: GOAL, coordinator: COORDINATOR },
+      {},
+      wired.deps,
+    );
+    const runId = start.json['runId'] as RunId;
+    const status = await executeCommand(wired.service, wired.db, { kind: 'status', json: true, runId }, {});
+    expect(status.json['executionMode']).toBe('worktree');
+  }, 60_000);
+});

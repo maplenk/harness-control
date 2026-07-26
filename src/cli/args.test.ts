@@ -119,6 +119,53 @@ describe('parseCliArgs — spec revise / approve / run', () => {
     });
   });
 
+  // B3 — `--in-place`: the ONLY route to the non-default execution mode.
+  it('parses `run --in-place`, and its ABSENCE is not `false` but nothing at all', () => {
+    // The status quo, byte-for-byte: no flag, no field. An `inPlace: false` here
+    // would be a new key on every existing parse result.
+    expect(parseCliArgs(['run', 'run_1'])).toEqual({ kind: 'run', json: false, runId: 'run_1' });
+    expect(parseCliArgs(['run', 'run_1', '--in-place'])).toEqual({
+      kind: 'run',
+      json: false,
+      runId: 'run_1',
+      inPlace: true,
+    });
+    // Composes with everything else `run` accepts, in any position.
+    expect(
+      parseCliArgs(['run', 'run_1', '--in-place', '--json', '--no-wait', '--implementor', 'claude:opus']),
+    ).toEqual({
+      kind: 'run',
+      json: true,
+      runId: 'run_1',
+      implementor: { harness: 'claude', model: 'opus' },
+      inPlace: true,
+      noWait: true,
+    });
+  });
+
+  it('refuses `--in-place` a VALUE, and refuses it on commands that do not have it', () => {
+    // A boolean that took a value would let `--in-place=worktree` read as opting
+    // OUT while switching the mode ON.
+    expect(parseCliArgs(['run', 'run_1', '--in-place=true'])).toEqual({
+      kind: 'usage_error',
+      message: '--in-place takes no value',
+    });
+    // The mode is chosen when the loop is driven. Accepting it on `resume` or
+    // `status` would suggest it could be changed after the workspace exists.
+    expect(parseCliArgs(['resume', 'run_1', '--in-place'])).toMatchObject({
+      kind: 'usage_error',
+      message: 'unknown option: --in-place',
+    });
+    expect(parseCliArgs(['status', 'run_1', '--in-place'])).toMatchObject({
+      kind: 'usage_error',
+      message: 'unknown option: --in-place',
+    });
+    expect(parseCliArgs(['start', '--in-place'])).toMatchObject({
+      kind: 'usage_error',
+      message: 'unknown option: --in-place',
+    });
+  });
+
   it('parses Grok Build implementor and verifier profiles', () => {
     expect(
       parseCliArgs([

@@ -740,9 +740,37 @@ export interface ImplementorPermissionObservation {
   readonly toolTitle?: string;
 }
 
+/**
+ * B5 — the outcome of ONE sub-assignment's implementor TURN inside a
+ * multi-assignment round (execution-modes spec §3.3, shared-tree parallelism).
+ *
+ * Deliberately says nothing about a commit: in shared-tree parallelism there is
+ * exactly ONE host commit for the whole round (§R2), so "did this assignment
+ * commit" is not a question that has an answer. What it CAN say honestly is
+ * whether the assignment's turn ended normally — which is what makes a partial
+ * fan-out visible instead of averaged away.
+ */
+export interface AssignmentRoundOutcome {
+  /** The spec-declared sub-assignment id (not the run's engine assignment id). */
+  readonly id: string;
+  /** Repo-relative declared write scope this implementor was confined to. */
+  readonly writeScope: readonly string[];
+  /** `delivered` = the turn ended `end_turn`; `no_deliverable` = anything else. */
+  readonly stage: 'delivered' | 'no_deliverable';
+  readonly stopReason?: AcpStopReason;
+  /** Bounded, redacted explanation for a `no_deliverable` sub-assignment. */
+  readonly diagnostic?: string;
+}
+
 export interface ImplementorResult {
   readonly runId: RunId;
   readonly assignmentId: AssignmentId;
+  /**
+   * B5: present only for a MULTI-ASSIGNMENT round — one entry per spec-declared
+   * sub-assignment, in spec order. Absent for every single-implementor round,
+   * which is every round the engine drove before B5.
+   */
+  readonly assignments?: readonly AssignmentRoundOutcome[];
   readonly worktreePath: string;
   readonly branch: string;
   readonly baseSha: GitSha;
@@ -974,6 +1002,45 @@ export function buildImplementorPrompt(
 }
 
 // ---------------------------------------------------------------------------
+// B5 — the turn/commit seam
+// ---------------------------------------------------------------------------
+/**
+ * Everything ONE implementor's prompt turn(s) produced, before any git happens.
+ * This is the unit a multi-assignment round fans out N of; the commit is the
+ * unit it joins them into (exactly one, §R2).
+ */
+export interface ImplementorTurnOutcome {
+  readonly stopReason: AcpStopReason;
+  readonly promptDiagnostics?: PromptDiagnostics;
+  readonly agentMessages: readonly string[];
+  readonly toolCalls: readonly ImplementorToolCall[];
+  readonly permissionRequests: readonly ImplementorPermissionObservation[];
+  readonly configApplied: readonly AppliedConfigOption[];
+}
+
+/**
+ * What a MULTI-assignment driver substitutes at the shared commit boundary.
+ * Every field is absent on the single-implementor path, where `commitRound`
+ * therefore behaves byte-for-byte as `run()` always did.
+ */
+export interface CommitRoundOverrides {
+  /**
+   * The boundary the commit gate consults. For a fan-out this is the UNION of
+   * the sub-assignments' scopes: the one commit carries all of their work, so a
+   * per-assignment boundary would refuse a sibling's legitimate write.
+   */
+  readonly commitBoundary?: WriteBoundary;
+  /** Per-sub-assignment outcomes, recorded verbatim on the round report. */
+  readonly assignments?: readonly AssignmentRoundOutcome[];
+  /**
+   * The JOINED stop reason. A fan-out has N of them; the join reports the worst
+   * (any abnormal stop wins) so `adjudicateImplementorDeliverable` sees a round
+   * that did not fully deliver as exactly that.
+   */
+  readonly stopReason?: AcpStopReason;
+}
+
+// ---------------------------------------------------------------------------
 // The RoleRunner
 // ---------------------------------------------------------------------------
 /**
@@ -1011,7 +1078,19 @@ export class ImplementorFlow {
     this.allowedShellCommands = resolveVerificationCommandTexts(context);
   }
 
-  async run(session: RoleSession): Promise<ImplementorResult> {
+  /**
+   * B5 — THE TURN HALF: drive the prompt turn(s) and collect what the agent
+   * itself produced. NO git, no commit, no provisioning, no report.
+   *
+   * Split out because shared-tree parallelism (§R2) needs N implementor TURNS
+   * and exactly ONE host commit: the commit is the round's, not any single
+   * assignment's. `run()` below is still turn-then-commit, so the
+   * single-implementor path is byte-for-byte what it was — the split is a
+   * factoring, not a behaviour change, and the ordering guarantees (confinement
+   * check before any prompt; commit strictly after every turn) are preserved by
+   * construction because `commitRound` cannot run before `runTurn` returns.
+   */
+  async runTurn(session: RoleSession): Promise<ImplementorTurnOutcome> {
     const handle = this.#handle;
     const cwd = handle.worktreePath;
 
@@ -1081,6 +1160,53 @@ export class ImplementorFlow {
       if (stopReason !== 'end_turn') break;
     }
 
+    return {
+      stopReason,
+      ...(promptDiagnostics !== undefined ? { promptDiagnostics } : {}),
+      agentMessages,
+      toolCalls: [...toolCalls.values()],
+      permissionRequests,
+      configApplied: session.configApplied,
+    };
+  }
+
+  /**
+   * B5 — THE COMMIT HALF: the host stages, gates and commits, then gathers the
+   * git facts ITSELF and assembles the §8 report.
+   *
+   * This is where the ONE host commit of a shared-tree round happens, which is
+   * exactly why it is separable: implementors never run git (§R2), so N turns
+   * and one commit is not a compromise — it is the only shape the git model
+   * allows for N writers in one tree, and it is what the verifier is handed.
+   *
+   * `turn` carries the agent-side facts; `overrides` lets a multi-assignment
+   * driver substitute the AGGREGATE facts (the union write boundary that must
+   * account for every dirty path, the per-assignment outcomes, the joined
+   * stop reason) without this method having to know how many agents ran.
+   */
+  async commitRound(
+    session: RoleSession,
+    turn: ImplementorTurnOutcome,
+    overrides: CommitRoundOverrides = {},
+  ): Promise<ImplementorResult> {
+    const handle = this.#handle;
+    const cwd = handle.worktreePath;
+    // §16 item 4 confinement, asserted in BOTH halves rather than only in the
+    // one that happens to run first. Splitting `run()` in two created a second
+    // public entry point into the round, and a guard that only one of them
+    // carries is a guard a future caller can skip by picking the other door.
+    if (session.role !== 'implementor') {
+      throw new Error(`ImplementorFlow expects role 'implementor', got '${session.role}'`);
+    }
+    if (path.resolve(session.cwd) !== path.resolve(cwd)) {
+      throw new Error(
+        `ImplementorFlow confinement violated: session cwd ${session.cwd} != worktree ${cwd}`,
+      );
+    }
+    const { agentMessages, toolCalls, permissionRequests } = turn;
+    const stopReason = overrides.stopReason ?? turn.stopReason;
+    const promptDiagnostics = turn.promptDiagnostics;
+
     // --- §8 report: commit the work, then gather the git facts OURSELVES ----
     const baseSha = String(handle.baseSha);
     const commitEnv = this.#options.commitEnv ?? IMPLEMENTOR_COMMIT_ENV;
@@ -1116,7 +1242,18 @@ export class ImplementorFlow {
     // certify content this assignment never owned — while dropping it silently
     // would hide an R1 violation that already happened. Positively-identified
     // breakage refuses.
-    const boundary = handle.writeBoundary;
+    //
+    // B5 — for a MULTI-ASSIGNMENT round the gate consults the UNION boundary
+    // (`overrides.commitBoundary`), because the tree holds N assignments' work
+    // and this one commit carries all of it. What that union can and cannot say
+    // is stated exactly once, here: a path outside EVERY declared scope is
+    // unattributable and refuses; a path inside some OTHER assignment's scope is
+    // admitted, because with concurrent writers in one tree the host cannot
+    // attribute a dirty path to an agent. Per-assignment prevention is the ACP
+    // write rule (each session carries its OWN narrower boundary); this is
+    // detection at the union, and the difference is a documented residual rather
+    // than a claim the union does not support.
+    const boundary = overrides.commitBoundary ?? handle.writeBoundary;
     if (boundary.declared.length > 0) {
       const dirty = await statusPorcelainPathsExact(cwd);
       const outside = pathsOutsideBoundary(
@@ -1242,6 +1379,7 @@ export class ImplementorFlow {
     return {
       runId: session.runId,
       assignmentId: handle.assignmentId,
+      ...(overrides.assignments !== undefined ? { assignments: overrides.assignments } : {}),
       worktreePath: cwd,
       branch: handle.branch,
       baseSha: handle.baseSha,
@@ -1265,11 +1403,21 @@ export class ImplementorFlow {
       ...(commit.sha !== undefined ? { commitSha: gitSha(commit.sha) } : {}),
       stopReason,
       ...(promptDiagnostics !== undefined ? { promptDiagnostics } : {}),
-      configApplied: session.configApplied,
+      configApplied: turn.configApplied,
       agentMessages,
-      toolCalls: [...toolCalls.values()],
+      toolCalls,
       permissionRequests,
     };
+  }
+
+  /**
+   * The single-implementor round: one turn, then the host commit. Composed from
+   * the two halves above so there is exactly ONE implementation of each, and so
+   * a multi-assignment driver reusing `commitRound` can never drift from what a
+   * single-assignment round does at its commit boundary.
+   */
+  async run(session: RoleSession): Promise<ImplementorResult> {
+    return this.commitRound(session, await this.runTurn(session));
   }
 }
 

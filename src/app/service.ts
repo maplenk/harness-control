@@ -243,10 +243,13 @@ import {
   RUN_META_PROJECTION,
   SPEC_DRAFT_PROJECTION,
   WORKFLOW_DISPATCH_EDGES,
+  assignmentRoundProjectionName,
   isEngineFoldedSupportingEvent,
   makeEngineReducer,
   migrateMergeReadinessBlockedState,
+  resolveAssignmentRoundState,
   uiStateOf,
+  type AssignmentRoundState,
   type ImplementVerifyLoopState,
   type MergeReadinessBlockedState,
   type RoleRoundAdvance,
@@ -3649,6 +3652,28 @@ export class OrchestrationService {
   getImplementVerifyLoopState(runId: RunId): ImplementVerifyLoopState | undefined {
     return this.#db.projections.get<ImplementVerifyLoopState>(runId, IMPLEMENT_VERIFY_LOOP_PROJECTION)
       ?.state;
+  }
+
+  /**
+   * B5 — record ONE sub-assignment's fan-out outcome, the moment its turn
+   * settles. Written per assignment rather than at the join precisely so a crash
+   * mid-fan-out keeps every assignment that already finished.
+   */
+  saveAssignmentRound(runId: RunId, state: AssignmentRoundState): void {
+    this.#requireMeta(runId);
+    this.#db.projections.save(runId, assignmentRoundProjectionName(state.id), state);
+  }
+
+  /**
+   * The persisted outcome for one sub-assignment, THROUGH the read boundary:
+   * absence, an old shape and an unreadable record all answer `undefined`, which
+   * the driver reads as "drive it". A resume must never crash on a record written
+   * before this projection existed.
+   */
+  getAssignmentRound(runId: RunId, assignmentKey: string): AssignmentRoundState | undefined {
+    return resolveAssignmentRoundState(
+      this.#db.projections.get<unknown>(runId, assignmentRoundProjectionName(assignmentKey))?.state,
+    );
   }
 
   // ---- Status --------------------------------------------------------------

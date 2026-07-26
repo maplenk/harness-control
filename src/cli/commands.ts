@@ -55,6 +55,7 @@ import {
   ResumeEligibilityError,
   SpecApprovalRefusedError,
   WorkspaceDriftError,
+  resolvePersistedExecutionMode,
   resolveRoleModel,
   type DesiredModelRecord,
   type IngestResult,
@@ -70,6 +71,7 @@ import {
   runImplementVerifyLoop,
   type ImplementVerifyLoopResult,
   type ImplementVerifyResumeInput,
+  type LoopAssignment,
 } from '../app/flows/orchestrate.js';
 import {
   validateCoordinatorSpec,
@@ -1208,6 +1210,18 @@ async function handleRun(
         taskScope: `Implement the approved specification end to end: ${draft.goal}`,
         criteria: draft.criteria,
         evidence: flows.evidence,
+        // B3: `--in-place` is the ONLY way an operator reaches the non-default
+        // mode, and it is passed only when they asked for it — an omitted flag
+        // never becomes an explicit `'worktree'`, so the loop's own default (and
+        // every existing test asserting it) is untouched.
+        ...(cmd.inPlace === true ? { executionMode: 'in_place' as const } : {}),
+        // B5: the decomposition comes from the APPROVED spec's canonical bytes —
+        // the exact bytes `approvedSpecHash` binds — so the fan-out that runs is
+        // provably the fan-out a human (or the pinned auto-approval) signed.
+        ...(() => {
+          const assignments = approvedSpecAssignments(draft.canonicalSpec);
+          return assignments.length > 0 ? { assignments } : {};
+        })(),
         ...(flows.runVerification !== undefined ? { runVerificationCommands: flows.runVerification } : {}),
       },
     );
@@ -1217,6 +1231,45 @@ async function handleRun(
   }
 
   return loopResultOutput('run', service, cmd.runId, result, implementorSpec, verifierSpec);
+}
+
+/**
+ * B5 — the approved decomposition, read from the CANONICAL SPEC BYTES.
+ *
+ * Those bytes are what `approvedSpecHash` binds (`canonicalizeSpec` emits
+ * `assignments` into them), so reading the fan-out from here means the
+ * decomposition that executes is the decomposition that was approved. Reading it
+ * from a separate projection would have introduced a second source that could
+ * disagree with the hash — and a decomposition that is not hash-bound makes the
+ * approval-time R1 gate advisory.
+ *
+ * TOTAL: unparseable bytes, a missing/!array `assignments`, or an entry missing
+ * the fields the driver needs all yield NO decomposition — i.e. today's
+ * single-implementor run. A spec written before B4 has no `assignments` at all,
+ * and that absence is not an error (rule 9); it is the status quo.
+ */
+export function approvedSpecAssignments(canonicalSpec: string): readonly LoopAssignment[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(canonicalSpec);
+  } catch {
+    return [];
+  }
+  if (parsed === null || typeof parsed !== 'object') return [];
+  const raw = (parsed as { assignments?: unknown }).assignments;
+  if (!Array.isArray(raw)) return [];
+  const assignments: LoopAssignment[] = [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== 'object') return [];
+    const candidate = entry as { id?: unknown; taskScope?: unknown; writeScope?: unknown };
+    if (typeof candidate.id !== 'string' || candidate.id.length === 0) return [];
+    if (typeof candidate.taskScope !== 'string' || candidate.taskScope.length === 0) return [];
+    const writeScope = Array.isArray(candidate.writeScope)
+      ? candidate.writeScope.filter((path): path is string => typeof path === 'string')
+      : [];
+    assignments.push({ id: candidate.id, taskScope: candidate.taskScope, writeScope });
+  }
+  return assignments;
 }
 
 /**
@@ -1253,6 +1306,11 @@ function loopResultOutput(
     rounds: result.rounds.length,
     implementationCommit: String(result.implementationCommit),
     worktreePath: result.worktree.worktreePath,
+    // B3: WHICH mode actually ran, from the handle the loop returned — never
+    // from the flag that was asked for. In `in_place` the "worktreePath" IS the
+    // operator's checkout, and a reader who cannot tell the two apart cannot
+    // tell whether that path is a scratch directory or their own tree.
+    executionMode: result.worktree.executionMode,
     warnings: result.warnings,
     plan: {
       implementor: resolvedView(resolveRoleModel(implementor)),
@@ -1268,8 +1326,15 @@ function loopResultOutput(
     `  implementor: ${describeSpec(implementor)}`,
     `  verifier:    ${describeSpec(verifier)}`,
     `  implementation commit: ${String(result.implementationCommit)}`,
+    `  execution mode: ${result.worktree.executionMode}`,
     `  worktree: ${result.worktree.worktreePath}`,
   ];
+  if (result.inPlaceHeadRestored === false) {
+    lines.push(
+      `  WARNING: the checkout is still on ${result.worktree.branch} — restoring your original HEAD failed ` +
+        '(git refuses to switch away from a dirty tree). Inspect and switch back manually.',
+    );
+  }
   for (const warning of result.warnings) lines.push(`  warning: ${warning}`);
   if (mr !== undefined) {
     lines.push(`  merge-readiness: ${mr.ready ? 'READY' : 'NOT READY'} (§16 — the harness never merges).`);
@@ -2178,6 +2243,16 @@ async function reenterImplementVerify(
       taskScope: loopState.taskScope,
       criteria: draft.criteria,
       evidence: flows.evidence,
+      // B5: a RESUMED multi-assignment run must resume as a multi-assignment run.
+      // The decomposition comes from the same hash-bound canonical bytes the
+      // original dispatch read, so the resumed round drives the SAME assignments
+      // — and the per-assignment projections tell it which of them already
+      // finished. Reading it from anywhere else could resume a different fan-out
+      // than the one the crash interrupted.
+      ...(() => {
+        const assignments = approvedSpecAssignments(draft.canonicalSpec);
+        return assignments.length > 0 ? { assignments } : {};
+      })(),
       ...(flows.runVerification !== undefined ? { runVerificationCommands: flows.runVerification } : {}),
       resume,
     },
@@ -2330,6 +2405,16 @@ function handleStatus(service: OrchestrationService, db: Database, runId: RunId)
     ...(st.approvedSpecHash !== undefined ? { approvedSpecHash: st.approvedSpecHash } : {}),
     ...(st.goal !== undefined ? { goal: st.goal } : {}),
     ...(st.workspacePath !== undefined ? { workspacePath: st.workspacePath } : {}),
+    // B3: WHICH execution mode this run's workspace was created under, through
+    // the persisted read boundary. `worktree` is what every run predating
+    // execution modes was actually created under, so absence is not "unknown" —
+    // it is the status quo, and `resolvePersistedExecutionMode` is the ONE
+    // reader allowed to say so. Reported before any workspace exists too: a run
+    // that has not reached `run` yet has not chosen, and `worktree` is what it
+    // will get unless the operator passes `--in-place`.
+    executionMode: resolvePersistedExecutionMode(
+      service.getImplementVerifyLoopState(runId)?.worktree,
+    ),
     planningChatEnabled:
       db.projections.get<RunMeta>(runId, RUN_META_PROJECTION)?.state.planningChatEnabled === true,
     vitals: {
@@ -2812,6 +2897,13 @@ function renderStatusText(view: Record<string, unknown>, suspension: string): st
     }`,
     `  operation:  ${JSON.stringify(view['operation'])}`,
     `  child active: ${String(view['childActive'])}`,
+    // B3: an operator has to be able to tell, from `status` alone, whether this
+    // run is writing in their own checkout.
+    `  execution mode: ${String(view['executionMode'])}${
+      view['executionMode'] === 'in_place'
+        ? ' (works in THIS checkout on an assignment branch; revert target is the start checkpoint)'
+        : ''
+    }`,
     `  planning chat: ${view['planningChatEnabled'] === true ? 'enabled' : 'disabled'}`,
     `  cost: ${costLabel} over ${String(vitals.cost['turns'])} turn(s); ` +
       `rss: ${vitals.rssBytes === null ? 'n/a' : `${vitals.rssBytes} bytes`}`,

@@ -271,6 +271,85 @@ export function boundariesOverlap(
 }
 
 /**
+ * B5 — the boundaries of a SHARED-TREE fan-out, built as one indivisible act.
+ *
+ * `perAssignment[i]` is what implementor `i`'s session may write; `union` is what
+ * the ONE host commit may carry (§R2). They are returned together, from one
+ * construction, on purpose: the fan-out driver has no other way to obtain either,
+ * so it cannot end up with per-session boundaries and a commit-gate boundary that
+ * disagree, and it cannot obtain ANY of them for an overlapping decomposition.
+ *
+ * R1 is enforced here rather than left to the caller. The approval gate checks a
+ * DOCUMENT and `GitWorktreeManager.#assertScopeDisjoint` checks the manager's LIVE
+ * handle set — but a fan-out derives its N boundaries from ONE shared handle, so
+ * it passes through neither. This is the third place the same property must hold,
+ * and making it the only producer is what stops it becoming a check someone must
+ * remember to add.
+ */
+export interface DisjointWriteBoundaries {
+  readonly perAssignment: readonly WriteBoundary[];
+  /** Covers every declared path exactly once — the commit gate's boundary. */
+  readonly union: WriteBoundary;
+}
+
+export interface WriteBoundaryDeclaration {
+  /** Label used in a conflict message (the spec-declared assignment id). */
+  readonly id: string;
+  readonly declaredScope: readonly string[];
+}
+
+export function disjointWriteBoundaries(
+  mode: ExecutionMode,
+  executionRoot: string,
+  declarations: readonly WriteBoundaryDeclaration[],
+): DisjointWriteBoundaries {
+  if (declarations.length === 0) {
+    throw new WorktreeError(
+      'unsafe_path',
+      'a shared-tree fan-out needs at least one declared assignment; zero would leave the commit gate with no boundary at all',
+    );
+  }
+  const perAssignment: WriteBoundary[] = [];
+  for (const declaration of declarations) {
+    // An EMPTY scope means the whole execution root. That is the right default
+    // for a LONE implementor and is exactly the maximal overlap for N of them,
+    // so it is refused here with its own words rather than reported as a
+    // mysterious collision at '.'.
+    if (declarations.length > 1 && declaration.declaredScope.length === 0) {
+      throw new WorktreeError(
+        'unsafe_path',
+        `assignment ${JSON.stringify(declaration.id)} declares no write scope. With ${declarations.length} ` +
+          'concurrent implementors in one tree an empty scope means the ENTIRE execution root, so every ' +
+          'assignment could write every path — which is precisely the overlap R1 exists to refuse.',
+      );
+    }
+    perAssignment.push(
+      writeBoundary({ mode, executionRoot, declaredScope: declaration.declaredScope }),
+    );
+  }
+  for (let i = 0; i < perAssignment.length; i += 1) {
+    for (let j = i + 1; j < perAssignment.length; j += 1) {
+      const overlap = boundariesOverlap(perAssignment[i] as WriteBoundary, perAssignment[j] as WriteBoundary);
+      if (overlap !== undefined) {
+        throw writeScopeConflictError(
+          String(declarations[i]?.id),
+          String(declarations[j]?.id),
+          overlap,
+        );
+      }
+    }
+  }
+  return {
+    perAssignment,
+    union: writeBoundary({
+      mode,
+      executionRoot,
+      declaredScope: declarations.flatMap((declaration) => declaration.declaredScope),
+    }),
+  };
+}
+
+/**
  * Raised when two assignments could write the same path — at spec approval, or
  * when a second live workspace is opened against a scope a live one already
  * covers. `already_leased` is the honest kind: the overlapping region is
