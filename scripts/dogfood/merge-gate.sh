@@ -68,18 +68,50 @@ STATUS_JSON="$LOGDIR/merge-gate-$STAMP-status.json"
 "${CLI[@]}" status "$RUN_ID" --json >"$STATUS_JSON" 2>/dev/null \
   || die "cannot read status for $RUN_ID (is dist built?)"
 
+# The readiness record does NOT come from `status`. `mergeReadinessView` is
+# emitted only by `run` and `recheck` (commands.ts:1258/:1567); `status --json`
+# has no `mergeReadiness` key at all. An earlier draft of this gate read it from
+# `status` and therefore refused a genuinely `merge_ready` run as "ready=absent"
+# — the same false-refusal failure as the earlier `verdict` guess, one layer up:
+# right field names, wrong source.
+#
+# The durable record is the `verification.completed.passed` event payload, which
+# is what the engine actually committed. Read it from a COPY of the store: a
+# read-only sqlite3 connection fails outright between runs (WAL, no `-shm`), and
+# a run-scoped CLI call would append `alert.delivered` to the run being gated.
+SNAP="$(mktemp -d "${TMPDIR:-/tmp}/merge-gate-snap-XXXXXX")"
+cp "$HARNESS_HOME/harness.db" "$SNAP/h.db"
+for side in "-wal" "-shm"; do
+  [ -f "$HARNESS_HOME/harness.db$side" ] && cp "$HARNESS_HOME/harness.db$side" "$SNAP/h.db$side"
+done
+READINESS_JSON="$LOGDIR/merge-gate-$STAMP-readiness.json"
+sqlite3 -noheader "$SNAP/h.db" \
+  "SELECT payload_json FROM events WHERE run_id='$RUN_ID' AND type='verification.completed.passed' ORDER BY sequence DESC LIMIT 1;" \
+  >"$READINESS_JSON" 2>/dev/null || true
+rm -rf "$SNAP"
+
 # `read` returns non-zero at EOF, which `set -e` would treat as fatal, so the
 # node side emits a trailing newline AND the read is guarded. Without both, the
 # gate exits 1 here with no message.
-read -r PHASE READY SIGNER COMMIT < <(node - "$STATUS_JSON" <<'NODE'
-const b = (o => o.json ?? o)(JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8')));
-const mr = b.mergeReadiness;
+read -r PHASE READY SIGNER COMMIT < <(node - "$STATUS_JSON" "$READINESS_JSON" <<'NODE'
+const fs = require('fs');
+const b = (o => o.json ?? o)(JSON.parse(fs.readFileSync(process.argv[2], 'utf8')));
+const raw = fs.readFileSync(process.argv[3], 'utf8').trim();
+let mr;
+if (raw !== '') {
+  try { mr = JSON.parse(raw).mergeReadiness; } catch { mr = 'UNREADABLE'; }
+}
 // Distinguish "no readiness record yet" from "a record whose shape I cannot
 // read" — the first is an ordinary not-ready state, the second is a bug in
 // this parser and must never be reported as a verdict.
-const ready = mr === undefined ? 'absent' : (mr.ready === true ? 'true' : (mr.ready === false ? 'false' : 'UNPARSEABLE'));
-const commit = mr?.verifiedCommit ?? '-';
-console.log([b.phase ?? '?', ready, mr?.specApprovedBy ?? '-', commit || '-'].join(' '));
+const ready = mr === undefined ? 'absent'
+  : mr === 'UNREADABLE' || typeof mr !== 'object' ? 'UNPARSEABLE'
+  : mr.ready === true ? 'true'
+  : mr.ready === false ? 'false'
+  : 'UNPARSEABLE';
+const commit = (typeof mr === 'object' && mr !== null ? mr.verifiedCommit : undefined) ?? '-';
+// The signer is on `status` itself, and is the authority here.
+console.log([b.phase ?? '?', ready, b.specApprovedBy ?? '-', commit || '-'].join(' '));
 NODE
 ) || true
 [ -n "${PHASE:-}" ] || die "could not parse run status from $STATUS_JSON"
