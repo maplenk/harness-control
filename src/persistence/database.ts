@@ -17,6 +17,7 @@ import {
   type QuotaConfig,
 } from './artifact-repository.js';
 import { SqliteProcessSampleRepository, type ProcessSampleRepository } from './telemetry-repository.js';
+import { SqliteOperationRepository, type OperationRepository } from './operation-repository.js';
 
 export interface Database {
   readonly driver: SqlDriver;
@@ -25,6 +26,7 @@ export interface Database {
   readonly projections: ProjectionRepository;
   readonly artifacts: ArtifactRepository;
   readonly telemetry: ProcessSampleRepository;
+  readonly operations: OperationRepository;
   readonly appliedMigrations: readonly AppliedMigration[];
   /** Delegates to the underlying driver — see `SqlDriver.transaction`. */
   transaction<T>(fn: () => T): T;
@@ -80,6 +82,7 @@ export async function openDatabase(options: OpenDatabaseOptions): Promise<Databa
     options.quotas ?? DEFAULT_QUOTAS,
   );
   const telemetry = new SqliteProcessSampleRepository(driver, clock);
+  const operations = new SqliteOperationRepository(driver, clock);
 
   return {
     driver,
@@ -88,6 +91,7 @@ export async function openDatabase(options: OpenDatabaseOptions): Promise<Databa
     projections,
     artifacts,
     telemetry,
+    operations,
     appliedMigrations,
     transaction: <T>(fn: () => T): T => driver.transaction(fn),
     transactionImmediate: <T>(fn: () => T): T => driver.transactionImmediate(fn),

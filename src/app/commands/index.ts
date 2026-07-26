@@ -8,3 +8,4 @@
 export * from './types.js';
 export * from './cli-seam.js';
 export * from './executor.js';
+export * from './operation-recovery.js';

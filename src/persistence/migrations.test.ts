@@ -45,6 +45,7 @@ describe.each(DRIVER_KINDS)('migrations (%s)', (kind) => {
       'artifact_admission_rejections',
       'raw_process_samples',
       'process_sample_aggregates',
+      'operations',
       'schema_migrations',
     ]) {
       expect(names).toContain(table);

@@ -46,3 +46,30 @@ export { openDatabase } from './database.js';
 
 export type { AppendTriggerOptions, AppendWithProjectionResult, ProjectionUpdate } from './write-path.js';
 export { appendTriggerWithEffects } from './write-path.js';
+
+export type {
+  AcceptOperationInput,
+  AcceptOperationResult,
+  OperationBindingDatabase,
+  OperationId,
+  OperationLifecycleState,
+  OperationOwner,
+  OperationRecord,
+  OperationRepository,
+  TerminalOperationState,
+  TransitionOperationInput,
+  TransitionOperationResult,
+} from './operation-repository.js';
+export {
+  OPERATION_COMMAND_PAYLOAD_VERSION,
+  OPERATION_LIFECYCLE_STATES,
+  OPERATION_TRANSITIONS,
+  TERMINAL_OPERATION_STATES,
+  OperationRunBindingConflictError,
+  SqliteOperationRepository,
+  bindRunToOperationAtomically,
+  hashOperationCommand,
+  isLegalOperationTransition,
+  isTerminalOperationState,
+  operationId,
+} from './operation-repository.js';
