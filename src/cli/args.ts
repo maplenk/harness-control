@@ -45,10 +45,16 @@ commands:
       T1: explicit human approval binding the drafted SpecVersion hash
       (omitted --spec-hash binds the draft's; a mismatching one is refused).
       --test-approve  automated-acceptance seam; REFUSED unless HARNESS_TEST_MODE=1.
-  run RUN_ID [--implementor PROFILE] [--verifier PROFILE] [--no-wait]
+  run RUN_ID [--implementor PROFILE] [--verifier PROFILE] [--in-place] [--no-wait]
       resolve the implementor/verifier plan for the approved spec.
       On a provider usage-limit pause the default policy WAITS in-process
       (schedule loop, §13); --no-wait exits code 3 with resume instructions.
+      --in-place runs in the CHECKOUT ITSELF on an assignment branch, with a
+      durable git start checkpoint as the revert target instead of a worktree
+      (B3): no clone, no dependency provisioning. It REQUIRES a clean checkout,
+      and it weakens drift detection to "any change outside the assignment's
+      write scope" — do not edit files in scope while the run is live. The
+      default remains worktree isolation; 'status' reports which mode a run is in.
   recheck RUN_ID             W2-2: re-probe §16 readiness for an integration_blocked run
       (run stays in verifying; T24 ingested once the user-actionable blockers clear).
   status RUN_ID [--json]     phase, suspension, ETA|unknown, vitals (rss/context/cost), checkpoints;
@@ -92,6 +98,18 @@ export type RunCommand =
       readonly runId: RunId;
       readonly implementor?: RoleModelSpec;
       readonly verifier?: RoleModelSpec;
+      /**
+       * B3: drive this run's workspace `in_place` — the checkout itself, on an
+       * assignment branch, with a durable start checkpoint as the revert target
+       * — instead of the default `worktree` isolation.
+       *
+       * Deliberately OPTIONAL and absent-means-worktree rather than an
+       * `--execution-mode` value flag: the mode is a closed two-value vocabulary
+       * whose default is the safe one, and a boolean cannot be given a third
+       * value by a typo. `undefined` and `false` are the same run, which is why
+       * the flag only ever appears when it was actually passed.
+       */
+      readonly inPlace?: boolean;
       /** W2-5: on a limit pause, exit code 3 with resume instructions instead
        * of the default in-process schedule-loop wait. */
       readonly noWait?: boolean;
@@ -356,7 +374,7 @@ function parseApprove(rest: readonly string[]): ParsedCliCommand {
 
 function parseRun(rest: readonly string[]): ParsedCliCommand {
   const collected = collectOptions(rest, {
-    booleans: ['json', 'no-wait'],
+    booleans: ['json', 'no-wait', 'in-place'],
     values: ['implementor', 'verifier', 'config'],
   });
   if (isErr(collected)) return usage(collected.error);
@@ -385,6 +403,7 @@ function parseRun(rest: readonly string[]): ParsedCliCommand {
     runId: runId.value,
     ...(implementor !== undefined ? { implementor } : {}),
     ...(verifier !== undefined ? { verifier } : {}),
+    ...(bools.has('in-place') ? { inPlace: true } : {}),
     ...(bools.has('no-wait') ? { noWait: true } : {}),
   };
 }

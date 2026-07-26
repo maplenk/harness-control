@@ -82,6 +82,12 @@ import {
   type VerificationRunner,
 } from './implementor.js';
 import {
+  multiImplementorFlow,
+  type LoopAssignment,
+  type MultiImplementorFlow,
+} from './multi-implementor.js';
+export type { LoopAssignment } from './multi-implementor.js';
+import {
   formatFixRequests,
   executeEvidenceReceiptsUnderConfinement,
   gitMergeReadinessProbe,
@@ -262,6 +268,19 @@ export interface ImplementVerifyLoopCommonInput {
    * execution root, which is what a single implementor has always had.
    */
   readonly writeScope?: readonly string[];
+  /**
+   * B5 — the approved spec's DECOMPOSITION: N implementors driven CONCURRENTLY
+   * against this one workspace, each confined to its own disjoint write scope,
+   * joined into the ONE host commit the round hands the verifier (§R2).
+   *
+   * Absent, or a single entry, is EXACTLY today's single-implementor round — the
+   * fan-out is not entered, not constructed, and cannot perturb it. Present with
+   * two or more entries, the implementor HALF of each round becomes the fan-out;
+   * provisioning, the receipts, verification, the §16 gate and the remediation
+   * bound are untouched, because all of them read `handle` and the round's
+   * implementation commit, which the fan-out produces in exactly the same shape.
+   */
+  readonly assignments?: readonly LoopAssignment[];
 }
 
 /** W2-5 resume re-entry input (see `ImplementVerifyLoopInput.resume`). */
@@ -868,13 +887,24 @@ export async function runImplementVerifyLoop(
         // idempotent, mutex+lease-held manager op is run from inside the flow after
         // the commit; a failure fails closed (self-check skipped, `provisioningFailed`
         // carried out for the halt below).
-        const flow = new ImplementorFlow(handle, context, {
+        const implementorOptions: ImplementorFlowOptions = {
           ...buildImplementorOptions(input),
           // Round-2 #3: exclude node_modules from the commit only while provisioning
           // is active; `worktree.provision='none'` keeps normal `git add -A`.
           provisionActive: worktrees.provisionStrategy !== 'none',
           provisionForVerification: () => worktrees.provisionForVerification(input.assignmentId),
-        });
+        };
+        // B5 — THE ONE PLACE the round decides how many implementors it drives.
+        //
+        // `resolveRoundFlow` returns the single-implementor `ImplementorFlow` for
+        // an absent or one-entry decomposition, which is every run that existed
+        // before B5: the fan-out is never constructed, so nothing about the proven
+        // path can be perturbed by it. Both shapes expose the SAME three fields
+        // the runner below reads (`allowedShellCommands`, `writeBoundary`, `run`)
+        // and both end at the same host commit, so everything downstream — the
+        // adjudicator, the receipt, provisioning, the verifier, the §16 gate — is
+        // literally the same code reading the same result.
+        const flow = resolveRoundFlow(deps, input, handle, context, implementorOptions, round);
         // F2: wrap the flow with the deliverable adjudicator — `runRole` persists
         // the verdict ATOMICALLY at round completion (no `completed`-then-overwrite
         // crash window a resume could read as "verify next"). The adjudicator reads
@@ -894,10 +924,18 @@ export async function runImplementVerifyLoop(
           allowedShellCommands: flow.allowedShellCommands,
           // B4: the SAME boundary the commit gate enforces, forwarded to the
           // provider's permission mediation so prevention and detection agree
-          // by construction rather than by two matching derivations.
+          // by construction rather than by two matching derivations. For a
+          // fan-out this is the LEAD assignment's boundary; each sibling session
+          // carries its own, and the commit gate consults their union.
           writeBoundary: flow.writeBoundary,
           run: (session) => flow.run(session),
-          diagnoseRoundOutcome: (result) => receiptMismatch ?? describeImplementorRoundDiagnostic(result),
+          // B5: a partial fan-out explains itself FIRST — "2 of 3 assignments
+          // finished" is the fact an operator needs, and the generic abnormal-stop
+          // summary below would otherwise report only the joined stop reason.
+          diagnoseRoundOutcome: (result) =>
+            receiptMismatch ??
+            ('joinDiagnostic' in flow ? flow.joinDiagnostic() : undefined) ??
+            describeImplementorRoundDiagnostic(result),
           adjudicateRoundOutcome: async (result) => {
             const hostHead = gitSha(await git.resolveSha(handle.worktreePath, 'HEAD'));
             // ROUND 8 (Blocker 1a): the round`s own receipt is authoritative.
@@ -1495,6 +1533,45 @@ function recordStartCheckpoint(
     }),
     worktree: { ...(existing?.worktree ?? {}), ...worktree },
   });
+}
+
+/**
+ * B5 — the ONE decision point between a single implementor and a fan-out.
+ *
+ * It is a function rather than an inline ternary so there is exactly one answer
+ * to "how many implementors does a round drive", and so the fallback is the
+ * DEFAULT rather than something a caller opts into: anything that is not a
+ * decomposition of two or more assignments resolves to the single-implementor
+ * flow that has always run. A spec with one `assignments[]` entry is deliberately
+ * NOT a fan-out — one implementor with a declared scope is a narrowing of today's
+ * round, and routing it through the concurrent driver would change the shape of a
+ * run for no gain.
+ */
+function resolveRoundFlow(
+  deps: ImplementVerifyLoopDeps,
+  input: ImplementVerifyLoopInput,
+  handle: WorktreeHandle,
+  context: ImplementorContext,
+  options: ImplementorFlowOptions,
+  round: number,
+): ImplementorFlow | MultiImplementorFlow {
+  const assignments = input.assignments;
+  if (assignments === undefined || assignments.length < 2) {
+    return new ImplementorFlow(handle, context, options);
+  }
+  return multiImplementorFlow(
+    { service: deps.service, clock: deps.clock },
+    {
+      runId: input.runId,
+      assignmentId: input.assignmentId,
+      round,
+      handle,
+      assignments,
+      context,
+      options,
+      implementorSpec: deps.service.effectiveRoleSpec(input.runId, 'implementor', input.implementor),
+    },
+  );
 }
 
 function ensureLeased(worktrees: GitWorktreeManager, assignmentId: AssignmentId): void {

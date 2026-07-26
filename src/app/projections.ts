@@ -446,6 +446,75 @@ export interface ImplementVerifyLoopState {
   readonly worktree?: WorktreeFactsState;
 }
 
+// ---------------------------------------------------------------------------
+// B5 — per-sub-assignment round records (shared-tree fan-out)
+// ---------------------------------------------------------------------------
+/**
+ * A multi-assignment round drives N implementors CONCURRENTLY against one tree,
+ * and a crash can land anywhere in that fan-out. The run-level
+ * `RoleRoundProjection` is a single record and cannot say "assignment A finished,
+ * B did not" — so each sub-assignment gets its OWN durable record, written the
+ * moment its turn settles rather than at the join.
+ *
+ * That is the whole point: a crash after A's turn and before B's leaves A's record
+ * on disk, so the resumed round re-drives only B. Without it, resume would either
+ * re-drive everything (paying for A twice and letting a second A turn contradict
+ * the first) or re-drive nothing (losing B).
+ *
+ * Named per assignment (`assignment_round:<id>`) because the projection store is
+ * keyed by `(runId, name)` and has no prefix scan: the READER always knows the ids
+ * — they come from the approved, hash-bound spec — so enumeration is never needed.
+ */
+export const ASSIGNMENT_ROUND_PROJECTION_PREFIX = 'assignment_round:';
+
+export function assignmentRoundProjectionName(assignmentKey: string): string {
+  return `${ASSIGNMENT_ROUND_PROJECTION_PREFIX}${assignmentKey}`;
+}
+
+export interface AssignmentRoundState {
+  /** The spec-declared sub-assignment id. */
+  readonly id: string;
+  /** The loop round this outcome belongs to — a record is ONLY usable for it. */
+  readonly round: number;
+  readonly stage: 'delivered' | 'no_deliverable';
+  /** The scope this implementor was confined to, recorded for the operator. */
+  readonly writeScope: readonly string[];
+  readonly stopReason?: string;
+  readonly diagnostic?: string;
+  readonly at: IsoTimestamp;
+}
+
+/**
+ * The READ boundary for a per-assignment round record.
+ *
+ * Total by construction: it returns `undefined` for absence, for a record written
+ * by a version that did not have this shape, and for any value it cannot vouch
+ * for. `undefined` means exactly "no usable record for this assignment", which the
+ * driver reads as "drive it" — the only interpretation that cannot lose work or
+ * fabricate a turn that never ran. It never throws, because a resume that crashes
+ * on an old record is the failure mode this codebase has already paid for twice
+ * (`migrateMergeReadinessBlockedState`, `resolveExecutionMode`).
+ */
+export function resolveAssignmentRoundState(raw: unknown): AssignmentRoundState | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined;
+  const record = raw as Partial<AssignmentRoundState>;
+  if (typeof record.id !== 'string' || record.id.length === 0) return undefined;
+  if (typeof record.round !== 'number' || !Number.isInteger(record.round)) return undefined;
+  if (record.stage !== 'delivered' && record.stage !== 'no_deliverable') return undefined;
+  const writeScope = Array.isArray(record.writeScope)
+    ? record.writeScope.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  return {
+    id: record.id,
+    round: record.round,
+    stage: record.stage,
+    writeScope,
+    ...(typeof record.stopReason === 'string' ? { stopReason: record.stopReason } : {}),
+    ...(typeof record.diagnostic === 'string' ? { diagnostic: record.diagnostic } : {}),
+    at: (typeof record.at === 'string' ? record.at : '') as IsoTimestamp,
+  };
+}
+
 /**
  * W2-1/W2-3: the SUPPORTING events the engine reducer folds into
  * `EngineState` (beyond §6.3 trigger events). `workflow.dispatch.advanced`

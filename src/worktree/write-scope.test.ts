@@ -16,6 +16,7 @@ import {
   boundaryAdmits,
   declaredPathsOverlap,
   declaredScopesOverlap,
+  disjointWriteBoundaries,
   isWholeRootBoundary,
   normalizeDeclaredScope,
   normalizeDeclaredScopePath,
@@ -194,5 +195,83 @@ describe('boundariesOverlap — lexical AND physical, because neither alone is e
     const first = writeBoundary({ mode: 'worktree', executionRoot: path.join(base, 'assignment-asg_a') });
     const second = writeBoundary({ mode: 'worktree', executionRoot: path.join(base, 'assignment-asg_a-2') });
     expect(boundariesOverlap(first, second)).toBeUndefined();
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// B5 — `disjointWriteBoundaries`: the ONE producer of a fan-out's boundaries.
+// ---------------------------------------------------------------------------
+describe('disjointWriteBoundaries — the fan-out chokepoint', () => {
+  it('returns per-assignment boundaries AND their union from one construction', () => {
+    const root = tempRoot();
+    const built = disjointWriteBoundaries('in_place', root, [
+      { id: 'backend', declaredScope: ['src', 'server'] },
+      { id: 'frontend', declaredScope: ['web'] },
+    ]);
+    expect(built.perAssignment.map((b) => b.declared)).toEqual([['src', 'server'], ['web']]);
+    // The union covers every declared path exactly once — the commit gate's
+    // boundary and the session boundaries come from the SAME call, so they
+    // cannot be derived inconsistently.
+    expect(built.union.declared).toEqual(['src', 'server', 'web']);
+    expect(built.union.roots).toEqual([
+      path.join(root, 'src'),
+      path.join(root, 'server'),
+      path.join(root, 'web'),
+    ]);
+  });
+
+  it('REFUSES nested scopes (the overlap a plain equality check would miss)', () => {
+    const root = tempRoot();
+    const thrown = (): unknown =>
+      disjointWriteBoundaries('in_place', root, [
+        { id: 'outer', declaredScope: ['src'] },
+        { id: 'inner', declaredScope: ['src/app'] },
+      ]);
+    expect(thrown).toThrow(WorktreeError);
+    expect(thrown).toThrow(/write scopes overlap/);
+  });
+
+  it('REFUSES a SYMLINK ALIAS that is lexically disjoint and physically the same dir', () => {
+    const root = tempRoot();
+    mkdirSync(path.join(root, 'real'), { recursive: true });
+    symlinkSync(path.join(root, 'real'), path.join(root, 'alias'));
+    expect(() =>
+      disjointWriteBoundaries('in_place', root, [
+        { id: 'a', declaredScope: ['real'] },
+        { id: 'b', declaredScope: ['alias'] },
+      ]),
+    ).toThrow(/write scopes overlap/);
+  });
+
+  it('REFUSES an empty scope in a decomposition, in its OWN words', () => {
+    const root = tempRoot();
+    expect(() =>
+      disjointWriteBoundaries('in_place', root, [
+        { id: 'scoped', declaredScope: ['src'] },
+        { id: 'everything', declaredScope: [] },
+      ]),
+    ).toThrow(/declares no write scope/);
+  });
+
+  it('ALLOWS a lone assignment to declare nothing — that is the whole root, today s shape', () => {
+    const root = tempRoot();
+    const built = disjointWriteBoundaries('worktree', root, [{ id: 'solo', declaredScope: [] }]);
+    expect(built.perAssignment[0]!.declared).toEqual([]);
+    expect(built.union.declared).toEqual([]);
+    expect(built.union.roots).toEqual([root]);
+  });
+
+  it('REFUSES an empty decomposition rather than producing a boundary-less commit gate', () => {
+    expect(() => disjointWriteBoundaries('in_place', tempRoot(), [])).toThrow(WorktreeError);
+  });
+
+  it('does NOT invent an overlap between sibling-prefixed names', () => {
+    const root = tempRoot();
+    const built = disjointWriteBoundaries('in_place', root, [
+      { id: 'a', declaredScope: ['src/app'] },
+      { id: 'b', declaredScope: ['src/application'] },
+    ]);
+    expect(built.union.declared).toEqual(['src/app', 'src/application']);
   });
 });

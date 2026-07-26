@@ -29,7 +29,7 @@ import { createRunFixture } from '../app/test-support.js';
 import { ROLE_ROUND_PROJECTION, type RoleRoundProjection } from '../app/projections.js';
 import { DurableDesiredModelStore } from '../app/desired-model-store.js';
 import type { RunId } from '../domain/ids.js';
-import { executeCommand, provisioningFailureView } from './commands.js';
+import { approvedSpecAssignments, executeCommand, provisioningFailureView } from './commands.js';
 import { makeTempGitRepo, type TempGitRepo } from '../worktree/test-support.js';
 
 const NO_SPAWN_FACTORY: RoleAdapterFactory = {
@@ -889,5 +889,47 @@ describe('provisioningFailureView — the JSON payload carries the cause', () =>
     });
     expect(view.cause).toBeUndefined();
     expect(view.detail).toBe('node_modules is NOT git-ignored');
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// B5 — the decomposition the fan-out executes comes from the CANONICAL SPEC
+// BYTES, which are exactly the bytes the approval hash binds.
+// ---------------------------------------------------------------------------
+describe('approvedSpecAssignments — the hash-bound decomposition reader', () => {
+  it('reads the assignments a canonicalized spec carries', () => {
+    const canonical = JSON.stringify({
+      goal: 'g',
+      assignments: [
+        { id: 'backend', taskScope: 'API half', writeScope: ['src'], criteria: ['AC-1'] },
+        { id: 'frontend', taskScope: 'UI half', writeScope: ['web'], criteria: ['AC-2'] },
+      ],
+    });
+    expect(approvedSpecAssignments(canonical)).toEqual([
+      { id: 'backend', taskScope: 'API half', writeScope: ['src'] },
+      { id: 'frontend', taskScope: 'UI half', writeScope: ['web'] },
+    ]);
+  });
+
+  // Rule 9 — every spec written before decompositions existed has no
+  // `assignments` at all, and that absence is the status quo, not an error.
+  it('reads NO decomposition from a pre-B4 spec, unparseable bytes, or a malformed entry', () => {
+    expect(approvedSpecAssignments(JSON.stringify({ goal: 'g' }))).toEqual([]);
+    expect(approvedSpecAssignments('not json at all')).toEqual([]);
+    expect(approvedSpecAssignments('null')).toEqual([]);
+    expect(approvedSpecAssignments(JSON.stringify({ assignments: 'nope' }))).toEqual([]);
+    // A PARTIALLY readable list yields NOTHING rather than a truncated fan-out:
+    // silently dropping an assignment would run a decomposition nobody approved.
+    expect(
+      approvedSpecAssignments(
+        JSON.stringify({
+          assignments: [
+            { id: 'backend', taskScope: 'ok', writeScope: ['src'] },
+            { taskScope: 'missing id', writeScope: ['web'] },
+          ],
+        }),
+      ),
+    ).toEqual([]);
   });
 });
