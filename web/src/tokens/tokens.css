@@ -1,0 +1,71 @@
+:root {
+  /* Background ramp */
+  --bg-0: #0b0e13;
+  --bg-1: #0f1319;
+  --bg-2: #141922;
+  --bg-3: #1a2029;
+  --bg-hover: #212834;
+
+  /* Borders */
+  --bd: #242b35;
+  --bd-2: #323b47;
+
+  /* Text ramp */
+  --tx-1: #e6eaf0;
+  --tx-2: #97a2b1;
+  --tx-3: #616c7e;
+
+  /* Accent (active/current) */
+  --accent: #35b0b5;
+  --accent-bg: #0f2625;
+  --accent-bd: #1f4d4e;
+
+  /* Amber (waiting/paused/attention) */
+  --amber: #e0a641;
+  --amber-bg: #282010;
+  --amber-bd: #4d3c15;
+
+  /* Red (failed/breaker/destructive) */
+  --red: #e0655a;
+  --red-bg: #281410;
+  --red-bd: #4d211c;
+
+  /* Green (verified/merge-ready) */
+  --green: #4fb87e;
+  --green-bg: #0f2318;
+  --green-bd: #1f4531;
+
+  /* Purple (successor / failover lineage) */
+  --purple: #9a86ff;
+  --purple-bg: #181630;
+  --purple-bd: #2f2a52;
+
+  --row-pad: 9px 12px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg-0);
+  color: var(--tx-1);
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mono {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
