@@ -276,7 +276,11 @@ async function executeCliDomainCommand(
     // best-effort/at-least-once alert delivery — flush any un-acked alerts to
     // their sinks (stderr push + status_json view) before serving the command.
     // Best-effort: never let a delivery hiccup fail the command.
-    if ('runId' in command) {
+    // `status` is an observation path. Alert delivery appends
+    // `alert.delivered`, so doing it before status turns polling into a writer
+    // that advances event cursors and contends with the run it is observing.
+    // Delivery remains best-effort on every mutating/run-driving command.
+    if ('runId' in command && command.kind !== 'status') {
       try {
         service.deliverPendingAlerts(command.runId);
       } catch {
@@ -413,6 +417,11 @@ function toApplicationCommand(
         workspace: command.workspace,
         goal: command.goal,
         coordinator: command.coordinator,
+        ...(command.implementor !== undefined ? { implementor: command.implementor } : {}),
+        ...(command.verifier !== undefined ? { verifier: command.verifier } : {}),
+        ...(command.executionMode !== undefined
+          ? { executionMode: command.executionMode }
+          : {}),
         ...(command.configPath !== undefined ? { configPath: command.configPath } : {}),
         ...(command.enableChat === true ? { enableChat: true as const } : {}),
       };
@@ -474,6 +483,11 @@ export function toRunCommand(
         workspace: command.workspace,
         goal: command.goal,
         coordinator: command.coordinator,
+        ...(command.implementor !== undefined ? { implementor: command.implementor } : {}),
+        ...(command.verifier !== undefined ? { verifier: command.verifier } : {}),
+        ...(command.executionMode !== undefined
+          ? { executionMode: command.executionMode }
+          : {}),
         ...(command.configPath !== undefined ? { configPath: command.configPath } : {}),
         ...(command.enableChat === true ? { enableChat: true as const } : {}),
         ...(options.noWait === true ? { noWait: true as const } : {}),
@@ -698,6 +712,63 @@ export function cliApplicationPort(input: {
       }
       const runCommand = toRunCommand(command, seam.options);
       const output = await executeCliDomainCommand(service, db, runCommand, env, deps);
+      return applicationResultFromCommandOutput(command.kind, output);
+    },
+  };
+}
+
+/**
+ * HTTP-side adapter over the same domain compositions as the CLI. The caller
+ * supplies an HTTP-origin context through the shared executor; CLI-only seams
+ * (`--test-approve`, presentation and wait flags) are structurally absent.
+ *
+ * Long-running commands use the non-waiting limit policy so an HTTP request
+ * never sleeps until a provider reset. The command itself may still run a
+ * coordinator/implementor turn; durable operations remain the recovery record.
+ */
+export function httpApplicationPort(input: {
+  readonly service: OrchestrationService;
+  readonly db: Database;
+  readonly env: NodeJS.ProcessEnv;
+  readonly deps: CommandDeps;
+}): ApplicationCommandPort {
+  const { service, db, env, deps } = input;
+  return {
+    async execute(command, context): Promise<ApplicationResult> {
+      if (context.origin !== 'http') {
+        return {
+          status: 'rejected',
+          command: command.kind,
+          error: {
+            code: 'http_origin_required',
+            message: `HTTP command port requires origin "http"; received "${context.origin}"`,
+            details: { origin: context.origin },
+          },
+        };
+      }
+      if (command.kind === 'respondToPermission') {
+        return {
+          status: 'rejected',
+          command: command.kind,
+          error: {
+            code: 'unsupported_command',
+            message:
+              'Durable ACP permission responses are not available in this MVP slice; stale live-session requests must never be guessed at.',
+            details: {},
+          },
+        };
+      }
+      const runCommand = toRunCommand(command, {
+        json: true,
+        noWait: true,
+      });
+      const output = await executeCliDomainCommand(
+        service,
+        db,
+        runCommand,
+        env,
+        deps,
+      );
       return applicationResultFromCommandOutput(command.kind, output);
     },
   };
@@ -1060,6 +1131,11 @@ async function handleStart(
     goal: cmd.goal,
     workspacePath: startBase.repoRoot,
     coordinator: cmd.coordinator,
+    ...(cmd.implementor !== undefined ? { requestedImplementor: cmd.implementor } : {}),
+    ...(cmd.verifier !== undefined ? { requestedVerifier: cmd.verifier } : {}),
+    ...(cmd.executionMode !== undefined
+      ? { defaultExecutionMode: cmd.executionMode }
+      : {}),
     baseCommit: startBase.baseCommit,
     ...(cmd.enableChat === true ? { planningChatEnabled: true } : {}),
   });

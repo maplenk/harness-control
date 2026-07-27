@@ -6,6 +6,28 @@
 import { describe, expect, it } from 'vitest';
 import { CLI_USAGE, parseCliArgs } from './args.js';
 
+describe('parseCliArgs — serve', () => {
+  it('defaults to an ephemeral port and accepts an explicit loopback port', () => {
+    expect(parseCliArgs(['serve'])).toEqual({ kind: 'serve', json: false });
+    expect(parseCliArgs(['serve', '--port', '0', '--json'])).toEqual({
+      kind: 'serve',
+      json: true,
+      port: 0,
+    });
+    expect(parseCliArgs(['serve', '--port=7717'])).toEqual({
+      kind: 'serve',
+      json: false,
+      port: 7717,
+    });
+  });
+
+  it('rejects invalid ports and positional arguments', () => {
+    expect(parseCliArgs(['serve', '--port', '-1'])).toMatchObject({ kind: 'usage_error' });
+    expect(parseCliArgs(['serve', '--port', '70000'])).toMatchObject({ kind: 'usage_error' });
+    expect(parseCliArgs(['serve', 'now'])).toMatchObject({ kind: 'usage_error' });
+  });
+});
+
 describe('parseCliArgs — start', () => {
   it('parses the coordinator profile + flags onto a RoleModelSpec', () => {
     expect(

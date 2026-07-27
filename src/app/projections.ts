@@ -143,6 +143,11 @@ export interface RunMeta {
   readonly goal: string;
   readonly workspacePath: string;
   readonly coordinator: RoleModelSpec;
+  /** Operator-selected implementation defaults. The coordinator's approved
+   * spec still supplies the fallback when these are absent (legacy/CLI runs). */
+  readonly requestedImplementor?: RoleModelSpec;
+  readonly requestedVerifier?: RoleModelSpec;
+  readonly defaultExecutionMode?: ExecutionMode;
   /** Opt-in Agent Room discussion remains bound to coordinator re-entry and
    * later spec-revision rounds for this run. */
   readonly planningChatEnabled?: boolean;

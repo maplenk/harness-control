@@ -14,6 +14,7 @@ import type {
   SpecVersionId,
 } from '../../domain/ids.js';
 import type { RoleName } from '../../domain/state.js';
+import type { ExecutionMode } from '../../domain/execution-mode.js';
 import type { RoleModelSpec } from '../model-resolution.js';
 
 // ---------------------------------------------------------------------------
@@ -48,6 +49,10 @@ export type ApplicationCommand =
       readonly workspace: string;
       readonly goal: string;
       readonly coordinator: RoleModelSpec;
+      /** Operator-selected defaults persisted with the run and offered back at implementation time. */
+      readonly implementor?: RoleModelSpec;
+      readonly verifier?: RoleModelSpec;
+      readonly executionMode?: ExecutionMode;
       readonly configPath?: string;
       /** Opt-in Agent Room discussion before final spec synthesis (domain intent, not presentation). */
       readonly enableChat?: boolean;

@@ -124,15 +124,21 @@ function validateCommand(command: ApplicationCommand): string | undefined {
       if (typeof start.goal !== 'string' || start.goal.trim() === '') {
         return 'start.goal must be a non-empty string';
       }
-      if (
-        start.coordinator === null ||
-        typeof start.coordinator !== 'object' ||
-        typeof start.coordinator.harness !== 'string' ||
-        start.coordinator.harness.trim() === '' ||
-        typeof start.coordinator.model !== 'string' ||
-        start.coordinator.model.trim() === ''
-      ) {
+      if (!validRoleSpec(start.coordinator)) {
         return 'start.coordinator must include non-empty harness and model';
+      }
+      if (start.implementor !== undefined && !validRoleSpec(start.implementor)) {
+        return 'start.implementor must include non-empty harness and model';
+      }
+      if (start.verifier !== undefined && !validRoleSpec(start.verifier)) {
+        return 'start.verifier must include non-empty harness and model';
+      }
+      if (
+        start.executionMode !== undefined &&
+        start.executionMode !== 'worktree' &&
+        start.executionMode !== 'in_place'
+      ) {
+        return 'start.executionMode must be worktree or in_place';
       }
       return undefined;
     }
@@ -201,6 +207,22 @@ function validateCommand(command: ApplicationCommand): string | undefined {
       return `unsupported command kind: ${String(_exhaustive)}`;
     }
   }
+}
+
+function validRoleSpec(value: unknown): value is {
+  readonly harness: string;
+  readonly model: string;
+} {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'harness' in value &&
+    typeof value.harness === 'string' &&
+    value.harness.trim() !== '' &&
+    'model' in value &&
+    typeof value.model === 'string' &&
+    value.model.trim() !== ''
+  );
 }
 
 function nonEmpty(value: unknown): boolean {

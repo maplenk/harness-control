@@ -9,7 +9,8 @@ export type { BetterSqlite3DriverOptions, OpenDriverOptions } from './drivers/in
 export type { AppliedMigration, Migration } from './migrations.js';
 export { MIGRATIONS, listAppliedMigrations, runMigrations } from './migrations.js';
 
-export { registerRun } from './runs.js';
+export type { RegisteredRun } from './runs.js';
+export { RESERVED_RUN_SCOPES, listRuns, registerRun } from './runs.js';
 
 export type { AppendOutcome, EventRepository, ListByRunOptions } from './event-repository.js';
 export { SqliteEventRepository } from './event-repository.js';

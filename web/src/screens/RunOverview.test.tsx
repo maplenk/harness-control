@@ -55,6 +55,26 @@ describe('RunOverview', () => {
     }
   });
 
+  it('derives workflow state from the authoritative run phase', () => {
+    render(
+      <RunOverview
+        overview={{
+          ...FIXTURE_OVERVIEW,
+          phase: 'created',
+          phaseLabel: 'created · idle',
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId('workflow-node-Spec').getAttribute('data-state')).toBe('active');
+    expect(screen.getByTestId('workflow-node-Approval').getAttribute('data-state')).toBe(
+      'pending',
+    );
+    expect(screen.getByTestId('workflow-node-Verify').getAttribute('data-state')).toBe(
+      'pending',
+    );
+  });
+
   it('renders the measured and estimated cost split', () => {
     render(<RunOverview overview={FIXTURE_OVERVIEW} />);
 

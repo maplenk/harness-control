@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "web/dist",
     "profiles",
     "README.md"
   ],
@@ -20,12 +21,16 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "postbuild": "node -e \"require('node:fs').chmodSync('dist/cli/index.js', 0o755)\"",
+    "build:web": "vite build web",
+    "postbuild": "vite build web && node -e \"require('node:fs').chmodSync('dist/cli/index.js', 0o755)\"",
     "prepack": "npm run build",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "npm run typecheck:engine && npm run typecheck:web",
+    "typecheck:engine": "tsc -p tsconfig.json --noEmit",
+    "typecheck:web": "tsc -p web/tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "tsx src/cli/index.ts",
+    "serve": "tsx src/cli/index.ts serve",
     "smoke:claude:provider": "tsx scripts/claude-provider-live-smoke.ts",
     "smoke:claude:provider:record": "tsx scripts/claude-provider-live-smoke.ts --record-evidence",
     "smoke:opencode:isolation": "tsx scripts/opencode-isolation-smoke.ts",

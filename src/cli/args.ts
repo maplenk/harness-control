@@ -20,6 +20,7 @@ import {
   type SpecVersionId,
 } from '../domain/ids.js';
 import type { RoleName } from '../domain/state.js';
+import type { ExecutionMode } from '../domain/execution-mode.js';
 import type { RoleModelSpec } from '../app/index.js';
 import { err, isErr, ok, type Result } from '../lib/result.js';
 import { parseRoleProfile, parseSwitchTarget } from './profile.js';
@@ -34,6 +35,11 @@ commands:
   doctor [--json] [--config FILE]
       environment diagnosis: adapter binaries + versions, auth (4-state),
       host provider-config safety, ACP handshake (fake), git, sqlite, quotas.
+
+  serve [--port N] [--json]
+      start the loopback-only Harness Control API and UI. Port 0 (the default)
+      selects an available port and writes scoped connection metadata under
+      HARNESS_HOME with owner-only permissions.
 
   start --workspace PATH --goal TEXT --coordinator PROFILE [--model ID] [--effort E] [--config FILE] [--enable-chat] [--no-wait]
       create a run (phase=created) with the coordinator profile pinned (§11.2).
@@ -82,7 +88,20 @@ global options:
 
 /** Commands that need the engine (everything but help/usage_error/doctor). */
 export type RunCommand =
-  | { readonly kind: 'start'; readonly json: boolean; readonly workspace: string; readonly goal: string; readonly coordinator: RoleModelSpec; readonly configPath?: string; readonly enableChat?: boolean; readonly noWait?: boolean }
+  | {
+      readonly kind: 'start';
+      readonly json: boolean;
+      readonly workspace: string;
+      readonly goal: string;
+      readonly coordinator: RoleModelSpec;
+      /** HTTP UI run defaults; the CLI parser deliberately leaves these absent. */
+      readonly implementor?: RoleModelSpec;
+      readonly verifier?: RoleModelSpec;
+      readonly executionMode?: ExecutionMode;
+      readonly configPath?: string;
+      readonly enableChat?: boolean;
+      readonly noWait?: boolean;
+    }
   | { readonly kind: 'spec_revise'; readonly json: boolean; readonly runId: RunId; readonly feedback: string; readonly noWait?: boolean }
   | {
       readonly kind: 'approve';
@@ -150,6 +169,7 @@ export type ParsedCliCommand =
   | { readonly kind: 'help' }
   | { readonly kind: 'usage_error'; readonly message: string }
   | { readonly kind: 'doctor'; readonly json: boolean; readonly configPath?: string }
+  | { readonly kind: 'serve'; readonly json: boolean; readonly port?: number }
   | RunCommand;
 
 /** The single simple RUN_ID + `--json` commands, keyed by their command kind. */
@@ -249,6 +269,8 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
   switch (command) {
     case 'doctor':
       return parseDoctor(rest);
+    case 'serve':
+      return parseServe(rest);
     case 'start':
       return parseStart(rest);
     case 'spec':
@@ -288,6 +310,20 @@ function parseDoctor(rest: readonly string[]): ParsedCliCommand {
   if (positionals.length > 0) return usage(`doctor: unexpected argument '${positionals[0]}'`);
   const configPath = values.get('config');
   return { kind: 'doctor', json: bools.has('json'), ...(configPath !== undefined ? { configPath } : {}) };
+}
+
+function parseServe(rest: readonly string[]): ParsedCliCommand {
+  const collected = collectOptions(rest, { booleans: ['json'], values: ['port'] });
+  if (isErr(collected)) return usage(collected.error);
+  const { values, bools, positionals } = collected.value;
+  if (positionals.length > 0) return usage(`serve: unexpected argument '${positionals[0]}'`);
+  const rawPort = values.get('port');
+  if (rawPort === undefined) return { kind: 'serve', json: bools.has('json') };
+  const port = Number(rawPort);
+  if (!Number.isInteger(port) || port < 0 || port > 65_535) {
+    return usage(`serve: --port must be an integer from 0 to 65535 (got '${rawPort}')`);
+  }
+  return { kind: 'serve', json: bools.has('json'), port };
 }
 
 function parseStart(rest: readonly string[]): ParsedCliCommand {

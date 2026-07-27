@@ -4,6 +4,7 @@ import { FIXTURE_GROUPS } from '../fixtures/runs';
 export interface FleetRailProps {
   readonly runs: readonly FleetRun[];
   readonly selectedRunId: string;
+  readonly onSelectRun?: (runId: string) => void;
 }
 
 function groupRuns(
@@ -18,7 +19,7 @@ function groupRuns(
     .filter((group) => group.runs.length > 0);
 }
 
-export function FleetRail({ runs, selectedRunId }: FleetRailProps) {
+export function FleetRail({ runs, selectedRunId, onSelectRun }: FleetRailProps) {
   const populated = groupRuns(runs, FIXTURE_GROUPS);
 
   return (
@@ -79,11 +80,20 @@ export function FleetRail({ runs, selectedRunId }: FleetRailProps) {
                       background: selected ? 'var(--bg-3)' : 'transparent',
                     }}
                   >
-                    <div
+                    <button
+                      type="button"
+                      onClick={() => onSelectRun?.(run.id)}
                       style={{
                         display: 'flex',
                         alignItems: 'flex-start',
                         gap: 8,
+                        width: '100%',
+                        padding: 0,
+                        border: 0,
+                        background: 'transparent',
+                        color: 'inherit',
+                        textAlign: 'left',
+                        cursor: onSelectRun === undefined ? 'default' : 'pointer',
                       }}
                     >
                       <span
@@ -147,7 +157,7 @@ export function FleetRail({ runs, selectedRunId }: FleetRailProps) {
                           </span>
                         </div>
                       </div>
-                    </div>
+                    </button>
                   </li>
                 );
               })}

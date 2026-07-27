@@ -169,6 +169,9 @@ describe('toRunCommand / routeCliCommand round-trip', () => {
       workspace: '/ws',
       goal: 'g',
       coordinator: CLAUDE_LOW,
+      implementor: { harness: 'codex', model: 'gpt-5.6-sol', effort: 'high' },
+      verifier: { harness: 'claude', model: 'sonnet', effort: 'medium' },
+      executionMode: 'in_place',
       configPath: '/cfg.json',
       enableChat: true,
       noWait: true,
@@ -506,4 +509,3 @@ describe('live-engine parity through the real CLI port', () => {
     });
   });
 });
-

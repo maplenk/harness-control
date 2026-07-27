@@ -430,6 +430,26 @@ describe('OrchestrationService — run lifecycle', () => {
     });
   });
 
+  it('persists operator-selected role and execution defaults in immutable run metadata', async () => {
+    const { service, db } = await setup();
+    const requestedImplementor = { harness: 'codex' as const, model: 'gpt-5.6-sol' };
+    const requestedVerifier = { harness: 'claude' as const, model: 'sonnet', effort: 'high' as const };
+    const { runId } = createRunFixture(service, {
+      goal: 'Remember the operator defaults',
+      workspacePath: '/ws',
+      coordinator: CLAUDE_LOW,
+      requestedImplementor,
+      requestedVerifier,
+      defaultExecutionMode: 'in_place',
+    });
+
+    expect(db.projections.get<RunMeta>(runId, RUN_META_PROJECTION)?.state).toMatchObject({
+      requestedImplementor,
+      requestedVerifier,
+      defaultExecutionMode: 'in_place',
+    });
+  });
+
   it('advances created → specifying → awaiting_approval on a fake coordinator turn (§6.2, §20 P3)', async () => {
     const { service, created } = await setup();
     const { runId } = createRunFixture(service, { goal: 'Add a flag', workspacePath: '/ws', coordinator: CLAUDE_LOW });

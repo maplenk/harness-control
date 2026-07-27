@@ -7,6 +7,7 @@ export interface RunOverviewProps {
 export function RunOverview({ overview }: RunOverviewProps) {
   const measured = overview.costMeasured.toFixed(2);
   const estimated = overview.costEstimated.toFixed(2);
+  const activeWorkflowIndex = workflowIndex(overview.phase);
 
   return (
     <section
@@ -108,16 +109,24 @@ export function RunOverview({ overview }: RunOverviewProps) {
             gap: 0,
           }}
         >
-          {overview.workflowNodes.map((node, index) => (
-            <li
-              key={node}
-              data-testid={`workflow-node-${node}`}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 0,
-              }}
-            >
+          {overview.workflowNodes.map((node, index) => {
+            const state =
+              index < activeWorkflowIndex
+                ? 'complete'
+                : index === activeWorkflowIndex
+                  ? 'active'
+                  : 'pending';
+            return (
+              <li
+                key={node}
+                data-state={state}
+                data-testid={`workflow-node-${node}`}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 0,
+                }}
+              >
               <div
                 style={{
                   display: 'flex',
@@ -138,16 +147,19 @@ export function RunOverview({ overview }: RunOverviewProps) {
                     fontWeight: 700,
                     border: '2px solid var(--accent)',
                     background:
-                      index <= 3 ? 'var(--accent)' : 'var(--bg-0)',
-                    color: index <= 3 ? '#04211f' : 'var(--tx-3)',
+                      state === 'complete' ? 'var(--accent)' : 'var(--bg-0)',
+                    color:
+                      state === 'complete' || state === 'active'
+                        ? 'var(--accent)'
+                        : 'var(--tx-3)',
                   }}
                 >
-                  {index < 3 ? '✓' : index === 3 ? '●' : index + 1}
+                  {state === 'complete' ? '✓' : state === 'active' ? '●' : index + 1}
                 </span>
                 <span
                   style={{
                     fontSize: '10.5px',
-                    color: index === 3 ? 'var(--accent)' : 'var(--tx-2)',
+                    color: state === 'active' ? 'var(--accent)' : 'var(--tx-2)',
                   }}
                 >
                   {node}
@@ -159,15 +171,17 @@ export function RunOverview({ overview }: RunOverviewProps) {
                   style={{
                     width: 34,
                     height: 2,
-                    background: index < 3 ? 'var(--accent)' : 'var(--bd)',
+                    background:
+                      index < activeWorkflowIndex ? 'var(--accent)' : 'var(--bd)',
                     margin: '0 2px',
                     alignSelf: 'flex-start',
                     marginTop: 10,
                   }}
                 />
               ) : null}
-            </li>
-          ))}
+              </li>
+            );
+          })}
         </ol>
       </header>
 
@@ -230,4 +244,25 @@ export function RunOverview({ overview }: RunOverviewProps) {
       </div>
     </section>
   );
+}
+
+function workflowIndex(phase: RunOverviewData['phase']): number {
+  switch (phase) {
+    case 'created':
+    case 'specifying':
+      return 0;
+    case 'awaiting_approval':
+      return 1;
+    case 'approved':
+    case 'implementing':
+    case 'needs_remediation':
+      return 2;
+    case 'verifying':
+      return 3;
+    case 'merge_ready':
+      return 4;
+    case 'cancelled':
+    case 'failed':
+      return -1;
+  }
 }

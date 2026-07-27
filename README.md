@@ -49,7 +49,7 @@ run survives process restarts and is inspectable after the fact.
 
 ```sh
 npm install
-npm run build        # tsc → dist/, then marks the bin executable
+npm run build        # engine → dist/, UI → web/dist/, then marks the bin executable
 npm test             # deterministic offline suite (vitest; no real spawns)
 npm run typecheck
 ```
@@ -63,6 +63,35 @@ during development). Run state lives under `HARNESS_HOME` (default
 `npm run build` before `npm pack`/`npm publish` — the tarball always reflects
 current source, never a stale local `dist/`. CI should still assert
 `dist/` matches a clean build (build from a clean checkout, diff the tree).
+
+## Harness Control (MVP)
+
+`serve` starts the five-screen local operator UI and its API on loopback only.
+Port `0` is the default, so the OS chooses an available port. The daemon writes
+the actual origin plus scoped bearer/CSRF tokens to
+`$HARNESS_HOME/connection.json` with mode `0600`; no fixed port or token is
+embedded in the client.
+
+```sh
+npm run build
+harness-orchestrator serve
+```
+
+The MVP screens are Fleet, New Run, Run Overview, Assignment Detail, and
+Verification. Fleet and run snapshots are assembled only from durable
+projections. Event polling uses an exclusive cursor (`after=N` returns
+`N+1` onward), and status/snapshot polling does not deliver alerts or append
+events. The browser never re-runs the engine reducer; raw events feed only the
+activity view. New Run persists the selected implementor, verifier, and
+execution mode as immutable run defaults; Start implementation sends those
+same values through the shared application-command path.
+
+This branch is intentionally honest about its current execution boundary:
+the API drives one repository per run and desired-model switching is keyed by
+run + role. Multi-repository start and assignment-scoped retry/reassign are
+refused with explicit capability errors rather than silently mapped to
+run-wide actions. The UI can describe those requests now, but does not label
+them operational until the corresponding engine scheduler/store changes land.
 
 ## Walkthrough (PLAN §18)
 

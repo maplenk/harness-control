@@ -690,6 +690,10 @@ describe('F15 — every reader of a declared command crosses the normalizing cho
       'cli/commands.ts',
       ['verificationCommands: normalizeVerificationCommands(c.verificationCommands),'],
     ],
+    [
+      'serve/read-model.ts',
+      ['commands: normalizeVerificationCommands(criterion.verificationCommands),'],
+    ],
     ['domain/entities.ts', ['readonly verificationCommands: readonly VerificationCommand[];']],
   ]);
 

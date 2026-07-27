@@ -197,6 +197,7 @@ import {
   type WorktreeTaintSink,
 } from '../supervisor/index.js';
 import { BYTES_PER_MB } from '../config/schema.js';
+import type { ExecutionMode } from '../domain/execution-mode.js';
 import { DurableProcessRegistryStore } from './process-registry-store.js';
 import { DurableSpawnReservationStore, type SpawnReservationRecord } from './spawn-reservation-store.js';
 import {
@@ -887,6 +888,10 @@ interface CreateRunCommonInput {
   /** The coordinator's resolved harness/model/effort (PLAN §7 proposes the
    * implementor/verifier profiles; those become `run` defaults later). */
   readonly coordinator: RoleModelSpec;
+  /** Optional operator defaults captured immutably for the later run command. */
+  readonly requestedImplementor?: RoleModelSpec;
+  readonly requestedVerifier?: RoleModelSpec;
+  readonly defaultExecutionMode?: ExecutionMode;
   /** Keep the coordinator's planning/revision rounds attached to an Agent Room. */
   readonly planningChatEnabled?: boolean;
   /** Default `{mode:'headless'}` (deny-all, §10.2). */
@@ -1623,6 +1628,15 @@ export class OrchestrationService {
       goal: input.goal,
       workspacePath: input.workspacePath,
       coordinator: input.coordinator,
+      ...(input.requestedImplementor !== undefined
+        ? { requestedImplementor: input.requestedImplementor }
+        : {}),
+      ...(input.requestedVerifier !== undefined
+        ? { requestedVerifier: input.requestedVerifier }
+        : {}),
+      ...(input.defaultExecutionMode !== undefined
+        ? { defaultExecutionMode: input.defaultExecutionMode }
+        : {}),
       ...(input.planningChatEnabled === true ? { planningChatEnabled: true } : {}),
       // F5: pin the base commit at create/start — the earliest reproducible
       // snapshot. Immutable (RunMeta is never re-saved).

@@ -29,7 +29,7 @@
  * required for `--json` piping.
  */
 import { realpathSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { chmod, mkdir, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -53,7 +53,14 @@ import { isErr } from '../lib/result.js';
 import { runDoctor, renderDoctorText, type DoctorOptions } from './doctor.js';
 import { CLI_USAGE, parseCliArgs, type ParsedCliCommand, type RunCommand } from './args.js';
 import { executeCommand, type CliFlowDeps } from './commands.js';
+import { httpApplicationPort } from './commands.js';
 import { createAgentRoomPlanningChatFactory } from './agent-room.js';
+import {
+  executeApplicationCommand,
+  type ApplicationCommand,
+  type CommandContext,
+} from '../app/commands/index.js';
+import { startHarnessServer } from '../serve/index.js';
 
 // Keep the historical entry-point surface importable from `./index.js` (the
 // arg parser + usage string are unit-tested there).
@@ -87,9 +94,116 @@ export async function main(argv: readonly string[]): Promise<number> {
       );
       return report.overall === 'fail' ? 1 : 0;
     }
+    case 'serve':
+      return runServeCommand(parsed, process.env);
     default:
       return runEngineCommand(parsed, process.env);
   }
+}
+
+async function runServeCommand(
+  command: Extract<ParsedCliCommand, { kind: 'serve' }>,
+  env: NodeJS.ProcessEnv,
+): Promise<number> {
+  const home = resolveHarnessHome(env);
+  await mkdir(home, { recursive: true });
+  const casRoot = path.join(home, 'artifacts');
+  const filename = path.join(home, 'harness.db');
+  const db = await openDatabase({ filename, casRoot });
+  const staticRoot = fileURLToPath(new URL('../../web/dist/', import.meta.url));
+  const execute = async (
+    applicationCommand: ApplicationCommand,
+    context: CommandContext,
+  ) => {
+    let config: EngineConfig;
+    if (applicationCommand.kind === 'start') {
+      if (applicationCommand.configPath !== undefined) {
+        const loaded = loadEngineConfigFromFile(applicationCommand.configPath);
+        if (isErr(loaded)) {
+          return {
+            status: 'invalid' as const,
+            command: applicationCommand.kind,
+            error: {
+              code: 'invalid_config',
+              message: loaded.error
+                .map((issue) => `${issue.path === '' ? '(root)' : issue.path}: ${issue.message}`)
+                .join('\n'),
+              details: {},
+            },
+          };
+        }
+        config = loaded.value;
+      } else {
+        config = DEFAULT_ENGINE_CONFIG;
+      }
+    } else {
+      config =
+        loadRunConfig(db, applicationCommand.runId) ?? DEFAULT_ENGINE_CONFIG;
+    }
+    // Artifact quotas are constructor-bound, so each write command gets a
+    // short-lived database handle configured from that run's durable config.
+    // The long-lived server handle remains an observation-only reader.
+    const commandDb = await openDatabase({
+      filename,
+      casRoot,
+      quotas: {
+        perRunBytes: config.quotas.perRunBytes,
+        globalBytes: config.quotas.globalBytes,
+      },
+    });
+    try {
+      const service = new OrchestrationService({ db: commandDb, config });
+      const flows = buildCliFlows(commandDb, config);
+      return await executeApplicationCommand(
+        httpApplicationPort({
+          service,
+          db: commandDb,
+          env,
+          deps: { ids: flows.ids, flows },
+        }),
+        { command: applicationCommand, context },
+      );
+    } finally {
+      commandDb.close();
+    }
+  };
+
+  const control = await startHarnessServer({
+    db,
+    ...(command.port !== undefined ? { port: command.port } : {}),
+    staticRoot,
+    execute,
+  });
+  const connectionPath = path.join(home, 'connection.json');
+  const connection = {
+    protocolVersion: 1,
+    pid: process.pid,
+    origin: control.origin,
+    port: control.port,
+    token: control.token,
+    csrfToken: control.csrfToken,
+  };
+  await writeFile(connectionPath, `${JSON.stringify(connection, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  await chmod(connectionPath, 0o600);
+  process.stdout.write(
+    command.json
+      ? `${JSON.stringify({ command: 'serve', ok: true, ...connection }, null, 2)}\n`
+      : `Harness Control is listening at ${control.origin}\nConnection metadata: ${connectionPath}\n`,
+  );
+
+  await new Promise<void>((resolve) => {
+    const stop = (): void => resolve();
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+    control.server.once('close', stop);
+  });
+  await control.close().catch(() => undefined);
+  await unlink(connectionPath).catch(() => undefined);
+  db.close();
+  return 0;
 }
 
 /**
